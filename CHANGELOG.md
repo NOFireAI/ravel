@@ -6,6 +6,985 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-11-18
+
+**Upgrade: apply the updated operator ClusterRole
+(`deploy/k8s/operator/rbac.yaml`) before upgrading the operator, on every
+install.** The operator watches HorizontalPodAutoscalers from startup. Without
+the new permissions, reconciles of every RavelCluster are delayed by up to
+about a minute per failed watch. See the first entry under Changed.
+
+### Added
+
+- **`stats.phases` reports a `fetch` phase for TopK late materialization's
+  row fetch.** A logs `SELECT *` (or wide projection) under `ORDER BY ... LIMIT
+  k` runs in two passes: phase 1 scans to pick the winners, phase 2 fetches
+  their wide columns (ADR-0774). Both passes charged `scan` before, so the
+  phase-2 fetch cost could only be found by running a second proxy statement
+  and subtracting, and `EXPLAIN` is refused on the read-only SQL endpoint.
+  `POST /api/v1/sql`'s `stats.phases` now carries a sixth phase, `fetch`,
+  appended after `keyIndex`, holding every GET, wire byte, cache hit and miss,
+  served and decompressed byte, and segment open of phase 2's row fetch, apart
+  from phase 1's `scan`. Phase 1 and every other read charge the phase they
+  charged before, the phases still sum to `stats.accounting`, and `fetch` is 0
+  on any statement that runs no late materialization. The same phase appears in
+  the PromQL `/api/v1/query` `stats.phases` array and in the MCP phase split
+  (requests and wire bytes only), since all three render the same phase list.
+- **MetricsBench read-back records each query call's `data.stats`.**
+  `ingest.json` and `readback-folded.json` carry `readback.query_stats`: for
+  every windowed count query, one entry per `/api/v1/query` call with its
+  window, never summed, and an explicit no-stats marker for the
+  `/api/v1/series` listings. The cold diagnostic pass also records each
+  repetition's resolve-phase GETs, unfolded segments resolved and metrics
+  fold cycles, and the fold cycles before and after the pass.
+- **A refused statement grouping by a string key now retries through the
+  bucketed final aggregate.** In the refusal retry the bucketed rule admits
+  Utf8, LargeUtf8, Utf8View, Binary, LargeBinary and BinaryView group keys
+  and routes them to disk in chunks of one byte budget, copied out of the
+  input and charged in full before a row is written, whose buffers stay
+  within that charge once a row is in; a first attempt still
+  plans them as before. This covers ClickBench statements 19, 34 and 35.
+  The prediction in `benchmarks/clickbench/bucket-bytes/` (#4152) puts the
+  route's written bytes at 27 to 51% of the smallest sort-merge retry
+  `spill_bytes_written` measured for the same statement and box; that is
+  predicted, not yet measured. The retry's INFO line gains
+  `routed_chunk_bytes`, and the bucketed exec's explain line shows it on
+  such a route.
+- **Key-index leaf format version 3 reader for metrics.** The catalog now
+  reads version 3 per-part key-index leaves on the metrics signal: the leaf
+  header carries an entry kind, and kind 1 is a posting (an ascending list
+  of series keys or class ordinals), decoded under its own bound with every
+  count checked before its list is allocated. Logs and spans leaves stay at version 2 and older
+  leaves read as before. `ravel-cli inspect kidx` prints the entry kind and,
+  with `--entries`, each posting. No fold writes version 3 yet, so metrics
+  data and query results are unchanged.
+- **Metrics series route.** A PromQL selector with two or more positive
+  equality matchers, the metric name included, is now routed through the per-part `series_label`,
+  `series_class` and `class_objects` key-index fields before the label-value
+  route, so an object holding each matched value on a different series is
+  pruned. Each part and selector the route cannot answer within its bounds
+  falls back to the label-value route, and results are unchanged.
+  `data.stats` gains `segmentsPrunedBySeriesIndex`, the `seriesIndexPasses`
+  rows and `seriesIndex`; `segmentsPrunedByLabelIndex` now excludes the
+  segments the series route pruned, and the two add up to every segment the
+  key-index routes pruned. No fold writes the series fields yet, so folded
+  data routes as before.
+- **The logs load summary prints `decode_wait` and `write_wait`.** Each appears
+  once, in seconds, and the load report JSON carries them as `decode_wait_ms`
+  and `write_wait_ms`, so a slow load shows whether it waited on the decode
+  stage or on the writes.
+- **`ravel-cli load --decode-workers W` builds a logs load's decoded batches on
+  W threads.** One thread still reads the `--read-cursors` cursors and deals
+  every batch's rows in the same order; the builds run on W workers and the
+  built batches reach the shard writers in the order they were dealt, so the
+  batch sequence is the same at any W. The objects written are the same at
+  any W only when no flush depends on timing (a per-batch `--target-bytes`,
+  or an explicit `--pipeline-depth`, a `--load-memory-bytes` the load never
+  fills, and no shard buffer older than `--max-flush-delay`). Otherwise
+  object boundaries depend on timing, independent of W: the stall flusher
+  fires on wall-clock samples of a decoder waiting on a full budget, and a
+  derived budget shrinks as W raises the memory floor. Every batch being
+  built, or built and not yet handed on, is charged to `--load-memory-bytes`;
+  rows waiting for a build are bounded by the memory floor, which counts the
+  cursor buffers each worker keeps alive. The default is one worker per four
+  available cores, at least 1, a starting point derived from the measured CPU
+  share of build and encode; under a budget derived from host memory it is
+  lowered until the floor leaves room for one batch. `1` is the previous
+  pipeline. `0` is rejected on every signal; metrics and spans loads ignore
+  any other value and warn. No wall-time effect is claimed here; epic #4203
+  measures it.
+- **Store-wide format activation record `sys/compat` and the provisioning
+  compat fence.** `ravel_catalog::compat` reads, creates and CAS-updates the
+  MACed `sys/compat` record, whose epoch, family versions and certificates
+  only move up; `activate_family` raises one family by exactly one version.
+  `CompatView` keeps a monotone in-process view and its `write_policy`
+  refuses a write when the view is older than 10 minutes, when the record is
+  missing for a fenced bucket, or when the active version is not writable.
+  The provisioning record gains `compat_epoch` and `compat_fenced_unix_ns`,
+  stamped at `format_version` 4 only on a fenced record; readers accept 1
+  through 4, and `raise_compat_fence` and a born-fenced create write them.
+  `ravel-server` reads `sys/compat` on a keyed bucket, and every writer in it
+  follows the record (#4244, #4245, #4246, #4301).
+- **Bulk writers emit a caller-chosen format version (ADR-4233).** The RSEG
+  (metrics), RLOG (logs, alerts, audit) and RSPAN (spans) writers take the
+  version to emit from their reader window instead of a compile-time
+  constant. Nothing changes for a deployment until a family is activated: a
+  writer given no version
+  emits the current one, and a default build writes the same bytes as
+  before. A test-only cargo feature, `format-drill`, adds a version one
+  above the current so the compatibility tests can exercise two versions;
+  release builds refuse it.
+- **Ingest flushes can follow the `sys/compat` activation policy
+  (ADR-4233).** A metrics, log or span router given an `IngestCompatPolicy`
+  writes the format version the policy names, chosen when the flush gets its
+  permit, fences the tenant's bucket before the first object above the
+  baseline, and asks the policy again before every data-object and
+  commit-record PUT attempt.
+  It refuses to publish on a stale view, an active version this build
+  cannot write, a `sys/compat` missing after an activation is on record (the
+  bucket is fenced or the view saw an epoch), or an active version that
+  moved after the permit. The format-floor checks compare the floor with the
+  version the policy names. Refused writes return a retryable error and are
+  counted by reason on `ravel_compat_publish_refused_total{family,reason}`.
+  `ravel-server` gives every router the policy on a keyed bucket; without a
+  policy (an unkeyed bucket), flushes are byte for byte unchanged.
+- **Maintenance writers follow `sys/compat` (ADR-4233).** With a compat
+  policy in `CompactorConfig::compat_policy`, compaction, the erasure
+  rewrite, `migrate`, the force 2 re-encode and the query-audit,
+  reshard-audit and legal-hold writers fix their write versions at run
+  start, before the claim and any PUT, and refuse a stale view, a missing
+  record on a fenced bucket, an unwritable active version or a publish
+  lifetime above the recorded one, counted under
+  `ravel_compat_publish_refused_total{family,reason}`. A run's format-floor
+  and newer-than-writable checks compare against the version that run
+  writes. Every PUT attempt, retries included, rechecks the view's age; the
+  first publish above the baseline raises the bucket's fence to the
+  family's activation epoch before its first PUT; a record PUT is abandoned
+  once the recorded publish lifetime has passed. `compaction-record` is a
+  ceiling: compaction, `migrate` and a direct `rewrite_and_publish` refuse
+  an active version this build cannot write, and a plain compaction still
+  writes version 1 records. `migrate` refuses a target that is not the
+  active version, and each force 2 bucket run checks the view's age and
+  that target again before its claim; the re-encode refuses unless
+  `compaction-record` is active at 2. An L0 migration that fails to decode
+  an input releases its claim at once.
+  `background_migrate_unit` runs one budgeted walk toward the active
+  version. Compaction holds a bucket whose input carries section kinds this
+  build does not know with outcome `HeldUnknownSection`, counted by the
+  counter `ravel_maintain_buckets_held_unknown_section_total`, and
+  `migrate`, the re-encode included, holds it under reason
+  `unknown_section`; both name the input's trailer version and the unknown
+  kinds. `ravel-server --mode maintain` installs the policy on a keyed
+  bucket; without one (an unkeyed bucket), the unknown-section hold is the
+  only change and every other bucket compacts to the same bytes as before.
+- **`ravel-server` follows the `sys/compat` format write policy.** On a keyed
+  bucket every process, in every mode, reads `sys/compat` at startup and every
+  60 seconds. Every writer consumes that view: first-touch provisioning, the
+  catalog fold, the alert evaluator, the ingest routers, the maintenance
+  writers and the query audit pipeline (#4301). The alert evaluator writes alert history at the RLOG
+  version the record names and keeps the alert lease parked once `rlog` is
+  activated. Each catalog family's active version is a ceiling for the fold:
+  it refuses its cycle, writing nothing, only when a family it writes would
+  emit a version above the active one or the active version is not one this
+  build reads. A view refuses writes as stale only after a GET of `sys/compat`
+  has returned an object and the last successful read is 10 minutes old; a
+  store that was never activated keeps its built-in versions even when the
+  read is refused with `AccessDenied`. An evaluator with no view (an unkeyed
+  bucket) treats a parked lease as held and never overwrites a lease written
+  under an activation. After an activation, a first touch creates a new
+  bucket's provisioning record born fenced. The gateway, query and maintain
+  IAM templates grant `s3:GetObject` on `sys/compat` and list it among their
+  bootstrap keys. `/metrics` renders
+  `ravel_compat_publish_refused_total{family,reason}`,
+  `ravel_compat_refresh_failures_total`, `ravel_compat_view_age_seconds`,
+  `ravel_compat_active_write_version{family}` and `ravel_compat_epoch`
+  (ADR-4233).
+- **`ravel-maintain` can initialize and activate `sys/compat`.**
+  `init_compat` runs a census of every tenant's config, provisioning records,
+  catalog objects, bucket records and data trailers, and creates `sys/compat`
+  at this build's baseline versions with `compat_epoch` 0, the configured `P`
+  and the version histogram it found. It refuses, writing nothing, on an
+  unkeyed store, a listing error, a key the store cannot address, an object it
+  cannot read, an object outside this build's read set (named per tenant,
+  signal, family and version) or an already fenced provisioning record; an
+  identical existing record is a no-op and a different one refuses. A
+  key-index leaf is in the read set when the decoder parses its version for
+  the leaf's signal. The census lists only `t/<h>/`, so objects under
+  `quarantine/` are not checked.
+  `activate` raises one family by exactly one version this build writes and
+  bumps the epoch in one CAS, retrying a lost race, then fences every
+  provisioning record at the new epoch and, for `rlog`, parks the alert lease
+  of every tenant with alert keys or alert rules. It records
+  `fence_complete_unix_ns` only after a walk with no failure, returns a resume
+  cursor otherwise, and resumes a family's pending walk instead of activating
+  it again. A walk interrupted while finding leases resumes by finding every
+  tenant's lease again, so no lease is skipped, and an activation is stamped
+  after the family's previous fence so its walk reads as pending even under
+  clock skew. It refuses an unkeyed store and a missing writer-role attestation.
+  `ravel-cli compat init` and `ravel-cli compat activate` run them (#4248,
+  ADR-4233).
+- **`compat certify` and its late-write pass retire a class-A reader against durable evidence.** `certify` runs a strict census of every live member object of a format family (every commit record's data object and every object under the shard's `l0/` and `l1/` prefixes), holds the certificate behind the activation and per-bucket `G_pre` time gates, and refuses on any member below the target version, any member this build cannot read, and any member whose trailer is absent, corrupt, or disagrees with its record's version stamp. The census and the late-write pass cover every shard the bucket's generation history names and every shard directory present under its `l0/`, `l1/` and `c/` prefixes, so a bucket holding data without a provisioning record is covered across all its shards. `certify` refuses a target below the family's existing certificate, and a target equal to it unless that certificate is contradicted (ADR-4233 decision 7). It raises the format floors only after the certificate CAS succeeds; a run interrupted between the two has its floor raises completed by the next run. Its census records its start time `S`, target version and activation epoch in a resumable cursor (`sys/maintain/certify/<family>/cursor`), so a run that resumes keeps the earlier `S`; the certificate it writes sets the late-write watermark to `S`, and the daily late-write pass then re-reads records modified since that watermark and marks the certificate contradicted on a lower-version find. The RLOG retention holds (logs, alerts and audit) and the RSPAN hold already kept an expired object whose trailer version is out of range; they now also keep one whose nested POSTINGS or KEY_IDX section version this build cannot read (ADR-4233 decision 7, hazard H5).
+- **`ravel-cli compat {init,activate,certify,verify,status}` operate the
+  retained-data compatibility contract `sys/compat` (ADR-4233).** Each is a
+  thin wrapper over `ravel-maintain` with typed exit codes and a
+  machine-readable `--json` rendering. `init` adopts a store at the baseline;
+  `activate` raises a family's active write version and fences every
+  provisioned bucket; `certify` writes a class-A family's reader-retirement
+  certificate after the time gate and a strict census; `verify` runs the
+  late-write pass and reports FinalizationPending, Contradicted and the
+  watermark; `status` prints the contract state. Every command signs and
+  verifies `sys/compat` under the global `--tenant-hash-key-file` deployment
+  key, and `init` and `activate` refuse an unkeyed store with a typed error.
+  `activate` refuses unless `--pre-baseline-processes-terminated` is given
+  (ADR-4233 decision 4), records the attestation in `activated_by`, and names
+  in its `--help` the residual the attestation does not close: a pre-baseline
+  maintain process that outlives the rollout still deletes alert history and
+  audit objects by age with no version hold, which no fence and no pass
+  detects. The `ravel-cli compat` commands are a preview in 0.34.0: their
+  exit codes and flags may change in the next release (#4423).
+- **A maintain server keeps `sys/compat` certificates checkable, and a
+  release that retires a format reader refuses an uncertified store.** A
+  `--mode maintain` process with `--tenant-hash-key-file` runs an hourly
+  compat task: for each certified `rseg`, `rlog` or `rspan` family it owns,
+  it runs the late-write pass once a day, records the watermark, and
+  finishes a certify run's pending floor raises once a pass past the
+  certificate has completed. `/metrics` on that process renders
+  `ravel_compat_late_write_watermark_seconds`,
+  `ravel_compat_certificate_contradicted` and
+  `ravel_compat_certify_finalization_pending` by `family`. The new
+  `--background-migrate` flag runs the background migrate unit on the same
+  tick, 10,000 L0 records per tenant and signal; the unit now walks a
+  floored bucket while the family's certificate is contradicted. At
+  startup, a build that retired a family's reader requires an
+  uncontradicted certificate at or above its oldest readable version with
+  the watermark past certification, and refuses a store that has
+  `sys/tenancy` but no `sys/compat`. No current release retires a reader,
+  so the gate is a no-op today (ADR-4233 decision 7).
+- **Retained-data compatibility tests: a row map, an end-to-end lifecycle
+  test, a frozen corpus and an append-only guard.** `ravel-compat-tests`
+  maps each row of ADR-4233 decision 9's compatibility matrix and decision
+  5's rollback table to the tests that pin it, marks the rows with only
+  partial or no coverage, and fails when a cited test does not exist. Its
+  own tests run real compactions under an N-only and an N+1-capable RSEG
+  table before and after activation, and drive init, activate, migrate,
+  certify, the superseded-input sweep and the late-write pass end to end
+  through the compat library functions, decoding every sample bit-exact. A
+  frozen baseline corpus under `crates/ravel-compat-tests/corpus/v0.34.0/`
+  (RSEG objects from a real compaction, plus RLOG and RSPAN objects from
+  the real writers) is read back against recorded per-sample and per-row
+  results, and `scripts/guards/check-compat-corpus-append-only.sh` refuses
+  any edit or deletion of a published corpus file. The compat-tests CI lane
+  also runs the `format-drill` window tests of `ravel-segment`,
+  `ravel-logseg`, `ravel-rspan` and `ravel-maintain`.
+- **`ravel-server` installs the `sys/compat` activation policy on every
+  writer (ADR-4233 decisions 1, 3, 4 and 7).** On a keyed bucket the server
+  builds one `CompatView` per process and hands it to the metrics, log and
+  span ingest routers (#4244), the maintenance compactor (#4245) and the
+  query audit pipeline, so an activation this build cannot honour stops
+  ingest at admission, every maintenance run and every audit write, not only
+  the catalog fold and alerting. Ingest admission refuses a stale view too,
+  so no row is acknowledged that the view cannot vouch for. A flush whose
+  view goes stale after its rows were acknowledged waits for a successful
+  read instead of dropping them, and is refused `view_stale` only once its
+  `max_flush_lifetime` from the first grant has passed; a stale view before
+  a PUT retry is waited out the same way. Admission also refuses
+  `publish_lifetime_above_compat` once `compat init` records a
+  `max_publish_lifetime_ns` below the router's lifetime, and a first touch
+  then creates no provisioning record; rows admitted before init still
+  publish inside the router's own lifetime (#4362). Every `view_stale`
+  answer wakes the `sys/compat` refresh, at most one extra read a second, so
+  ingest recovers within about a second of `sys/compat` becoming readable
+  instead of on the next 60 second tick (#4362). The ingest routers'
+  per-signal refusals render on `/metrics`
+  under `ravel_compat_publish_refused_total{family,reason}` alongside the
+  maintenance ones, with every ingest reason pre-filled at 0 and the series
+  sorted by family and reason. On a store that never ran compat init
+  (`sys/compat` absent) every writer emits its build's `CURRENT` version and
+  no writer creates `sys/compat` or a format-version 4 provisioning record,
+  so v0.34.0 writes nothing a v0.33.0 binary refuses; a 5xx on the startup
+  read of `sys/compat` refuses ingest with a retryable 503 until a read
+  succeeds. The teardown flush, of `shutdown()` or of a router dropped
+  without it, the drain's bypass passes included, goes through the policy
+  like any flush: after an activation a teardown under a stale view writes
+  nothing to the fenced bucket, and on a store that never ran compat init it publishes at the
+  baseline (#4362). The per-tenant compat-epoch cache the shards hold by
+  `Arc` outlives the router's switch, so the `no_bucket_view` reason is
+  never raised (docs/consistency-model.md).
+- **The operator hands a tier's replica count to a horizontal scaler.**
+  An `autoscaling` block on `spec.gateway`, `spec.query` or `spec.maintain`
+  (mode `Managed` or `External`, `minReplicas`, `maxReplicas`,
+  `targetCPUUtilizationPercentage`, `scaleDownStabilizationSeconds`) stops the
+  operator applying `replicas` after handing the live count to the
+  `ravel-operator-handover` field manager, so the tier does not drop to one
+  replica. `Managed` renders a CPU HorizontalPodAutoscaler per tier that
+  removes one pod per 60 s (gateway, query) or 600 s (maintain). A `Managed`
+  tier without a CPU request, a gateway on `ingressNginx` ingest affinity,
+  and a `Managed` tier whose `<cluster>-<tier>` HPA name is already taken by
+  an HPA the operator does not own, keep their managed count (declared, or
+  the adopted count if the tier was autoscaled before) and raise
+  `AutoscalingWithheld`; the operator leaves that other HPA as it is.
+  Removing the block keeps the live count, recorded in
+  `status.replicaAdoptions`, until `replicas` changes; the operator deletes
+  its own HPA before forcing that count. The operator counts an HPA as its
+  own only when it carries the operator's `app.kubernetes.io/managed-by` and
+  `app.kubernetes.io/instance` labels for the cluster and an ownerReference
+  to the RavelCluster's uid, and deletes only an HPA its once-per-pass list
+  shows as its own. If the operator cannot list HPAs, the pass stops at the
+  first tier in its apply order that might apply or delete an HPA, before
+  any write to that tier, so the tiers after it are not applied either and
+  the HPA sweep does not run; the pass reports `Degraded` reason
+  `AutoscalingHpaListFailed`. The
+  operator ClusterRole gains HorizontalPodAutoscaler permissions. See
+  "Autoscaling" in docs/guides/kubernetes.md.
+- **The operator reports the state of the HorizontalPodAutoscalers it
+  renders.** For each tier whose `Managed` HPA the operator owns,
+  `status.hpaReplicas` carries the HPA's `desiredReplicas` and
+  `currentReplicas`, and the `AutoscalingDegraded` condition is set while
+  such an HPA reports `ScalingActive=False` (for example reason
+  `FailedGetResourceMetric` when metrics-server is missing) or
+  `AbleToScale=False`, naming the tier, the HPA condition, its reason and its
+  message. HPAs the operator does not own are not read for either. The
+  operator now watches the HPAs it owns, and an owned HPA triggers a
+  reconcile when its `desiredReplicas` or `currentReplicas` changes, the
+  status of its `ScalingActive` or `AbleToScale` condition, or the reason of
+  either while that condition is not `True`, or its generation (which the
+  API server bumps on a spec change only with the `HPAGeneration` feature
+  gate on; elsewhere a spec edit to an owned HPA triggers nothing by itself
+  and is reverted at the next pass that renders it). The metrics it
+  rewrites on each sync, the reason of a `True` condition and a condition's
+  message do not, so a change to the message alone shows at the next pass
+  that reads the HPAs. A pass whose HPA list
+  fails, or that is held for store qualification, keeps the previous
+  `hpaReplicas` and `AutoscalingDegraded` unchanged.
+  Deleting an owned HPA is now conditioned on the uid the pass's HPA list
+  read, so an HPA recreated at the same name in between is not deleted, and
+  an owned HPA listed without a uid is not deleted (`Degraded` reason
+  `AutoscalingHpaUidMissing`). `maintain` with `enabled: false` is no longer
+  named in `AutoscalingWithheld`. Upgrading: apply the updated ClusterRole in
+  `deploy/k8s/operator/rbac.yaml` before upgrading the operator; an operator
+  without `list` and `watch` on HorizontalPodAutoscalers retries the watch
+  and holds back event-driven reconciles of every RavelCluster for up to
+  about a minute per failure. See "Autoscaling" in docs/guides/kubernetes.md.
+- **The key-index repair report shows what a pair-budget build cost.**
+  `ravel-cli catalog fold --rebuild-key-index` now reports, in text and
+  `--json`, the pair budget it built under (`key_index_build_max_pairs`),
+  its build passes (`passes`, and `passes_per_field`), its KEY_IDX section
+  reads (`sections_read`), the pairs built per field (`field_pairs`), and
+  its ranged GETs and bytes split into a footer phase and a section phase
+  (`footer_phase_ranged_gets`, `footer_phase_bytes_read`,
+  `section_phase_ranged_gets`, `section_phase_bytes_read`), whose sums are
+  the existing `ranged_gets` and `section_bytes_read`. Each attempt carries
+  its passes, section reads and phase GETs, and the text report marks a
+  batch that stopped the run before its publish step as
+  `attempt N (stopped before publish):`.
+
+### Fixed
+
+- **A maintain memo reseed reads a bounded number of snapshot objects.** The
+  reseed that runs at startup and on every membership change fetched every
+  snapshot under `sys/maintain/memo/` that passed the listing checks, so a
+  principal with the `sys/maintain/*` write grant could make each reseed read
+  and MAC-check any number of forged 32 MiB objects while the maintain
+  loop waited. A reseed now GETs at most 256 objects and 1 GiB of listed
+  bytes, reading the snapshots of live processes first and then the newest;
+  objects past that budget are counted under a new `over_budget` reject reason
+  in the reseed's warning. Under such a flood a recently departed process's
+  snapshot can go unread, which costs its units a cold rescan, never wrong
+  maintenance.
+- **`ravel-cli catalog fold --rebuild-key-index` builds under the pair
+  budget.** The repair built each part's leaves in one pass and held every
+  section read of its batch, so its memory grew with the part, about 6.8 GB
+  of pairs for a logs day. It now runs the fold's own build in passes under
+  `key_index_build_max_pairs`: each field holds at most its share of the
+  budget plus one pair, or its largest key8 run plus one when that run is
+  over the share, and at the same budget its leaves match the fold's byte
+  for byte. A part built in several passes reads the sections the repair
+  does not hold (see the `--key-index-repair-hold-bytes` entry) once per
+  pass, and a part deferred on a failed GET or over the metrics byte cap can
+  leave leaves of earlier passes unreferenced for the sweep.
+- **A PromQL read over L1 metrics objects is held to the memory budget instead
+  of growing the process past it.** The catalog decode of an object whose runs
+  the compactor merged materialized every sample's per-sample provenance (up to
+  96 bytes a sample, for every sample in the object whatever the matchers
+  select) against a charge sized from the section bytes, which store it in a
+  few bytes; a page batch's decoded samples, many times its stored pages, were
+  not charged until the fold had taken them; the fold charged its growth after
+  folding; and the fold's charge was released before the evaluator read the
+  merged series. Each is now reserved before it is allocated, page batches are
+  also cut on their decoded size, and the fold's reservation is held until the
+  evaluation ends, so a read the budget cannot hold is refused with the 422
+  `FetchMemoryExhausted` before it allocates. A read that fits answers as
+  before; a range query whose selector copies no longer fit beside the held
+  fold reads those selectors at every step, as it already did when the budget
+  refused a copy.
+- **`ravel-cli maintain migrate` walks past a bucket refused for its part
+  indexes.** A bucket whose RLOG merge is refused with `part_key_space` or
+  `part_range_window` (ADR-3853) is listed as `not_migrated` with
+  `reason=part_index_refusal` and its claim completed, and the walk goes on to
+  later buckets; previously the refusal ended the whole walk.
+- **The two-level RLOG merge sizes level 2 from the runs level 1 wrote.**
+  After level 1, a derived `W2` is now re-derived from the measured run
+  blocks, so a unit whose prediction was priced high no longer runs level 2
+  on fewer workers than its runs fit (hour 498272's shard 1 ran 2). The
+  prediction before level 1 prices the run block at the 99th percentile of
+  the inputs' price per record instead of the maximum, so one block over a
+  few records no longer sets it. A configured `level2_workers` is still used
+  as given. The predicted `W2` is reported as `level2_workers_predicted`
+  when it differs. Level 2 on one range worker now plans its passes beside
+  the final parts it encodes in parallel instead of in the same room, so
+  the unit stays under its memory ceiling; only the floor of two builders
+  can pass it, by at most two final part targets (#4123). Because the
+  builders it reserves follow the host's core share, `level2_passes` can
+  differ between hosts with different core counts for the same unit. With
+  several range workers, each now plans its passes beside its one final
+  part, so the unit stays under its ceiling there too; a derived
+  `level2_workers` drops to the largest count that fits, and a configured
+  one that does not fit is refused with `LevelTwoFit`.
+- **Azure's `AuthorizationPermissionMismatch` on Get Account Information now
+  names the missing permission.** Construction of an `AzureStore` fails with
+  `access denied` on a 403 whenever the configured identity cannot read
+  `x-ms-is-hns-enabled` (ADR-4158 D6), but the message gave no way to tell
+  that failure from any other 403. It now names the control-plane action
+  `Microsoft.Storage/storageAccounts/blobServices/getInfo/action`, says the
+  built-in Storage Blob Data roles do not include it, and points at the
+  Kubernetes guide's "Azure Blob Storage with workload identity" section.
+  Every other 401 or 403, including this code on a blob or list request,
+  keeps the plain text.
+- **The operator's `BucketProtectionVerified=False` message on Azure now
+  names the right container protections.** It told operators to configure
+  "blob versioning, soft delete and an immutability policy" by hand, a list
+  ADR-4158's 2026-11-13 operator correction replaced. It now says: blob
+  versioning paired with a lifecycle rule that deletes previous versions;
+  soft delete with a bounded retention; and an immutability policy only
+  where it does not refuse the deletes retention and erasure need.
+- **The MCP SQL tools no longer return internal error detail when a result
+  cannot be encoded as JSON.** An internal failure of the JSON encoding step (a
+  corrupt result column, such as an out-of-range dictionary key or an array of
+  an unexpected type) used to be formatted with its `Display` into the tool
+  failure, passing server-side detail to the caller. The MCP surface now
+  returns only the fixed, redacted client message, the same one the HTTP SQL
+  surface returns, keeps the failure class internal, and logs the full error
+  once with the tenant hash. A result whose column type has no JSON form still
+  names the column, its type and the reason, unchanged.
+- **The catalog fold's postings build and `/api/v1/query_exemplars` charge the
+  L1 per-sample provenance decode against the memory budget.** Both decoded the
+  ADR-0092 per-sample provenance extension uncharged, up to 64 B of columns plus
+  a 32 B `SampleProvenance` per sample, for a result that never reads it (issue
+  #4194, follow-up to #4118). They now route through `ravel_segment`'s
+  `CatalogCharge` hook, so an over-budget decode is refused before it allocates
+  and an in-budget decode is unchanged.
+- **A PromQL read of native histograms with many buckets is held to the
+  memory budget.** A histogram value's span and bucket vectors (8 bytes per
+  span and per bucket) were charged only after the decode had allocated them,
+  so a read of wide histograms could grow the process well past the budget
+  before the refusal. Each page batch now charges them before it decodes, by
+  a bound taken from the fetched page sizes, and decodes in groups of series
+  that fit its share of the budget. The ALP and GCD value codecs decode into
+  the output column instead of through a second sample buffer. A read that
+  fits answers as before.
+- **A `LIKE '%lit%'` logs scan on the planned route reads no block in its plan
+  phase for an object above the whole-object bound, when the content it
+  pushes is `Contains` arms alone.** A statement whose pushed content holds
+  only `Contains` arms, with no stream-attribute arm and only `NumRange` or
+  `NumNotEq` prune arms, now plans each object above the whole-object bound
+  from its footer and four directories, and the object is no longer counted in
+  `plan_full_reads`. A scan with more partitions than segments and a read
+  cache on its fetcher takes this route. Previously the plan fetched every
+  column of the object's ts-candidate blocks to count survivors that no
+  `Contains` arm can reduce. An object at or under the bound is still planned
+  from one whole-object read. A `LIKE` on an undeclared attribute pushes no
+  `Contains` arm and is planned as before, and a statement that also pushes an
+  attribute equality or a `has_word` arm still reads blocks to plan.
+- **A loopback store no longer derives hundreds of GET permits on a large
+  host.** With no `--store-get-concurrency` or `--fetch-concurrency` and a
+  loopback store endpoint, the derived store GET concurrency is capped at 64
+  (ADR-4203 decision 3). A 192-core host derived 384, and 384 permits
+  against 32 made whole-segment ClickBench statements up to 64% slower on a
+  loopback endpoint. The startup line names the cap with
+  `source="derived-loopback-cap"`. Explicit flags, non-loopback stores and
+  `--promql-fetch-fanout` are unchanged; the derived `--sql-partition-count`
+  gets its own loopback cap of 32 (see the #4272 entry). On a loopback host
+  of 128 or more cores, the default `latency-first` logs policy's
+  measured-concurrency precondition (256 for both the GET concurrency and
+  the partition count) is no longer met by the derived defaults; set
+  `--fetch-concurrency`, or both `--store-get-concurrency` and
+  `--sql-partition-count`, to 256 or more to reach it.
+- **A restarted server's first logs scan on the striped route plans from the
+  directories the startup warm-up cached.** Beside the whole-part warm, the
+  warm-up now runs a logs metadata pass over every logs object in
+  its window above the whole-object bound, not only the 4 most recent parts.
+  For each object it reads the suffix probe, then one coalesced read of the
+  SKIP_IDX and PAGE_DIR the probe does not hold and one of the STREAM_DIR and
+  FIELD_DIR it does not hold, through the plan phase's own unkeyed read and
+  under the same cache keys, and no column page. On the striped route (more
+  SQL partitions than objects) a first statement whose plan reads the
+  directories unkeyed, such as a `LIKE` with a pushed `Contains` arm, then
+  issues no footer or directory GET for an object the pass reached. On the
+  whole-segment fast path a narrow projection finds the probe in the cache; a
+  wide projection reads the whole object in one GET with no probe and gains
+  nothing. A keyed plan finds the probe, but the pass reads no KEY_IDX, BLOOM
+  or POSTINGS, and a BLOOM or POSTINGS section outside the probe is coalesced
+  into the keyed plan's SKIP_IDX and PAGE_DIR read when it lies within the
+  coalesce gap, giving that read an extent the pass did not warm. The
+  whole-part warm keeps its 4-part cap and reads a logs part whole only at or
+  under the plan bound, leaving larger parts to this pass (see the #4307
+  entry). The pass runs inside the warm-up's 10-second deadline. Its
+  ceiling is half of `--cache-max-bytes`, charged only with the bytes its own
+  reads fetch, so the whole-part warm's residents do not use it up. It admits
+  objects while those bytes plus their probes stay within the ceiling, reads
+  at most one object fewer at once than the store GET concurrency (at least
+  one), and skips an object whose read fails. The
+  `cache warmup: pass complete` line reports `metadata_objects_warmed`,
+  `metadata_bytes_warmed` and `metadata_budget_reached`, and a
+  `cache warmup: warmed tenant logs metadata` line reports the first two per
+  tenant.
+- **A `logs` query that projects `attrs` with many typed attribute columns no
+  longer searches each row's attributes once per column.** Such a query,
+  `SELECT *` among them, is built on the row path. There each typed attribute
+  column and `attrs['k']` column looked its key up with a linear search of
+  the row's merged attributes, so the cost per row grew with the square of
+  the tenant's typed column count. With four or more such columns projected,
+  one pass over each row's merged attributes now resolves all of them. The
+  values are unchanged: the first entry holding a key still wins.
+- **A fold refuses a previous catalog part or tenant config record that a
+  newer build wrote, instead of rebuilding over it.** A previous `.csnap`
+  part, `.npost` postings object, reused `.cstat` statistics object or
+  carried `.kidx` leaf whose stored version is above the set this build
+  reads now fails the fold cycle with `SnapshotFormatError::NewerPart`,
+  naming the object key, its kind and the version, before the HEAD CAS and
+  without rebuilding the object. A tenant config record above
+  `TENANT_CONFIG_MAX_READ_VERSION` fails the cycle with
+  `ProvisioningError::NewerTenantConfig` instead of folding under deployment
+  defaults. Both are retryable. Previously a mixed-version deployment could
+  have an older folder rebuild from the commit layout over parts a newer
+  build wrote, or fold one tenant under defaults. The fold now also
+  version-checks, before its first PUT, every such object it drops or
+  replaces without otherwise reading it: a ranged GET of the version prefix
+  for `.npost` postings and every `.kidx` leaf, and a full GET and decode for
+  `.cstat` statistics and, on a rebuild, the `.csnap` parts it did not read.
+  `catalog fold --rebuild-key-index` refuses a newer `.kidx` leaf rather than
+  replacing it. A store error other than `NotFound` on any of these GETs, or
+  on the fold's own read of a previous part, postings object, statistics
+  baseline or carried leaf, now fails the cycle with `CatalogError::Store`
+  before any PUT; previously a failed postings or statistics GET fell back to
+  a from-scratch rebuild and a failed part GET to a rebuild from the commit
+  layout, which drop the unread object. A `NotFound` GET, a part stamped
+  below the read set, or a corrupt one, still takes the rebuild path.
+- **`maintain migrate` walks past a bucket it cannot carry forward, holds
+  it, and raises no floor while any bucket is held.** An input
+  outside this build's reader window, an input recorded above the version
+  this build writes, or a data object that fails to decode now holds its
+  bucket: the walk logs the hold with its reason and goes on, and the run
+  then fails with `migrate held N bucket(s) and did not raise the floor`,
+  naming each bucket and reason (ADR-4233 decision 6). The walk, the
+  verification re-audit and the version census also fail with a typed error
+  naming the key when a listing holds a key the store cannot address, where
+  they previously counted a population short by that key. The query-audit
+  age sweep now applies the format-version hold: an expired audit object
+  outside the reader window keeps its whole ingest hour and is counted on
+  `ravel_maintain_retention_held_out_of_window_objects_total`; a corrupt one
+  is still deleted (ADR-4233 decision 4, H7). A migrate or compaction cursor
+  stored under a tag this build does not know is left in place: the run
+  starts from the beginning and neither overwrites nor deletes it (H9).
+- **A held `maintain migrate` run prints its report and one line per held
+  bucket.** The run prints the same report a finished walk prints, then
+  `held: shard S hour H reason=<reason> <detail>` for each bucket, and exits
+  nonzero as before. The `--reencode-compaction-parts` path now holds a
+  bucket whose compaction record names a part above the version this build
+  writes, with reason `newer_than_writable`, and the walk goes on, where it
+  previously failed the whole run with an internal error (ADR-4233
+  decision 6).
+- **A compaction claim at an unknown `format_version` is never stolen.**
+  Previously a claim above this build's `CLAIM_FORMAT_VERSION` (written by a
+  newer build) read as unreadable and was stolen once older than the 24 h
+  lease ceiling plus jitter, and a version-0 claim (never written by any
+  build) was treated like any readable claim and stolen at its declared
+  lease. A claim at either version is now version-protected (ADR-4233
+  decision 4, H8): it is never stolen or overwritten, at any age, and the
+  bucket's erasure or compaction stays pending until an operator deletes the
+  claim object by hand or a build that knows the version reclaims it. A
+  running process rechecks such a claim once per lease, so a hand delete is
+  noticed without a restart. The `ravel_maintain_claims_skipped_total`
+  counter still counts this case, and its skip log line names it under its
+  own reason, `version_protected_claim`, instead of folding it into
+  `unreadable_claim`; each process logs the
+  hazard at `warn` once per bucket for its lifetime, not on every tick.
+- **A keyed log or span request whose idempotency marker was written by a newer
+  build is refused with a retryable error instead of being ingested again.** A
+  marker whose version is above the one this build reads decoded as corrupt and
+  was treated as a miss, so the request was stored a second time. The lookup now
+  fails with a typed newer-marker error before the marker's checksum or payload
+  is read. The logs and traces handlers answer it with the same retryable 503
+  (gRPC `UNAVAILABLE`) as a failed lookup, before any of the request's data is
+  written, and `/metrics` counts it in
+  `ravel_ingest_idempotency_newer_marker_refusals_total{signal}`, not in
+  `ravel_ingest_idempotency_lookup_failures_total`.
+  A marker that is truncated, has a bad magic or checksum, or carries a
+  malformed payload is still counted corrupt and treated as a miss.
+- **The alert evaluator refuses its tick on a history object written by a
+  newer build instead of rebuilding state without it.** When a tenant's alert
+  history holds an object whose RLOG format version is newer than this build
+  reads, and whose bytes match its commit record's content hash, the
+  evaluator used to skip the object and fold the rest, which re-fired or
+  dropped the transitions it held. The tick now refuses with a typed error
+  (ADR-4233 decision 4, hazard H3): it keeps the previous durable state,
+  writes no transition and no state memo, re-queues no notification from the
+  incomplete fold, reports `outcome="history_unavailable"`, and counts the
+  refusal on the new `ravel_alert_history_newer_version_refusals_total`.
+  Because a refused tick writes no memo, that counter rises on every tick that folds that history until
+  the evaluator runs a build whose RLOG reader window includes that version
+  (roll forward). An object older than this build reads is still skipped and
+  counted on
+  `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`
+  (ADR-2708 decision D6). An object whose bytes do not match the content
+  hash is corruption and fails the tick as before.
+- **The startup cache warm-up warms a tenant whose event times are far older
+  than its ingest time.** It chose parts by an event-time window anchored at
+  the tenant's latest ingest hour, so a tenant loaded with old data (the
+  ClickBench tenant's 2013 rows) matched nothing and every start logged
+  `parts_warmed=0 metadata_objects_warmed=0`. The warm set is now every part
+  filed in the tenant's latest ingest hour and the 24 hours before it,
+  whatever its event times, newest ingest hour first, under the same part cap,
+  cache share and deadline as before.
+- **The startup cache warm-up's logs metadata pass no longer waits for every
+  whole-part warm.** The warm-up read every tenant's most recent parts whole,
+  one at a time, before the metadata pass began, so on a large tenant the
+  10-second deadline could expire with only a few objects' metadata read. It
+  now resolves tenants' parts, at most 4 tenants at once and each on one of
+  the shared store GET requests, and runs the whole-part warm and the metadata
+  pass on the tenants in order as their parts are resolved, all under the
+  same deadline, so slow listings over many tenants still leave the first tenants
+  warmed. The whole-part warm reads at most 2 parts of each of a tenant's
+  signals at once through the shared store GET limit, and holds to the half of
+  `--cache-max-bytes` the metadata pass does not use (all of it when the pass
+  does not run), so it no longer evicts metadata the pass warmed while the
+  pass stays inside its half. Each part sets aside what its read fetches: a
+  logs part its whole size, a metric part its whole size at or below 512 KiB
+  and otherwise its 64 KiB footer tail. A part that does not fit waits for the
+  reads in flight of its tenant and signal and is skipped only when it still
+  does not fit with none left. With a GET concurrency of 1 the pass holds the
+  only request, and a hung metadata read still holds back resolution and the
+  whole-part warm until the deadline. The pass-complete line gains
+  `tenant_discovery_elapsed_ms`, `part_resolution_elapsed_ms`,
+  `whole_part_warm_elapsed_ms` and `metadata_pass_elapsed_ms`; the deadline
+  warning gains `parts_warmed`, `metadata_objects_warmed`,
+  `metadata_bytes_warmed` and `step`; both gain `metadata_get_permits` and
+  `whole_part_bytes_reserved`, and the per-(tenant, signal) line gains
+  `parts_over_budget`.
+- **Retention keeps a bucket's tombstone while the bucket still holds a key the
+  store cannot address.** The physical sweep's verifying listing skipped such a
+  key, so a bucket whose only remaining object had one read as empty and lost
+  its tombstone with the object still in place. The listing now reports skipped
+  keys under the bucket's commit and `l1/` prefixes, any one of them keeps the
+  tombstone for a later pass, and each held bucket is counted once per pass in
+  the new `ravel_maintain_retention_unaddressable_held_buckets_total` counter.
+- **`migrate` no longer walks past a held bucket after a budget stop, and
+  holds more inputs it cannot carry forward.** A budget stop now caps the
+  persisted cursor just before the run's first held bucket, so the next run
+  re-examines the hold and reports it again instead of resuming past it. On
+  the `--reencode-compaction-parts` path every refusal of a part now holds the
+  bucket and lets the walk continue (an out-of-window part as
+  `input_out_of_window`, an undecodable one as `corrupt_input`), not only a
+  part newer than this build writes. An RLOG input whose directory names a
+  section version this build cannot read is held as out of window rather than
+  corrupt (ADR-4233 H5), and the per-bucket listings each L0 migration and
+  re-encode plan from are now strict, so a key the census cannot address fails
+  the run. Alert retention now applies the same version hold as metrics and
+  audit retention: an alert object whose format version is outside this
+  build's reader window is kept and counted, never deleted.
+- **A writer that cannot read `sys/compat` no longer writes past the
+  freshness horizon unless its latest failed read was refused as access
+  denied.** Before its first successful read, a process whose latest
+  `sys/compat` read failed with a 5xx, a timeout or throttling now refuses
+  (`view_stale`) instead of writing to buckets whose `compat_epoch` is 0
+  indefinitely, until a later read succeeds or is refused as access denied;
+  only a view that saw no record and whose latest failure was access denied
+  keeps that exemption. A first touch that would create
+  a provisioning record under a stale view is refused as retryable (HTTP 503,
+  gRPC `UNAVAILABLE`), counted under
+  `ravel_compat_publish_refused_total{reason="view_stale"}`, and writes no
+  record; the first touch of a bucket whose record exists is accepted as
+  before. Alert ticks with no publish record are held to the
+  default one-hour publish lifetime. The fold now names key-index leaf
+  version 2 as the version it writes. Compaction counts a bucket held for an
+  unknown section kind apart from one held for being outside the reader
+  window, and a `--mode maintain` server renders it as
+  `ravel_maintain_buckets_held_unknown_section_total`; maintenance publish
+  refusals render under their own `reason` labels.
+- **MCP failures no longer carry internal error text or stored values to the
+  caller at the sites this entry names.** A failed `ravel_analyze_timeseries` analytic
+  used to format the analytics error into its `internal` failure, and a result
+  envelope that could not be serialized returned the serializer's error as
+  `data.reason`. A `ravel_query_promql` sample or `ravel_analyze_timeseries`
+  call that could not be serialized returned the serializer's error, and a
+  trace span id, PromQL timestamp or analytics `downsampled` cell of an
+  unexpected type was printed whole into the message. Each now returns a fixed
+  message under the same class (the serialization error with no `data` at
+  all), naming at most the cell's type, and logs the full error or value once
+  at warn with the tenant hash. A gate check over the server's MCP adapter and
+  the `ravel-mcp` tool layer refuses a failure constructor (`internal`,
+  `redacted_internal`, `failure`, any `McpError` constructor, or a `json!`
+  reason) whose arguments are formatted text, unless a reasoned marker shows it
+  only echoes caller input or compiled-in values. It does not see text
+  formatted into a variable on an earlier line.
+- **`ravel-cli catalog fold --rebuild-key-index` takes
+  `--key-index-build-max-pairs`.** The CLI refused the flag beside the
+  repair and always built at the default 8,000,000 pairs; it now passes the
+  value to the repair as its pair budget. A run interrupted by a failed
+  build now reports the ranged GETs, section bytes and leaf PUTs that build
+  issued, which it dropped before. Leaf counts are PUTs issued, the failed
+  one included. The repair's leaves match a fold's byte for byte only when
+  it builds the same fields the fold built, not under `--field` or for a
+  part that gains only some of its declared fields.
+- **Maintenance holds report the right reason and section, and activation can
+  no longer read as fenced before its walk runs.** When compaction holds an
+  RLOG input whose POSTINGS or KEY_IDX section is at a version this build
+  does not read, the hold, the `compact-bucket` text and the `compact-tenant`
+  line (` section=<name>`) now name the section. The force 2 re-encode holds
+  an RLOG or RSPAN part outside the reader window as `input_out_of_window`,
+  as it already did for RSEG, once a whole-object read confirms the part
+  matches its record's content hash. A part that fails the content hash
+  check is held as `corrupt_input` (an RSEG part was reported as a
+  compaction invariant breach before), and the hold marks the bucket claim
+  completed as every other hold does.
+  Buckets that `migrate` holds no longer spend its budget, and a budget stop
+  that made no progress still persists the walk position. `compat activate`
+  now stamps an activation inside its CAS, one past the
+  `fence_complete_unix_ns` it replaces, and a fence walk records
+  `fence_complete_unix_ns` only while its epoch is still pending, so a late
+  walker of an earlier epoch cannot mark the next activation fenced. The
+  activation report carries `stamp_ahead_of_clock_ns` when that stamp is
+  past the local clock by more than the clock skew allowance.
+- **A transient store error no longer stops ravel-server at startup
+  (#4325).** The store reads that refuse to start (`sys/qualification`,
+  the retired-reader gate's reads of `sys/compat` and `sys/tenancy`,
+  `sys/tenancy` pinning, the `--tenant-kms-config` key-epoch records, the
+  `shard_count` provisioning records, `sys/gc` and the `sys/ipcrypt/policy`
+  marker) now retry a transient store error (a timeout, a throttle or another
+  retryable store error) with capped, jittered backoff, logging one warning
+  per retry. `--startup-store-deadline` (`RAVEL_STARTUP_STORE_DEADLINE`,
+  default `15s` from process start) bounds the retries and each retry, not a
+  read's first attempt, so a slow but healthy store still starts: a retry
+  still running after the time left before the deadline or 5 s, whichever is
+  longer, is cut off, and the refusal names the read and that bound or the
+  attempt count. A read whose first attempt fails transiently before the
+  deadline refuses by the deadline plus 5 s; a first attempt that hangs ends
+  when the store's own request timeout and retries give up. The work before
+  a listener binds can outlast the operator's liveness probe, which can
+  restart the pod 25 s after it starts; the
+  deployment guide gives the budget and the startup probe that covers it.
+  Every other error refuses at once with its previous message, and `0s`
+  restores the old behaviour. The
+  Azure store construction request, the `--require-bucket-protection` read
+  and the `--format-window-check` reads are not retried.
+- **`compat certify` finishes a crashed run's floor raises only after a
+  late-write pass clears the window.** A certification that crashed between
+  the certificate CAS and its last floor raise left a cursor carrying the
+  certificate's time. A later run used to finish the raises on the census
+  numbers alone, which could floor a bucket at the target while it held a
+  below-target write that landed after the CAS and that no late-write pass
+  had yet turned into `contradicted`, so `background_migrate_unit` would
+  skip that bucket. The resume now finishes the raises only once the
+  late-write watermark has passed the certificate time (a pass started
+  after the CAS found nothing); until then it reports
+  `FinalizationPending` and raises nothing (#4344, #4233).
+- The certify census, its pre-CAS recheck and the late-write pass now
+  enumerate tenants with the strict `t/` listing `compat init` uses, so an
+  unaddressable prefix or a non-tenant directory refuses rather than being
+  skipped, and the shard-directory scan refuses a directory like `l0/1/`
+  or `l0/00001/` that is not the canonical zero-padded shard spelling the
+  census lists under. The completed cursor is deleted only while it is
+  still at the version the run read, so a concurrent run's fresh cursor is
+  not removed (#4344, #4233).
+- **A flush held closed on a provisioning view the router cannot trust is
+  dropped and counted after `max_flush_lifetime` with no successful
+  provisioning read instead of held without bound.** While the provisioning
+  record could not be re-read, a buffer whose flush could not confirm its
+  shard index was in the read-side scan set kept its rows, strict waiters and
+  byte-budget charge for the whole outage. The hold now ends once
+  `max_flush_lifetime` has passed with no provisioning read succeeding since
+  the hold began (a successful read restarts it). The attempt that finds it
+  spent keeps the buffer and starts a background read of the record without
+  waiting for it, so the shard keeps serving other tenants; the flush opens
+  if a read issued after the spend confirms the view. The buffer is dropped
+  only once such a read has failed, or `max_flush_lifetime` more has passed
+  with no read confirming the view; a read the read backoff refuses drops
+  nothing. Then the rows are not
+  written, strict writers get a retryable 503, the bytes are refunded, the
+  drop is logged at ERROR and counted on
+  `ravel_ingest_abandoned_stale_provisioning_total` by signal. A shutdown
+  inside that bound still writes the buffer in place. A flush waiting out a
+  stale `sys/compat` view now asks it a last time one second before its
+  deadline, so a view that answers then leaves the attempt time to publish.
+- **A write routed on the grace window is refused when its undeferred flush
+  trigger would open past the window's horizon.** A router whose provisioning
+  re-read failed kept acknowledging buffered rows up to the last nanosecond
+  before the horizon, though their flush opens up to the flush trigger age
+  bound (about 40 s at the defaults) later, past the horizon, where it was
+  held, and dropped if no provisioning read succeeded within the bound above.
+  In that last stretch the write is now refused with a retryable 503 and
+  nothing is buffered. A buffer held below `--idle-flush-byte-floor` (about an
+  hour) or whose flush is deferred can still open past the horizon after its
+  rows were acknowledged, and is then held under the bound above.
+- **A slow router read no longer sets a newer cached provisioning view
+  back.** A write-path read issued before a background read that installed
+  first replaced the newer view and its stamp with its own.
+- **The admin and maintain IAM templates grant `s3:PutObject` on `sys/compat`.**
+  The `ravel-cli compat init`, `activate` and `certify` commands (admin role)
+  and the maintain late-write pass (`update_compat`) write that key, and
+  neither shipped template allowed it, so the first activation failed with
+  `AccessDenied` and the late-write watermark could not advance. Gateway and
+  query templates still only read it.
+- **The admin IAM template grants `s3:PutObject` and `s3:DeleteObject` on
+  `sys/maintain/certify/*`.** `ravel-cli compat certify` keeps a store-wide
+  census cursor at that prefix (`certify_cursor_key`) and neither action was
+  granted, so certify was refused at its first cursor write.
+- **The maintain IAM template grants `s3:DeleteObject` on
+  `sys/maintain/certify/*`.** The maintain process's own scheduled compat job
+  also finishes a certify run (`compat_maintain.rs` calls
+  `ravel_maintain::certify`), and its finalization could not delete the
+  cursor, leaving it behind for every later pass to redo the floor raises.
+- **The admin IAM template grants `s3:PutObject` on `t/*/a/alert-lease`.**
+  `compat activate`'s fence walk parks every tenant's alert lease
+  (`ravel_alerting::park_lease`) under the admin credential, and the grant
+  was missing, so activating `rlog` above the baseline was refused at its
+  first lease park.
+- **The maintain IAM template lists `t/*/a/prov`, `t/*/u/prov` and
+  `sys/maintain/certify/*`.** The RLOG family's compat-certify census and
+  finalization read every tenant's alerts and audit provisioning record and
+  the store-wide census cursor, both normally absent, and no maintain list
+  grant covered them, so every tick's certify pass was refused with
+  `AccessDenied` on AWS instead of reading them as absent.
+- **A logs or spans query with a commit token counts each record once after
+  the token's write is compacted (#4418).** Until the sweep deleted the
+  compacted input's commit record, the token step added that input beside
+  the part that already held its rows, and logs and spans have no
+  query-time dedup, so every record of the write was returned twice. The
+  step now leaves out an input whose rows the snapshot already serves from
+  a compaction or rewrite output, and an input whose bucket is tombstoned,
+  and serves a live erasure rewrite's output parts in place of an input it
+  replaced unless the snapshot still serves another object that rewrite
+  replaced, deciding from the records' input sets. Tokens whose commit
+  record is already swept are resolved before the others, so the answer no
+  longer depends on token order. A token whose write is not compacted is
+  still served from its own object, and metrics are unchanged. The check
+  runs only when the snapshot holds a level-1 part of the token's bucket
+  or an erasure is pending, and then costs each token one LIST of its
+  bucket, plus one GET per compaction record not in the cache and one per
+  rewrite record: N such tokens pay N LISTs even in one bucket, and while
+  an erasure is pending every logs or spans token whose input is not
+  already in the snapshot pays its LIST and rewrite GETs. A store error on
+  that check now fails the query with a retryable error (HTTP SQL 503
+  unavailable, Flight SQL `Unavailable`), where the same query used to
+  succeed, with each record twice when the write was compacted; a checksum
+  mismatch on a record it reads fails with 500, as on every catalog read.
+
+### Changed
+
+- **Upgrade: apply the updated operator ClusterRole before upgrading the
+  operator, on every install.** The operator now watches
+  HorizontalPodAutoscalers from startup, whether or not any RavelCluster
+  autoscales, and needs `list` and `watch` on `horizontalpodautoscalers` in
+  the `autoscaling` API group, which `deploy/k8s/operator/rbac.yaml` grants.
+  Upgraded the other way round, the watch fails with 403 Forbidden and
+  retries, logging a `reconcile stream error` warning each time, and each
+  failure delays the operator's reaction to spec edits and Deployment changes
+  on every RavelCluster by up to about a minute. Applying the ClusterRole
+  afterwards ends it without a restart. See "Autoscaling" in
+  docs/guides/kubernetes.md.
+- **TopK late materialization re-reads only the winning blocks.** The
+  phase-2 row fetch of a `SELECT * ... ORDER BY ... LIMIT k` logs statement
+  now opens each segment holding a winner once instead of once per winning
+  block. Above the block-range threshold it fetches only the winning blocks'
+  pages of a version-4 object, and the whole-object crossovers weigh those
+  pages alone, where it previously fetched the query's whole candidate set
+  per block (ADR-0774, amendment of 2026-11-16).
+- **The logs SQL row path builds its batches from the decoded block.** A
+  logs scan that projects the `attrs` map, runs under a pending erasure, or
+  hits a block with an `attrs_raw` overflow page now builds the `attrs` map,
+  every `attrs['k']` column and every typed attribute column straight from the
+  decoded block and each stream's resource and scope attributes, decoded once
+  per stream in each block, instead of rebuilding a `LogRecord` per row. Erased rows are
+  dropped before any column is built. Results are unchanged. The stats JSON
+  of `POST /api/v1/sql` reports `rowpathBatches` and `columnarBatches`, the
+  number of batches each logs build path produced (ADR-2773 decision 4).
+  `strCellsValidated` drops for statements that read `attrs['k']` columns
+  on the columnar path: the per-key build now validates each plain-page
+  `Str` cell once, where it validated a UTF-8 winner twice before.
+  Late-materialized TopK queries still fetch their phase-2 rows through the
+  record-based build.
+- **The catalog fold builds key-index leaves by default.** `ravel-server`
+  and `ravel-cli catalog fold` now build per-part key-index leaves for logs
+  and spans, and the metrics `label_value` leaf, which follows the same
+  switch, unless `--no-fold-key-index-leaves` or `--no-key-index-leaves` is
+  given. With the switch on, folds of every signal, metrics included, seal
+  parts at the UTC day. `--no-fold-metrics-label-index` and
+  `--no-metrics-label-index` still turn off the metrics leaf alone. `--fold-key-index-leaves` and `--key-index-leaves` are still
+  accepted and change nothing; each conflicts with its opt-out, and the
+  pair-budget flags are refused beside the opt-out instead of requiring the
+  old opt-in. The first fold after the upgrade re-partitions each tenant's
+  retained history into UTC-day parts and builds every day's leaves once.
+  Every process that folds a tenant must run this version and agree on the
+  switch: a folder with the build off re-partitions the tenant and drops
+  leaves on each of its folds, and reports `key_index_switch_off_over_leaves`
+  with a warning (ADR-3939).
+- **`ravel-cli load --page-choice exhaustive|estimated`.** The flag selects
+  how the RLOG writer picks each page's encoding. `exhaustive`, the default,
+  seals every candidate encoding and keeps the smallest. `estimated` seals
+  one candidate picked from the page's statistics. On the ClickBench entry
+  load (c6a.4xlarge, #4203 comment 6900891749), `estimated` cut load wall
+  time from 490.1 s to 452.4 s (7.7%) and load CPU by 11.1%, for 2.43% more
+  l0 bytes. It also roughly doubled hot reads of the long `URL` column in
+  ClickBench Q24 and Q28 (#4388), which is why it is not the default. No
+  format change (ADR-4203 decision 7): readers decode objects from either
+  choice the same way. The load summary's `page choice` line and the report
+  JSON's `page_choice` field name the choice used.
+- **A nested section with a newer grammar version than this build knows reports a typed error.** POSTINGS (RLOG) and KEY_IDX (RLOG and RSPAN) previously fell back to the generic corruption error when their internal version byte was above the known set; they now return `UnsupportedSectionVersion { section, version }` instead, naming the section and the version seen. **RSEG, RLOG, and RSPAN readers now report which section kind ids they skipped as unknown.** Each opened object exposes the list of unrecognized section kinds it encountered; empty for any object this build wrote (ADR-4233 H5/H6).
+- **The derived SQL partition count is capped at 32 on a loopback store.**
+  On a loopback store endpoint (`--store s3`, `gcs` or `azure` against a
+  loopback `--s3-endpoint`, `--gcs-endpoint` or `--azure-endpoint`), when
+  neither `--sql-partition-count` nor `--fetch-concurrency` is set,
+  `ravel-server` now derives `max(8, min(2 x cores, 32))` scan partitions
+  instead of `max(8, 2 x cores)`, logged at source `derived-loopback-cap`
+  when the cap lowers it; the in-memory attempt's final-exchange floor of 16
+  still applies to that capped count. On a c6a.metal loopback run this cut
+  the ClickBench cold total from 150.5 s to 137.2 s and the hot total from
+  24.4 s to 16.5 s (ADR-4203, amendment 2026-11-16). An explicit
+  `--sql-partition-count` is used as given, and a non-loopback store keeps
+  `max(8, 2 x cores)`.
+- **Startup cache warm-up skips whole-warming logs parts above the plan
+  bound.** The whole-part step now reads a logs part the way the query path
+  does: whole only when its object size is at or under
+  `LogSegmentFetcher::plan_whole_object_bound`, and not at all above it, where
+  the query path plans from the part's directories and reads by range only the
+  blocks a statement keeps. A part above the bound is left to the logs metadata
+  pass, which warms its footer and directories; the whole-part step no longer
+  reads its blocks. Such a part is counted in a new `parts_above_plan_bound`
+  field, and a part at or under the bound past the whole-part cap, which
+  neither step warms, in a new `parts_beyond_cap` field, both on the
+  per-(tenant, signal) warm line and the pass-complete line. The per-(tenant,
+  signal) `warn!` that nothing warmed now fires when there were parts at or
+  under the bound and none of them warmed or was skipped over budget, whatever
+  the parts above it. When the metadata pass does
+  not run, parts above the bound get no warm at all and the warm-up logs one
+  `warn!` per pass saying so. The whole-part cap, the metadata share of the
+  cache budget, the warm deadline and `/readyz` behaviour are unchanged. A
+  tenant whose parts are all above the bound now has only their metadata
+  warmed, so its first column-page reads are paid cold. The whole-part step
+  builds its logs fetcher with the query path's `max_fetch_run_bytes` too, so a
+  part at or under the bound is warmed under the same extent keys the query path
+  reads. When every metadata read the pass started for a tenant's parts above
+  the bound failed, it logs its own `warn!`, so that fault is not
+  silenced by the per-(tenant, signal) line staying at `info!` for such parts.
+- **A declared I64 column's `=` against an integer literal filters inside the
+  logs scan.** `WHERE "UserID" = 435090932899640449` on a declared I64
+  column is now evaluated by a local scan (not a distributed coordinator's)
+  and leaves no `FilterExec` above it,
+  while its block pruning and KEY_IDX probe stay as they were. On the row
+  path (`attrs` projected, a pending erasure, or a block with an `attrs_raw`
+  page) the scan builds the filter's column first and builds the `attrs`
+  map, every `attrs['k']` column and every other column only for the rows
+  the filter keeps; the new `attrs_rows_built` scan metric counts the rows
+  whose `attrs` map was built. Answers are unchanged (ADR-0093, amendment
+  2026-11-16).
+- **The key-index repair reads a held section once instead of in every
+  pass.** `ravel-cli catalog fold --rebuild-key-index` keeps each entry's
+  KEY_IDX section from its first read for the part's later build passes,
+  in part order while the part's held bytes stay within a cap, and
+  releases them when the part's build ends. Entries past the cap are read
+  in every pass as before, and the leaves are unchanged. The cap defaults
+  to 2,000,000,000 bytes less 88 bytes per pair of
+  `--key-index-build-max-pairs` (1,296,000,000 at the default 8,000,000);
+  `--key-index-repair-hold-bytes` sets it (refused without
+  `--rebuild-key-index`), and 0 restores reading every section in every
+  pass. The fold's own leaf build is unchanged. The rebuild report adds `section_hold_cap_bytes`,
+  `section_hold_entries` and `section_hold_peak_bytes`. For the measured
+  548-entry logs day the default is predicted, not measured, to cut the
+  repair from 27,400 ranged GETs and 28.8 GB of section reads to 1,096 and
+  about 1.15 GB, holding about 1.15 GB more at its peak.
+- **A metrics or spans load warns that it ignores `--page-choice estimated`,**
+  since the page choice applies to logs loads only (#4409).
+
 ## [0.33.0] - 2026-11-13
 
 ### Added
