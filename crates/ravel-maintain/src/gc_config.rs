@@ -1635,6 +1635,19 @@ mod tests {
         assert_eq!(err, GcConfigError::UnsupportedVersion { got: 3 });
     }
 
+    /// Version 0, from a writer that never stamped the field, is below the
+    /// read set and refused rather than read as version 1, so the read set
+    /// is closed at both ends (ADR-0066's `GcConfig` read-set amendment).
+    #[tokio::test]
+    async fn version_0_is_refused() {
+        let store = store();
+        seed_raw(store.as_ref(), 0, 0).await;
+        let err = read_gc_config(store.as_ref())
+            .await
+            .expect_err("version 0 must be refused");
+        assert_eq!(err, GcConfigError::UnsupportedVersion { got: 0 });
+    }
+
     /// Bootstrap on an empty bucket writes format version 1 with no TTL field,
     /// even when the caller's defaults are version 2, so a new build touching
     /// a fresh bucket first cannot lock out an older build that reads only
