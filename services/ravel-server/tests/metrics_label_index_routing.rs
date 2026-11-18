@@ -337,6 +337,7 @@ fn catalog_from_flags(store: Arc<dyn ObjectStoreBackend>, flags: &[&str]) -> Arc
                 shard_count: 1,
                 build_key_index_leaves: cli.fold_key_index_leaves,
                 metrics_label_index: !cli.maintenance.no_fold_metrics_label_index,
+                metrics_series_index: cli.maintenance.fold_metrics_series_index,
                 ..server_catalog_config_base()
             },
         )
@@ -349,10 +350,15 @@ const LABEL_INDEX_ON: &[&str] = &["--fold-key-index-leaves"];
 /// Leaves on with the metrics leaf opted out: without the opt-out this arm
 /// would build the metrics leaf and the unrouted control would route.
 const LABEL_INDEX_OFF: &[&str] = &["--fold-key-index-leaves", "--no-fold-metrics-label-index"];
+/// Leaves on with the metrics series index turned on beside the metrics
+/// leaf (ADR-4146 decision 2).
+const SERIES_INDEX_ON: &[&str] = &["--fold-key-index-leaves", "--fold-metrics-series-index"];
 
 #[derive(Clone, Copy, Default)]
 struct Setup {
     label_index: bool,
+    /// Fold with [`SERIES_INDEX_ON`]; needs `label_index`.
+    series_index: bool,
     /// Also publish one object into the current, unsealed hour.
     recent: bool,
     /// The recent object also holds `instance="target"`.
@@ -432,10 +438,10 @@ async fn serve(setup: Setup) -> Fixture {
             .await,
         );
     }
-    let flags = if setup.label_index {
-        LABEL_INDEX_ON
-    } else {
-        LABEL_INDEX_OFF
+    let flags = match (setup.label_index, setup.series_index) {
+        (true, true) => SERIES_INDEX_ON,
+        (true, false) => LABEL_INDEX_ON,
+        (false, _) => LABEL_INDEX_OFF,
     };
     let report = catalog_from_flags(Arc::clone(&store), flags)
         .fold(
@@ -453,6 +459,7 @@ async fn serve(setup: Setup) -> Fixture {
         "every object folds: {report:?}"
     );
     assert_eq!(report.metrics_label_index_parts_over_cap, 0, "{report:?}");
+    assert_eq!(report.metrics_series_index_parts_over_cap, 0, "{report:?}");
     assert_eq!(
         report.key_index_leaves_written > 0,
         setup.label_index,
@@ -1173,7 +1180,9 @@ async fn the_cumulative_segment_check_counts_segments_resolved_before_the_route(
 /// Adds the three ADR-4146 series fields to the folded part, built with the
 /// catalog's leaf encoders from the series `publish_object` writes: object
 /// `seq` holds series `2 * seq`, and a holder also series `2 * seq + 1`.
-/// Each series is its own class. No fold writes these fields yet.
+/// Each series is its own class. Built by hand, apart from the fold's own
+/// series build, which `promql_query_range_routes_on_a_fold_built_series_index`
+/// covers.
 async fn add_series_leaves(fixture: &Fixture) {
     use ravel_catalog::{
         KeyIndexLeafEntry, KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexPostingEntry,
@@ -1386,4 +1395,105 @@ async fn promql_query_range_reaches_the_series_route() {
     assert!(rows.iter().all(|row| row["partsProbed"] == 1), "{stats}");
     let [gets, _, _] = key_index_figures(&routed);
     assert_eq!(pass_gets, gets, "every leaf GET is a series pass's");
+}
+
+/// ADR-4146 W1 reachability, patterned on
+/// `promql_query_range_reaches_the_series_route`, which adds hand-built
+/// series leaves: here the fold itself builds the three series fields under
+/// the server's `--fold-metrics-series-index`, at leaf version 3, and the R2
+/// series route over that part answers the plan `{__name__="cpu_seconds",
+/// instance="target"}` alone. Its two positive pairs intersect to the two
+/// target series, each held by one holder object, so the plan keeps exactly
+/// the two holders' entries: the four non-holders are pruned by the series
+/// index and never opened, the holders are read as in the unrouted run, and
+/// the answer is the unrouted run's.
+#[tokio::test]
+async fn promql_query_range_routes_on_a_fold_built_series_index() {
+    use ravel_catalog::{KeyIndexLeafLimits, decode_head, verify_key_index_leaf};
+
+    let _serial = SERIAL.lock().await;
+    let query = format!("{METRIC}{{instance=\"{TARGET}\"}}");
+    let now = Some(now_ns());
+    let off = serve(Setup {
+        now,
+        ..Setup::default()
+    })
+    .await;
+    let unrouted = off.query_range(&query).await;
+    let on = serve(Setup {
+        label_index: true,
+        series_index: true,
+        now,
+        ..Setup::default()
+    })
+    .await;
+    assert_eq!(on.flags, SERIES_INDEX_ON);
+
+    let head_key = format!(
+        "t/{}/catalog/{}/HEAD",
+        TenantId::new(TENANT).hash().to_hex(),
+        Signal::Metrics.key_prefix()
+    );
+    let head = on
+        .recorder
+        .get(&head_key, GetRange::Full)
+        .await
+        .expect("HEAD");
+    let head = decode_head(&head.data).expect("decode HEAD");
+    assert_eq!(head.parts.len(), 1);
+    let mut versions: Vec<(String, u32)> = Vec::new();
+    for leaf in &head.parts[0].key_index {
+        let bytes = on
+            .recorder
+            .get(&leaf.key, GetRange::Full)
+            .await
+            .expect("leaf")
+            .data;
+        let summary =
+            verify_key_index_leaf(&bytes, &KeyIndexLeafLimits::default()).expect("verify");
+        versions.push((leaf.field.clone(), summary.header.format_version));
+    }
+    assert_eq!(
+        versions,
+        vec![
+            ("class_objects".to_string(), 3),
+            ("label_value".to_string(), 2),
+            ("series_class".to_string(), 3),
+            ("series_label".to_string(), 3),
+        ]
+    );
+    on.recorder.clear();
+
+    let (code, routed) = on
+        .query_range_under(&query, ravel_query::EngineConfig::default())
+        .await;
+    assert_eq!(code, StatusCode::OK, "{routed}");
+    let non_holders = OBJECTS - HOLDERS.len() as u64;
+    assert_eq!(non_holders, 4);
+    assert_eq!(stat(&routed, "segmentsPrunedBySeriesIndex"), non_holders);
+    assert_eq!(stat(&routed, "segmentsPrunedByLabelIndex"), 0);
+    assert_eq!(stat(&unrouted, "segmentsPrunedBySeriesIndex"), 0);
+    let stats = &routed["data"]["stats"];
+    assert_eq!(stats["seriesIndex"]["plansRouted"], 1, "{stats}");
+    assert_eq!(stats["seriesIndex"]["planPartsAnswered"], 1, "{stats}");
+    let names: Vec<&str> = stats["seriesIndexPasses"]
+        .as_array()
+        .expect("pass rows")
+        .iter()
+        .map(|row| row["pass"].as_str().expect("pass name"))
+        .collect();
+    assert_eq!(names, ["A", "B", "C"]);
+
+    let result = matrix(&routed);
+    assert_eq!(result.len(), HOLDERS.len());
+    assert_eq!(result, matrix(&unrouted), "routing changes no answer");
+    let off_gets = off.sealed_gets();
+    let on_gets = on.sealed_gets();
+    for seq in 0..OBJECTS as usize {
+        if HOLDERS.contains(&(seq as u64)) {
+            assert_eq!(on_gets[seq], off_gets[seq], "holder {seq} is read as before");
+        } else {
+            assert_eq!(on_gets[seq], 0, "non-holder {seq} is never opened");
+        }
+    }
 }

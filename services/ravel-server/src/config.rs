@@ -1806,6 +1806,19 @@ pub struct MaintenanceArgs {
     #[arg(long)]
     pub no_fold_metrics_label_index: bool,
 
+    /// Turns on the metrics series index (ADR-4146 decision 2): every fold
+    /// this process runs with the key-index leaf build and the metrics
+    /// `label_value` leaf on also builds the three series fields
+    /// (`series_label`, `series_class`, `class_objects`) of each metrics part
+    /// it re-encodes, from each object's SERIES_IDS and stored label sets.
+    /// A part whose three fields would total more than 1% of its data bytes
+    /// gets none of them. While a tenant has a pending metrics erasure the
+    /// fold writes no series leaf. Off by default: turn it on only after
+    /// every query, maintain and fold process runs a build that reads leaf
+    /// format version 3. Refused in `--mode gateway`, which runs no fold.
+    #[arg(long)]
+    pub fold_metrics_series_index: bool,
+
     /// The interval, in seconds, of the scheduled fold another process runs
     /// for this one's catalog: set it to the maintain tier's
     /// `--fold-interval-secs`. Read only by the request-budget refusal, which
@@ -7572,6 +7585,10 @@ impl Cli {
                     "no_fold_metrics_label_index",
                     "--no-fold-metrics-label-index",
                 ),
+                (
+                    "fold_metrics_series_index",
+                    "--fold-metrics-series-index",
+                ),
             ] {
                 if passed(id) {
                     return Err(Self::command().error(
@@ -8494,6 +8511,7 @@ impl Cli {
             build_key_index_leaves: self.fold_key_index_leaves,
             key_index_build_max_pairs: self.fold_key_index_build_max_pairs,
             metrics_label_index: !self.maintenance.no_fold_metrics_label_index,
+            metrics_series_index: self.maintenance.fold_metrics_series_index,
         }
     }
 
@@ -12787,6 +12805,38 @@ mod tests {
         let message = err.to_string();
         assert!(
             message.contains("--no-fold-metrics-label-index") && message.contains("gateway"),
+            "the refusal must name the flag and the mode, got: {message}"
+        );
+    }
+
+    /// ADR-4146 decision 2: the metrics series index is off by default in
+    /// every mode, `--fold-metrics-series-index` turns it on in the modes
+    /// that fold and reaches the fold configuration, and `gateway` refuses
+    /// it.
+    #[test]
+    fn fold_metrics_series_index_is_off_by_default_with_an_opt_in() {
+        for mode in ["maintain", "all", "query"] {
+            let mut args = vec!["ravel-server", "--mode", mode];
+            let cli = Cli::parse_validated_from(args.clone())
+                .unwrap_or_else(|err| panic!("--mode {mode} starts without the flag: {err}"));
+            assert!(!cli.maintenance.fold_metrics_series_index);
+            assert!(!cli.fold_task_config().metrics_series_index);
+            args.push("--fold-metrics-series-index");
+            let cli = Cli::parse_validated_from(args)
+                .unwrap_or_else(|err| panic!("--mode {mode} must accept the opt-in: {err}"));
+            assert!(cli.maintenance.fold_metrics_series_index);
+            assert!(cli.fold_task_config().metrics_series_index);
+        }
+        let err = Cli::parse_validated_from([
+            "ravel-server",
+            "--mode",
+            "gateway",
+            "--fold-metrics-series-index",
+        ])
+        .expect_err("a gateway runs no fold and must refuse the opt-in");
+        let message = err.to_string();
+        assert!(
+            message.contains("--fold-metrics-series-index") && message.contains("gateway"),
             "the refusal must name the flag and the mode, got: {message}"
         );
     }
