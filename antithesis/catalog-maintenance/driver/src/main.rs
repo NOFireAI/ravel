@@ -8,20 +8,26 @@
 //! hours and later past the sweep's protection horizon, overwrite HEAD with
 //! garbage through raw S3, audit the store against what HEAD names and for
 //! swept compaction inputs, and check that no scan exceeds the stored
-//! multiset of seeded and live records. The eventually stops faults, sweeps
-//! every shard and checks the whole multiset. See
+//! multiset of seeded and live records. Three forced races, run as drawn
+//! rules and again in the eventually, put the servers in situations a fault
+//! schedule alone rarely reaches: a fold losing its HEAD CAS, a compaction
+//! record PUT losing to a concurrent compaction, and a sweep past a
+//! compaction record that HEAD has not folded. The eventually stops faults,
+//! sweeps every shard and checks the whole multiset. See
 //! antithesis/catalog-maintenance/README.md for the properties.
 
 mod audit;
 mod cli;
 mod clock;
+mod forced;
 mod multiset;
+mod race;
 mod s3;
 mod seed;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,8 +43,11 @@ use ravel_antithesis_driver::model::{self, Attempt, Mode, Model, Signal, Write};
 use ravel_antithesis_driver::otlp::{self, PartialSuccess};
 use ravel_antithesis_driver::ravel::{self, Ravel, Reply, SqlFailure};
 
+use ravel_antithesis_catalog_driver::{keys, proxy};
+
 use audit::{InputKeys, JsonPart};
 use cli::Cli;
+use forced::Held;
 use s3::Store;
 use seed::Plan;
 
@@ -61,6 +70,20 @@ const DECODES_PER_AUDIT: usize = 16;
 const SETUP_BUDGET: Duration = Duration::from_secs(600);
 /// Acked writes verified by one token read in the eventually.
 const TOKEN_BATCH: usize = 20;
+/// Fold races the eventually runs until a server fold is overtaken.
+const FOLD_RACES_EVENTUALLY: u32 = 6;
+/// Record races the eventually runs until a server's record PUT loses.
+const RECORD_RACES_EVENTUALLY: u32 = 3;
+/// How long a record race waits for a server to send a record PUT after the
+/// nudge: several maintenance intervals.
+const HELD_WAIT: Duration = Duration::from_secs(120);
+/// Live writes a forced race adds, at most, to give the current hour a
+/// compactable bucket.
+const FILL_WRITES: u32 = 16;
+/// How long the unfolded-record sweep waits after each of its jumps for the
+/// maintenance servers' scheduled sweeps: several maintenance intervals.
+const UNFOLDED_PASS_WAIT: Duration = Duration::from_secs(150);
+const NS_PER_SECOND: u64 = 1_000_000_000;
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -121,6 +144,8 @@ struct Config {
     eventually_on: bool,
     eventually_after: Option<u64>,
     clock: ClockPlan,
+    /// The `s3proxy` container's control port.
+    proxy: String,
 }
 
 impl Config {
@@ -162,6 +187,7 @@ impl Config {
                 reread_s: env_u64("FAKETIME_CACHE_DURATION", 2),
                 min_acked: usize::try_from(env_u32("CLOCK_JUMP_MIN_ACKED", 20)).unwrap_or(20),
             },
+            proxy: std::env::var("S3_PROXY_CONTROL").unwrap_or_else(|_| "s3proxy:9001".to_string()),
         }
     }
 }
@@ -171,6 +197,8 @@ impl Config {
 struct Jump {
     before_ns: u64,
     after_ns: u64,
+    /// The total offset after this move.
+    offset_s: u64,
     reached_driver: bool,
 }
 
@@ -203,6 +231,29 @@ struct Shared {
     sweep_jump_started: AtomicBool,
     /// The horizon and window jumps, once both reached the driver.
     sweep_jump: Mutex<Option<(Jump, Jump)>>,
+    /// The offset the file holds: every jump and nudge so far.
+    offset_s: Mutex<u64>,
+    /// The client and token of the on-demand fold route.
+    admin: reqwest::blocking::Client,
+    token: String,
+    /// The last fold race's skewed-fold and mean server-fold seconds.
+    fold_race_timings: Mutex<(f64, f64)>,
+    /// Fold races run; numbers each one's HEAD garbage.
+    fold_races: AtomicU64,
+    /// Whether a server fold lost its HEAD CAS to the skewed fold.
+    fold_overtaken: AtomicBool,
+    /// The `s3proxy` control port.
+    proxy: String,
+    /// Record races run.
+    record_races: AtomicU64,
+    /// Whether a server's record PUT lost to the `ravel-cli` compaction.
+    record_lost: AtomicBool,
+    /// Set once the unfolded-record sweep took its first sweep jump; the rule
+    /// runs it once per timeline.
+    unfolded_started: AtomicBool,
+    /// Whether an unfolded-record sweep reached its situation; the
+    /// eventually runs one until it has.
+    unfolded_reached: AtomicBool,
     /// Every key an audit or the sweep jump has listed, and the swept
     /// inputs confirmed gone. Keys are never reused, so one listed here and
     /// absent from a later LIST was deleted.
@@ -276,6 +327,7 @@ struct HeadView {
     created_unix_ns: Option<u64>,
     /// `None` when there is no HEAD, or its parts lack the expected fields.
     parts: Option<Vec<JsonPart>>,
+    watermark_hour: Option<u64>,
 }
 
 impl Shared {
@@ -316,6 +368,40 @@ impl Shared {
         };
         m.writes.insert(id, w.clone());
         Some(w)
+    }
+
+    /// One strict log write of `records` records over `streams` streams,
+    /// retried on a 503, a 429 or no response; `node` picks each attempt's
+    /// node. Returns whether it was acknowledged.
+    fn write(&self, records: u32, streams: u32, node: &mut dyn FnMut() -> usize) -> bool {
+        let Some(w) = self.register(records) else {
+            return false;
+        };
+        let body = otlp::logs_request(w.id, records, streams, w.ts_ns);
+        for attempt_no in 0..=MAX_RETRIES {
+            let k = self.begin_attempt(w.id);
+            let reply = self.ravel.export(
+                node(),
+                "/v1/logs",
+                &body,
+                w.mode.header(),
+                None,
+                false,
+                WRITE_TIMEOUT,
+            );
+            let attempt = classify(&reply);
+            self.finish_attempt(w.id, k, attempt.clone());
+            let retryable = match attempt {
+                Attempt::NoResponse => true,
+                Attempt::Refused { status } => status == 503 || status == 429,
+                Attempt::Acked { .. } => return true,
+                _ => false,
+            };
+            if !retryable || attempt_no == MAX_RETRIES {
+                break;
+            }
+        }
+        false
     }
 
     fn begin_attempt(&self, id: u64) -> usize {
@@ -381,11 +467,11 @@ impl Shared {
                 .and_then(|h| h.get("created_unix_ns"))
                 .and_then(serde_json::Value::as_u64),
             parts,
+            watermark_hour: head
+                .and_then(|h| h.get("watermark_hour"))
+                .and_then(serde_json::Value::as_u64),
         };
-        let watermark = head
-            .and_then(|h| h.get("watermark_hour"))
-            .and_then(serde_json::Value::as_u64);
-        if let (Some(wm), Some(parts)) = (watermark, &view.parts) {
+        if let (Some(wm), Some(parts)) = (view.watermark_hour, &view.parts) {
             self.observe_head(wm, parts);
         }
         Some(view)
@@ -536,7 +622,7 @@ impl Shared {
             return;
         }
         let acked = lock(&self.model).acked_logs.len();
-        let jump = self.shift_clock(self.clock.jump_s, self.clock.jump_s, reason);
+        let jump = self.shift_clock(self.clock.jump_s, reason);
         *slot = Some(jump);
         drop(slot);
         if !jump.reached_driver {
@@ -546,7 +632,8 @@ impl Shared {
             "clock: the driver's clock jumped forward",
             &json!({
                 "reason": reason,
-                "offset_s": self.clock.jump_s,
+                "jump_s": self.clock.jump_s,
+                "offset_s": jump.offset_s,
                 "min_jump_s": clock::min_jump_s(),
                 "before_ns": jump.before_ns,
                 "after_ns": jump.after_ns,
@@ -577,8 +664,7 @@ impl Shared {
             },
             None => println!("sweep jump: no HEAD key known, so nothing listed before the jump"),
         }
-        let horizon_offset = self.clock.jump_s + self.clock.horizon_jump_s;
-        let horizon = self.shift_clock(horizon_offset, self.clock.horizon_jump_s, reason);
+        let horizon = self.shift_clock(self.clock.horizon_jump_s, reason);
         if !horizon.reached_driver {
             return;
         }
@@ -587,8 +673,7 @@ impl Shared {
             println!("sweep jump: the fold after the horizon jump failed");
         }
         let marked = (0..SHARDS).filter(|&shard| self.sweep(shard)).count();
-        let window_offset = horizon_offset + self.clock.window_jump_s;
-        let window = self.shift_clock(window_offset, self.clock.window_jump_s, reason);
+        let window = self.shift_clock(self.clock.window_jump_s, reason);
         if !window.reached_driver {
             return;
         }
@@ -597,7 +682,7 @@ impl Shared {
             "clock: the clocks jumped past the sweep's protection horizon and pinned-query window",
             &json!({
                 "reason": reason,
-                "offset_s": window_offset,
+                "offset_s": window.offset_s,
                 "horizon_jump_s": self.clock.horizon_jump_s,
                 "protection_horizon_s": clock::protection_horizon_s(),
                 "window_jump_s": self.clock.window_jump_s,
@@ -608,23 +693,28 @@ impl Shared {
         self.settle("pinned-window jump");
     }
 
-    /// Write `offset_s`, the total offset, and wait for the driver's own
-    /// clock to move by `by_s`. libfaketime rereads the file every
-    /// `reread_s` seconds; the driver runs under it like every other
-    /// container.
-    fn shift_clock(&self, offset_s: u64, by_s: u64, reason: &str) -> Jump {
+    /// Raise the total offset by `by_s` and wait for the driver's own clock
+    /// to move by it. libfaketime rereads the file every `reread_s` seconds;
+    /// the driver runs under it like every other container.
+    fn shift_clock(&self, by_s: u64, reason: &str) -> Jump {
         let before_ns = now_ns();
-        if let Err(e) = clock::write_offset(&self.clock.file, offset_s) {
-            assert_unreachable!(
-                "clock: the driver could not write the clock offset",
-                &json!({ "file": self.clock.file.display().to_string(), "detail": e })
-            );
-            return Jump {
-                before_ns,
-                after_ns: before_ns,
-                reached_driver: false,
-            };
-        }
+        let offset_s = {
+            let mut total = lock(&self.offset_s);
+            if let Err(e) = clock::write_offset(&self.clock.file, *total + by_s) {
+                assert_unreachable!(
+                    "clock: the driver could not write the clock offset",
+                    &json!({ "file": self.clock.file.display().to_string(), "detail": e })
+                );
+                return Jump {
+                    before_ns,
+                    after_ns: before_ns,
+                    offset_s: *total,
+                    reached_driver: false,
+                };
+            }
+            *total += by_s;
+            *total
+        };
         let deadline = Instant::now() + Duration::from_secs(self.clock.reread_s + 30);
         let mut after_ns = now_ns();
         while !clock::moved(before_ns, after_ns, by_s) && Instant::now() < deadline {
@@ -646,8 +736,25 @@ impl Shared {
         Jump {
             before_ns,
             after_ns,
+            offset_s,
             reached_driver,
         }
+    }
+
+    /// Move every clock forward by `by_s` outside the three planned jumps,
+    /// and settle. The local loop adds every such move, from the line this
+    /// prints, to the offset it expects.
+    fn nudge(&self, by_s: u64, reason: &str) -> bool {
+        if by_s == 0 {
+            return true;
+        }
+        let jump = self.shift_clock(by_s, reason);
+        if !jump.reached_driver {
+            return false;
+        }
+        println!("clock: moved forward by {by_s} s outside the planned jumps ({reason})");
+        self.settle(reason);
+        true
     }
 
     /// After a jump reached the driver: wait one more reread, within which
@@ -777,6 +884,550 @@ impl Shared {
             println!("maintain compact-tenant: {}", out.summary());
         }
         out.ok()
+    }
+
+    /// `POST /api/v1/admin/fold` on one `--mode all` server: the body on a
+    /// 200, else why not.
+    fn admin_fold(&self, node: usize) -> Result<String, String> {
+        let url = format!("{}/api/v1/admin/fold", self.ravel.nodes[node]);
+        let resp = self
+            .admin
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&json!({ "signal": "logs", "tenant": self.tenant }))
+            .timeout(Duration::from_secs(u64::from(CLI_TIMEOUT_S)))
+            .send()
+            .map_err(|e| format!("{url}: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().map_err(|e| format!("{url}: {e}"))?;
+        if status.is_success() {
+            Ok(body)
+        } else {
+            Err(format!("{url}: {status}: {body}"))
+        }
+    }
+
+    /// One fold race (README.md, "The forced races"): nudge every clock to
+    /// just before an hour seals, overwrite HEAD with garbage, start a
+    /// `ravel-cli` fold whose clock runs `race::FOLD_SKEW_S` ahead, and
+    /// `delay_frac` into the window the last race's timings give, post an
+    /// on-demand fold to each `--mode all` server. The garbage HEAD makes
+    /// every fold rebuild and lets the on-demand route past its rate gate.
+    /// The caller holds the gate's write guard: nothing else moves the clock
+    /// or HEAD's bytes meanwhile. Returns whether a server fold lost its HEAD
+    /// CAS to the skewed fold.
+    fn fold_race(&self, delay_frac: f64, reason: &str) -> bool {
+        let Some(head_key) = lock(&self.head_key).clone() else {
+            println!("fold race: no HEAD key known yet");
+            return false;
+        };
+        if !self.nudge(
+            clock::fold_race_nudge_s(now_ns() / 1_000_000_000),
+            "fold race",
+        ) {
+            return false;
+        }
+        let now_s = now_ns() / 1_000_000_000;
+        let Some((seal, ahead_hour)) = clock::fold_race_seal(now_s)
+            .and_then(|seal| Some((seal, clock::sealed_watermark_hour(seal)?)))
+        else {
+            println!("fold race: {now_s} is outside the race's window after the nudge");
+            return false;
+        };
+        let n = self.fold_races.fetch_add(1, Ordering::SeqCst);
+        // Bytes no earlier race wrote, so HEAD's version is new on a store
+        // that derives it from content.
+        let garbage = format!("antithesis: not a catalog HEAD (fold race {n})");
+        if let Err(e) = self.store.put(&head_key, garbage.as_bytes()) {
+            println!("fold race: overwriting HEAD: {e}");
+            return false;
+        }
+        let skewed = format!("+{}", *lock(&self.offset_s) + race::FOLD_SKEW_S);
+        let (cli_s, server_s) = *lock(&self.fold_race_timings);
+        let delay_s = race::server_delay_s(cli_s, server_s, delay_frac);
+        let started = Instant::now();
+        let ((cli_out, cli_took), servers) = std::thread::scope(|scope| {
+            let cli = scope.spawn(|| {
+                let out = self.cli.run_env(
+                    &self.args(&["catalog", "fold", "--shards", "4", "--json"]),
+                    CLI_TIMEOUT_S,
+                    &[("FAKETIME", skewed.as_str())],
+                );
+                (out, started.elapsed())
+            });
+            std::thread::sleep(Duration::from_secs_f64(delay_s));
+            let posts: Vec<_> = (0..self.ravel.nodes.len())
+                .map(|node| {
+                    scope.spawn(move || {
+                        let t = Instant::now();
+                        (self.admin_fold(node), t.elapsed())
+                    })
+                })
+                .collect();
+            let servers: Vec<_> = posts
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        (Err("the post thread panicked".to_string()), Duration::ZERO)
+                    })
+                })
+                .collect();
+            let cli = cli.join().unwrap_or_else(|_| {
+                (
+                    cli::Output {
+                        code: None,
+                        stdout: String::new(),
+                        stderr: "the fold thread panicked".to_string(),
+                    },
+                    Duration::ZERO,
+                )
+            });
+            (cli, servers)
+        });
+        let cli_fold = race::parse_cli_fold(&cli_out.stdout);
+        let answered: Vec<f64> = servers
+            .iter()
+            .filter(|(r, _)| r.is_ok())
+            .map(|(_, took)| took.as_secs_f64())
+            .collect();
+        if cli_out.ok() && !answered.is_empty() {
+            let mean = answered.iter().sum::<f64>() / answered.len() as f64;
+            *lock(&self.fold_race_timings) = (cli_took.as_secs_f64(), mean);
+        }
+        let folds: Vec<Option<race::ServerFold>> = servers
+            .iter()
+            .map(|(r, _)| r.as_ref().ok().and_then(|b| race::parse_server_fold(b)))
+            .collect();
+        let won = cli_fold.as_ref().is_some_and(|c| {
+            folds
+                .iter()
+                .flatten()
+                .any(|s| race::overtaken(c, s, ahead_hour))
+        });
+        let details = json!({
+            "reason": reason,
+            "race": n,
+            "seal_s": seal,
+            "ahead_hour": ahead_hour,
+            "skew_s": race::FOLD_SKEW_S,
+            "server_delay_s": delay_s,
+            "cli_s": cli_took.as_secs_f64(),
+            "cli": cli_fold.as_ref().map(|c| format!("{c:?}")).unwrap_or_else(|| cli_out.summary()),
+            "servers": servers.iter().map(|(r, took)| match r {
+                Ok(body) => format!("{body} ({:.1} s)", took.as_secs_f64()),
+                Err(e) => e.clone(),
+            }).collect::<Vec<_>>(),
+        });
+        println!("fold race: {details}");
+        assert_sometimes!(
+            won,
+            "catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead",
+            &details
+        );
+        if won {
+            self.fold_overtaken.store(true, Ordering::SeqCst);
+        }
+        let _ = self.inspect_json();
+        won
+    }
+
+    /// The tenant prefix, inspecting HEAD first if no inspect has shown it.
+    fn known_prefix(&self) -> Option<String> {
+        if self.tenant_prefix().is_none() {
+            let _ = self.inspect_json();
+        }
+        self.tenant_prefix()
+    }
+
+    /// One command to the `s3proxy` control port.
+    fn proxy_cmd(&self, command: &str) -> Result<String, String> {
+        let reply = proxy::control(&self.proxy, command);
+        if let Err(e) = &reply {
+            println!("s3 proxy: {e}");
+        }
+        reply
+    }
+
+    /// A `(hour, shard)` bucket of the current or the previous hour that a
+    /// compaction would publish a record for, after up to [`FILL_WRITES`]
+    /// live writes if none has one yet. The caller holds the gate's write
+    /// guard, so no other write lands meanwhile.
+    fn compactable_bucket(&self, prefix: &str, what: &str) -> Option<(u64, u32)> {
+        let mut next_node = 0usize;
+        for writes in 0..=FILL_WRITES {
+            let hour = now_ns() / NS_PER_HOUR;
+            let hours = [hour.saturating_sub(1), hour];
+            let mut listed = BTreeSet::new();
+            for h in hours {
+                for shard in 0..SHARDS {
+                    match self.store.list(&keys::bucket_prefix(prefix, shard, h)) {
+                        Ok(keys) => listed.extend(keys),
+                        Err(e) => {
+                            println!("{what}: listing the buckets of hour {h}: {e}");
+                            return None;
+                        }
+                    }
+                }
+            }
+            if let Some(found) = forced::compactable_bucket(prefix, hours, SHARDS, &listed) {
+                return Some(found);
+            }
+            if writes == FILL_WRITES {
+                println!("{what}: no compactable bucket in hour {hour} or the one before");
+                break;
+            }
+            let n = self.ravel.nodes.len().max(1);
+            self.write(4, 4, &mut || {
+                next_node += 1;
+                next_node % n
+            });
+        }
+        None
+    }
+
+    /// One record race (README.md, "The forced races"): hold the next
+    /// compaction record PUT a server sends, nudge every clock until a
+    /// compactable bucket seals for compaction, and while the PUT is held
+    /// run a `ravel-cli` compaction of the held record's bucket, which
+    /// publishes the same record key first. The released create-only PUT
+    /// then finds the record in place. The caller holds the gate's write
+    /// guard. Returns whether the server's PUT lost.
+    fn record_race(&self, reason: &str) -> bool {
+        let Some(prefix) = self.known_prefix() else {
+            println!("record race: no HEAD key known yet");
+            return false;
+        };
+        let Some((hour, shard)) = self.compactable_bucket(&prefix, "record race") else {
+            return false;
+        };
+        if self
+            .proxy_cmd("pass")
+            .and_then(|_| self.proxy_cmd("hold-record"))
+            .is_err()
+        {
+            return false;
+        }
+        let n = self.record_races.fetch_add(1, Ordering::SeqCst);
+        let lost = self.record_race_held(n, &prefix, (hour, shard), reason);
+        let _ = self.proxy_cmd("pass");
+        if lost {
+            self.record_lost.store(true, Ordering::SeqCst);
+        }
+        lost
+    }
+
+    /// [`Shared::record_race`] once the proxy holds the next record PUT.
+    fn record_race_held(&self, n: u64, prefix: &str, bucket: (u64, u32), reason: &str) -> bool {
+        let now_s = now_ns() / NS_PER_SECOND;
+        let nudge_s = clock::seal_nudge_s(now_s, bucket.0, clock::compaction_seal_margin_s());
+        if !self.nudge(nudge_s, "record race") {
+            return false;
+        }
+        let deadline = Instant::now() + HELD_WAIT;
+        let (key, record, age) = loop {
+            let Ok(reply) = self.proxy_cmd("held") else {
+                return false;
+            };
+            match forced::judge_held(&reply, prefix) {
+                Held::Race { key, record, age } => break (key, record, age),
+                Held::Skip(key) => {
+                    println!("record race: released {key}, not a PUT to race");
+                    if self.proxy_cmd("release").is_err() {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                    if self.proxy_cmd("hold-record").is_err() {
+                        return false;
+                    }
+                }
+                Held::Nothing => {}
+            }
+            if Instant::now() >= deadline {
+                println!(
+                    "record race: no server sent a compaction record PUT within {} s of the nudge",
+                    HELD_WAIT.as_secs()
+                );
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        let shard_arg = record.shard.to_string();
+        let hour_arg = record.hour.to_string();
+        let args = self.args(&[
+            "maintain",
+            "compact-bucket",
+            "--shard",
+            &shard_arg,
+            "--hour",
+            &hour_arg,
+            "--no-claim",
+        ]);
+        let budget = forced::cli_budget(age);
+        let started = Instant::now();
+        let ((cli_out, cli_took), before, released, after) = std::thread::scope(|scope| {
+            let cli = scope.spawn(|| {
+                let out = self.cli.run(&args, CLI_TIMEOUT_S);
+                (out, started.elapsed())
+            });
+            while !cli.is_finished() && started.elapsed() < budget {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let before = self.store.get(&key);
+            let released = self.proxy_cmd("release");
+            let cli = cli.join().unwrap_or_else(|_| {
+                (
+                    cli::Output {
+                        code: None,
+                        stdout: String::new(),
+                        stderr: "the compaction thread panicked".to_string(),
+                    },
+                    Duration::ZERO,
+                )
+            });
+            // Time for the released PUT and the server's handling of its
+            // answer.
+            std::thread::sleep(Duration::from_secs(3));
+            (cli, before, released, self.store.get(&key))
+        });
+        let lost = released.is_ok() && matches!(before, Ok(Some(_)));
+        let changed = match (&before, &after) {
+            (Ok(Some(b)), Ok(Some(a))) => Some(a != b),
+            _ => None,
+        };
+        let details = json!({
+            "reason": reason,
+            "race": n,
+            "bucket_hour": bucket.0,
+            "bucket_shard": bucket.1,
+            "held_key": key,
+            "held_age_ms": age.as_millis(),
+            "cli_budget_s": budget.as_secs_f64(),
+            "cli_s": cli_took.as_secs_f64(),
+            "cli": cli_out.summary(),
+            "published_before_release": before.as_ref().map(Option::is_some),
+            "released": released.is_ok(),
+            "record_bytes_changed_after_release": changed,
+        });
+        println!("record race: {details}");
+        assert_sometimes!(
+            lost,
+            "catalog: a server's compaction record PUT lost to a concurrent compaction",
+            &details
+        );
+        lost
+    }
+
+    /// The unfolded-record sweep (README.md, "The forced races"): with every
+    /// server's compaction record PUT refused, nudge every clock until a
+    /// compactable bucket's hour seals for the fold and fold it into HEAD,
+    /// refuse every server's PUT of HEAD, publish the bucket's compaction
+    /// record through `ravel-cli`, then jump every clock past the record's
+    /// protection horizon and, once the servers' sweeps ran, past the
+    /// pinned-query window and the interior re-verify interval. HEAD names
+    /// the record's inputs throughout, so the servers' sweeps must keep
+    /// them. The caller holds the gate's write guard. Returns whether the
+    /// sequence reached that situation.
+    fn unfolded_sweep(&self, reason: &str) -> bool {
+        let Some(prefix) = self.known_prefix() else {
+            println!("unfolded sweep: no HEAD key known yet");
+            return false;
+        };
+        let Some(bucket) = self.compactable_bucket(&prefix, "unfolded sweep") else {
+            return false;
+        };
+        if self
+            .proxy_cmd("pass")
+            .and_then(|_| self.proxy_cmd("refuse-records"))
+            .is_err()
+        {
+            return false;
+        }
+        let reached = self.unfolded_sweep_refused(&prefix, bucket, reason);
+        // The driver's own check of what the sweep's HEAD gate protects,
+        // before any fold can move HEAD on.
+        self.audit(&|_| 0);
+        let _ = self.proxy_cmd("pass");
+        if reached {
+            self.unfolded_reached.store(true, Ordering::SeqCst);
+        }
+        reached
+    }
+
+    /// [`Shared::unfolded_sweep`] once the proxy refuses record PUTs.
+    fn unfolded_sweep_refused(
+        &self,
+        prefix: &str,
+        (hour, shard): (u64, u32),
+        reason: &str,
+    ) -> bool {
+        let now_s = now_ns() / NS_PER_SECOND;
+        let nudge_s = clock::seal_nudge_s(now_s, hour, clock::seal_margin_s());
+        if !self.nudge(nudge_s, "unfolded sweep: fold seal") {
+            return false;
+        }
+        let folded = (0..3).find_map(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            if !self.fold() {
+                return None;
+            }
+            self.inspect_json()
+                .filter(|v| v.watermark_hour.is_some_and(|w| w >= hour))
+        });
+        let Some(view) = folded else {
+            println!("unfolded sweep: no fold folded hour {hour}");
+            return false;
+        };
+        let bucket_prefix = keys::bucket_prefix(prefix, shard, hour);
+        match self.store.list(&bucket_prefix) {
+            Ok(listed) if keys::bucket(&bucket_prefix, &listed).compactable() => {}
+            Ok(listed) => {
+                println!(
+                    "unfolded sweep: {bucket_prefix} is no longer compactable: {:?}",
+                    keys::bucket(&bucket_prefix, &listed)
+                );
+                return false;
+            }
+            Err(e) => {
+                println!("unfolded sweep: listing {bucket_prefix}: {e}");
+                return false;
+            }
+        }
+        if self
+            .proxy_cmd(&format!("refuse-key {}", view.head_key))
+            .is_err()
+        {
+            return false;
+        }
+        let head = match self.store.get(&view.head_key) {
+            Ok(Some(bytes)) => bytes,
+            other => {
+                println!("unfolded sweep: reading HEAD: {other:?}");
+                return false;
+            }
+        };
+        let shard_arg = shard.to_string();
+        let hour_arg = hour.to_string();
+        let out = self.cli.run(
+            &self.args(&[
+                "maintain",
+                "compact-bucket",
+                "--shard",
+                &shard_arg,
+                "--hour",
+                &hour_arg,
+                "--no-claim",
+            ]),
+            CLI_TIMEOUT_S,
+        );
+        if !out.ok() {
+            println!("unfolded sweep: maintain compact-bucket: {}", out.summary());
+            return false;
+        }
+        let records = match self.store.list(&bucket_prefix) {
+            Ok(listed) => keys::bucket(&bucket_prefix, &listed).records,
+            Err(e) => {
+                println!("unfolded sweep: listing {bucket_prefix}: {e}");
+                return false;
+            }
+        };
+        let [record] = records.as_slice() else {
+            println!(
+                "unfolded sweep: {bucket_prefix} holds {} compaction records after the compaction",
+                records.len()
+            );
+            return false;
+        };
+        let decoded = self
+            .cli
+            .run(&["commit", "decode-compaction", record], CLI_TIMEOUT_S);
+        let inputs = if decoded.ok() {
+            audit::compaction_inputs(prefix, record, &decoded.stdout)
+        } else {
+            None
+        };
+        let Some(inputs) = inputs else {
+            println!(
+                "unfolded sweep: commit decode-compaction {record}: {}",
+                decoded.summary()
+            );
+            return false;
+        };
+        lock(&self.inputs_of).insert(record.clone(), inputs.clone());
+        let before: BTreeSet<String> = match self.store.list(prefix) {
+            Ok(keys) => keys.into_iter().collect(),
+            Err(e) => {
+                println!("unfolded sweep: listing {prefix}: {e}");
+                return false;
+            }
+        };
+        lock(&self.sweeps).observe(before.iter().cloned());
+        let present = forced::present_inputs(&inputs, &before);
+        self.unfolded_started.store(true, Ordering::SeqCst);
+        if !self.nudge(
+            self.clock.horizon_jump_s,
+            "unfolded sweep: protection horizon",
+        ) {
+            return false;
+        }
+        std::thread::sleep(UNFOLDED_PASS_WAIT);
+        if !self.nudge(
+            clock::unfolded_window_jump_s(),
+            "unfolded sweep: pinned-query window",
+        ) {
+            return false;
+        }
+        // The servers' next full sweep pass would delete a marked input; a
+        // deletion ends the wait early.
+        let deadline = Instant::now() + UNFOLDED_PASS_WAIT;
+        let mut after: Option<BTreeSet<String>> = None;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_secs(10));
+            if let Ok(keys) = self.store.list(prefix) {
+                let listed: BTreeSet<String> = keys.into_iter().collect();
+                let any_gone = present.iter().any(|k| !listed.contains(k));
+                after = Some(listed);
+                if any_gone {
+                    break;
+                }
+            }
+        }
+        let gone: Vec<String> = after.as_ref().map_or_else(Vec::new, |listed| {
+            present
+                .iter()
+                .filter(|k| !listed.contains(*k))
+                .filter(|k| matches!(self.store.get(k), Ok(None)))
+                .cloned()
+                .collect()
+        });
+        let head_after = self.store.get(&view.head_key).ok().flatten();
+        let record_present = matches!(self.store.get(record), Ok(Some(_)));
+        let reached =
+            forced::unfolded_reached(&head, head_after.as_deref(), record_present, present.len());
+        let details = json!({
+            "reason": reason,
+            "bucket_hour": hour,
+            "bucket_shard": shard,
+            "record": record,
+            "head_key": view.head_key,
+            "head_unchanged": head_after.as_deref() == Some(head.as_slice()),
+            "record_present": record_present,
+            "inputs_before": present.len(),
+            "listed_after": after.is_some(),
+            "inputs_deleted": first(&gone),
+            "horizon_jump_s": self.clock.horizon_jump_s,
+            "window_jump_s": clock::unfolded_window_jump_s(),
+            "offset_s": *lock(&self.offset_s),
+        });
+        println!("unfolded sweep: {details}");
+        assert_sometimes!(
+            reached,
+            "catalog: the clocks passed a compaction record's protection horizon and \
+             pinned-query window while HEAD had not folded it",
+            &details
+        );
+        reached
     }
 
     /// The audit, then the sweep check over its LIST.
@@ -978,33 +1629,9 @@ impl Workload {
         };
         let records = tc.draw(gs::integers::<u32>().min_value(1).max_value(8));
         let streams = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
-        let Some(w) = s.register(records) else {
-            return;
-        };
-        let body = otlp::logs_request(w.id, records, streams, w.ts_ns);
-        for attempt_no in 0..=MAX_RETRIES {
-            let node = draw_node(&tc, s.ravel.nodes.len());
-            let k = s.begin_attempt(w.id);
-            let reply = s.ravel.export(
-                node,
-                "/v1/logs",
-                &body,
-                w.mode.header(),
-                None,
-                false,
-                WRITE_TIMEOUT,
-            );
-            let attempt = classify(&reply);
-            s.finish_attempt(w.id, k, attempt.clone());
-            let retryable = match attempt {
-                Attempt::NoResponse => true,
-                Attempt::Refused { status } => status == 503 || status == 429,
-                _ => false,
-            };
-            if !retryable || attempt_no == MAX_RETRIES {
-                break;
-            }
-        }
+        s.write(records, streams, &mut || {
+            draw_node(&tc, s.ravel.nodes.len())
+        });
     }
 
     #[rule(groups = ["main"], weight = 1)]
@@ -1065,6 +1692,58 @@ impl Workload {
         } else {
             s.jump_clock("drawn");
         }
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
+    fn race_folds(&self, tc: TestCase) {
+        let s = &self.0;
+        if s.stopping.load(Ordering::SeqCst) || lock(&s.head_key).is_none() {
+            return;
+        }
+        if !tc.draw(gs::weighted_booleans(0.03)) {
+            return;
+        }
+        let frac = f64::from(tc.draw(gs::integers::<u32>().min_value(1).max_value(9))) / 10.0;
+        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        s.fold_race(frac, "drawn");
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
+    fn race_records(&self, tc: TestCase) {
+        let s = &self.0;
+        if s.stopping.load(Ordering::SeqCst) || lock(&s.head_key).is_none() {
+            return;
+        }
+        if !tc.draw(gs::weighted_booleans(0.03)) {
+            return;
+        }
+        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        s.record_race("drawn");
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
+    fn sweep_unfolded(&self, tc: TestCase) {
+        let s = &self.0;
+        if s.stopping.load(Ordering::SeqCst)
+            || s.unfolded_started.load(Ordering::SeqCst)
+            || lock(&s.head_key).is_none()
+        {
+            return;
+        }
+        if !tc.draw(gs::weighted_booleans(0.02)) {
+            return;
+        }
+        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stopping.load(Ordering::SeqCst) || s.unfolded_started.load(Ordering::SeqCst) {
+            return;
+        }
+        s.unfolded_sweep("drawn");
     }
 
     #[rule(groups = ["main"], weight = 1)]
@@ -1161,6 +1840,24 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         } else {
             s.jump_clock("eventually");
         }
+    }
+    if lock(&s.head_key).is_none() {
+        let _ = s.inspect_json();
+    }
+    for attempt in 0..FOLD_RACES_EVENTUALLY {
+        if s.fold_overtaken.load(Ordering::SeqCst) {
+            break;
+        }
+        s.fold_race(f64::from(attempt % 3 + 1) / 4.0, "eventually");
+    }
+    for _ in 0..RECORD_RACES_EVENTUALLY {
+        if s.record_lost.load(Ordering::SeqCst) {
+            break;
+        }
+        s.record_race("eventually");
+    }
+    if !s.unfolded_reached.load(Ordering::SeqCst) {
+        s.unfolded_sweep("eventually");
     }
     // With faults stopped the fold and the compaction run over every hour
     // the jump sealed, so the multiset below is checked after both.
@@ -1440,14 +2137,20 @@ fn main(tc: TestCase) {
     let seeded = plan.expected(cfg.inject_swap);
     let ravel = Ravel::new(cfg.nodes.clone(), cfg.token.clone()).unwrap_or_else(|e| die(&e));
     let maint = Ravel::new(cfg.maint_nodes.clone(), cfg.token.clone()).unwrap_or_else(|e| die(&e));
+    let admin = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|e| die(&format!("building the HTTP client: {e}")));
     let Config {
         clock,
+        token,
         tenant,
         max_writes,
         eventually_on,
         eventually_after,
         nodes,
         maint_nodes,
+        proxy,
         ..
     } = cfg;
     let shared = Arc::new(Shared {
@@ -1467,6 +2170,17 @@ fn main(tc: TestCase) {
         jump: Mutex::new(None),
         sweep_jump_started: AtomicBool::new(false),
         sweep_jump: Mutex::new(None),
+        offset_s: Mutex::new(0),
+        admin,
+        token,
+        fold_race_timings: Mutex::new((0.0, 0.0)),
+        fold_races: AtomicU64::new(0),
+        fold_overtaken: AtomicBool::new(false),
+        proxy,
+        record_races: AtomicU64::new(0),
+        record_lost: AtomicBool::new(false),
+        unfolded_started: AtomicBool::new(false),
+        unfolded_reached: AtomicBool::new(false),
         sweeps: Mutex::new(audit::SweepLedger::default()),
         inputs_of: Mutex::new(BTreeMap::new()),
         gate: RwLock::new(()),

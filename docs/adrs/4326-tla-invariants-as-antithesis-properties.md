@@ -55,7 +55,8 @@ flowchart LR
   `inv_always!` there. Its predicate reads evidence the guarded step did not
   itself produce: the store call's result or a re-read, never a flag the same
   code just set. `assert_always` also fails when never reached, so it is the
-  default. `inv_always_or_unreachable!` is allowed only on a guard that only a
+  default; that guarantee is judged per workload (see the per-workload
+  amendment below). `inv_always_or_unreachable!` is allowed only on a guard that only a
   fault reaches, and its row then also names an `inv_reachable!`. A site
   whose re-read can fail to tell uses `inv_always_if_known!` (see the #4335
   amendment below).
@@ -109,7 +110,9 @@ as it does `format-drill`.
 Pass rule, two levels. Every mutant must make its named property false in the
 local loop on the build box (mutant image, real server, real driver; no
 Antithesis hours), and then fail its property in its own Antithesis run, with
-a counterexample whose condition is false. Never reached does not count. A mutant whose property passes, or that fails only
+a counterexample whose condition is false. Never reached does not count; a
+mutant whose situation faults rarely produce gets a driver action that
+forces it (see the forced-situation amendment below). A mutant whose property passes, or that fails only
 another property, means the property is vacuous and blocks the wave.
 
 ### 4. Workloads
@@ -122,7 +125,9 @@ a marker file there.
   assertions and the mutant image.
 - `catalog-maintenance`: RustFS, init, two `--mode all`, two `--mode
   maintain`, and a driver that also runs `ravel-cli` (seeded load, fold,
-  compact and sweep on demand, HEAD corruption through raw S3, the audit).
+  compact and sweep on demand, HEAD corruption through raw S3, the audit),
+  and an `s3proxy` container between the servers and RustFS (see the
+  forced-situation amendment below).
   Lifecycle and reshard are profiles of this driver, each with its own config
   directory and test name: holds, erasure requests and minimum GC horizons;
   `provision reshard` and a third maintain worker.
@@ -187,7 +192,9 @@ one hour above it. Twenty-nine runs at that rate cost about 29 hours beyond
 their caps, so the rerun reserve is 15 hours, not 24, and the epic plans to the
 whole of the raised budget. A further rerun beyond that reserve needs the
 owner's go. The #4335 amendment below brings the mutant count to 20; the
-twentieth mutant's Antithesis run is not priced here.
+twentieth mutant's Antithesis run is not priced here. "Every new SUT
+assertion reached" counts only the areas a workload owns (see the
+per-workload amendment below).
 
 Runs are priced per workload config, of which decision 4 defines five
 (ingest-durability; catalog-maintenance and its lifecycle and reshard
@@ -290,7 +297,9 @@ the clock jump therefore runs in the Antithesis config itself, not only in
 the local loop:
 
 - Every container, the object store included, runs under libfaketime and
-  reads one offset file on a shared volume. The offset starts at `+0`; each
+  reads one offset file on a shared volume (all but `s3proxy`, and the three
+  jumps below are not the only clock moves; see the forced-situation
+  amendment below). The offset starts at `+0`; each
   process rereads it at most every `FAKETIME_CACHE_DURATION` (2 s), so a
   jump lands in every process within about 2 s of the offset write. Inside
   that window a process that has not reread is a whole jump behind one that
@@ -466,3 +475,56 @@ faults these switches stand in for. `check-release-profile.sh` refuses
 Dockerfile and `publish-images.yml`) and in every workspace manifest, except
 `antithesis` forwarded by a feature of the same name, so a published binary
 compiles neither switch in.
+
+## Amendment (2026-11-18): per-workload expected set (#4336)
+
+<!-- amendment-applies: sections="1. One invariant, one carrier|7. Budget" pointer="per-workload amendment" -->
+
+The workload images build one ravel-server binary, and since #4444 it carries
+the instrumentation of every area. So `assert_always`'s guarantee that a
+property is reached (decision 1), and the clean-smoke band "every new SUT
+assertion reached" (decision 7), are judged per workload, against the areas
+that workload owns: an area is owned by the workload its
+`formal/tla/<area>/antithesis-mutants.tsv` mutants run on, and a workload's
+own driver assertions are its own. An always-assertion of an area the
+workload does not own is expected to go unreached there. It is listed, apart
+from the gated ones, and is never counted as a failure, in the local loop and
+in the triage of an Antithesis report alike. The workload that owns that area
+answers for reaching it. Owner decision, 2026-11-18.
+
+## Amendment (2026-11-18): forced situations for silent mutants (#4336)
+
+<!-- amendment-applies: sections="3. Mutant controls|4. Workloads|Amendment (2026-11-17): the clock jump runs in the Antithesis config (#4334)" pointer="forced-situation amendment" -->
+
+Decision 3 counts a mutant only when its property goes false, and never
+reached does not count. Three catalog mutants change what a server does only
+in a situation that faults and the planned clock jumps rarely or never
+produce: `lost-cas-proceeds` needs a fold that loses its HEAD CAS to a HEAD
+it did not build, `compaction-loser-overwrites` a compaction record PUT that
+loses its create-only PUT to a concurrent compaction of the same bucket, and
+`sweep-superseded-no-head-gate` a full sweep pass past a compaction record's
+protection horizon and pinned-query window while HEAD has not folded the
+record. A mutant like these gets a driver action that forces its situation,
+and each such action:
+
+- uses only steps the system must survive in production: every clock moving
+  forward together, a concurrent `ravel-cli` maintenance run, one store
+  request delayed in the network or refused;
+- runs in the plain config as well as in the mutant run, and asserts that it
+  reached its situation with a sometimes-assertion the local loop requires,
+  so a plain run that never got there fails instead of passing every mutant
+  that needs it;
+- runs again in the `eventually` until it was reached once.
+
+Two parts of the catalog-maintenance topology change with it. Decision 4's
+topology gains an `s3proxy` container between the ravel-server containers
+and the store. It forwards every byte unchanged until the driver sets a rule
+over its control port (hold the next compaction record PUT, refuse record
+PUTs, refuse one key's PUTs), and it is a container of its own because the
+driver is excluded from faults. It signs nothing and keeps no wall-clock
+state, so it is the one container that does not run under libfaketime. And
+the clock-jump amendment's three planned jumps are no longer the only clock
+moves: a forced action moves every clock forward too, the same way and under
+the same write-gate hold, and logs each move so the local loop's offset check
+adds it. The sequences, and why each is legitimate, are in
+`antithesis/catalog-maintenance/README.md`, "The forced races".

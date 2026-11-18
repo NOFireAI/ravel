@@ -1099,6 +1099,7 @@ dependencies = [
  "hegeltest",
  "parquet",
  "ravel-antithesis-driver",
+ "reqwest",
  "serde_json",
 ]
 
