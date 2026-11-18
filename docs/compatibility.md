@@ -169,8 +169,12 @@ baseline to activate.
   census or the late-write pass finds what such writers wrote below the
   target. That is why activation refuses unless the operator attests that
   every writer role can read `sys/compat` (ADR-4233 blind-view amendment). `ravel-cli compat activate` takes that attestation
-  from `--pre-baseline-processes-terminated`, the flag it also requires for
-  the termination prerequisite; it has no separate flag for it.
+  from its own required flag, `--writer-roles-can-read-compat`, separate
+  from `--pre-baseline-processes-terminated`, and records it in the
+  family's `activated_by`. The CLI cannot check the grant: a writer role
+  not granted read on `sys/compat` keeps writing the baseline version to
+  unprovisioned paths and to buckets it first touches after the
+  activation.
 - **A build that cannot write the active version** refuses that family's
   publishes with `ActiveVersionNotWritable` (retryable), counted under
   `ravel_compat_publish_refused_total{family,reason}`. It still starts,
@@ -217,7 +221,8 @@ Supported:
    `ravel-cli compat init` once.
 2. B to B+1: a rolling upgrade. B+1 writes N until F is activated.
 3. On B+1: terminate every pre-baseline process, activate F at N+1 with
-   `ravel-cli compat activate --pre-baseline-processes-terminated`,
+   `ravel-cli compat activate --pre-baseline-processes-terminated
+   --writer-roles-can-read-compat`,
    migrate with `ravel-server --mode maintain --background-migrate`,
    certify with `ravel-cli compat certify`, and let the maintain process,
    under a role with the grants the maintenance guide's step 1 lists,
@@ -244,7 +249,7 @@ Refused:
   common returns of one (its request admission, folds, maintenance under
   `m`, `l` and `s`, queries and alert evaluation on fenced buckets), but
   they are defence in depth; the termination is the guarantee (ADR-4233
-  prerequisite amendment). `ravel-cli compat activate` refuses, exit 2,
+  prerequisite amendment). `ravel-cli compat activate` refuses, exit 5,
   unless `--pre-baseline-processes-terminated` attests it, and records the
   attestation in the family's `activated_by`. The flag cannot detect a
   missed process; it records that the operator checked.
@@ -275,13 +280,13 @@ The `ravel-cli compat` subcommands (`init`, `activate`, `certify`,
 `verify`, `status`) share one set of exit codes: 0 done; 1 an error (a
 store, listing or `sys/compat` fault, or an `activate` whose 8 attempts
 all lost the conditional write or met a retryable store error), printed to
-stderr; 2 refused, with
-`sys/compat` unchanged and the reason printed (a command-line error also
-exits 2); 3 contradicted; 4 pending, rerun the same command. The
+stderr; 2 a command-line usage error from the argument parser, before the
+command runs; 3 contradicted; 4 pending, rerun the same command; 5
+refused, with `sys/compat` unchanged and the reason printed. The
 [maintenance guide](guides/operations/maintenance.md#rolling-a-format-bump)
 gives each command's flags and report fields.
 
-- **`ravel-cli compat init`** exits 2, writing nothing, on: an unkeyed
+- **`ravel-cli compat init`** exits 5, writing nothing, on: an unkeyed
   store; a publish lifetime that is not positive; an object it cannot read
   or classify; any object outside this build's read sets (the message
   gives the number of tenant, signal, family and version groups and the
@@ -290,13 +295,14 @@ gives each command's flags and report fields.
   record it would write. A listing error, a key it cannot address, an
   entry under `t/` that is not a tenant, or a failed GET exits 1. An
   identical existing record is a no-op, exit 0.
-- **`ravel-cli compat activate`** exits 2 before any read without
-  `--pre-baseline-processes-terminated`, and before any write on: an
-  unkeyed store; an absent `sys/compat`; a family with no entry; a version
+- **`ravel-cli compat activate`** exits 5 before any read without
+  `--pre-baseline-processes-terminated` or without
+  `--writer-roles-can-read-compat`, and before any write on: an unkeyed
+  store; an absent `sys/compat`; a family with no entry; a version
   this build does not write; a version not above the active one; and a
   version more than one above it. It exits 4 when the version is active
   but the fence walk stopped; a rerun resumes the walk.
-- **`ravel-cli compat certify`** exits 2 for any family but `rseg`, `rlog`
+- **`ravel-cli compat certify`** exits 5 for any family but `rseg`, `rlog`
   and `rspan`, and before its census until `activated + H + P + T_req` and
   the newest `compat_fenced_unix_ns + G_pre` (plus the clock-skew
   allowance) have passed, or while the activation's fence walk is
@@ -307,7 +313,7 @@ gives each command's flags and report fields.
   provisioning records, and such a bucket then refuses the run with
   `BucketRecentlyFenced` until its new fence time plus `G_pre` (6 h 0 m
   30 s with the defaults) and the skew allowance. Its census exits 3 on a
-  member below the target, and 2 on a member it cannot read, a trailer
+  member below the target, and 5 on a member it cannot read, a trailer
   that disagrees with its record's stamp, or an incomplete shard listing;
   an entry under `t/` that is not a tenant, or a key under `t/` it cannot
   address, exits 1. It exits 4 when
