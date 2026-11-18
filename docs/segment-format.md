@@ -402,6 +402,19 @@ the decoded live footprint is bounded by the same section byte cap the run-major
 columns use. The columns live inside SERIES_META, under its existing section
 `crc32c`; no page CRC or checksum boundary changes.
 
+A decode that does not materialize the extension enforces less. Each
+`_charged` catalog decoder skips it when its `CatalogCharge` returns false
+from `decodes_provenance`, and today only the metrics series listing does
+(the discovery read behind `/api/v1/series`, `/api/v1/labels` and
+`/api/v1/label/<name>/values`). That decode validates the presence column as
+above and checks each of the four columns' encoding tag, then steps over each
+column by its `block_len` prefix. It enforces none of the other rules: column
+length, `created_unix_ns` reconstruction, the in-page index range and the
+live-footprint cap. A corrupt extension that still steps to the section's end
+is therefore accepted by a listing and rejected by any read that decodes
+provenance, such as a sample read of the same object. The section `crc32c`
+covers both reads.
+
 Both SERIES_META forms carry the columns. In the whole-section form (kind 6)
 they are the trailing blocks 17-21 above. In the sparse (chunked)
 SERIES_META_CHUNKS form (kind 9) the same columns are re-laid per chunk, scoped
