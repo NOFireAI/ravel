@@ -6404,31 +6404,33 @@ impl Catalog {
                     // failed to land. A Valid HEAD's bytes carry folder_id and
                     // created_unix_ns, so its version does not recur.
                     ravel_invariant::inv_always_if_known!(
-                        match {
+                        {
                             let reread = self.store().get(&head_key, GetRange::Full).await;
                             counters.get_requests += 1;
-                            reread
-                        } {
-                            Ok(got) if cas_acked => match &put_mode {
-                                PutMode::CasVersion(conditioned) => {
-                                    if matches!(head_state, HeadState::Corrupt { .. }) {
-                                        None
-                                    } else {
-                                        Some(got.version != *conditioned)
+                            match reread {
+                                Ok(got) if cas_acked => match &put_mode {
+                                    PutMode::CasVersion(conditioned) => {
+                                        if matches!(head_state, HeadState::Corrupt { .. }) {
+                                            None
+                                        } else {
+                                            Some(got.version != *conditioned)
+                                        }
                                     }
+                                    PutMode::CreateIfAbsent | PutMode::Overwrite => Some(true),
+                                },
+                                Ok(got) => {
+                                    snapshot_format::decode_head(&got.data).ok().map(|stored| {
+                                        canonical_head_digest(&stored)
+                                            .is_ok_and(|digest| digest == head_digest)
+                                    })
                                 }
-                                PutMode::CreateIfAbsent | PutMode::Overwrite => Some(true),
-                            },
-                            Ok(got) => snapshot_format::decode_head(&got.data)
-                                .ok()
-                                .map(|stored| canonical_head_digest(&stored)
-                                    .is_ok_and(|digest| digest == head_digest)),
-                            Err(StoreError::NotFound) if cas_acked => match &put_mode {
-                                PutMode::CreateIfAbsent => Some(false),
-                                PutMode::CasVersion(_) | PutMode::Overwrite => None,
-                            },
-                            Err(StoreError::NotFound) => Some(false),
-                            Err(_) => None,
+                                Err(StoreError::NotFound) if cas_acked => match &put_mode {
+                                    PutMode::CreateIfAbsent => Some(false),
+                                    PutMode::CasVersion(_) | PutMode::Overwrite => None,
+                                },
+                                Err(StoreError::NotFound) => Some(false),
+                                Err(_) => None,
+                            }
                         },
                         "catalog: a fold reports as folded only a HEAD the store holds",
                         std::collections::BTreeMap::from([

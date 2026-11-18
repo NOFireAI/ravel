@@ -1840,27 +1840,27 @@ async fn sweep_superseded_impl(
                     // afresh, not the one the gate above planned from. A HEAD
                     // that cannot be read then proves nothing either way.
                     ravel_invariant::inv_always!(
-                        !match {
+                        !{
                             let cached = _head_names_group.borrow().get(&index).copied();
-                            cached
-                        } {
-                            Some(named) => named,
-                            None => {
-                                let named = matches!(
-                                    SnapshotReachability::new()
-                                        .with_read_gate(config.read_gate.clone())
-                                        .object_gate(
-                                            store,
-                                            tenant,
-                                            signal,
-                                            group.ingest_hour_bucket,
-                                            &group.objects,
-                                        )
-                                        .await,
-                                    Ok(SnapshotGate::Blocked(SnapshotBlock::Named))
-                                );
-                                _head_names_group.borrow_mut().insert(index, named);
-                                named
+                            match cached {
+                                Some(named) => named,
+                                None => {
+                                    let named = matches!(
+                                        SnapshotReachability::new()
+                                            .with_read_gate(config.read_gate.clone())
+                                            .object_gate(
+                                                store,
+                                                tenant,
+                                                signal,
+                                                group.ingest_hour_bucket,
+                                                &group.objects,
+                                            )
+                                            .await,
+                                        Ok(SnapshotGate::Blocked(SnapshotBlock::Named))
+                                    );
+                                    _head_names_group.borrow_mut().insert(index, named);
+                                    named
+                                }
                             }
                         },
                         "catalog: a sweep never deletes an object the current HEAD names",
