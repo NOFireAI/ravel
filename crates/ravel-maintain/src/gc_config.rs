@@ -1648,6 +1648,35 @@ mod tests {
         assert_eq!(err, GcConfigError::UnsupportedVersion { got: 0 });
     }
 
+    /// A `set` over a version above what this build reads is refused and
+    /// leaves the stored bytes as they were, so it cannot strip a field it
+    /// does not know (ADR-0066 decision 5).
+    #[tokio::test]
+    async fn set_over_version_3_is_refused_and_writes_nothing() {
+        let store = store();
+        seed_raw(store.as_ref(), 3, DEFAULT_HEAD_CACHE_TTL_NS).await;
+        let before = store
+            .get(GC_CONFIG_KEY, GetRange::Full)
+            .await
+            .expect("seeded")
+            .data;
+        let err = set_gc_config(
+            store.as_ref(),
+            GcConfigProposal::from(GcConfigValues::maintain_defaults()),
+            DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            2,
+        )
+        .await
+        .expect_err("a set over version 3 must be refused");
+        assert_eq!(err, GcConfigError::UnsupportedVersion { got: 3 });
+        let after = store
+            .get(GC_CONFIG_KEY, GetRange::Full)
+            .await
+            .expect("still present")
+            .data;
+        assert_eq!(after, before, "a refused set must not rewrite sys/gc");
+    }
+
     /// Bootstrap on an empty bucket writes format version 1 with no TTL field,
     /// even when the caller's defaults are version 2, so a new build touching
     /// a fresh bucket first cannot lock out an older build that reads only

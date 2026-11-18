@@ -225,7 +225,7 @@ which fails if a new versioned message lands unclassified):
 | `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2, 3}** (3 read, and written only behind the `StorageLayoutWrite` opt-in: ADR-2135's rollout opt-in amendment; {1, 2, 3, 4} since the ADR-4233 R1 rows amendment below) |
 | `MetricMetadataRecord` | **CAS-mutable** | ingest metadata sink read→`merge_entries`→write | **{1, 2}** |
 | `AuthTokenMap` | **CAS-mutable** | `sys/auth` CAS-replace | {1, 2} (managed_by; floor added in R2) |
-| `GcConfig` | **CAS-mutable** | `ravel-maintain::gc_config::set_gc_config` | {1}, ceiling-only gate |
+| `GcConfig` | **CAS-mutable** | `ravel-maintain::gc_config::set_gc_config` | {1}, ceiling-only gate (stale: {1, 2} with a floor since ADR-1133 decision 4, see the GcConfig read-set amendment below) |
 | `CompactionClaim` | **CAS-mutable** | ADR-1029 claim renew/steal/complete | {1}, ceiling-only gate |
 | `KeyEpochRecord` | **CAS-mutable** | `ravel-catalog::key_epoch` append-epoch CAS | {1} (floor added in R2) |
 
@@ -315,7 +315,9 @@ both would be if an additive field lands before their gate is widened.
 `CompactionClaim` (ADR-1029) is likewise CAS-mutable with a permissive gate and
 no post-v1 additive field. R1 did not touch any of their gates. R2 fixed
 `KeyEpochRecord`'s (it lives in this crate); `GcConfig` and `CompactionClaim`
-remain flagged for their owning tasks in ravel-maintain and ravel-fleet.
+remain flagged for their owning tasks in ravel-maintain and ravel-fleet
+(`GcConfig`'s gate has since been closed to {1, 2}; see the GcConfig
+read-set amendment below).
 
 **Rejected R1 alternatives** (and why the reader-set-plus-rewrite-refusal shape
 won): an unknown-tail bytes field to carry unmodeled fields across a rewrite (its
@@ -763,7 +765,9 @@ certificate rather than every bucket's floor alone, and only for the class A
 families. The window opens at the baseline release, not at v1.0. The
 `ProvisioningRecord` read set becomes {1, 2, 3, 4}; version 4 carries
 `compat_epoch` and `compat_fenced_unix_ns` and is written only by an
-activation's fence, so the R1 table row for `ProvisioningRecord` changes
+activation's fence (too narrow: `stamp_for` also stamps 4 on a record that
+carries either field or is already at 4, see the ADR-4233 R1 rows amendment
+below), so the R1 table row for `ProvisioningRecord` changes
 with the code that adds the reader.
 
 ## Amendment (2026-11-17, #4250): the ADR-4233 R1 rows
@@ -776,7 +780,8 @@ The R1 table rows below now match `classification_table()` in
 This amendment does not reconcile the `GcConfig` row: the table and the
 test both give it {1}, while `GcConfigValues::from_proto`
 (`crates/ravel-maintain/src/gc_config.rs`, around lines 246-257) reads 1
-and 2. That difference is tracked in issue #4399.
+and 2. That difference is tracked in issue #4399 and reconciled by the
+GcConfig read-set amendment below.
 
 - `ProvisioningRecord` reads {1, 2, 3, 4}. Its writers stamp 3, and stamp
   4 when the record carries `compat_epoch` (field 8) or
@@ -801,6 +806,47 @@ and 2. That difference is tracked in issue #4399.
 The test now asserts the read sets of six records against their readers'
 constants (`ProvisioningRecord`, `CompatRecord`, `TenantConfigRecord`,
 `MetricMetadataRecord`, `AuthTokenMap` and `KeyEpochRecord`), and its
-entries for the other seven messages are maintained by hand; the R1 text
+entries for the other seven messages are maintained by hand (six since the
+GcConfig read-set amendment below); the R1 text
 counting "the other six messages" predates the two added rows (see the
 ADR-4233 R1 rows amendment).
+
+## Amendment (2026-11-18, #4399): the `GcConfig` read set is {1, 2}, and provisioning version 4's stamp rule
+
+<!-- amendment-applies: sections="Amendment (R1, #1300): the CAS-mutable sys/* records version on every additive change" pointer="GcConfig read-set amendment" -->
+<!-- amendment-supersedes: phrase="entries for the other seven messages are maintained by hand" pointer="GcConfig read-set amendment" -->
+<!-- amendment-supersedes: phrase="is written only by an activation's fence" pointer="ADR-4233 R1 rows amendment" -->
+
+Two statements above disagree with the code. The code is right in both
+cases, so this amendment corrects the text and the classification test. No
+persistent format, reader or writer changes.
+
+**`GcConfig` reads {1, 2}, closed at both ends.** ADR-1133 decision 4 added
+`head_cache_ttl_ns` to `sys/gc` and set `GC_FORMAT_VERSION` to 2
+(`crates/ravel-maintain/src/gc_config.rs`). `GcConfigValues::from_proto`
+accepts version 1, reading the TTL as the compiled default, and version 2,
+refusing a non-positive TTL. It refuses every other version, 0 included, as
+`UnsupportedVersion`. The R1 table's "{1}, ceiling-only gate" and the R1
+text that leaves `GcConfig` flagged are therefore stale. Bootstrap writes
+version 1. `gc-config set` writes 2 when it records a HEAD cache TTL or the
+object it read is already at 2, and 1 otherwise. A `set` reads the current
+object through the same decoder before its CAS write, so it refuses a
+version above 2 and writes nothing, which is decision 5's rewrite refusal.
+
+The classification test's `GcConfig` entry is now {1, 2}, and
+`gc_config_read_set_matches_its_readers_constants` checks it against
+ravel-maintain's `GC_FORMAT_VERSION_V1..=GC_FORMAT_VERSION`. Because
+ravel-maintain depends on ravel-catalog, the test reads the two constants
+from ravel-maintain's source text, as it reads the proto. Six entries
+(`TenancyMarker`, `TenantRecoveryManifest`, `IpcryptPolicyMarker`,
+`AdmissionUsageSnapshot`, `WorkerHeartbeat` and `CompactionClaim`) remain
+maintained by hand, not seven.
+
+**Provisioning version 4.** The ADR-4233 amendment of 2026-11-15 says
+version 4 "is written only by an activation's fence". `stamp_for`
+(`crates/ravel-catalog/src/provisioning.rs`) stamps 4 whenever the record
+carries `compat_epoch` or `compat_fenced_unix_ns`, or is already at 4, so a
+record is also written at 4 by a raise before a writer's first publish
+above a family's baseline and by a first touch after an activation. The
+ADR-4233 R1 rows amendment states that rule, and the older sentence now
+points to it.
