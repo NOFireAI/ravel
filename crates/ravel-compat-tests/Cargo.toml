@@ -37,6 +37,11 @@ prost = "0.14"
 # and span flushes compute it. Already a transitive dependency.
 blake3 = "1.8"
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros"] }
+# The recording and yielding store wrapper in tests/common/tap.rs implements
+# `ObjectStoreBackend`, whose methods are `async_trait` and take `Bytes`. Both
+# are already dependencies of ravel-object-store, at the workspace versions.
+async-trait = "0.1"
+bytes = "1"
 uuid = "1.24"
 
 [lints.rust]
