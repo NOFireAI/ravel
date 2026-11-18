@@ -1446,6 +1446,28 @@ async fn run_ranged_gap(
     coalesce_gap: Option<u64>,
     disable_crossover: bool,
 ) -> RangedRun {
+    run_ranged_with(
+        rule,
+        coalesce_gap,
+        disable_crossover,
+        &ranged_statement(),
+        // The probe reaches back to the end of BLOCKS and no further, so it
+        // holds every directory and filter section and no page.
+        |object| blocks_extent(object).1,
+    )
+    .await
+}
+
+/// [`run_ranged_gap`] with the statement and the suffix probe's start chosen by
+/// the caller: `probe_start` maps the object to the offset the probe reaches
+/// back to.
+async fn run_ranged_with(
+    rule: bool,
+    coalesce_gap: Option<u64>,
+    disable_crossover: bool,
+    sql: &str,
+    probe_start: fn(&[u8]) -> u64,
+) -> RangedRun {
     let base = Arc::new(MemoryStore::new());
     let (snapshot, object) = ranged_snapshot(base.as_ref()).await;
     let recording = Arc::new(RecordingStore {
@@ -1453,11 +1475,8 @@ async fn run_ranged_gap(
         log: std::sync::Mutex::new(Vec::new()),
     });
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
-    // The probe reaches back to the end of BLOCKS and no further, so it holds
-    // every directory section and no page.
-    let (_, blocks_end) = blocks_extent(&object);
-    let mut block_range =
-        BlockRangeFetcher::new(store.clone()).with_suffix_len(object.len() as u64 - blocks_end);
+    let mut block_range = BlockRangeFetcher::new(store.clone())
+        .with_suffix_len(object.len() as u64 - probe_start(&object));
     if let Some(gap) = coalesce_gap {
         block_range = block_range.with_coalesce_gap(gap);
     }
@@ -1479,7 +1498,7 @@ async fn run_ranged_gap(
     .with_declared_columns(declared_columns());
     let ctx = session(provider, &config(Setup::new().rule(rule)));
     let plan = ctx
-        .sql(&ranged_statement())
+        .sql(sql)
         .await
         .expect("statement plans")
         .create_physical_plan()
@@ -1667,6 +1686,98 @@ async fn phase_two_reads_only_the_winners_pages_and_opens_the_object_once() {
     assert_eq!(
         with.wire.total(),
         with.log.iter().map(|(_, len)| len).sum::<u64>()
+    );
+}
+
+/// The SKIP_IDX section's offset in `object`. The writer emits BLOOM and
+/// POSTINGS before SKIP_IDX and the other directories after it, so a probe
+/// reaching back to here holds every directory and neither filter section.
+fn skip_idx_start(object: &[u8]) -> u64 {
+    let footer = ravel_logseg::footer::open_source(object).expect("footer");
+    let skip = footer
+        .section(ravel_logseg::footer::kind::SKIP_IDX)
+        .copied()
+        .expect("SKIP_IDX");
+    for kind in [
+        ravel_logseg::footer::kind::BLOOM,
+        ravel_logseg::footer::kind::POSTINGS,
+    ] {
+        if let Some(filter) = footer.section(kind) {
+            assert!(filter.offset + filter.len <= skip.offset, "{kind:?}");
+        }
+    }
+    skip.offset
+}
+
+/// A statement whose winners are every block the `ts` window keeps: `has_word`
+/// matches every record, so no block is pruned and the 20 newest records fill
+/// blocks 1 to 5. `has_word` makes BLOOM and POSTINGS sections the scan reads.
+fn crossing_statement() -> String {
+    format!(
+        "SELECT * FROM logs WHERE ts >= {} AND ts <= {} AND has_word(body, 'row') \
+         ORDER BY ts DESC LIMIT {}",
+        ts_literal(RANGED_TS_MIN),
+        ts_literal(RANGED_TS_BASE + RANGED_RECORDS as i64 - 1),
+        RANGED_RECORDS - RECORDS_PER_BLOCK,
+    )
+}
+
+/// Phase 2 whose winners' pages alone cross the coverage crossover reads the
+/// object whole after its probe and places no section first (issue #4306). The
+/// winners are blocks 1 to 5, every block the skip index keeps, so their
+/// positions settle the winners without opening the scan, and five of six
+/// blocks' pages cross the threshold. The probe holds every directory but
+/// neither BLOOM nor POSTINGS, which only resolving the positions through the
+/// scan would need.
+///
+/// Fails against an ordering that places the scan's filter sections to resolve
+/// the positions before checking the crossover (`fetch_object_v4` without its
+/// settled-winners crossover): phase 2 is then the probe, the filter sections'
+/// GET, and the whole object.
+#[tokio::test]
+async fn phase_two_whose_winners_cross_reads_whole_after_the_probe_alone() {
+    let sql = crossing_statement();
+    let with = run_ranged_with(true, Some(0), false, &sql, skip_idx_start).await;
+    let without = run_ranged_with(false, Some(0), false, &sql, skip_idx_start).await;
+    assert!(
+        with.explain.contains("LogsRowFetchExec"),
+        "{}",
+        with.explain
+    );
+    let expected: Vec<i64> = (RANGED_TS_MIN..RANGED_TS_BASE + RANGED_RECORDS as i64)
+        .rev()
+        .collect();
+    assert_eq!(ts_of(&with.rows), expected);
+    assert_eq!(with.rows, without.rows, "the rewrite changed the result");
+    assert_eq!(with.segments_fetched, 1);
+
+    let fetch_gets = with.wire.phase_requests(QueryPhase::Fetch);
+    let fetch_wire = with.wire.phase(QueryPhase::Fetch);
+    let phase_two = &with.log[with.log.len() - fetch_gets as usize..];
+    eprintln!(
+        "phase 2: gets={fetch_gets} bytes={fetch_wire} object={} log={phase_two:?}",
+        with.object.len()
+    );
+    let probe = with.object.len() as u64 - skip_idx_start(&with.object);
+    assert_eq!(
+        phase_two,
+        &[
+            (GetRange::Suffix(probe), probe),
+            (GetRange::Full, with.object.len() as u64),
+        ],
+        "one probe, then the whole object, with no section GET between them"
+    );
+    assert_eq!(
+        (fetch_gets, fetch_wire),
+        (2, probe + with.object.len() as u64),
+        "the fetch phase's exact GETs and wire bytes"
+    );
+    // Probe 1,708 bytes plus the whole 9,708-byte object. Placing the filter
+    // sections first adds their GET: 3 GETs and 13,868 bytes.
+    assert_eq!(
+        (fetch_gets, fetch_wire, with.object.len()),
+        (2, 11_416, 9_708),
+        "pinned fetch-phase figures on this fixture"
     );
 }
 
