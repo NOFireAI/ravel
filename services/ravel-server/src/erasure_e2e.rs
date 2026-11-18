@@ -742,6 +742,144 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
     }
 }
 
+/// Selects mutant `name` on this thread until the returned guard drops;
+/// `None` outside the invariants build, where no mutant is compiled in (the
+/// `inv_sometimes!` body, and so the reference to `ravel_invariant::mutant`,
+/// is dropped without the feature).
+fn scoped_mutant(name: &'static str) -> Option<Box<dyn std::any::Any>> {
+    let guard: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = Default::default();
+    let _ = name;
+    ravel_invariant::inv_sometimes!(
+        {
+            let scoped = ravel_invariant::mutant::scoped(name).expect("a registered mutant");
+            *guard.borrow_mut() = Some(Box::new(scoped) as Box<dyn std::any::Any>);
+            true
+        },
+        "ravel-server test: a mutant is scoped",
+        ""
+    );
+    guard.into_inner()
+}
+
+/// `(is_violation, details)` of every captured evaluation of `message`; empty
+/// outside the invariants build.
+fn captured_evaluations(message: &'static str) -> Vec<(bool, String)> {
+    let found = std::cell::RefCell::new(Vec::new());
+    let _ = message;
+    ravel_invariant::inv_sometimes!(
+        {
+            found.borrow_mut().extend(
+                ravel_invariant::capture::evaluations_of(message)
+                    .into_iter()
+                    .map(|e| (e.is_violation(), e.details)),
+            );
+            true
+        },
+        "ravel-server test: evaluations are read",
+        ""
+    );
+    found.into_inner()
+}
+
+/// CompletionImpliesNoPreRewriteExposure (ADR-4326): the served-set gate holds a
+/// request's `.done` while an in-scope bucket still serves the subject -- here
+/// the ingest hour open at the request's acknowledgement is unsealed, so the
+/// completion resolver keeps the request blocked -- and writes it only once no
+/// in-scope bucket serves it. The `complete-ignores-served-set` mutant arm drops
+/// the gate and writes the `.done` while the subject is still served, which the
+/// SUT invariant evaluates false.
+#[tokio::test]
+async fn completion_waits_for_the_served_set() {
+    // --- Part A: the shipped served-set gate (default build) -------------
+    {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_metrics_bucket(store.as_ref(), &tenant_id, 0, "a").await;
+
+        let request_id = Uuid::from_u128(0x5E12);
+        let dreq_key = submit_erasure_request(
+            store.as_ref(),
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            ERASED_SUBJECT,
+            TEST_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let mut harness = TickHarness::new();
+        // The rewrite runs on hour 0, but the ack-open hour is unsealed and in
+        // scope, so the served set still blocks the subject: no .done.
+        harness.tick(store.as_ref(), &tenant, TEST_NOW_NS, 1).await;
+        assert!(
+            !object_exists(store.as_ref(), &done_key).await,
+            "an in-scope bucket still serves the subject (the ack-open hour is unsealed), so the \
+             completion is withheld"
+        );
+        assert!(
+            object_exists(store.as_ref(), &dreq_key).await,
+            "the request stays pending while the served set blocks it"
+        );
+
+        // Past the ack-open hour's seal: no in-scope bucket serves the subject,
+        // so the completion is written.
+        let sealed = harness.ack_hour_sealed_ns(TEST_NOW_NS);
+        harness.tick(store.as_ref(), &tenant, sealed, 1).await;
+        assert!(
+            object_exists(store.as_ref(), &done_key).await,
+            "once no in-scope bucket serves the subject, the completion is written"
+        );
+    }
+
+    // --- Part B: the complete-ignores-served-set mutant arm --------------
+    // No-op in a default build, where `scoped_mutant` returns `None`.
+    let Some(_mutant) = scoped_mutant("lifecycle/complete-ignores-served-set") else {
+        return;
+    };
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant_id = TenantId::new("acme");
+    let tenant = tenant_id.hash();
+    publish_metrics_bucket(store.as_ref(), &tenant_id, 0, "a").await;
+    let request_id = Uuid::from_u128(0x5E13);
+    let done_key =
+        keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+    submit_erasure_request(
+        store.as_ref(),
+        &tenant,
+        Signal::Metrics,
+        request_id,
+        ERASED_SUBJECT,
+        TEST_NOW_NS,
+    )
+    .await;
+
+    let mut harness = TickHarness::new();
+    // Same first tick as Part A: the served set still blocks the subject. The
+    // shipped build writes no `.done` here (Part A's first assertion); the mutant
+    // drops the gate and writes it anyway.
+    harness.tick(store.as_ref(), &tenant, TEST_NOW_NS, 1).await;
+
+    assert!(
+        object_exists(store.as_ref(), &done_key).await,
+        "the complete-ignores-served-set mutant writes .done while the subject is still served -- \
+         the shipped build's `assert!(!object_exists(done_key))` from Part A is the assertion that \
+         fails under this mutant"
+    );
+    let found: Vec<(bool, String)> = captured_evaluations(
+        "erasure: a completion is written only when no pre-rewrite object is still served",
+    )
+    .into_iter()
+    .filter(|(_, details)| details.contains(&request_id.to_string()))
+    .collect();
+    assert!(
+        found.iter().any(|(violation, _)| *violation),
+        "CompletionImpliesNoPreRewriteExposure must evaluate false under the mutant: {found:?}"
+    );
+}
+
 // === Metrics with key-index leaves and the label index on =================
 
 /// The metrics chain again, with the fold building the ADR-3694 decision 2

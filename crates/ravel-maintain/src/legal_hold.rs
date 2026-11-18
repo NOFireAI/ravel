@@ -224,6 +224,52 @@ impl LeaseCheck for LegalHoldCheck {
     }
 }
 
+/// The hold snapshot a sweep's delete loop runs under, re-read from the store
+/// at the delete as the independent evidence `RefreshFailureNeverSweeps` and
+/// `HeldObjectNeverDeleted` read (ADR-4326 lifecycle), distinct from the
+/// pre-pass [`LegalHoldCheck`] the sweep was handed.
+///
+/// A successful re-read returns `Some(hold)` and the caller proceeds under it.
+/// A failed re-read leaves the tenant's hold state unknown; the honest path
+/// then deletes nothing this tick, so this returns `None` and the caller sweeps
+/// nothing. The `refresh-failure-is-no-hold` mutant proceeds under an empty
+/// snapshot instead, which the `RefreshFailureNeverSweeps` assertion here
+/// catches: the sweep is entered while the re-read, the store call's own
+/// result, failed.
+///
+/// Instrumentation only: a shipped build (neither `capture` nor `antithesis`)
+/// never reaches a caller's gate, which is guarded by
+/// [`ravel_invariant::EVALUATES`].
+pub async fn sweep_delete_gate(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> Option<LegalHoldCheck> {
+    let reread = LegalHoldCheck::refresh(store, tenant).await;
+    if reread.is_ok() || ravel_invariant::inv_mutant!("lifecycle/refresh-failure-is-no-hold") {
+        // The predicate reads the re-read's own Ok/Err (the store call's
+        // result), not the proceed decision: a sweep is entered only when the
+        // hold state was actually re-read.
+        ravel_invariant::inv_always!(
+            reread.is_ok(),
+            "gc: a failed hold refresh sweeps nothing",
+            std::collections::BTreeMap::from([
+                ("tenant", tenant.to_hex()),
+                ("reread_ok", reread.is_ok().to_string()),
+            ])
+        );
+        Some(match reread {
+            Ok(hold) => hold,
+            Err(_) => LegalHoldCheck::empty(),
+        })
+    } else {
+        ravel_invariant::inv_reachable!(
+            "gc: a failed hold refresh skipped a sweep tick",
+            std::collections::BTreeMap::from([("tenant", tenant.to_hex())])
+        );
+        None
+    }
+}
+
 /// Fold decoded hold records to the sorted set of currently-active scopes:
 /// per distinct `hold.scope`, the record with the greatest `(ts_ns, op.rank())`
 /// wins, and the scope is active iff that winner is a `set` (ADR-0040 decision
@@ -404,7 +450,12 @@ pub async fn write_hold_set_with_compat(
         attrs.push((ATTR_REASON.to_string(), AttrValue::Str(reason.into())));
     }
     let body = format!("legal hold set scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await?;
+    ravel_invariant::inv_reachable!(
+        "gc: a legal hold is placed",
+        std::collections::BTreeMap::from([("scope", scope.to_string())])
+    );
+    Ok(())
 }
 
 /// Write a new immutable `clear` record releasing the legal hold on `scope` at
@@ -446,7 +497,12 @@ pub async fn write_hold_clear_with_compat(
         (ATTR_SCOPE.to_string(), AttrValue::Str(scope.into())),
     ];
     let body = format!("legal hold clear scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await?;
+    ravel_invariant::inv_reachable!(
+        "gc: a legal hold is released",
+        std::collections::BTreeMap::from([("scope", scope.to_string())])
+    );
+    Ok(())
 }
 
 /// Encode one legal-hold RLOG record as an L0 [`Signal::Audit`] object and its
@@ -664,6 +720,103 @@ mod tests {
                 "active_version_not_writable"
             ),
             refused + 1
+        );
+    }
+
+    const SWEEPS_NOTHING: &str = "gc: a failed hold refresh sweeps nothing";
+
+    /// A [`FaultStore`] whose only fault fails the one LIST
+    /// [`LegalHoldCheck::refresh`] issues (the audit hold shard's commit
+    /// prefix), so a sweep-delete gate re-read fails.
+    fn store_with_failing_refresh(
+        tenant: &TenantHash,
+    ) -> ravel_object_store::fault::FaultStore<ravel_object_store::memory::MemoryStore> {
+        use ravel_object_store::fault::{FaultPlan, Op, Rule, ScriptedFault};
+        use ravel_object_store::memory::MemoryStore;
+
+        let hold_prefix = keys::commit_shard_prefix(tenant, Signal::Audit, AUDIT_HOLD_SHARD)
+            .expect("audit hold shard prefix");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Transient("hold shard unavailable".into()),
+            )
+            .with_key_contains(hold_prefix),
+        );
+        ravel_object_store::fault::FaultStore::new(MemoryStore::new(), plan)
+    }
+
+    /// The `refresh-failure-is-no-hold` mutant proceeds into the sweep under an
+    /// empty hold snapshot when the re-read failed, so
+    /// `RefreshFailureNeverSweeps` evaluates false at the gate. Judged from the
+    /// re-read's own `Err` (the store call's result), not the proceed decision.
+    #[tokio::test]
+    async fn mutant_refresh_failure_sweeps_breaks_never_sweeps() {
+        let Some(_mutant) =
+            crate::publish::tests::scoped_mutant("lifecycle/refresh-failure-is-no-hold")
+        else {
+            return;
+        };
+        let tenant = TenantHash([0x2a; 16]);
+        let store = store_with_failing_refresh(&tenant);
+
+        let proceeded = sweep_delete_gate(&store, &tenant).await;
+        assert!(
+            proceeded.is_some(),
+            "the mutant proceeds into the sweep despite the failed refresh"
+        );
+        let found = crate::publish::tests::evaluations(SWEEPS_NOTHING, &tenant.to_hex());
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "RefreshFailureNeverSweeps must evaluate false under the mutant: {found:?}"
+        );
+    }
+
+    /// Without the mutant, a failed refresh returns `None`: the tick sweeps
+    /// nothing and the property is never evaluated (no delete to judge). This is
+    /// the honest path the mutant removes.
+    #[tokio::test]
+    async fn a_failed_refresh_without_the_mutant_skips_the_sweep() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let tenant = TenantHash([0x2c; 16]);
+        let store = store_with_failing_refresh(&tenant);
+
+        let proceeded = sweep_delete_gate(&store, &tenant).await;
+        assert!(
+            proceeded.is_none(),
+            "a failed refresh skips the sweep without the mutant"
+        );
+        let found = crate::publish::tests::evaluations(SWEEPS_NOTHING, &tenant.to_hex());
+        assert!(
+            found.is_empty(),
+            "the property is never evaluated when the tick is skipped: {found:?}"
+        );
+    }
+
+    /// A readable refresh proceeds under its real hold snapshot, so the property
+    /// is evaluated at the gate and holds.
+    #[tokio::test]
+    async fn refresh_failure_never_sweeps_holds_on_a_readable_refresh() {
+        use ravel_object_store::memory::MemoryStore;
+
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let tenant = TenantHash([0x2b; 16]);
+        let store = MemoryStore::new();
+
+        let proceeded = sweep_delete_gate(&store, &tenant).await;
+        assert!(proceeded.is_some(), "a readable refresh proceeds");
+        let found = crate::publish::tests::evaluations(SWEEPS_NOTHING, &tenant.to_hex());
+        assert!(
+            !found.is_empty(),
+            "the property is evaluated when the sweep proceeds"
+        );
+        assert!(
+            found.iter().all(|(held, _)| *held),
+            "never false on a readable refresh: {found:?}"
         );
     }
 }
