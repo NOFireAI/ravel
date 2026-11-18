@@ -10,9 +10,16 @@ license = "Apache-2.0"
 # workspace never builds this crate.
 [workspace]
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "driver"
 path = "src/main.rs"
+
+[[bin]]
+name = "s3-proxy"
+path = "src/bin/s3_proxy.rs"
 
 [dependencies]
 # The acked-record model and the OTLP/SQL client.
