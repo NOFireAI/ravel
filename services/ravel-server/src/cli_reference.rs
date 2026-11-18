@@ -14,7 +14,7 @@
 
 use std::fmt::Write as _;
 
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 
 /// Opening marker for the generated block. The generator rewrites everything
 /// between this and [`END_MARKER`]; the preamble above stays hand-written.
@@ -36,9 +36,13 @@ pub struct FlagRow {
 
 /// Whether an argument is one the binary defines, as opposed to clap's
 /// auto-generated `--help`/`--version`, which are not part of the reference.
+/// Decided by the argument's action, not its id: a subcommand argument whose
+/// id is `version` (`compat activate --version`) is the binary's own.
 fn is_user_arg(arg: &Arg) -> bool {
-    let id = arg.get_id().as_str();
-    id != "help" && id != "version"
+    !matches!(
+        arg.get_action(),
+        ArgAction::Help | ArgAction::HelpShort | ArgAction::HelpLong | ArgAction::Version
+    )
 }
 
 /// The user-defined arguments of a single command, excluding clap's
@@ -229,6 +233,46 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+
+    /// A subcommand argument whose id is `version` is a row of the reference,
+    /// while clap's own `--help` and `--version` are not. An id filter drops
+    /// the subcommand's `--version`; a filter that keeps every argument lists
+    /// clap's.
+    #[test]
+    fn a_subcommand_version_flag_is_a_row_and_clap_flags_are_not() {
+        let mut cmd = Command::new("tool").version("1.0").subcommand(
+            Command::new("activate").arg(
+                Arg::new("version")
+                    .long("version")
+                    .action(ArgAction::Set)
+                    .help("The version to activate"),
+            ),
+        );
+        cmd.build();
+
+        let root_ids: Vec<&str> = cmd
+            .get_arguments()
+            .map(|arg| arg.get_id().as_str())
+            .collect();
+        assert!(
+            root_ids.contains(&"help") && root_ids.contains(&"version"),
+            "clap generated its own flags: {root_ids:?}"
+        );
+        assert_eq!(user_args(&cmd).count(), 0);
+
+        let activate = cmd
+            .find_subcommand("activate")
+            .expect("activate subcommand");
+        let rows: Vec<String> = user_args(activate).map(flag_name).collect();
+        assert_eq!(rows, vec!["--version".to_string()]);
+
+        let block = render_command_tree_block(&cmd);
+        assert!(
+            block.contains("| `--version` |  |  | The version to activate |"),
+            "{block}"
+        );
+        assert_eq!(count_data_rows(&block), 1, "{block}");
+    }
 
     /// A value containing a backtick must render as one intact code-span cell:
     /// the fence widens past the inner backtick (double backticks with padding
