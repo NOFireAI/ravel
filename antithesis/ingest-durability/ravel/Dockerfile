@@ -54,6 +54,9 @@ COPY --from=server /symbols /symbols
 COPY --from=cli /symbols/ravel-cli /symbols/ravel-cli
 COPY --from=cli /out/ravel-cli /usr/local/bin/ravel-cli
 COPY antithesis/ingest-durability/ravel/init.sh /usr/local/bin/ravel-antithesis-init
-RUN chmod 755 /usr/local/bin/ravel-antithesis-init
+# The coverage variant's entrypoint (config-coverage); the base config runs
+# ravel-server directly and never calls it.
+COPY antithesis/ingest-durability/ravel/supervise.sh /usr/local/bin/ravel-antithesis-supervise
+RUN chmod 755 /usr/local/bin/ravel-antithesis-init /usr/local/bin/ravel-antithesis-supervise
 EXPOSE 4318 4317
 ENTRYPOINT ["/usr/local/bin/ravel-server"]

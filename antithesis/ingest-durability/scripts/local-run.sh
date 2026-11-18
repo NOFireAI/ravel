@@ -14,6 +14,14 @@
 #                                     names in
 #                                     formal/tla/commit/antithesis-mutants.tsv
 #                                     was evaluated false at least once.
+#   CONFIG=config-coverage            the coverage variant (README.md,
+#                                     "Coverage variant"): the run also fails
+#                                     unless every "required" assertion in
+#                                     local/coverage-required.tsv was hit with
+#                                     its condition true.
+#   LOCAL_COMPOSE_OVERRIDE=<file>     one more compose file layered last, such
+#                                     as one naming other image tags on a
+#                                     shared build host.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WL="$(cd "$HERE/.." && pwd)"
@@ -21,7 +29,17 @@ OUT="${1:?out dir}"
 SECS="${2:-300}"
 TSV="$WL/../../formal/tla/commit/antithesis-mutants.tsv"
 MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
-export COMPOSE_FILE="$WL/config/docker-compose.yaml:$WL/local/docker-compose.local.yaml"
+VARIANT_CONFIG="${CONFIG:-config}"
+case "$VARIANT_CONFIG" in
+    config) VARIANT=base ;;
+    config-coverage) VARIANT=coverage ;;
+    *) echo "refused: CONFIG must be config or config-coverage, not '$VARIANT_CONFIG'"; exit 1 ;;
+esac
+if [ "$VARIANT" = coverage ] && [ -n "$MUTANT" ]; then
+    echo "refused: mutant runs use the base config; unset CONFIG or RAVEL_ANTITHESIS_MUTANT"
+    exit 1
+fi
+export COMPOSE_FILE="$WL/$VARIANT_CONFIG/docker-compose.yaml:$WL/local/docker-compose.local.yaml"
 export COMPOSE_PROJECT_NAME=ravel-antithesis
 if [ -n "$MUTANT" ]; then
     expected=$(awk -F'\t' -v m="$MUTANT" '!/^#/ && $2 == m && m ~ /^commit\// { print $3 }' "$TSV")
@@ -46,6 +64,10 @@ if [ -n "$MUTANT" ]; then
     export RAVEL_ANTITHESIS_MUTANT="$MUTANT"
     COMPOSE_FILE="$COMPOSE_FILE:$WL/local/docker-compose.mutant.yaml"
     echo "mutant $MUTANT: expecting \"$expected\" to be violated"
+fi
+if [ -n "${LOCAL_COMPOSE_OVERRIDE:-}" ]; then
+    [ -f "$LOCAL_COMPOSE_OVERRIDE" ] || { echo "refused: no compose file at $LOCAL_COMPOSE_OVERRIDE"; exit 1; }
+    COMPOSE_FILE="$COMPOSE_FILE:$LOCAL_COMPOSE_OVERRIDE"
 fi
 mkdir -p "$OUT"
 if [ -n "${WORKLOAD_EVENTUALLY_AFTER_SECS:-}" ]; then
@@ -144,5 +166,28 @@ if [ -s "$OUT/violated.tsv" ]; then
     echo "FAIL: always-type assertions violated:"
     cat "$OUT/violated.tsv"
     exit 1
+fi
+if [ "$VARIANT" = coverage ]; then
+    # Each listed assertion with its hits and its passes (hits with the
+    # condition true) from assertions.tsv; a message absent there is 0 0.
+    awk -F'\t' '
+        NR == FNR { hits[$4] = $2; passes[$4] = $3; next }
+        /^#/ || NF < 2 { next }
+        { printf "%s\t%d\t%d\t%s\n", $1, hits[$2], passes[$2], $2 }
+    ' "$OUT/assertions.tsv" "$WL/local/coverage-required.tsv" > "$OUT/coverage.tsv"
+    echo "coverage variant (class, hits, passes, message):"
+    cat "$OUT/coverage.tsv"
+    required=$(awk -F'\t' '$1 == "required"' "$OUT/coverage.tsv" | wc -l)
+    awk -F'\t' '$1 == "required" && $3 < 1 { print $4 }' "$OUT/coverage.tsv" > "$OUT/coverage-unmet.tsv"
+    if [ "$required" -eq 0 ]; then
+        echo "FAIL: no required assertion read from local/coverage-required.tsv"
+        exit 1
+    fi
+    if [ -s "$OUT/coverage-unmet.tsv" ]; then
+        echo "FAIL: required coverage assertions never hit with their condition true:"
+        cat "$OUT/coverage-unmet.tsv"
+        exit 1
+    fi
+    echo "OK: all $required required coverage assertions met"
 fi
 echo "OK: no always-type assertion violated"
