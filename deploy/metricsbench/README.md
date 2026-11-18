@@ -577,7 +577,7 @@ script, and run in CI's `doc-scripts` job.
 | `--anchor-ms N` | The replay anchor, which must be on the profile's scrape grid (exit 65 otherwise, case h). Default: the profile's window ending at least 10 minutes before the run, on the grid, stamped `anchor_source` as from the clock. Ravel drops samples older than its 45-day `--max-ingest-lag`, so a fixed old anchor fails Ravel's read-back. |
 | `--passes N`, `--reps N` | Passed to `metricsbench_query` as `--passes` and `--reps-per-pass` and stamped (case g); its own defaults (5 and 3) otherwise. A timed pass stops repeating a statement for an engine once that engine's repetition times out, and lists the repetitions left out in the diagnostics sidecar's `skipped_reps` (ADR-0927, 2026-11-06 amendment). |
 | `--keep` | Leave the stack up; stamps say `kept (--keep)` and no `down -v` runs (case g). |
-| `--ravel-only` | The Ravel-only shape, below: Ravel alone, its series listing read back on the L0 catalog and again on the L1 one, no query step. Needs `MB_STAGE1=1 MB_STAGE1_ARMS=l1` (exit 64, case ro2); refused with exit 65 on any profile but `history` and `ci`, and with a flag that needs a comparator or a step it does not run (case ro2). |
+| `--ravel-only` | The Ravel-only shape, below: Ravel alone, its series listing read back on the L0 catalog and again on the L1 one, no query step. Needs `MB_STAGE1=1 MB_STAGE1_ARMS=l1` (exit 64, case ro2); refused with exit 65 on any profile but `history` and `ci`, and with a flag that needs a comparator or a step it does not run (case ro2). Runs on the real-S3 lane with the two flags below, on `<PREFIX>-ravel` alone (case ro7). |
 | `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the `memory` step fails: a full run still runs steps 15 to 18 and then exits 75 (case d; step 14 lists the other exits), and the diagnostic mode exits 75 at once (case e3). |
 | `--ravel-objects-band MIN:MAX` | The band the `objects` step checks the count of Ravel's data objects (`t/<tenant>/m/l0/*.rseg` keys) against, inclusive (cases v1, v2). It counts data objects only, not commit records, probes or the whole bucket, so the same figure is comparable between s3s-fs and real S3. A value not of the form `MIN:MAX`, a minimum above the maximum (case v3), or the flag with the falsification run (case v4) exits 64. |
 | `--diagnostic-prometheus-max-samples N` | The falsification run, below. |
@@ -1939,19 +1939,26 @@ cases):
 - `MB_RAVEL_ONLY=1` runs the measured profile with `--ravel-only` (below)
   in place of `--rss-band`. Launch refuses it with 64 without
   `MB_STAGE1=1 MB_STAGE1_ARMS=l1`, on a profile other than `history` and
-  `ci`, with `MB_CONTROL_IMAGE`, with `MB_RSS_BAND`, with a real-s3-prefix,
-  and without `MB_OBJECTS_BAND` or `MB_STAGE1_BANDS`, which it needs even on
-  `ci`: the shipped ci band file is for a four-engine run. `MB_STAGE1=1` on
-  `history` needs it. `0` or unset changes nothing.
+  `ci`, with `MB_CONTROL_IMAGE`, with `MB_RSS_BAND`, and without
+  `MB_OBJECTS_BAND` or `MB_STAGE1_BANDS`, which it needs even on `ci`: the
+  shipped ci band file is for a four-engine run. With a real-s3-prefix it
+  launches (launch case `ro-real-s3`), and the measured run uses
+  `<prefix>-ravel` alone (the box's bucket summary lists that bucket alone,
+  case `box-run ro`). `MB_STAGE1=1` on `history` needs it. `0` or unset
+  changes nothing.
 
-The #3941 series-listing measurement launches on the portable lane, with
-`MB_STAGE1_BANDS` naming a band file pre-registered for `history` (none
-ships here):
+The #3941 series-listing measurement launches on the real-S3 lane, so the
+listing pays real S3 GET latency, with `MB_STAGE1_BANDS` naming a band file
+pre-registered for `history` (none ships here). Create the measured run's
+Ravel bucket and the ci smoke's four buckets first (`make-buckets.sh
+--ravel-only` makes `<prefix>-ravel` alone):
 
 ```sh
+deploy/metricsbench/aws/make-buckets.sh --ravel-only <prefix>
+deploy/metricsbench/aws/make-buckets.sh <prefix>-ci
 MB_PROFILE=history MB_STAGE1=1 MB_STAGE1_ARMS=l1 MB_RAVEL_ONLY=1 \
   MB_STAGE1_BANDS=<band file> MB_OBJECTS_BAND=<MIN:MAX> \
-  deploy/metricsbench/aws/launch.sh <harness-commit> <ravel-image@sha256:...> <ravel-source-commit> <anchor-ms> <label>
+  deploy/metricsbench/aws/launch.sh <harness-commit> <ravel-image@sha256:...> <ravel-source-commit> <anchor-ms> <label> <prefix>
 ```
 
 Timings on `cardinality`: one warm
@@ -1972,20 +1979,44 @@ exits 65 before anything starts in these cases (case ro2):
 - with any profile but `history` and `ci`;
 - with a flag for a step it does not run:
   `--diagnostic-prometheus-max-samples`, `--passes`, `--reps`,
-  `--rss-band`, `--real-s3-bucket-prefix`, `--real-s3-region`,
-  `--folded-catalog-get-max-fraction` or `--folded-catalog-get-floor`. A
-  folded-catalog flag is refused even when its value is the default;
+  `--rss-band`, `--folded-catalog-get-max-fraction` or
+  `--folded-catalog-get-floor`. A folded-catalog flag is refused even when
+  its value is the default;
 - with `MB_CONTROL_IMAGE`.
 
 `--bin-dir` needs only `metricsbench_ingest`. `MB_L1_MAX_PART_BYTES` applies
 as in the l1 arm.
 
+It runs on either lane. With `--real-s3-bucket-prefix PREFIX
+--real-s3-region REGION` (issue #4481) Ravel's store moves onto
+`<PREFIX>-ravel` as on the real-S3 lane below, so the read-backs pay real S3
+GET latency (case ro7):
+
+- `real-s3.yml` is layered as for a full real-S3 run, and `fetch-s3s-fs`
+  does not run. `run.sh` exports `METRICSBENCH_S3_BUCKET_SUFFIXES=ravel`,
+  so `createbuckets` checks `<PREFIX>-ravel` alone. No Mimir container
+  starts and no Mimir bucket is checked or touched, so only
+  `<PREFIX>-ravel` needs to exist.
+- `objects-l0` and `objects-l1` list `<PREFIX>-ravel` on the regional AWS
+  endpoint, and the catalog list and inspect go through `ravel-qualify`
+  under `real-s3.yml`.
+- `store_kind` is `s3`, and `object_store` lists `<PREFIX>-ravel` alone.
+- `comparability` stays `non-comparable` with `Ravel-only diagnostic`.
+
+`ravel_only.store` records the lane on both lanes: `lane` (`real-s3` or
+`portable`), `bucket` (`<PREFIX>-ravel` or `ravel-metricsbench`), `region`
+(the `--real-s3-region`, or null on s3s-fs) and `endpoint`. Each
+`ravel_only.STATE.readback` also names the `bucket` the server read, so
+each GET delta names the store it counts (cases ro1, ro7).
+
 Steps, in order, stopping at the first failure (case ro1):
 
 1. `fetch-s3s-fs`, `fold-flags` and `stage1-flags`, as in a Stage 1 run.
    `fold-flags` records no step of its own in `steps_completed`.
+   `fetch-s3s-fs` does not run on the real-S3 lane (case ro7).
 2. `up`: `docker compose ... up -d ravel-server`. This starts ravel-server
-   and what it depends on (s3s, `createbuckets` and `ravel-qualify`). It
+   and what it depends on (s3s, `createbuckets` and `ravel-qualify`; on the
+   real-S3 lane no s3s). It
    starts no comparator. Unlike a Stage 1 run, ravel-server starts with the
    metrics label index on (`--fold-key-index-leaves` plus the label index's
    on flag, stamped as `stage1.server_flags_up`), so the background fold
@@ -2129,7 +2160,8 @@ Before the run, on an EC2 host:
 1. Create four empty buckets in the region: `<PREFIX>-ravel`,
    `<PREFIX>-mimir-blocks`, `<PREFIX>-mimir-ruler` and
    `<PREFIX>-mimir-alertmanager`. `run.sh` does not create them, since bucket
-   names are global and a bucket outlives the run.
+   names are global and a bucket outlives the run. A `--ravel-only` run needs
+   `<PREFIX>-ravel` alone (case ro7).
 2. Give the instance role read and write access to them.
 3. Set the instance's metadata hop limit to 2. Both engines get credentials
    from the instance metadata service through the Docker bridge, one hop past
@@ -2141,7 +2173,8 @@ keeps its data after `down -v`, so each run needs fresh ones. `s3s` does not
 start and `fetch-s3s-fs` does not run (case s).
 
 `stamps.json` says `store_kind: "s3"` and lists the buckets under
-`object_store`. The provenance says `--store-backend s3`, endpoint `n/a` and
+`object_store` (case s; for `--ravel-only`, `<PREFIX>-ravel` alone, case
+ro7). The provenance says `--store-backend s3`, endpoint `n/a` and
 `backend_bills_requests: true` (case s). Without the flags none of this happens
 (case s1). The lane has no credentials to record: neither engine is given a
 key.

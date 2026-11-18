@@ -13,7 +13,9 @@
 # arms wait for hours to pass or seal, which the ci smoke has no use for. The
 # control image is pulled beside the main one. L1_MAX_PART_BYTES reaches the
 # measured run alone as MB_L1_MAX_PART_BYTES, and RAVEL_ONLY=1 runs it with
-# --ravel-only and no --rss-band; the ci smoke stays a full four-engine run.
+# --ravel-only and no --rss-band, on the same lane and store flags as a full
+# run (with REAL_S3_PREFIX, on PREFIX-ravel alone); the ci smoke stays a full
+# four-engine run.
 # Exit codes beyond each step's own: 21 STAGE1=1 with no band file for the
 # measured profile (before anything is built), 22 the ci smoke's band check
 # failed, 23 the measured run exited 0 and its band check failed.
@@ -62,6 +64,17 @@ measured_run() {
     deploy/metricsbench/run.sh --profile "$PROFILE" --ravel-image "$RAVEL_IMAGE" --ravel-source-commit "$RAVEL_SOURCE_COMMIT" \
     --bin-dir target/release --out-dir /mb/out-run --anchor-ms "$ANCHOR_MS" \
     "${shape[@]}" --ravel-objects-band "$OBJECTS_BAND" "$@"
+}
+
+# measured_bucket_suffixes: the real-S3 buckets the measured run uses, as
+# suffixes after REAL_S3_PREFIX; with RAVEL_ONLY=1 the Ravel bucket alone,
+# since a Ravel-only run starts no Mimir.
+measured_bucket_suffixes() {
+  if [ "${RAVEL_ONLY:-}" = 1 ]; then
+    echo "ravel"
+  else
+    echo "ravel mimir-blocks mimir-ruler mimir-alertmanager"
+  fi
 }
 
 # Sourced by deploy/metricsbench/tests/run.test.sh for the functions above.
@@ -160,7 +173,7 @@ stage "$PROFILE exit ${code}"
 up /mb/out-run out-run
 gzip -k /mb/store-metrics.log; put /mb/store-metrics.log.gz; put /mb/cpu.log
 if [ -n "$REAL_S3_PREFIX" ]; then
-  for s in ravel mimir-blocks mimir-ruler mimir-alertmanager; do
+  for s in $(measured_bucket_suffixes); do
     echo "${PROFILE} ${s} $(aws s3 ls --recursive --summarize "s3://${REAL_S3_PREFIX}-${s}/" | tail -2 | tr -s ' ' | tr '\n' ' ')" >>/mb/buckets.txt
   done
   put /mb/buckets.txt

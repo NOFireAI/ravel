@@ -2,17 +2,24 @@
 # Create the four empty real-S3 buckets run.sh's real-S3 lane expects for each
 # prefix, each with a bucket policy granting only the benchmark's instance role,
 # so the role's own policy is not widened per run.
-# Usage: MB_INSTANCE_ROLE_ARN=arn:aws:iam::<account>:role/<role> make-buckets.sh <prefix> [<prefix> ...]
+# Usage: MB_INSTANCE_ROLE_ARN=arn:aws:iam::<account>:role/<role> make-buckets.sh [--ravel-only] <prefix> [<prefix> ...]
 # A real-S3 run needs <prefix> for the measured profile and <prefix>-ci for the
 # smoke; run.sh refuses a bucket that already holds an object, so every run
-# needs fresh prefixes.
+# needs fresh prefixes. --ravel-only creates <prefix>-ravel alone for every
+# prefix given: a Ravel-only measured run (launch.sh MB_RAVEL_ONLY=1) starts no
+# Mimir, while its ci smoke is a full run and needs all four.
 set -euo pipefail
 : "${MB_INSTANCE_ROLE_ARN:?set MB_INSTANCE_ROLE_ARN to the role behind MB_INSTANCE_PROFILE}"
-[ "$#" -ge 1 ] || { echo "usage: $0 <prefix> [<prefix> ...]" >&2; exit 64; }
+suffixes="ravel mimir-blocks mimir-ruler mimir-alertmanager"
+if [ "${1:-}" = --ravel-only ]; then
+  suffixes="ravel"
+  shift
+fi
+[ "$#" -ge 1 ] || { echo "usage: $0 [--ravel-only] <prefix> [<prefix> ...]" >&2; exit 64; }
 region=${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}
 [ -n "$region" ] || { echo "no region: set AWS_REGION" >&2; exit 64; }
 for p in "$@"; do
-  for s in ravel mimir-blocks mimir-ruler mimir-alertmanager; do
+  for s in $suffixes; do
     b="${p}-${s}"
     if [ "$region" = us-east-1 ]; then
       aws s3api create-bucket --bucket "$b" >/dev/null

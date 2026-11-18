@@ -389,12 +389,17 @@
 # listing on the L0 catalog and again on the L1 one (issue #4392). It is
 # refused with exit 65 for a profile other than history and ci, and with
 # --diagnostic-prometheus-max-samples, --passes, --reps, --rss-band,
-# --real-s3-bucket-prefix, --real-s3-region, --folded-catalog-get-max-fraction,
-# --folded-catalog-get-floor or MB_CONTROL_IMAGE, which act on steps it does
-# not run. Only metricsbench_ingest is required in --bin-dir. Steps:
-# fetch-s3s-fs, fold-flags, stage1-flags, up (docker compose up -d
-# ravel-server, which starts its object store and one-shots and no
-# comparator; ravel-server runs with the label index on, stamped as
+# --folded-catalog-get-max-fraction, --folded-catalog-get-floor or
+# MB_CONTROL_IMAGE, which act on steps it does not run. It takes
+# --real-s3-bucket-prefix and --real-s3-region (issue #4481): Ravel's store
+# moves onto <PREFIX>-ravel as on the real-S3 lane below, createbuckets checks
+# that bucket alone, no Mimir bucket is checked or touched, and
+# ravel_only.store stamps the lane, the bucket and the region (portable:
+# ravel-metricsbench on s3s); each ravel_only.STATE.readback carries the
+# bucket too. Only metricsbench_ingest is required in --bin-dir. Steps:
+# fetch-s3s-fs (not on the real-S3 lane), fold-flags, stage1-flags, up
+# (docker compose up -d ravel-server, which starts its object store and
+# one-shots and no comparator; ravel-server runs with the label index on, stamped as
 # stage1.server_flags_up), qualify, image, ready (Ravel alone), then
 #
 #   ingest      metricsbench_ingest with the Ravel row alone
@@ -476,7 +481,10 @@
 # <PREFIX>-mimir-alertmanager buckets with the instance role's credentials.
 # fetch-s3s-fs does not run and s3s does not start; createbuckets instead fails
 # the qualify step when a bucket is missing or holds an object. stamps.json and
-# the provenance name real S3. It takes a published image only.
+# the provenance name real S3. It takes a published image only. With
+# --ravel-only the overlay is the same, but METRICSBENCH_S3_BUCKET_SUFFIXES=ravel
+# narrows createbuckets' check to <PREFIX>-ravel, Mimir never starts, and
+# object_store lists that bucket alone.
 #
 # The stack is always torn down with `docker compose ... down -v` (after its
 # logs, s3s-fs's among them when it ran, are saved to <out>/compose.log) unless
@@ -2653,8 +2661,6 @@ if [ "$ravel_only" -eq 1 ]; then
     refuse "--ravel-only with --passes or --reps: they size the query step's passes against the comparators, and the Ravel-only shape runs no query step"
   [ "${#bands[@]}" -eq 0 ] ||
     refuse "--ravel-only with --rss-band: the bands are checked by the memory step over the comparator stack, which the Ravel-only shape does not run"
-  [ -z "$real_s3_prefix" ] && [ -z "$real_s3_region" ] ||
-    refuse "--ravel-only with --real-s3-bucket-prefix or --real-s3-region: the real-S3 lane holds Ravel and Mimir buckets for a comparable run, and a Ravel-only run is not one"
   [ -z "$folded_catalog_get_flags" ] ||
     refuse "--ravel-only with${folded_catalog_get_flags}: the limit is checked by step readback-folded, which the Ravel-only shape does not run"
   [ -z "${MB_CONTROL_IMAGE:-}" ] && [ -z "${MB_CONTROL_SOURCE_COMMIT:-}" ] ||
@@ -2912,6 +2918,16 @@ else
     export METRICSBENCH_S3_BUCKET_PREFIX="$real_s3_prefix" METRICSBENCH_S3_REGION="$real_s3_region"
   fi
 fi
+# The buckets real-s3.yml's createbuckets checks, as suffixes after the
+# prefix. Unset, it checks all four; the Ravel-only shape starts no Mimir, so
+# it checks the Ravel bucket alone.
+if [ "$real_s3" -eq 1 ] && [ "$ravel_only" -eq 1 ]; then
+  real_s3_bucket_suffixes="ravel"
+  export METRICSBENCH_S3_BUCKET_SUFFIXES="$real_s3_bucket_suffixes"
+else
+  real_s3_bucket_suffixes="ravel mimir-blocks mimir-ruler mimir-alertmanager"
+  unset METRICSBENCH_S3_BUCKET_SUFFIXES
+fi
 # compose interpolates ravel.yml on every command, `ps` and `down` included.
 export RAVEL_IMAGE="${ravel_image:-unset-diagnostic-run-starts-no-ravel}"
 # The same for docker-compose.yml's S3S_FS_BIN, which fetch-s3s-fs replaces
@@ -3048,6 +3064,12 @@ if [ "$ravel_only" -eq 1 ]; then
   stamp_set ravel_only.enabled true
   stamp_str comparability non-comparable
   stamp_str comparability_reason "Ravel-only diagnostic"
+  if [ "$real_s3" -eq 1 ]; then
+    stamp_set ravel_only.store "$(python3 -I -c 'import json,sys; print(json.dumps({"lane":"real-s3","bucket":sys.argv[1]+"-ravel","region":sys.argv[2],"endpoint":"regional AWS endpoint"}))' \
+      "$real_s3_prefix" "$real_s3_region")"
+  else
+    stamp_set ravel_only.store '{"lane": "portable", "bucket": "ravel-metricsbench", "region": null, "endpoint": "http://s3s:9000"}'
+  fi
   stamp_set ravel_only.ingest_readback null
   for key in l0 l1; do
     stamp_set "ravel_only.${key}" '{"catalog": null, "objects": null, "catalog_objects": null, "readback": null, "series_query_ms": null, "verdict": null}'
@@ -3523,6 +3545,14 @@ folded_readback() {
   readback_folded_step
   object_spans_step
   FOLDED_RAN=1
+}
+
+# stamp_real_s3_object_store: object_store on the real-S3 lane, naming the
+# buckets createbuckets checks (real_s3_bucket_suffixes after the prefix).
+stamp_real_s3_object_store() {
+  # shellcheck disable=SC2086 # the suffixes are one word each
+  stamp_set object_store "$(python3 -I -c 'import json,sys; print(json.dumps({"implementation":"s3","region":sys.argv[1],"credentials":"instance-role","buckets":[sys.argv[2]+"-"+b for b in sys.argv[3:]]}))' \
+    "$real_s3_region" "$real_s3_prefix" $real_s3_bucket_suffixes)"
 }
 
 # sha256_of FILE: the file's sha256 as 64 lowercase hex characters.
@@ -4738,6 +4768,8 @@ ravel_only_readback() {
     stamp_code=$?
   [ -n "$stamp" ] || fail_step "$step" "the read-back on the ${state} catalog could not be stamped (ravel-only-readback exited ${stamp_code})"
   stamp_set "ravel_only.${state}.readback" "$stamp"
+  # The bucket ravel-server read, so each GET delta names the store it counts.
+  stamp_str "ravel_only.${state}.readback.bucket" "$(stage1_bucket)"
   verdict="$(py get "$STAMPS" "ravel_only.${state}.readback.verdict")"
   stamp_str "ravel_only.${state}.verdict" "$verdict"
   ms="$(py get "$STAMPS" "ravel_only.${state}.readback.series_query_ms")"
@@ -4837,7 +4869,11 @@ run_ravel_only() {
   done
   stamp_str stage1.background_fold "on, with the label index, from up until stage1-l0-fold stops ravel-server; stage1-l0 and stage1-l1 recreate ravel-server with --disable-fold, so only stage1-l0-fold changes the snapshot readback-l0 reads and only stage1-l1-fold the one readback-l1 reads"
 
-  fetch_s3s_fs
+  if [ "$real_s3" -eq 1 ]; then
+    stamp_real_s3_object_store
+  else
+    fetch_s3s_fs
+  fi
   fold_flags_step
   stage1_label_index_flags
   # Every fold of the run builds the metrics label index, the background one
@@ -4951,8 +4987,7 @@ run_full() {
   stamp_str object_spans "not taken: the run ended before the object spans step"
   stamp_str cold_ravel_diagnostic "not taken: the run ended before the cold pass"
   if [ "$real_s3" -eq 1 ]; then
-    stamp_set object_store "$(python3 -I -c 'import json,sys; print(json.dumps({"implementation":"s3","region":sys.argv[1],"credentials":"instance-role","buckets":[sys.argv[2]+"-"+b for b in ("ravel","mimir-blocks","mimir-ruler","mimir-alertmanager")]}))' \
-      "$real_s3_region" "$real_s3_prefix")"
+    stamp_real_s3_object_store
   else
     fetch_s3s_fs
   fi
