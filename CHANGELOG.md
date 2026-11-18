@@ -130,9 +130,10 @@ about a minute per failed watch. See the first entry under Changed.
   policy (an unkeyed bucket), flushes are byte for byte unchanged.
 - **Maintenance writers follow `sys/compat` (ADR-4233).** With a compat
   policy in `CompactorConfig::compat_policy`, compaction, the erasure
-  rewrite, `migrate`, the force 2 re-encode and the query-audit,
-  reshard-audit and legal-hold writers fix their write versions at run
-  start, before the claim and any PUT, and refuse a stale view, a missing
+  rewrite, `migrate` and the force 2 re-encode fix their write versions at
+  run start, before the claim and any PUT; the query-audit, reshard-audit
+  and legal-hold writers do the same when called with a policy
+  (`*_with_compat`). They refuse a stale view, a missing
   record on a fenced bucket, an unwritable active version or a publish
   lifetime above the recorded one, counted under
   `ravel_compat_publish_refused_total{family,reason}`. A run's format-floor
@@ -155,11 +156,12 @@ about a minute per failed watch. See the first entry under Changed.
   `migrate`, the re-encode included, holds it under reason
   `unknown_section`; both name the input's trailer version and the unknown
   kinds. `ravel-server --mode maintain` installs the policy on a keyed
-  bucket; without one (an unkeyed bucket), the unknown-section hold is the
-  only change and every other bucket compacts to the same bytes as before.
+  bucket. The `ravel` CLI's maintenance, `hold` and reshard commands install
+  none, and without a policy the unknown-section hold is the only change and
+  every other bucket compacts to the same bytes as before.
 - **`ravel-server` follows the `sys/compat` format write policy.** On a keyed
   bucket every process, in every mode, reads `sys/compat` at startup and every
-  60 seconds. Every writer consumes that view: first-touch provisioning, the
+  60 seconds. These writers consume that view: first-touch provisioning, the
   catalog fold, the alert evaluator, the ingest routers, the maintenance
   writers and the query audit pipeline (#4301). The alert evaluator writes alert history at the RLOG
   version the record names and keeps the alert lease parked once `rlog` is
@@ -659,13 +661,14 @@ about a minute per failed watch. See the first entry under Changed.
   tombstone for a later pass, and each held bucket is counted once per pass in
   the new `ravel_maintain_retention_unaddressable_held_buckets_total` counter.
 - **`migrate` no longer walks past a held bucket after a budget stop, and
-  holds more inputs it cannot carry forward.** A budget stop now caps the
-  persisted cursor just before the run's first held bucket, so the next run
-  re-examines the hold and reports it again instead of resuming past it. On
-  the `--reencode-compaction-parts` path every refusal of a part now holds the
-  bucket and lets the walk continue (an out-of-window part as
-  `input_out_of_window`, an undecodable one as `corrupt_input`), not only a
-  part newer than this build writes. An RLOG input whose directory names a
+  holds more inputs it cannot carry forward.** A budget stop that migrated
+  something caps the persisted cursor just before the run's first held
+  bucket, so the next run re-examines the hold and reports it again instead
+  of resuming past it; a stop that migrated nothing persists the position it
+  reached, and the hold is reported again once the walk drains and restarts.
+  On the `--reencode-compaction-parts` path a part outside the reader window
+  is held as `input_out_of_window` and an undecodable one as `corrupt_input`,
+  as a part newer than this build writes already was. An RLOG input whose directory names a
   section version this build cannot read is held as out of window rather than
   corrupt (ADR-4233 H5), and the per-bucket listings each L0 migration and
   re-encode plan from are now strict, so a key the census cannot address fails
@@ -729,8 +732,9 @@ about a minute per failed watch. See the first entry under Changed.
   completed as every other hold does.
   Buckets that `migrate` holds no longer spend its budget, and a budget stop
   that made no progress still persists the walk position. `compat activate`
-  now stamps an activation inside its CAS, one past the
-  `fence_complete_unix_ns` it replaces, and a fence walk records
+  now stamps an activation inside its CAS at its own clock or one past the
+  `fence_complete_unix_ns` it replaces, whichever is later, and a fence walk
+  records
   `fence_complete_unix_ns` only while its epoch is still pending, so a late
   walker of an earlier epoch cannot mark the next activation fenced. The
   activation report carries `stamp_ahead_of_clock_ns` when that stamp is
@@ -773,9 +777,9 @@ about a minute per failed watch. See the first entry under Changed.
   unaddressable prefix or a non-tenant directory refuses rather than being
   skipped, and the shard-directory scan refuses a directory like `l0/1/`
   or `l0/00001/` that is not the canonical zero-padded shard spelling the
-  census lists under. The completed cursor is deleted only while it is
-  still at the version the run read, so a concurrent run's fresh cursor is
-  not removed (#4344, #4233).
+  census lists under. The completed cursor is deleted only if a read just
+  before the delete finds it at the version the run read, so a fresh cursor
+  another run wrote before that read is not removed (#4344, #4233).
 - **A flush held closed on a provisioning view the router cannot trust is
   dropped and counted after `max_flush_lifetime` with no successful
   provisioning read instead of held without bound.** While the provisioning
@@ -872,7 +876,8 @@ about a minute per failed watch. See the first entry under Changed.
   on every RavelCluster by up to about a minute. Applying the ClusterRole
   afterwards ends it without a restart. See "Autoscaling" in
   docs/guides/kubernetes.md.
-- **TopK late materialization re-reads only the winning blocks.** The
+- **TopK late materialization opens each winning segment once and, on a large
+  version-4 object, reads only the winning blocks.** The
   phase-2 row fetch of a `SELECT * ... ORDER BY ... LIMIT k` logs statement
   now opens each segment holding a winner once instead of once per winning
   block. Above the block-range threshold it fetches only the winning blocks'
