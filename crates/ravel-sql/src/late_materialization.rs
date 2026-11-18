@@ -727,6 +727,11 @@ impl ExecutionPlan for LogsRowFetchExec {
     }
 }
 
+/// One segment's winning blocks for a phase-2 fetch: each a surviving-block
+/// position paired with the `(surviving-row, output position)` pairs to read
+/// from it, in ascending block order.
+type SegmentBlocks = Vec<(usize, Vec<(usize, usize)>)>;
+
 /// Read phase 1's rows, re-read the blocks they came from, and build the
 /// restored output batches.
 ///
@@ -734,11 +739,6 @@ impl ExecutionPlan for LogsRowFetchExec {
 /// phase holds (the fetched records first, then the batches built from them,
 /// with the record term released as the records are dropped) and returned so
 /// the stream can release each batch's share as it hands it downstream.
-/// One segment's winning blocks for a phase-2 fetch: each a surviving-block
-/// position paired with the `(surviving-row, output position)` pairs to read
-/// from it, in ascending block order.
-type SegmentBlocks = Vec<(usize, Vec<(usize, usize)>)>;
-
 async fn fetch_rows(
     input: SendableRecordBatchStream,
     source: RowFetchSource,

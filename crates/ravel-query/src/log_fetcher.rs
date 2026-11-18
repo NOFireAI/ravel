@@ -4968,9 +4968,15 @@ struct OwnedBlocks<'a> {
 /// object, strictly ascending. A version-4 ranged read resolves them to
 /// whole-object block indices from that same survivor list, restricts its
 /// candidate set to those blocks, and stores the resolution in `resolved`, so
-/// the open names the blocks by value. A read that resolves nothing (the
-/// object was read whole, or it is version 3) leaves `resolved` empty, and the
-/// open addresses `positions` as before.
+/// the open names the blocks by value. It does so whenever it opens the scan
+/// to resolve, including when the coverage crossover then reads the object
+/// whole. `resolved` stays empty, and the open addresses `positions` as
+/// before, when no version-4 ranged read runs (a version-3 object, an object
+/// read whole before its footer is resolved: at or under the block-range
+/// threshold, carried whole, of unrecorded size, or at or under the size
+/// crossover), and when the last position is the last skip-index candidate and
+/// the coverage crossover fires on the winners that settles, so the object is
+/// read whole without opening the scan.
 #[derive(Clone, Copy)]
 struct OrdinalBlocks<'a> {
     positions: &'a [usize],
@@ -8343,6 +8349,37 @@ impl BlockRangeFetcher {
             fences = merge_fences(&foreign_extents);
             candidates.retain(|c| owned.binary_search(c).is_ok());
         }
+        // Issue #4306: the survivor list is a subset of `candidates`, both
+        // ascending, so when the last position is the last candidate every
+        // candidate survives and the winners are `candidates[positions]`
+        // without opening the scan. Weigh the crossover on those winners'
+        // pages before placing any scan section: when it fires, the whole
+        // object makes every section redundant. The open then addresses the
+        // positions over the whole object, so the winners settled here are
+        // never trusted for rows.
+        if let Some(ordinal) = ordinal_blocks
+            && ordinal.positions.last().map(|&p| p + 1) == Some(candidates.len())
+        {
+            let settled: Vec<usize> = ordinal
+                .positions
+                .iter()
+                .filter_map(|&p| candidates.get(p).copied())
+                .collect();
+            let settled_wanted = projected_page_extents(
+                key,
+                page_dir,
+                blocks_desc.offset,
+                &settled,
+                selected.as_ref(),
+            )?;
+            let settled_bytes = self.bridged_run_bytes(&seg_ref.level, &settled_wanted, &fences);
+            if settled_bytes as f64 / blocks_desc.len.max(1) as f64 >= self.coverage_threshold {
+                stats.candidate_blocks = settled.len() as u64;
+                return self
+                    .read_v4_whole(seg_ref, tenant_hash, phases, pin, asm, accounting, stats)
+                    .await;
+            }
+        }
         // Issue #797: a row-ref fetch's positions index the survivor list the
         // scan computes over this object, which needs the scan's own filter
         // sections. Place those first, open the scan over them, and resolve the
@@ -8428,37 +8465,9 @@ impl BlockRangeFetcher {
                 }
             }
         } else if wanted_bytes as f64 / blocks_desc.len.max(1) as f64 >= self.coverage_threshold {
-            // `wanted` is already owned (resolved above from the decoded skip
-            // index and page directory, not borrowed from `asm`), so dropping
-            // the assembler here is safe, as the version-3 coverage crossover
-            // does: it releases the placed regions and their reservation
-            // guards BEFORE the covering GET reserves fresh (ADR-1170
-            // decision 2).
-            drop(asm);
-            // Bounded by the fetch bound (ADR-0996 decision 2), like the
-            // version-3 coverage crossover above.
-            let (bytes, live_gets, live_bytes) = self
-                .covering_read(
-                    seg_ref,
-                    tenant_hash,
-                    total_size,
-                    GetRange::Full,
-                    phases.blocks,
-                    pin,
-                    accounting,
-                )
-                .await?;
-            if live_gets > 0 {
-                stats.block_range_gets = live_gets;
-                stats.block_bytes_fetched = live_bytes;
-            }
-            stats.whole_object = true;
-            // No per-block cache admission from the whole object here, unlike
-            // the version-3 path: a version-4 block is not a contiguous extent,
-            // so there is no block-keyed entry a later ranged read would look
-            // for. The chunk ranges are the cache unit instead, and this read
-            // resolved none of them.
-            return Ok((bytes, stats));
+            return self
+                .read_v4_whole(seg_ref, tenant_hash, phases, pin, asm, accounting, stats)
+                .await;
         }
 
         self.place_scan_sections(
@@ -8496,6 +8505,49 @@ impl BlockRangeFetcher {
             }),
             None => asm.into_bytes(),
         };
+        Ok((bytes, stats))
+    }
+
+    /// The version-4 coverage crossover's whole-object read. Everything this
+    /// read needs is owned rather than borrowed from `asm`, so dropping the
+    /// assembler first is safe, as the version-3 coverage crossover does: it
+    /// releases the placed regions and their reservation guards BEFORE the
+    /// covering GET reserves fresh (ADR-1170 decision 2).
+    #[allow(clippy::too_many_arguments)]
+    async fn read_v4_whole(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        phases: ReadPhases,
+        pin: &EtagPin,
+        asm: ObjectAssembler,
+        accounting: &QueryAccounting,
+        mut stats: BlockRangeStats,
+    ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
+        drop(asm);
+        // Bounded by the fetch bound (ADR-0996 decision 2), like the
+        // version-3 coverage crossover.
+        let (bytes, live_gets, live_bytes) = self
+            .covering_read(
+                seg_ref,
+                tenant_hash,
+                seg_ref.object_size,
+                GetRange::Full,
+                phases.blocks,
+                pin,
+                accounting,
+            )
+            .await?;
+        if live_gets > 0 {
+            stats.block_range_gets = live_gets;
+            stats.block_bytes_fetched = live_bytes;
+        }
+        stats.whole_object = true;
+        // No per-block cache admission from the whole object here, unlike
+        // the version-3 path: a version-4 block is not a contiguous extent,
+        // so there is no block-keyed entry a later ranged read would look
+        // for. The chunk ranges are the cache unit instead, and this read
+        // resolved none of them.
         Ok((bytes, stats))
     }
 
