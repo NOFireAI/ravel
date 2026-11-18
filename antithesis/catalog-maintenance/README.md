@@ -38,9 +38,11 @@ No retention window is configured: neither the servers nor the driver pass
 delete superseded and orphaned objects but never a live record, and the
 multiset property below holds across sweeps.
 
-Images, entrypoint store wait, label stamping, the launch-time label check and
-the instrumentation check are the ingest-durability workload's, under the tag
-`catalog-maintenance` and the test name `ravel-catalog-maintenance`.
+Images, label stamping, the launch-time label check and the instrumentation
+check are the ingest-durability workload's, under the tag
+`catalog-maintenance` and the test name `ravel-catalog-maintenance`. As there,
+the servers run under an init process with a 300 s `--startup-store-deadline`
+and no entrypoint store wait; their entrypoint only waits for the seed marker.
 
 ## Seeding (ADR-4326 decision 5)
 
