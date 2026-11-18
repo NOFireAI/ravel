@@ -858,6 +858,32 @@ fn tier_one_cost_charges_one_get_up_to_the_fetchers_whole_read_bound() {
     assert_eq!(TierOneCost::PROBE_ONLY.segment_gets(1, u64::MAX), u64::MAX);
 }
 
+/// A saturated or operator-raised `block_range_threshold` still reads a big
+/// object whole in one GET, but the charge stops at 1 at the default
+/// threshold, so a multi-megabyte whole read is not priced as one leaf GET.
+#[test]
+fn tier_one_cost_caps_the_logs_whole_read_bound() {
+    use crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let probed = TIER_ONE_MAX_GETS_PER_SEGMENT;
+    let fetcher = LogSegmentFetcher::new(store).with_block_range_threshold(u64::MAX);
+    assert_eq!(fetcher.block_range_threshold(), u64::MAX);
+    let logs = TierOneCost::for_logs(&fetcher);
+    assert_eq!(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, 524_288);
+    assert_eq!(logs.segment_gets(1024 * 1024, probed), 2, "1 MiB segment");
+    assert_eq!(
+        logs.segment_gets(524_288, probed),
+        1,
+        "524,288-byte segment"
+    );
+    assert_eq!(
+        logs.segment_gets(524_289, probed),
+        2,
+        "524,289-byte segment"
+    );
+}
+
 /// Entries in an ADR-3939 logs day part.
 const DAY_PART_ENTRIES: usize = 552;
 

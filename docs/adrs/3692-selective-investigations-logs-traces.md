@@ -1786,20 +1786,41 @@ GET at or under the caller's whole-read bound and 2 otherwise, the ADR-2707
 decision 5 value. The router reads the bound from the fetcher it routes
 for: `block_range_threshold` for logs, not `plan_whole_object_bound`,
 because a keyed segment between the two is still probed; and
-`trace_probe_bytes` for spans. `TierOneCost` in
+`trace_probe_bytes` for spans. The logs bound is capped at
+`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD` (524,288 bytes): `block_range_threshold`
+is not pinned there, since `resolve_logs_fetch` sets it to `u64::MAX` when
+routing saturates and an operator can set it, and a multi-megabyte whole
+read charged 1 would undercharge tier 1 without bound. A logs segment read
+whole above the cap is charged 2 (`tier_one_cost_caps_the_logs_whole_read_bound`). `TierOneCost` in
 `crates/ravel-query/src/key_index_route.rs` holds the per-band table, with
 the code and the test behind each row. The metrics series route keeps the
 flat 2 per segment; its fetcher has the same whole-read rule, and charging
 it per segment is a separate change.
 
-**What stays.** A probed segment is still charged 2.
-`keyed_objects_the_scan_skips_are_probed_not_planned` pins a probe chain
-of four reads ahead of the whole-object GET (tail read, footer chase,
-KEY_IDX prefix, one bucket; its `dependencyDepth` assertion), so a probed
-segment can cost more than 2 and the comparison still leans toward tier 1
-there. Raising
-that charge would change ADR-2707 decision 5 and is not done here. Outcomes,
+**What stays.** A probed segment is still charged 2. The probe chain is
+longer than 2 reads: `keyed_objects_the_scan_skips_are_probed_not_planned`
+lists the reads ahead of the whole-object GET as the tail probe and its
+chase, the KEY_IDX prefix and a bucket, so a probed segment can cost more
+than 2 and the comparison still leans toward tier 1 there. Raising that
+charge would change ADR-2707 decision 5 and is not done here. Outcomes,
 statistics fields and `parts_over_tier_one` are unchanged.
+
+The charge still counts GETs, not bytes. `DEFAULT_LOG_REQUEST_COST_BYTES`
+prices one request at 1,887,437 bytes (about 1.8 MiB; `log_fetcher.rs`: `b`
+extra bytes for `k` saved requests win when `b < k x request_cost`). A
+whole read of at most 524,288 bytes therefore costs tier 1 between 1.0 and
+about 1.28 request-equivalents, never 2, and a leaf GET of `T1_BYTES`
+(11 KiB) about 1.006. A flat 2 overcharges that band by at least 0.72 a
+segment; 1 undercharges it by at most 0.28, and the cap is what keeps the
+undercharge there. A tier-2 block answer opens the object whole too, so on
+a KEY_IDX hit the whole read cancels; but tier 2 never opens a segment its
+leaves prune, so each whole-read segment sent to tier 1 trades up to
+524,288 bytes for the leaf GETs it saves. A part with `n` whole-read
+segments is misrouted to tier 1 when its worst case falls in
+`n < worst <= ~1.28 n`. The worst example is 30 segments just under 512 KiB
+and a 30-key set on one slice: a worst case of 31 leaf GETs against a tier-1
+cost of 30, so the part goes to tier 1 and reads about 15 MiB whole, where
+the flat 2 admitted it at 60. A byte-aware comparison is a separate change.
 
 **Figures.** A logs day part of 552 segments now has a tier-1 cost of 1,104
 less one for each segment at or under the threshold. The key-set ceiling

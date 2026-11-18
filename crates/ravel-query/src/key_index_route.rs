@@ -57,9 +57,9 @@ use ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{Signal, TenantHash};
 
-use crate::LogSegmentFetcher;
 use crate::phase_accounting::PhaseAccounting;
 use crate::span_fetcher::SpanSegmentFetcher;
+use crate::{DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogSegmentFetcher};
 
 mod series;
 
@@ -321,12 +321,14 @@ const TIER_ONE_MAX_GETS_PER_SEGMENT: u64 = 2;
 /// the caller's tier-1 read takes the whole object in its first GET.
 ///
 /// Worst case to worst case, per signal and `object_size` band (`B` the
-/// logs fetcher's `block_range_threshold`, `P` its `plan_whole_object_bound`,
+/// logs fetcher's `block_range_threshold`, `W` the smaller of `B` and
+/// [`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`], `P` its `plan_whole_object_bound`,
 /// `T` the spans fetcher's `trace_probe_bytes`):
 ///
 /// | signal | band | tier-1 GETs | charged | source |
 /// |---|---|---|---|---|
-/// | logs | `size <= B` | 1, the whole object, no KEY_IDX probe | 1 | `log_fetcher.rs` `key_probe_reads` (`object_size > self.block_range_threshold`); ravel-server `sql_logs_key_index_probe_bound.rs` `objects_at_or_under_the_threshold_are_read_whole_unprobed` |
+/// | logs | `size <= W` | 1, the whole object, no KEY_IDX probe | 1 | `log_fetcher.rs` `key_probe_reads` (`object_size > self.block_range_threshold`); ravel-server `sql_logs_key_index_probe_bound.rs` `objects_at_or_under_the_threshold_are_read_whole_unprobed` |
+/// | logs | `W < size <= B` | 1, the whole object, no KEY_IDX probe | 2 | [`TierOneCost::for_logs`]; `tier_one_cost_caps_the_logs_whole_read_bound` |
 /// | logs | `B < size <= P` | footer suffix (+ chase), KEY_IDX prefix, buckets, then the whole object on a hit | 2 | `log_fetcher.rs` `probe_segment_keyed` and `plan_segment_keyed_with`; `sql_logs_key_index_probe_bound.rs` `sub_break_even_objects_the_scan_plans_are_probed` |
 /// | logs | `size > P` | the same probe, then a planned block read | 2 | `sql_logs_key_index_probe_bound.rs` `keyed_objects_the_scan_skips_are_probed_not_planned` |
 /// | spans | `size <= T` | 1, the tail probe covers the object and every later read slices it | 1 | `span_fetcher.rs` `ranged_trace_scan` (`probe_len = self.trace_probe_bytes.min(size)`), `key_index_read`, `section_bytes` |
@@ -334,12 +336,30 @@ const TIER_ONE_MAX_GETS_PER_SEGMENT: u64 = 2;
 ///
 /// The bound is `B`, not `P`: between them tier 1 still probes KEY_IDX. A
 /// probed segment is charged the ADR's conservative 2 whatever its band,
-/// below the probe's own worst case of 4 (tail, chase, KEY_IDX prefix,
-/// bucket: `keyed_objects_the_scan_skips_are_probed_not_planned`), so the
-/// comparison leans toward tier 1 on probed segments.
+/// though its probe chain is longer than 2 reads (the tail probe and its
+/// chase, the KEY_IDX prefix and a bucket, as listed in
+/// `keyed_objects_the_scan_skips_are_probed_not_planned`), so the comparison
+/// leans toward tier 1 on probed segments.
 /// The whole-object read after a KEY_IDX hit is not charged: below `P` a
 /// tier-2 block answer opens the object whole too, so it cancels, and above
 /// `P` both routes read the routed blocks.
+///
+/// For logs the bound is `W`, not `B`, because `B` is not pinned at
+/// [`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`]: `resolve_logs_fetch` sets it to `u64::MAX` when
+/// routing saturates, and an operator can set it. The charge counts GETs, not
+/// bytes. A request is worth
+/// [`DEFAULT_LOG_REQUEST_COST_BYTES`](crate::DEFAULT_LOG_REQUEST_COST_BYTES) (about 1.8
+/// MiB) of transfer, so a whole read of at most 524,288 bytes costs between
+/// 1.0 and about 1.28 request-equivalents, and a leaf GET of ADR-3692's
+/// `T1_BYTES` (11 KiB) about 1.006:
+/// 1 undercharges that band by at most 0.28 where 2 would overcharge it by at
+/// least 0.72, and the cap is what bounds the undercharge. Tier 2 never opens
+/// a segment its leaves prune, so each whole-read segment sent to tier 1
+/// trades up to 524,288 bytes for the leaf GETs it saves. A part with `n`
+/// whole-read segments is misrouted to tier 1 when its worst case is in `n <
+/// worst <= ~1.28 n`: 30 segments just under 512 KiB and a 30-key set on one
+/// slice (worst case 31) read about 15 MiB whole where tier 2 issues 31 leaf
+/// GETs. Above the cap a whole read is charged 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TierOneCost {
     /// `None` when every segment is probed.
@@ -353,11 +373,16 @@ impl TierOneCost {
     };
 
     /// The logs tier-1 read of `fetcher`: whole and unprobed at or under its
-    /// [`LogSegmentFetcher::block_range_threshold`].
+    /// [`LogSegmentFetcher::block_range_threshold`], charged 1 only up to
+    /// [`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`].
     #[must_use]
     pub fn for_logs(fetcher: &LogSegmentFetcher) -> Self {
         TierOneCost {
-            whole_object_bound: Some(fetcher.block_range_threshold()),
+            whole_object_bound: Some(
+                fetcher
+                    .block_range_threshold()
+                    .min(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD),
+            ),
         }
     }
 

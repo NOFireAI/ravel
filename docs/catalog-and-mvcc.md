@@ -1336,8 +1336,9 @@ the tier-1 cost of the part's segments in the routed snapshot (the
 statement's window) is not admitted: it reads as uncovered after no leaf
 GET and is counted in `parts_over_tier_one`, not `parts_uncovered`. A
 segment's tier-1 cost is 1 GET when tier 1 reads it whole without a KEY_IDX
-probe (at or under the logs fetcher's `block_range_threshold` or the spans
-fetcher's `trace_probe_bytes`) and 2 otherwise, the tier-1 probe's two
+probe (at or under the logs fetcher's `block_range_threshold`, capped at
+524,288 bytes for the charge, or the spans fetcher's `trace_probe_bytes`)
+and 2 otherwise, the tier-1 probe's two
 ranged GETs (ADR-3692's per-segment tier-1 cost amendment). A logs day part
 (26 slices, 552 entries) with all 552 segments in the window costs at most
 1,050 at k = 1,024 against a tier-1 cost of 1,104 less one for each segment
