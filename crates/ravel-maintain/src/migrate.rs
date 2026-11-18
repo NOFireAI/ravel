@@ -2534,14 +2534,22 @@ pub async fn background_migrate_unit(
                 floor,
             });
         };
-        if let StoredCursor::Drained { stamp: drained, .. } =
-            read_cursor(store, &cursor_key).await?
-            && drained == stamp
-        {
-            return Ok(BackgroundMigrateOutcome::DrainedUnderContradiction {
-                active_version,
-                floor,
-            });
+        match read_cursor(store, &cursor_key).await {
+            Ok(StoredCursor::Drained { stamp: drained, .. }) if drained == stamp => {
+                return Ok(BackgroundMigrateOutcome::DrainedUnderContradiction {
+                    active_version,
+                    floor,
+                });
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                tenant = %tenant_hash.to_hex(),
+                signal = ?signal,
+                family,
+                error = %err,
+                "background migrate: could not read the drained stamp of a contradicted \
+                 family; walking it"
+            ),
         }
     }
     let walked = migrate_family(
@@ -2559,8 +2567,9 @@ pub async fn background_migrate_unit(
     .await;
     match walked {
         Ok(report) => {
+            // `FloorRaised` is set only after a complete walk whose re-audit
+            // found no straggler.
             if let Some(stamp) = contradiction
-                && report.walk_complete
                 && matches!(report.verification, Some(Verification::FloorRaised { .. }))
                 && let Err(err) = write_drained_stamp(store, &cursor_key, stamp).await
             {
@@ -7069,8 +7078,9 @@ mod tests {
 
     /// A contradicted family is walked once per certificate and watermark: a
     /// walk that drains clean records what it ran under at the cursor key, the
-    /// next unit call sends no LIST, and a re-certification or a completed
-    /// late-write pass (a moved watermark) walks it again.
+    /// next unit call sends no LIST, and a re-certification (a new certified
+    /// time, or a new certified version alone) or a completed late-write pass
+    /// (a moved watermark) walks it again.
     #[tokio::test]
     async fn a_contradicted_family_is_walked_once_per_certificate_and_watermark() {
         use crate::compat_policy::test_support::{
@@ -7103,7 +7113,7 @@ mod tests {
         provision(store.as_ref(), 1).await;
         seed_at(store.as_ref(), 0, 100, 1, "alpha", 6).await;
         activate(store.as_ref(), FAMILY_RSEG, 7).await;
-        let clock = FixedClock::new(sealed_now_ns_for(103));
+        let clock = FixedClock::new(sealed_now_ns_for(104));
         let config = CompactorConfig {
             compat_policy: Some(
                 policy(store.clone(), ManualClock::at(T0))
@@ -7118,7 +7128,7 @@ mod tests {
             BackgroundMigrateOutcome::Walked { .. }
         ));
 
-        let contradict = |certified_unix_ns: i64, watermark_unix_ns: i64| {
+        let contradict = |version: u32, certified_unix_ns: i64, watermark_unix_ns: i64| {
             let store = store.clone();
             async move {
                 update_compat(store.as_ref(), &keys(), |record| {
@@ -7126,7 +7136,7 @@ mod tests {
                         if entry.family == FAMILY_RSEG {
                             entry.contradicted = true;
                             entry.certificate = Some(ravel_proto::sys::v1::Certificate {
-                                version: 7,
+                                version,
                                 certified_unix_ns,
                                 ..Default::default()
                             });
@@ -7147,14 +7157,19 @@ mod tests {
         let lists = || counted.sequence_progress(0);
 
         let mut hour = 100;
-        for (round, (certified, watermark)) in [(T0, T0 + 1), (T0 + 2, T0 + 1), (T0 + 2, T0 + 3)]
-            .into_iter()
-            .enumerate()
+        for (round, (version, certified, watermark)) in [
+            (6, T0, T0 + 1),
+            (6, T0 + 2, T0 + 1),
+            (6, T0 + 2, T0 + 3),
+            (7, T0 + 2, T0 + 3),
+        ]
+        .into_iter()
+        .enumerate()
         {
             // A late writer still writing 6 lands under the floor.
             hour += 1;
             seed_at(store.as_ref(), 0, hour, 1, "alpha", 6).await;
-            contradict(certified, watermark).await;
+            contradict(version, certified, watermark).await;
             view.refresh().await.expect("refresh");
 
             let before = lists();
@@ -7181,6 +7196,231 @@ mod tests {
             assert_eq!(store_snapshot(store.as_ref()).await, snapshot);
         }
         assert!(lists() < 10_000, "the sequence counted every LIST");
+    }
+
+    /// A contradicted family's walk that drains with a straggler left (a late
+    /// write in an hour not yet sealed) records no drained stamp, so the next
+    /// tick walks the family again rather than resting under the same
+    /// certificate and watermark. Once the hour seals, the walk migrates it,
+    /// records the stamp, and the family rests.
+    #[tokio::test]
+    async fn a_contradicted_walk_that_leaves_a_straggler_records_no_drained_stamp() {
+        use crate::compat_policy::test_support::{
+            ManualClock, T0, activate, family, keys, policy, write_compat,
+        };
+        use ravel_catalog::compat::{FAMILY_RSEG, update_compat};
+
+        async fn unit(
+            store: &dyn ObjectStoreBackend,
+            clock: &FixedClock,
+            config: &CompactorConfig,
+        ) -> BackgroundMigrateOutcome {
+            background_migrate_unit(
+                store,
+                clock,
+                config,
+                tenant_hash(),
+                Signal::Metrics,
+                FAMILY,
+                1,
+                MigrateBudget::unlimited(),
+            )
+            .await
+            .expect("background unit")
+        }
+
+        let store = Arc::new(MemoryStore::new());
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 6)], NS_PER_HOUR).await;
+        provision(store.as_ref(), 1).await;
+        seed_at(store.as_ref(), 0, 100, 1, "alpha", 6).await;
+        activate(store.as_ref(), FAMILY_RSEG, 7).await;
+        let clock = FixedClock::new(sealed_now_ns_for(101));
+        let config = CompactorConfig {
+            compat_policy: Some(
+                policy(store.clone(), ManualClock::at(T0))
+                    .await
+                    .with_family(FAMILY_RSEG, two_rseg()),
+            ),
+            ..CompactorConfig::default()
+        };
+        let view = config.compat_policy.as_ref().expect("policy").view();
+        assert!(matches!(
+            unit(store.as_ref(), &clock, &config).await,
+            BackgroundMigrateOutcome::Walked { .. }
+        ));
+
+        // Late writers still writing 6: one in a sealed hour, one in the hour
+        // the clock is in, which the walk cannot migrate yet.
+        let unsealed_hour =
+            u32::try_from(sealed_now_ns_for(101).div_euclid(NS_PER_HOUR)).expect("hour fits");
+        seed_at(store.as_ref(), 0, 101, 1, "alpha", 6).await;
+        seed_at(store.as_ref(), 0, unsealed_hour, 2, "beta", 6).await;
+        update_compat(store.as_ref(), &keys(), |record| {
+            for entry in &mut record.families {
+                if entry.family == FAMILY_RSEG {
+                    entry.contradicted = true;
+                    entry.certificate = Some(ravel_proto::sys::v1::Certificate {
+                        version: 7,
+                        certified_unix_ns: T0,
+                        ..Default::default()
+                    });
+                    entry.late_writes_verified_through_unix_ns = T0 + 1;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .expect("update sys/compat");
+        view.refresh().await.expect("refresh");
+
+        let cursor_key = migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY);
+        let stragglers = Some(Verification::Stragglers {
+            l0: 1,
+            l1: 0,
+            rewrite_parts: 0,
+            blocked: Vec::new(),
+        });
+        for (tick, migrated) in [(0, 1), (1, 0)] {
+            let BackgroundMigrateOutcome::Walked { report, held, .. } =
+                unit(store.as_ref(), &clock, &config).await
+            else {
+                panic!("tick {tick}: a contradicted family with a straggler is walked");
+            };
+            assert!(held.is_empty(), "tick {tick}: {held:?}");
+            assert!(report.walk_complete, "tick {tick}: {report:?}");
+            assert_eq!(report.buckets_migrated, migrated, "tick {tick}: {report:?}");
+            assert_eq!(report.verification, stragglers, "tick {tick}");
+            assert_eq!(
+                read_cursor(store.as_ref(), &cursor_key)
+                    .await
+                    .expect("read cursor"),
+                StoredCursor::Absent,
+                "tick {tick}: a drain with a straggler left records no stamp"
+            );
+        }
+
+        let later = FixedClock::new(sealed_now_ns_for(unsealed_hour));
+        let BackgroundMigrateOutcome::Walked { report, .. } =
+            unit(store.as_ref(), &later, &config).await
+        else {
+            panic!("the sealed straggler is walked");
+        };
+        assert_eq!(report.buckets_migrated, 1, "{report:?}");
+        assert_eq!(
+            report.verification,
+            Some(Verification::FloorRaised { floor_version: 7 })
+        );
+        assert!(matches!(
+            read_cursor(store.as_ref(), &cursor_key)
+                .await
+                .expect("read cursor"),
+            StoredCursor::Drained { .. }
+        ));
+        assert!(matches!(
+            unit(store.as_ref(), &later, &config).await,
+            BackgroundMigrateOutcome::DrainedUnderContradiction { floor: 7, .. }
+        ));
+    }
+
+    /// The drained stamp is advisory: a failed read of it walks the family
+    /// rather than failing the unit.
+    #[tokio::test]
+    async fn a_failed_drained_stamp_read_walks_the_family() {
+        use crate::compat_policy::test_support::{
+            ManualClock, T0, activate, family, keys, policy, write_compat,
+        };
+        use ravel_catalog::compat::{FAMILY_RSEG, update_compat};
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+
+        let store = Arc::new(MemoryStore::new());
+        write_compat(store.as_ref(), vec![family(FAMILY_RSEG, 6)], NS_PER_HOUR).await;
+        provision(store.as_ref(), 1).await;
+        seed_at(store.as_ref(), 0, 100, 1, "alpha", 6).await;
+        activate(store.as_ref(), FAMILY_RSEG, 7).await;
+        let clock = FixedClock::new(sealed_now_ns_for(102));
+        let config = CompactorConfig {
+            compat_policy: Some(
+                policy(store.clone(), ManualClock::at(T0))
+                    .await
+                    .with_family(FAMILY_RSEG, two_rseg()),
+            ),
+            ..CompactorConfig::default()
+        };
+        async fn unit(
+            store: &dyn ObjectStoreBackend,
+            clock: &FixedClock,
+            config: &CompactorConfig,
+        ) -> Result<BackgroundMigrateOutcome> {
+            background_migrate_unit(
+                store,
+                clock,
+                config,
+                tenant_hash(),
+                Signal::Metrics,
+                FAMILY,
+                1,
+                MigrateBudget::unlimited(),
+            )
+            .await
+        }
+        assert!(matches!(
+            unit(store.as_ref(), &clock, &config)
+                .await
+                .expect("first walk"),
+            BackgroundMigrateOutcome::Walked { .. }
+        ));
+        seed_at(store.as_ref(), 0, 101, 1, "alpha", 6).await;
+        update_compat(store.as_ref(), &keys(), |record| {
+            for entry in &mut record.families {
+                if entry.family == FAMILY_RSEG {
+                    entry.contradicted = true;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .expect("update sys/compat");
+        let view = config.compat_policy.as_ref().expect("policy").view();
+        view.refresh().await.expect("refresh");
+        assert!(matches!(
+            unit(store.as_ref(), &clock, &config)
+                .await
+                .expect("contradicted walk"),
+            BackgroundMigrateOutcome::Walked { .. }
+        ));
+        let cursor_key = migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY);
+        assert!(matches!(
+            read_cursor(store.as_ref(), &cursor_key)
+                .await
+                .expect("read cursor"),
+            StoredCursor::Drained { .. }
+        ));
+
+        // A late write the stamp would hide; the stamp read is the unit's
+        // first GET of the cursor key.
+        seed_at(store.as_ref(), 0, 102, 1, "alpha", 6).await;
+        let faulty = FaultStore::new(
+            store.clone(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Transient("stamp read".into()))
+                    .with_key_contains(cursor_key.clone())
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+        let BackgroundMigrateOutcome::Walked { report, .. } = unit(&faulty, &clock, &config)
+            .await
+            .expect("a failed stamp read is not a unit failure")
+        else {
+            panic!("a failed stamp read walks the family");
+        };
+        assert_eq!(faulty.fault_count(Op::Get, FaultKind::Transient), 1);
+        assert_eq!(report.buckets_migrated, 1, "{report:?}");
+        assert_eq!(
+            compacted_versions(store.as_ref(), 0, 102).await,
+            vec![(7, 7)]
+        );
     }
 
     /// An active version this build cannot write makes the background unit a
