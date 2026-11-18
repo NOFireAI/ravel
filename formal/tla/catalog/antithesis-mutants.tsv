@@ -1,0 +1,22 @@
+# negative cfg stem	mutant (inv_mutant! in crates/)	property it must make false
+carryforward-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); the carry branch is reached by every fold of the catalog-maintenance workload past its first
+compaction-loser-diverged-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); no catalog assertion carries the diverged-loser outcome
+compaction-loser-overwrites	catalog/compaction-loser-overwrites	catalog: a published compaction record is never replaced
+compaction-swaps-record	catalog/compaction-swaps-record	catalog: compaction preserves the acked multiset
+corrupt-head-ignores-delete-gate	catalog/corrupt-head-ignores-delete-gate	catalog: a delete gate never clears under an unreadable HEAD
+entry-corruption-ignores-delete-gate	none: ADR-4326 as amended by #4335 ships no mutant for the entry-identity trigger; the workload corrupts only HEAD, so no run reaches an undecodable covering entry
+entry-undecodable-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); the workload corrupts only HEAD, so no run reaches an undecodable covering entry
+fold-includes-tombstoned-entries	none: TombstonedBucketContributesNothing is out of the catalog scope of ADR-4326 decision 2 (tombstones belong to the maintain and lifecycle areas)
+fold-names-entry-above-watermark	none: SnapshotEntriesBelowWatermark is out of the catalog scope of ADR-4326 decision 2; crate tests own the watermark bound
+frontier-reconcile-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); retention-frontier reconcile is out of the catalog scope of decision 2
+head-corruption-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); carried by the reachable "catalog: delete pass refused on an unreadable HEAD"
+head-names-unwritten-part	none: ADR-4326 as amended by #4335 ships no mutant for HeadNamesUnwrittenPart; HeadNamesOnlyCompleteParts is checked by the store audit, "catalog: every object HEAD names exists"
+lost-cas-proceeds	catalog/lost-cas-proceeds	catalog: a fold reports as folded only a HEAD the store holds
+metrics-dedup-dropped	none: SignalDedupContract is out of scope (ADR-4326 decision 2); differential tests own it
+overlap-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); no catalog assertion carries overlapping L1 outputs
+part-corruption-ignores-delete-gate	none: ADR-4326 as amended by #4335 ships no mutant for the covering-part trigger; the workload corrupts only HEAD, so no run reaches an unreadable covering part
+part-unreadable-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); the workload corrupts only HEAD, so no run reaches an unreadable covering part
+query-fails-closed-on-missing-index	none: query rows are out of scope (ADR-4326 decision 2); differential tests own them
+reconcile-on-tick	none: ReconcileOnlyOnWatermarkAdvance is out of the catalog scope of ADR-4326 decision 2; crate tests own it
+snapshot-changes-mid-attempt	none: query rows are out of scope (ADR-4326 decision 2); differential tests own them
+sweep-superseded-no-head-gate	catalog/sweep-superseded-no-head-gate	catalog: a sweep never deletes an object the current HEAD names

@@ -65,6 +65,10 @@ x-ravel-server: &ravel-server
     <<: [*ravel-store, *faketime-env]
     FAKETIME_CHECK_BINARY: /usr/local/bin/ravel-server
     RUST_LOG: info
+    # Empty selects no mutant. scripts/mutant-config.sh writes a copy of this
+    # file that names one, over the catalog-maintenance-mutants images
+    # (README.md, "Mutants").
+    RAVEL_ANTITHESIS_MUTANT: ""
   volumes: ["faketime:/faketime:ro"]
   depends_on:
     faketime: *faketime-done

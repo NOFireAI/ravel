@@ -40,7 +40,9 @@ multiset property below holds across sweeps.
 
 Images, entrypoint store wait, label stamping, the launch-time label check and
 the instrumentation check are the ingest-durability workload's, under the tag
-`catalog-maintenance` and the test name `ravel-catalog-maintenance`.
+`catalog-maintenance` and the test name `ravel-catalog-maintenance`. A mutant
+run uses the tag `catalog-maintenance-mutants` and the test name
+`ravel-catalog-maintenance-mutant` (see "Mutants").
 
 ## Seeding (ADR-4326 decision 5)
 
@@ -271,6 +273,78 @@ stamps on a probe PUT) read at least the three jumps' total minus 60 s ahead
 of the host.
 The last line is `clock jump: PASS` or `clock jump: FAIL`.
 
+## Mutants
+
+ADR-4326 decision 3 (as amended by #4335) gives the catalog area five
+mutants. Each is an `inv_mutant!("catalog/<stem>")` switch in ravel-server's
+library code, compiled in only by the `antithesis-mutants` cargo feature and
+selected at start by `RAVEL_ANTITHESIS_MUTANT`; a name ravel-server does not
+register makes it refuse to start. `formal/tla/catalog/antithesis-mutants.tsv`
+names the property each one must make false, and `local-run.sh` reads it from
+there.
+
+| Mutant | Switch | Property it makes false | Asserted in |
+|---|---|---|---|
+| `catalog/lost-cas-proceeds` | a fold whose HEAD CAS was refused carries on as if it had won | `catalog: a fold reports as folded only a HEAD the store holds` | `crates/ravel-catalog/src/fold.rs` |
+| `catalog/sweep-superseded-no-head-gate` | the superseded-input sweep takes every group's HEAD gate as clear without consulting HEAD | `catalog: a sweep never deletes an object the current HEAD names` | `crates/ravel-maintain/src/sweep.rs` |
+| `catalog/corrupt-head-ignores-delete-gate` | both delete paths treat an undecodable HEAD as naming nothing | `catalog: a delete gate never clears under an unreadable HEAD`, or its sibling on the unreferenced-part sweep, `catalog: a catalog sweep never deletes under an unreadable HEAD` | `crates/ravel-maintain/src/reachability.rs`, `crates/ravel-maintain/src/sweep.rs` |
+| `catalog/compaction-loser-overwrites` | a publisher that loses the record's create-only PUT writes its own payload over the winner's | `catalog: a published compaction record is never replaced` | `crates/ravel-maintain/src/publish.rs` |
+| `catalog/compaction-swaps-record` | compaction moves its last input identity to a writer id no writer is issued, before building the parts | `catalog: compaction preserves the acked multiset` | the driver (`driver/src/main.rs`) |
+
+The corrupt-HEAD mutant switches off the HEAD guard of both delete passes,
+and each pass asserts `CorruptHeadFailsClosedOnDeletePaths` under its own
+literal, so either literal going false counts. The `.tsv` names the first.
+
+Only the four ravel-server containers run a mutant. The driver's on-demand
+fold, compaction and sweep go through `ravel-cli`, which no image builds
+with `antithesis-mutants`, so a mutant fires only in the servers' scheduled
+folds (all four) and in `maint1`/`maint2`'s compaction and sweep. The sweep
+and corrupt-HEAD mutants need a sweep that reaches a delete, so they fire
+only after the sweep jumps ("The sweep jumps"); the corrupt-HEAD one also
+needs the driver's `corrupt_head` rule to land before a scheduled sweep.
+
+`MUTANTS=1 scripts/build.sh` builds the mutant images:
+`ravel-antithesis-server:catalog-maintenance-mutants`, whose ravel-server is
+built with `--features sql,antithesis,antithesis-mutants` (the Dockerfile's
+`SERVER_FEATURES` build argument), and
+`ravel-antithesis-driver:catalog-maintenance-mutants`, built over it. Both
+carry the `org.ravel.antithesis.ref` label, and the server image also
+`org.ravel.antithesis.features`. Besides the instrumentation check, the build
+checks that the server binary registers the five catalog mutant names. The
+default build (no `MUTANTS`) is unchanged: features `sql,antithesis`, tag
+`catalog-maintenance`.
+
+`RAVEL_ANTITHESIS_MUTANT=catalog/<stem>` selects a mutant for `local-run.sh`
+and `launch.sh`. Both pass it to `scripts/mutant-config.sh`, which writes a
+copy of `config/` where every workload image names its `-mutants` tag and the
+ravel-server environment's `RAVEL_ANTITHESIS_MUTANT: ""` names the mutant.
+It refuses, and so both scripts refuse:
+
+- a name that is not one of the five `catalog/` mutants in the `.tsv` (the
+  message lists them);
+- a copy whose rewrite did not move every image line and set exactly one
+  selector.
+
+Both scripts also refuse when `ravel-antithesis-server:catalog-maintenance-mutants`
+lacks `antithesis-mutants` in its `org.ravel.antithesis.features` label: a
+server built without the feature ignores the variable, so the run would test
+no mutant. With the variable unset or empty both run the plain config,
+unchanged.
+
+A mutant run of `local-run.sh` exits 0 only when the mutant's property was
+evaluated false at least once (it appears in `violated.tsv`). Every other
+always-type assertion that went false, and every other gate that failed, is
+printed as `REPORT (mutant run, not gated): ...` and does not change the exit
+code; a mutant that breaks only another property fails the run, as decision
+3 requires. Setup failures that leave no evidence (compose up, setup
+complete, `first_start_workload`, unparsable SDK output) still exit 1. The
+self-check and a mutant run cannot be combined.
+
+`launch.sh` launches a mutant run under the test name
+`ravel-catalog-maintenance-mutant`, with `(mutant <name>)` appended to the
+description and `--param attrs.mutant=<name>`; a plain run passes
+`attrs.mutant=none`.
+
 ## Build, run locally, launch
 
 The same steps as ingest-durability, from this directory's `scripts/`:
@@ -303,10 +377,49 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   `catalog: compaction preserves the acked multiset` must appear in
   `violated.tsv`, and no assertion other than it and `catalog: no scan shows
   a phantom or an excess copy` may. The other gates still apply.
+- `RAVEL_ANTITHESIS_MUTANT=catalog/<stem> scripts/local-run.sh <out-dir>
+  [seconds]` is a mutant control run over the `-mutants` images (see
+  "Mutants"); it exits 0 only when that mutant's property was violated.
 - `scripts/clock-spike.sh <out-dir> [seconds]` (above).
 - `scripts/export-images.sh`, `scripts/import-images.sh`, `scripts/launch.sh
   <hours>`. `launch.sh` validates and launches with a 15-minute setup
-  timeout, above the driver's own 600 s setup budget.
+  timeout, above the driver's own 600 s setup budget. `MUTANTS=1` moves the
+  two image scripts to the `-mutants` images (saved as
+  `<name>.mutants.tar.zst`), and `RAVEL_ANTITHESIS_MUTANT` makes `launch.sh`
+  launch a mutant run.
+
+A smoke and a mutant run, on the build host and then on the launching
+machine:
+
+```sh
+# build host (x86_64, Docker)
+antithesis/catalog-maintenance/scripts/build.sh
+MUTANTS=1 antithesis/catalog-maintenance/scripts/build.sh
+# ok ravel-antithesis-server:catalog-maintenance-mutants: /symbols/ravel-server registers the 5 catalog mutants
+
+antithesis/catalog-maintenance/scripts/local-run.sh out/plain
+# OK: no always-type assertion violated or unhit, ...
+for m in lost-cas-proceeds sweep-superseded-no-head-gate corrupt-head-ignores-delete-gate \
+    compaction-loser-overwrites compaction-swaps-record; do
+  RAVEL_ANTITHESIS_MUTANT=catalog/$m antithesis/catalog-maintenance/scripts/local-run.sh out/$m
+done
+# mutant OK: catalog/<stem> violated "<its property>"   (once per mutant)
+
+antithesis/catalog-maintenance/scripts/export-images.sh s3://<bucket>/<prefix>
+MUTANTS=1 antithesis/catalog-maintenance/scripts/export-images.sh s3://<bucket>/<prefix>
+
+# launching machine
+antithesis/catalog-maintenance/scripts/import-images.sh s3://<bucket>/<prefix>
+MUTANTS=1 antithesis/catalog-maintenance/scripts/import-images.sh s3://<bucket>/<prefix>
+antithesis/catalog-maintenance/scripts/launch.sh 12 "catalog-maintenance smoke"
+RAVEL_ANTITHESIS_MUTANT=catalog/lost-cas-proceeds \
+  antithesis/catalog-maintenance/scripts/launch.sh 12
+```
+
+The `weekly` file in this directory is the marker that opts the workload
+into the weekly run (ADR-4326 decision 4). This tree has no
+`.github/workflows/antithesis-weekly.yml` yet (#4308), so nothing reads the
+marker yet.
 
 ## New external dependencies
 

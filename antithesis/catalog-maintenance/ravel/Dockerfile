@@ -29,10 +29,13 @@ RUN curl -fsSL --max-time 300 -o libfaketime.tar.gz \
  && cp src/libfaketimeMT.so.1 /out/
 
 FROM rust:1.97.1-trixie AS server
+# scripts/build.sh passes sql,antithesis,antithesis-mutants for the
+# catalog-maintenance-mutants image only (ADR-4326 decision 3).
+ARG SERVER_FEATURES=sql,antithesis
 WORKDIR /src
 ENV CARGO_BUILD_JOBS=8
 COPY . .
-RUN cargo build --release --locked -p ravel-server --features sql,antithesis \
+RUN cargo build --release --locked -p ravel-server --features "$SERVER_FEATURES" \
       --config 'build.target = "x86_64-unknown-linux-gnu"' \
       --config 'profile.release.lto = false' \
       --config 'target.x86_64-unknown-linux-gnu.rustflags = ["-Ccodegen-units=1", "-Cpasses=sancov-module", "-Cllvm-args=-sanitizer-coverage-level=3", "-Cllvm-args=-sanitizer-coverage-trace-pc-guard", "-Cllvm-args=-sanitizer-coverage-pc-table", "-Clink-args=-Wl,--build-id"]' \
@@ -41,7 +44,8 @@ RUN cargo build --release --locked -p ravel-server --features sql,antithesis \
  && cp /out/ravel-server /symbols/
 
 # ravel-cli qualifies the bucket here, and the driver image copies it from
-# this image to seed, fold, compact, sweep and decode. It is not under test.
+# this image to seed, fold, compact, sweep and decode. It is not under test,
+# and no mutant is compiled into it.
 FROM rust:1.97.1-trixie AS cli
 WORKDIR /src
 ENV CARGO_BUILD_JOBS=8
