@@ -247,6 +247,28 @@ connection, a pushed-but-broken main).
   `DRILL_RUN` (default `.dd-tools/drill-run`); the script header lists
   the other variables. `scripts/compat/released-binary-drill.test.sh`
   runs the decision logic (`drill-lib.sh`) on recorded listings in CI.
+- `scripts/compat/check-corpus-identity.sh RELEASE_DIR`: the release-time
+  byte-identity check of a frozen corpus (ADR-4233 decision 9, issue
+  #4399). `RELEASE_DIR` is a directory name under
+  `crates/ravel-compat-tests/corpus/` (`v0.34.0`) or its path. Run it on
+  a checkout of the release tag. It moves the committed release directory
+  aside, seeds a fresh one with the committed `PROVENANCE` (which
+  `generate_corpus` reads back and never writes), runs
+  `RAVEL_COMPAT_CORPUS_RELEASE=<release> cargo test --manifest-path
+  crates/ravel-compat-tests/Cargo.toml --test corpus -- --ignored
+  generate_corpus`, and diffs the two with `diff -r -x PROVENANCE -x
+  VERIFIED`, printing any difference. An EXIT trap puts the committed
+  directory back on every exit path, INT and TERM included; after a
+  SIGKILL the committed copy is left under
+  `crates/ravel-compat-tests/.corpus-identity-<release>.*/`, and `git
+  checkout -- <release dir>` restores it. Exit 0: byte-identical, with
+  the count of files compared. 1: a difference, a failed generator run or
+  other step, a committed directory with nothing to compare, or a failed
+  restore. 64:
+  bad usage, no such directory, no `PROVENANCE`, or uncommitted changes
+  under the directory. On a pass, record the result in a new `VERIFIED`
+  file in the release directory (tag, commits, method, result), as
+  `corpus/v0.34.0/VERIFIED` does.
 
 - `scripts/brig.sh new|run|shell|plan|stop|rm|update|path NAME`,
   `scripts/brig.sh login`: the host side of the `make brig*` targets

@@ -10,7 +10,8 @@
 //! `corpus/v0.34.0/` is the baseline candidate, written before the v0.34.0
 //! tag exists. Its `PROVENANCE` records the git tree of each product crate
 //! that wrote a fixture; the byte-identity check against the tagged build is
-//! a release step, not this test, and its result goes in a new file.
+//! a release step, not this test, and its result goes in a new file. The
+//! release step is `scripts/compat/check-corpus-identity.sh`.
 //!
 //! On-disk shape of one release directory:
 //!   - `manifest.txt`, `objects/<NNNN>.bin`, `expected.txt`: metrics. Two RSEG
