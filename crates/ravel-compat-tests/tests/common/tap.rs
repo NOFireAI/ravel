@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::pin::Pin as StdPin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -31,6 +31,7 @@ pub struct TapStore<S> {
     writes: Mutex<Vec<Write>>,
     crash_when: Option<CrashWhen>,
     crashed: AtomicBool,
+    calls: AtomicUsize,
 }
 
 impl<S: ObjectStoreBackend> TapStore<S> {
@@ -42,6 +43,7 @@ impl<S: ObjectStoreBackend> TapStore<S> {
             writes: Mutex::new(Vec::new()),
             crash_when: None,
             crashed: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
         }
     }
 
@@ -75,7 +77,13 @@ impl<S: ObjectStoreBackend> TapStore<S> {
         std::mem::take(&mut *self.writes.lock().expect("writes lock"))
     }
 
+    /// Store calls entered so far, including any still waiting on their yield.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
     async fn enter(&self) -> Result<(), StoreError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         if self.yield_each_call {
             YieldOnce(false).await;
         }
