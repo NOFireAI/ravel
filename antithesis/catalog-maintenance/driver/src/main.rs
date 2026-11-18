@@ -16,12 +16,13 @@ mod audit;
 mod cli;
 mod clock;
 mod multiset;
+mod race;
 mod s3;
 mod seed;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -61,6 +62,8 @@ const DECODES_PER_AUDIT: usize = 16;
 const SETUP_BUDGET: Duration = Duration::from_secs(600);
 /// Acked writes verified by one token read in the eventually.
 const TOKEN_BATCH: usize = 20;
+/// Fold races the eventually runs until a server fold is overtaken.
+const FOLD_RACES_EVENTUALLY: u32 = 6;
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -171,6 +174,8 @@ impl Config {
 struct Jump {
     before_ns: u64,
     after_ns: u64,
+    /// The total offset after this move.
+    offset_s: u64,
     reached_driver: bool,
 }
 
@@ -203,6 +208,17 @@ struct Shared {
     sweep_jump_started: AtomicBool,
     /// The horizon and window jumps, once both reached the driver.
     sweep_jump: Mutex<Option<(Jump, Jump)>>,
+    /// The offset the file holds: every jump and nudge so far.
+    offset_s: Mutex<u64>,
+    /// The client and token of the on-demand fold route.
+    admin: reqwest::blocking::Client,
+    token: String,
+    /// The last fold race's skewed-fold and mean server-fold seconds.
+    fold_race_timings: Mutex<(f64, f64)>,
+    /// Fold races run; numbers each one's HEAD garbage.
+    fold_races: AtomicU64,
+    /// Whether a server fold lost its HEAD CAS to the skewed fold.
+    fold_overtaken: AtomicBool,
     /// Every key an audit or the sweep jump has listed, and the swept
     /// inputs confirmed gone. Keys are never reused, so one listed here and
     /// absent from a later LIST was deleted.
@@ -536,7 +552,7 @@ impl Shared {
             return;
         }
         let acked = lock(&self.model).acked_logs.len();
-        let jump = self.shift_clock(self.clock.jump_s, self.clock.jump_s, reason);
+        let jump = self.shift_clock(self.clock.jump_s, reason);
         *slot = Some(jump);
         drop(slot);
         if !jump.reached_driver {
@@ -546,7 +562,8 @@ impl Shared {
             "clock: the driver's clock jumped forward",
             &json!({
                 "reason": reason,
-                "offset_s": self.clock.jump_s,
+                "jump_s": self.clock.jump_s,
+                "offset_s": jump.offset_s,
                 "min_jump_s": clock::min_jump_s(),
                 "before_ns": jump.before_ns,
                 "after_ns": jump.after_ns,
@@ -577,8 +594,7 @@ impl Shared {
             },
             None => println!("sweep jump: no HEAD key known, so nothing listed before the jump"),
         }
-        let horizon_offset = self.clock.jump_s + self.clock.horizon_jump_s;
-        let horizon = self.shift_clock(horizon_offset, self.clock.horizon_jump_s, reason);
+        let horizon = self.shift_clock(self.clock.horizon_jump_s, reason);
         if !horizon.reached_driver {
             return;
         }
@@ -587,8 +603,7 @@ impl Shared {
             println!("sweep jump: the fold after the horizon jump failed");
         }
         let marked = (0..SHARDS).filter(|&shard| self.sweep(shard)).count();
-        let window_offset = horizon_offset + self.clock.window_jump_s;
-        let window = self.shift_clock(window_offset, self.clock.window_jump_s, reason);
+        let window = self.shift_clock(self.clock.window_jump_s, reason);
         if !window.reached_driver {
             return;
         }
@@ -597,7 +612,7 @@ impl Shared {
             "clock: the clocks jumped past the sweep's protection horizon and pinned-query window",
             &json!({
                 "reason": reason,
-                "offset_s": window_offset,
+                "offset_s": window.offset_s,
                 "horizon_jump_s": self.clock.horizon_jump_s,
                 "protection_horizon_s": clock::protection_horizon_s(),
                 "window_jump_s": self.clock.window_jump_s,
@@ -608,23 +623,28 @@ impl Shared {
         self.settle("pinned-window jump");
     }
 
-    /// Write `offset_s`, the total offset, and wait for the driver's own
-    /// clock to move by `by_s`. libfaketime rereads the file every
-    /// `reread_s` seconds; the driver runs under it like every other
-    /// container.
-    fn shift_clock(&self, offset_s: u64, by_s: u64, reason: &str) -> Jump {
+    /// Raise the total offset by `by_s` and wait for the driver's own clock
+    /// to move by it. libfaketime rereads the file every `reread_s` seconds;
+    /// the driver runs under it like every other container.
+    fn shift_clock(&self, by_s: u64, reason: &str) -> Jump {
         let before_ns = now_ns();
-        if let Err(e) = clock::write_offset(&self.clock.file, offset_s) {
-            assert_unreachable!(
-                "clock: the driver could not write the clock offset",
-                &json!({ "file": self.clock.file.display().to_string(), "detail": e })
-            );
-            return Jump {
-                before_ns,
-                after_ns: before_ns,
-                reached_driver: false,
-            };
-        }
+        let offset_s = {
+            let mut total = lock(&self.offset_s);
+            if let Err(e) = clock::write_offset(&self.clock.file, *total + by_s) {
+                assert_unreachable!(
+                    "clock: the driver could not write the clock offset",
+                    &json!({ "file": self.clock.file.display().to_string(), "detail": e })
+                );
+                return Jump {
+                    before_ns,
+                    after_ns: before_ns,
+                    offset_s: *total,
+                    reached_driver: false,
+                };
+            }
+            *total += by_s;
+            *total
+        };
         let deadline = Instant::now() + Duration::from_secs(self.clock.reread_s + 30);
         let mut after_ns = now_ns();
         while !clock::moved(before_ns, after_ns, by_s) && Instant::now() < deadline {
@@ -646,8 +666,25 @@ impl Shared {
         Jump {
             before_ns,
             after_ns,
+            offset_s,
             reached_driver,
         }
+    }
+
+    /// Move every clock forward by `by_s` outside the three planned jumps,
+    /// and settle. The local loop adds every such move, from the line this
+    /// prints, to the offset it expects.
+    fn nudge(&self, by_s: u64, reason: &str) -> bool {
+        if by_s == 0 {
+            return true;
+        }
+        let jump = self.shift_clock(by_s, reason);
+        if !jump.reached_driver {
+            return false;
+        }
+        println!("clock: moved forward by {by_s} s outside the planned jumps ({reason})");
+        self.settle(reason);
+        true
     }
 
     /// After a jump reached the driver: wait one more reread, within which
@@ -777,6 +814,151 @@ impl Shared {
             println!("maintain compact-tenant: {}", out.summary());
         }
         out.ok()
+    }
+
+    /// `POST /api/v1/admin/fold` on one `--mode all` server: the body on a
+    /// 200, else why not.
+    fn admin_fold(&self, node: usize) -> Result<String, String> {
+        let url = format!("{}/api/v1/admin/fold", self.ravel.nodes[node]);
+        let resp = self
+            .admin
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&json!({ "signal": "logs", "tenant": self.tenant }))
+            .timeout(Duration::from_secs(u64::from(CLI_TIMEOUT_S)))
+            .send()
+            .map_err(|e| format!("{url}: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().map_err(|e| format!("{url}: {e}"))?;
+        if status.is_success() {
+            Ok(body)
+        } else {
+            Err(format!("{url}: {status}: {body}"))
+        }
+    }
+
+    /// One fold race (README.md, "The forced races"): nudge every clock to
+    /// just before an hour seals, overwrite HEAD with garbage, start a
+    /// `ravel-cli` fold whose clock runs `race::FOLD_SKEW_S` ahead, and
+    /// `delay_frac` into the window the last race's timings give, post an
+    /// on-demand fold to each `--mode all` server. The garbage HEAD makes
+    /// every fold rebuild and lets the on-demand route past its rate gate.
+    /// The caller holds the gate's write guard: nothing else moves the clock
+    /// or HEAD's bytes meanwhile. Returns whether a server fold lost its HEAD
+    /// CAS to the skewed fold.
+    fn fold_race(&self, delay_frac: f64, reason: &str) -> bool {
+        let Some(head_key) = lock(&self.head_key).clone() else {
+            println!("fold race: no HEAD key known yet");
+            return false;
+        };
+        if !self.nudge(
+            clock::fold_race_nudge_s(now_ns() / 1_000_000_000),
+            "fold race",
+        ) {
+            return false;
+        }
+        let now_s = now_ns() / 1_000_000_000;
+        let Some((seal, ahead_hour)) = clock::fold_race_seal(now_s)
+            .and_then(|seal| Some((seal, clock::sealed_watermark_hour(seal)?)))
+        else {
+            println!("fold race: {now_s} is outside the race's window after the nudge");
+            return false;
+        };
+        let n = self.fold_races.fetch_add(1, Ordering::SeqCst);
+        // Bytes no earlier race wrote, so HEAD's version is new on a store
+        // that derives it from content.
+        let garbage = format!("antithesis: not a catalog HEAD (fold race {n})");
+        if let Err(e) = self.store.put(&head_key, garbage.as_bytes()) {
+            println!("fold race: overwriting HEAD: {e}");
+            return false;
+        }
+        let skewed = format!("+{}", *lock(&self.offset_s) + race::FOLD_SKEW_S);
+        let (cli_s, server_s) = *lock(&self.fold_race_timings);
+        let delay_s = race::server_delay_s(cli_s, server_s, delay_frac);
+        let started = Instant::now();
+        let ((cli_out, cli_took), servers) = std::thread::scope(|scope| {
+            let cli = scope.spawn(|| {
+                let out = self.cli.run_env(
+                    &self.args(&["catalog", "fold", "--shards", "4", "--json"]),
+                    CLI_TIMEOUT_S,
+                    &[("FAKETIME", skewed.as_str())],
+                );
+                (out, started.elapsed())
+            });
+            std::thread::sleep(Duration::from_secs_f64(delay_s));
+            let posts: Vec<_> = (0..self.ravel.nodes.len())
+                .map(|node| {
+                    scope.spawn(move || {
+                        let t = Instant::now();
+                        (self.admin_fold(node), t.elapsed())
+                    })
+                })
+                .collect();
+            let servers: Vec<_> = posts
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        (Err("the post thread panicked".to_string()), Duration::ZERO)
+                    })
+                })
+                .collect();
+            let cli = cli.join().unwrap_or_else(|_| {
+                (
+                    cli::Output {
+                        code: None,
+                        stdout: String::new(),
+                        stderr: "the fold thread panicked".to_string(),
+                    },
+                    Duration::ZERO,
+                )
+            });
+            (cli, servers)
+        });
+        let cli_fold = race::parse_cli_fold(&cli_out.stdout);
+        let answered: Vec<f64> = servers
+            .iter()
+            .filter(|(r, _)| r.is_ok())
+            .map(|(_, took)| took.as_secs_f64())
+            .collect();
+        if cli_out.ok() && !answered.is_empty() {
+            let mean = answered.iter().sum::<f64>() / answered.len() as f64;
+            *lock(&self.fold_race_timings) = (cli_took.as_secs_f64(), mean);
+        }
+        let folds: Vec<Option<race::ServerFold>> = servers
+            .iter()
+            .map(|(r, _)| r.as_ref().ok().and_then(|b| race::parse_server_fold(b)))
+            .collect();
+        let won = cli_fold.as_ref().is_some_and(|c| {
+            folds
+                .iter()
+                .flatten()
+                .any(|s| race::overtaken(c, s, ahead_hour))
+        });
+        let details = json!({
+            "reason": reason,
+            "race": n,
+            "seal_s": seal,
+            "ahead_hour": ahead_hour,
+            "skew_s": race::FOLD_SKEW_S,
+            "server_delay_s": delay_s,
+            "cli_s": cli_took.as_secs_f64(),
+            "cli": cli_fold.as_ref().map(|c| format!("{c:?}")).unwrap_or_else(|| cli_out.summary()),
+            "servers": servers.iter().map(|(r, took)| match r {
+                Ok(body) => format!("{body} ({:.1} s)", took.as_secs_f64()),
+                Err(e) => e.clone(),
+            }).collect::<Vec<_>>(),
+        });
+        println!("fold race: {details}");
+        assert_sometimes!(
+            won,
+            "catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead",
+            &details
+        );
+        if won {
+            self.fold_overtaken.store(true, Ordering::SeqCst);
+        }
+        let _ = self.inspect_json();
+        won
     }
 
     /// The audit, then the sweep check over its LIST.
@@ -1068,6 +1250,23 @@ impl Workload {
     }
 
     #[rule(groups = ["main"], weight = 1)]
+    fn race_folds(&self, tc: TestCase) {
+        let s = &self.0;
+        if s.stopping.load(Ordering::SeqCst) || lock(&s.head_key).is_none() {
+            return;
+        }
+        if !tc.draw(gs::weighted_booleans(0.03)) {
+            return;
+        }
+        let frac = f64::from(tc.draw(gs::integers::<u32>().min_value(1).max_value(9))) / 10.0;
+        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        s.fold_race(frac, "drawn");
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
     fn corrupt_head(&self, tc: TestCase) {
         let s = &self.0;
         let Some(_g) = s.enter() else {
@@ -1161,6 +1360,15 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         } else {
             s.jump_clock("eventually");
         }
+    }
+    if lock(&s.head_key).is_none() {
+        let _ = s.inspect_json();
+    }
+    for attempt in 0..FOLD_RACES_EVENTUALLY {
+        if s.fold_overtaken.load(Ordering::SeqCst) {
+            break;
+        }
+        s.fold_race(f64::from(attempt % 3 + 1) / 4.0, "eventually");
     }
     // With faults stopped the fold and the compaction run over every hour
     // the jump sealed, so the multiset below is checked after both.
@@ -1440,8 +1648,13 @@ fn main(tc: TestCase) {
     let seeded = plan.expected(cfg.inject_swap);
     let ravel = Ravel::new(cfg.nodes.clone(), cfg.token.clone()).unwrap_or_else(|e| die(&e));
     let maint = Ravel::new(cfg.maint_nodes.clone(), cfg.token.clone()).unwrap_or_else(|e| die(&e));
+    let admin = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|e| die(&format!("building the HTTP client: {e}")));
     let Config {
         clock,
+        token,
         tenant,
         max_writes,
         eventually_on,
@@ -1467,6 +1680,12 @@ fn main(tc: TestCase) {
         jump: Mutex::new(None),
         sweep_jump_started: AtomicBool::new(false),
         sweep_jump: Mutex::new(None),
+        offset_s: Mutex::new(0),
+        admin,
+        token,
+        fold_race_timings: Mutex::new((0.0, 0.0)),
+        fold_races: AtomicU64::new(0),
+        fold_overtaken: AtomicBool::new(false),
         sweeps: Mutex::new(audit::SweepLedger::default()),
         inputs_of: Mutex::new(BTreeMap::new()),
         gate: RwLock::new(()),

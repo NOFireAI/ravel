@@ -120,20 +120,65 @@ pub fn moved(before_ns: u64, after_ns: u64, jump_s: u64) -> bool {
     after_ns.saturating_sub(before_ns) >= want
 }
 
+/// `max_flush_lifetime + clock_skew_allowance + fold_safety_margin`: an hour
+/// seals this long after it ends.
+pub fn seal_margin_s() -> u64 {
+    MAX_FLUSH_LIFETIME_S + CLOCK_SKEW_ALLOWANCE_S + FOLD_SAFETY_MARGIN_S
+}
+
+/// The newest sealed hour at `now_s`, as `sealed_watermark_hour` in
+/// crates/ravel-catalog/src/fold.rs computes it with the default parameters.
+pub fn sealed_watermark_hour(now_s: u64) -> Option<u64> {
+    let floor_hours = now_s.checked_sub(seal_margin_s())? / 3600;
+    floor_hours.checked_sub(1)
+}
+
+/// The first second after `now_s` at which the sealed watermark moves.
+pub fn next_seal_s(now_s: u64) -> u64 {
+    let phase = seal_margin_s() % 3600;
+    (now_s + 3600 - phase) / 3600 * 3600 + phase
+}
+
+/// The fold race starts at least this long before the seal it straddles, so
+/// a server fold posted up to `race::MAX_SERVER_DELAY_S` after the start
+/// still reads its clock before the seal.
+const FOLD_RACE_TAIL_S: u64 = 60;
+/// And at most this long before it, so the skewed fold, `FOLD_SKEW_S` ahead,
+/// reads its clock past the seal with this much to spare.
+const FOLD_RACE_LEAD_S: u64 = crate::race::FOLD_SKEW_S - 15;
+/// Where a nudge puts the clocks: this long before the next seal, inside the
+/// race's window.
+const FOLD_RACE_AIM_S: u64 = 150;
+/// The smallest nudge: one the settle after it cannot overrun.
+const MIN_NUDGE_S: u64 = 10;
+
+/// The seal a fold race started at `now_s` straddles: the skewed fold sees
+/// the hour that seals then as sealed and the server folds do not. `None`
+/// when `now_s` is outside the race's window.
+pub fn fold_race_seal(now_s: u64) -> Option<u64> {
+    let seal = next_seal_s(now_s);
+    (FOLD_RACE_TAIL_S..=FOLD_RACE_LEAD_S)
+        .contains(&(seal - now_s))
+        .then_some(seal)
+}
+
+/// How far to move every clock forward so a fold race started then is inside
+/// its window; 0 when one started at `now_s` already is.
+pub fn fold_race_nudge_s(now_s: u64) -> u64 {
+    if fold_race_seal(now_s).is_some() {
+        return 0;
+    }
+    next_seal_s(now_s + MIN_NUDGE_S + FOLD_RACE_AIM_S) - FOLD_RACE_AIM_S - now_s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const NS_PER_HOUR: u64 = 3_600_000_000_000;
 
-    /// The newest sealed hour at `now_ns`, as `sealed_watermark_hour` in
-    /// crates/ravel-catalog/src/fold.rs computes it with the default
-    /// parameters.
     fn sealed_watermark_hour(now_ns: u64) -> Option<u64> {
-        let margin_ns =
-            (MAX_FLUSH_LIFETIME_S + CLOCK_SKEW_ALLOWANCE_S + FOLD_SAFETY_MARGIN_S) * NS_PER_SECOND;
-        let floor_hours = now_ns.checked_sub(margin_ns)? / NS_PER_HOUR;
-        floor_hours.checked_sub(1)
+        super::sealed_watermark_hour(now_ns / NS_PER_SECOND)
     }
 
     #[test]
@@ -149,6 +194,64 @@ mod tests {
             Some(98)
         );
         assert_eq!(sealed_watermark_hour(margin_ns), None);
+    }
+
+    #[test]
+    fn the_next_seal_is_where_the_watermark_moves() {
+        let start = 1_800_000_000;
+        for now in start..start + 2 * 3600 + 7 {
+            let seal = next_seal_s(now);
+            assert!(seal > now && seal - now <= 3600, "{now}");
+            assert_eq!(sealed_watermark_hour(seal - 1), sealed_watermark_hour(now));
+            assert_eq!(
+                sealed_watermark_hour(seal),
+                sealed_watermark_hour(now).map(|h| h + 1)
+            );
+        }
+        // The default margin puts each seal at twenty past the hour.
+        assert_eq!(next_seal_s(start) % 3600, 1200);
+    }
+
+    #[test]
+    fn a_fold_race_in_its_window_straddles_the_seal() {
+        let skew = crate::race::FOLD_SKEW_S;
+        let delay = crate::race::MAX_SERVER_DELAY_S as u64;
+        let start = 1_800_000_000;
+        let mut inside = 0;
+        for now in start..start + 3600 {
+            let Some(seal) = fold_race_seal(now) else {
+                continue;
+            };
+            inside += 1;
+            let w = sealed_watermark_hour(now);
+            // The skewed fold sees one more sealed hour, the servers, posted
+            // up to the delay bound later, none.
+            assert_eq!(sealed_watermark_hour(now + skew), w.map(|h| h + 1));
+            assert_eq!(sealed_watermark_hour(now + delay + 15), w);
+            assert_eq!(seal, next_seal_s(now));
+        }
+        assert_eq!(inside, FOLD_RACE_LEAD_S - FOLD_RACE_TAIL_S + 1);
+    }
+
+    #[test]
+    fn a_nudge_lands_inside_the_fold_race_window() {
+        let start = 1_800_000_000;
+        for now in start..start + 3600 {
+            let nudge = fold_race_nudge_s(now);
+            if fold_race_seal(now).is_some() {
+                assert_eq!(nudge, 0);
+                continue;
+            }
+            assert!((MIN_NUDGE_S..MIN_NUDGE_S + 3600).contains(&nudge), "{now}");
+            // Settling for up to the window's slack after the nudge still
+            // starts the race inside it.
+            for settle in [0, 30, 80] {
+                assert!(
+                    fold_race_seal(now + nudge + settle).is_some(),
+                    "{now}+{settle}"
+                );
+            }
+        }
     }
 
     #[test]

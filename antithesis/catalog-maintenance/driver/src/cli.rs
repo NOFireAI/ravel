@@ -50,11 +50,18 @@ impl Cli {
     /// Run `ravel-cli --store s3 --tenant-hash-unkeyed <args>` for at most
     /// `timeout_s` seconds.
     pub fn run(&self, args: &[&str], timeout_s: u32) -> Output {
+        self.run_env(args, timeout_s, &[])
+    }
+
+    /// [`Cli::run`] with `env` set on the process, such as a libfaketime
+    /// timestamp file of its own.
+    pub fn run_env(&self, args: &[&str], timeout_s: u32, env: &[(&str, &str)]) -> Output {
         let out = Command::new("timeout")
             .arg(timeout_s.to_string())
             .arg(&self.bin)
             .args(["--store", "s3", "--tenant-hash-unkeyed"])
             .args(args)
+            .envs(env.iter().copied())
             .output();
         match out {
             Ok(o) => Output {

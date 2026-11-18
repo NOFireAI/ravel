@@ -21,6 +21,9 @@ antithesis_sdk = "0.4"
 antithesis-instrumentation = "0.1"
 hegeltest = { version = "0.52", features = ["static-engine"] }
 serde_json = "1"
+# The on-demand fold route the fold race posts to; the version and features
+# the ingest-durability driver already builds.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
 # The seed file `ravel-cli load` reads. The versions the repository's own
 # Cargo.lock pins.
 arrow-array = "59"
