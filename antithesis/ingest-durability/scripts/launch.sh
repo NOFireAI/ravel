@@ -22,8 +22,9 @@ TAG=ingest-durability
 TEST_NAME=ravel-ingest-durability
 
 if [ -n "$MUTANT" ]; then
-    # Only a commit mutant listed in the TSV: an unknown name would select
-    # nothing, and the run would pass as a plain run.
+    # Only a commit mutant listed in the TSV. ravel-server refuses an unknown
+    # name at startup (ravel_invariant::init), so a typo would launch a run
+    # whose every node exits at once; refusing here costs no compute hours.
     if ! awk -F'\t' -v m="$MUTANT" '!/^#/ && $2 == m && m ~ /^commit\// { found = 1 } END { exit !found }' "$TSV"; then
         echo "refused: $MUTANT is not a mutant listed in formal/tla/commit/antithesis-mutants.tsv" >&2
         exit 1
