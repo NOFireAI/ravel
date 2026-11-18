@@ -19834,7 +19834,9 @@ pub(crate) mod tests {
     /// writes at the same budget. The restart stores the leaves the
     /// one-call build writes with writer 35's read failed, the same leaves
     /// as a fold whose first-pass read of writer 35 failed and needed no
-    /// restart.
+    /// restart. The metrics series fields (ADR-4146) are built in one pass
+    /// with no restart, and store the same bytes carried, from scratch and in
+    /// one fold ([`series_index::assert_series_leaves_carried_equal_from_scratch`]).
     #[tokio::test]
     async fn the_leaves_are_the_same_carried_from_scratch_and_after_a_restart() {
         let writer_35 = {
@@ -19955,6 +19957,7 @@ pub(crate) mod tests {
                 "budget {max_pairs}: after a restart"
             );
         }
+        series_index::assert_series_leaves_carried_equal_from_scratch().await;
     }
 
     /// The share is fixed for the build (ADR-3692 decision 5): with two
