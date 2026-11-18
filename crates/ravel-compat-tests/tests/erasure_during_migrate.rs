@@ -20,10 +20,11 @@
 //! tracked separately as issue #4449, and neither test here exercises it.
 //!
 //! The second test runs the same race against the maintain process's
-//! background migrate unit (`--background-migrate`, issue #4448), with its
-//! configuration built the way the server builds it: the base configuration
-//! joined to the claim protocol through
-//! `CompactorConfig::with_claim_participant`, not a hand-set participant.
+//! background migrate unit (`--background-migrate`, issue #4448). Its
+//! configuration is the base configuration joined to the claim protocol
+//! through `CompactorConfig::with_claim_participant`, as a separate process
+//! from the erasure. The ids of both are chosen here; the server's own
+//! construction of the migrate's id is tested in ravel-server.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -391,9 +392,9 @@ fn an_erasure_and_a_pinned_query_during_migrate_complete_at_n_plus_1() {
     );
 }
 
-/// The background migrate unit's configuration as the maintain process builds
-/// it from `base`: the compactor configuration with `--maintain-claims` on and
-/// no participant, joined to the claim protocol as process `process` on the
+/// The background migrate unit's configuration: `base`, with claims on and no
+/// participant, joined to the claim protocol through
+/// `CompactorConfig::with_claim_participant` as process `process` on the
 /// unit's own `clock`.
 fn background_config(base: &CompactorConfig, process: u128, clock: &FixedClock) -> CompactorConfig {
     base.with_claim_participant(
@@ -473,7 +474,7 @@ async fn background_seed(seed: u64, tally: &mut BackgroundTally) {
     assert_eq!(
         (base.coordination, base.claim_participant.is_none()),
         (Coordination::On, true),
-        "seed {seed}: the base is the server's: claims on, no participant yet"
+        "seed {seed}: the base has claims on and no participant yet"
     );
     let unit_clock = FixedClock::new(sealed_now_ns());
     let migrate_config = background_config(&base, 1, &unit_clock);
@@ -583,8 +584,9 @@ async fn background_seed(seed: u64, tally: &mut BackgroundTally) {
     );
 }
 
-/// A claimed erasure beside the background migrate unit, configured as the
-/// maintain process configures it, over 32 seeded interleavings: no seed ends
+/// A claimed erasure beside the background migrate unit, joined to the claim
+/// protocol through `CompactorConfig::with_claim_participant` as a separate
+/// process from the erasure, over 32 seeded interleavings: no seed ends
 /// with two live records in the bucket, and no query returns the erased
 /// sample.
 #[test]

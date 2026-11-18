@@ -397,12 +397,9 @@ async fn run_background_migrate(
         claim_participant: None,
         ..CompactorConfig::clone(&ctx.compactor)
     };
-    let compactor = crate::maintain::claiming(
-        &unclaimed,
-        ctx.migrate_claim_process_id,
-        ctx.clock.clone(),
-    )
-    .into_owned();
+    let compactor =
+        crate::maintain::claiming(&unclaimed, ctx.migrate_claim_process_id, ctx.clock.clone())
+            .into_owned();
     let runtime = tokio::runtime::Handle::current();
     let walked = tokio::task::spawn_blocking(move || {
         runtime.block_on(async move {
@@ -1292,7 +1289,9 @@ mod tests {
                 panic!("{label}: one provisioned signal, one unit: {report:?}");
             };
             let Ok(BackgroundMigrateOutcome::Walked { report: walk, .. }) = &unit.outcome else {
-                panic!("{label}: the walk stands down rather than going on to the rewrite: {report:?}");
+                panic!(
+                    "{label}: the walk stands down rather than going on to the rewrite: {report:?}"
+                );
             };
             assert_eq!(
                 (walk.buckets_migrated, walk.not_migrated.len()),

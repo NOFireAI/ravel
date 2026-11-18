@@ -109,8 +109,9 @@ Payload is a versioned-tag protobuf:
   renewed_count, lease_duration_ns, owner_clock_ns }
 ```
 
-`owner_process_id` is the ADR-0057/0065 startup UUID; `attempt_id` is
-fresh per acquisition. `input_set_hash` and `owner_clock_ns` are
+`owner_process_id` is the ADR-0057/0065 startup UUID (or another id the
+process draws for a concurrent claiming task, see the 2026-11-18
+amendment); `attempt_id` is fresh per acquisition. `input_set_hash` and `owner_clock_ns` are
 informational (operator forensics), never inputs to any decision.
 `state` is `running` or `completed`.
 
@@ -586,7 +587,9 @@ The renewal store error is the case that motivated this, but a matching
 process id covers every claim this process left behind: one from a run that
 failed with any other error after taking it, and this process's own
 completed claim from an earlier run. Process ids are fresh per process
-start and per CLI invocation, so none of these is another process's claim.
+start and per CLI invocation, so none of these is another process's claim
+(a process with two concurrent claiming tasks gives each its own id, see
+the 2026-11-18 amendment).
 A concurrent sibling run of the same bucket in one process, which the
 supervisor and the CLI walk do not produce, would cancel at its next
 renewal if that fell before it published, and otherwise duplicate the
@@ -1004,3 +1007,45 @@ and `version_protected_warn_fires_once_per_work_id` in
 `a_future_format_claim_stalls_an_erasure_for_at_most_the_lease_ceiling` named
 by the 2026-11-09 amendment: that test is no longer accurate, since a
 future-format claim is no longer stolen at any age.
+
+## Amendment (2026-11-18): a process may claim under more than one owner id (issue #4448)
+
+<!-- amendment-applies: sections="1. A reusable claim primitive in ravel-fleet|Amendment (2026-09-30): reclaim a same-process leftover claim without waiting out the lease (issue #2156)" pointer="2026-11-18 amendment" -->
+<!-- amendment-supersedes: phrase="`owner_process_id` is the ADR-0057/0065 startup UUID;" pointer="2026-11-18 amendment" -->
+
+Decision 1 said `owner_process_id` is the ADR-0057/0065 startup UUID, the
+id the process's `sys/maintain/workers/<process_id>` heartbeat is keyed
+under. That held while each process had one claiming task. A maintain
+process run with `--background-migrate` has two that run concurrently: the
+maintenance tick (compaction and erasure rewrite) and the background
+migrate walk. The 2026-09-30 amendment makes a claim guard reclaim a claim
+held under its own owner id at once, without waiting for the lease, so two
+concurrent tasks under one id would each take a bucket the other holds.
+
+A process may therefore claim under more than one owner id, one per
+concurrent claiming task:
+
+- The maintenance tick claims under the startup UUID, as before.
+- Background migrate claims under its own id, drawn from the process RNG
+  once per process start, when the server builds the compat maintenance
+  context. It always installs its own participant under that id, replacing
+  any participant already in the configuration, so the two tasks never
+  share one. At startup the server logs that id next to the worker id, the
+  one record that maps it back to the process.
+- A claim's owner id therefore need not match any heartbeat key. No
+  decision reads that link: the claim guard compares an observed owner id
+  only with its own, for the same-process reclaim. An operator following a
+  claim holder to a heartbeat finds none for a background migrate claim and
+  uses the startup log line instead.
+
+The 2026-09-30 amendment's reasoning holds per owner id: an owner id is
+fresh per process start and per claiming task, so a claim under the
+guard's own owner id is still one this task left behind.
+
+Tests, each shown failing against a mutation of the code it pins:
+`the_spawned_context_draws_a_migrate_claim_id_apart_from_the_worker_id` in
+`services/ravel-server/src/compat_maintain.rs` fails when the context takes
+the worker id; `background_migrate_stands_down_for_a_claim_the_ticks_process_id_holds`
+in the same file fails when the walk claims under the worker id, and, for
+a configuration that already carries a participant under the worker id,
+when the walk reuses that participant.
