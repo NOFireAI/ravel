@@ -1,14 +1,21 @@
-//! The memory-budget charge of a series listing over one L1 metrics part, as a
-//! function of part size (issue #4393), for the `l1_listing_charge` bin.
+//! The memory-budget charge of reading one L1 metrics part's catalog, as a
+//! function of part size (issues #4393 and #4433), for the `l1_listing_charge`
+//! bin. It measures two paths over the same part, each with its own band:
 //!
-//! A metrics listing decodes each L1 part's catalog through the charged path
-//! (`docs/query-engine.md`, "Per-sample provenance"): up to
-//! [`PROVENANCE_COLUMN_BYTES_PER_SAMPLE`] of decoded provenance columns plus a
-//! [`SAMPLE_PROVENANCE_BYTES`] `SampleProvenance` for every sample in the part,
-//! whatever the matchers select, on top of the catalog sections' decoded
-//! length. That bound grows with the samples a part holds, so the part cap
-//! (`--max-l1-part-bytes`) sets the budget a listing needs. This module
-//! measures the charge instead of bounding it.
+//! - **Listing**: the series listing the metrics discovery endpoints run,
+//!   `QueryEngine::resolve_series`, whose per-object read
+//!   (`SegmentFetcher::list_series_phase_accounted`) skips the per-sample
+//!   provenance extension (`docs/query-engine.md`, "Per-sample provenance").
+//!   Its charge is the wire bytes its GETs hold plus the catalog sections'
+//!   decoded length ([`listing_charge`]); what grows with samples is stored
+//!   bytes only.
+//! - **Sample read**: the catalog decode every sample path runs,
+//!   `SegmentFetcher::fetch_series`, which decodes and charges up to
+//!   [`PROVENANCE_COLUMN_BYTES_PER_SAMPLE`] of provenance columns plus a
+//!   [`SAMPLE_PROVENANCE_BYTES`] `SampleProvenance` for every sample in the
+//!   part, whatever the matchers select, on top of the listing's charge. That
+//!   grows with the samples a part holds, so the part cap
+//!   (`--max-l1-part-bytes`) sets the budget a sample read needs.
 //!
 //! Per run it:
 //!
@@ -24,48 +31,49 @@
 //!    contiguous slice of event time for every series, as a replay writes
 //!    them, under its own writer sequence, so the compactor merges each
 //!    series' runs and writes the per-sample provenance extension (the smoke
-//!    test pins a peak above 96 bytes per sample, which only a part carrying
-//!    provenance for every sample charges). The
-//!    generator's anomalies (missing, stale, reset, out-of-order) are not
-//!    injected;
+//!    test pins a sample-read peak above 96 bytes per sample, which only a
+//!    part carrying provenance for every sample charges). The generator's
+//!    anomalies (missing, stale, reset, out-of-order) are not injected;
 //! 2. compacts the bucket with `ravel_maintain::compact_bucket` at each
 //!    `max_l1_part_bytes` cap, from a fresh store holding the same L0 objects,
 //!    and refuses a cap that closed fewer than [`MIN_FULL_PARTS`] full parts
 //!    (every part but the tail);
-//! 3. lists the first part with a matcher selecting every series under a fresh
-//!    `MemoryBudget`, and binary-searches the smallest budget limit at which
-//!    the listing succeeds to a 1 % resolution ([`minimal_budget`]). A refusal
-//!    is `FetchError::FetchMemoryExhausted`; any other error ends the run.
+//! 3. measures the first part on both paths with a matcher selecting every
+//!    series under a fresh `MemoryBudget`, binary-searching the smallest
+//!    budget limit at which each succeeds to a 1 % resolution
+//!    ([`minimal_budget`]). A refusal is `FetchError::FetchMemoryExhausted`;
+//!    any other error ends the run.
 //!
-//! The listing call is `SegmentFetcher::fetch_series`. The function the
-//! metrics discovery endpoints call per object,
-//! `SegmentFetcher::list_series_phase_accounted`, is `pub(crate)` in
-//! ravel-query; it runs the same `open_segment` and `decode_selected` as
-//! `fetch_series`, and between them fetches the three catalog sections
-//! `decode_selected` fetches and decodes SERIES_IDS uncharged, so the
-//! reservations the two take are the same. [`engine_listing_succeeds`] lists
-//! through `QueryEngine::resolve_series`, which reaches that function, and the
-//! smoke test (`tests/l1_listing_charge.rs`) checks the two agree on a
-//! one-part bucket.
+//! `resolve_series` lists every object a resolve returns and reserves each
+//! series it keeps for the rest of the call, so over a bucket of many parts
+//! its peak would add the series of the parts listed before the largest one.
+//! To measure one part, the listing runs over a store holding only that part:
+//! [`isolate_part`] writes the bucket again with only the part's series and
+//! compacts it into one part, and refuses a part whose content hash differs
+//! from the measured one. The sample read calls `fetch_series` on the part
+//! directly.
 //!
 //! Per cap the report carries the part's wire bytes, its catalog sections'
 //! decoded length (the figure `SegmentFetcher` reserves before the decode),
-//! its samples and series, the minimal succeeding budget (the peak charge,
-//! with the largest refused limit beside it), that peak per sample, and the
-//! upper bound issue #4393 states, `(64 + 32) * samples + catalog decode
-//! length` ([`upper_bound`]). That formula leaves out the wire bytes the
-//! listing's own GETs hold while the catalog decodes: the open GET (the whole
-//! object up to 512 KiB, the 64 KiB footer tail above it) and the catalog
-//! sections' run. The report carries those bytes ([`held_fetch_bound`]) and
-//! their sum with the formula ([`listing_bound`]), and how far the peak lies
-//! above the formula. A listing under exactly the formula's figure is refused
-//! (the smoke test pins it), so the bound band is checked against
-//! [`listing_bound`]; the search starts there, so the peak it reports is at or
-//! below that bound whenever a listing under it succeeds. [`check_report`]
-//! holds the bands: peak per sample in
-//! [`PEAK_PER_SAMPLE_BAND`], the peak at or below the listing bound, and the
-//! peak non-decreasing as samples per part grow across the caps. A figure
-//! outside its band, missing, or emitted twice is a failure.
+//! the wire bytes the GETs hold while the catalog decodes
+//! ([`held_fetch_bound`]: the open GET, the whole object up to 512 KiB and the
+//! 64 KiB footer tail above it, and the catalog sections' run), and its
+//! samples and series. For each path it carries the minimal succeeding budget
+//! (the peak, with the largest refused limit beside it) and that peak per
+//! sample. The listing's entry adds [`listing_charge`], held fetch bytes plus
+//! catalog decode length. The sample read's adds the upper bound issue #4393
+//! states, `(64 + 32) * samples + catalog decode length` ([`upper_bound`]),
+//! how far the peak lies above it, and [`sample_read_bound`], that formula
+//! plus the held fetch bytes it leaves out. A sample read under exactly
+//! [`upper_bound`] is refused (the smoke test pins it).
+//!
+//! Each search starts at its path's bound, so the peak it reports is at or
+//! below that bound whenever a read under it succeeds. [`check_report`] holds
+//! the bands: listing peak per sample in [`LISTING_PEAK_PER_SAMPLE_BAND`] and
+//! sample-read peak per sample in [`SAMPLE_PEAK_PER_SAMPLE_BAND`], each peak
+//! at or below its path's bound, and each path's peak non-decreasing as
+//! samples per part grow across the caps. A figure outside its band, missing,
+//! or emitted twice is a failure.
 //!
 //! Run it with
 //! `cargo run --release -p ravel-bench --bin l1_listing_charge` (the four
@@ -73,6 +81,7 @@
 //! to stdout and a table to stderr; the exit code is non-zero when a band
 //! fails.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -114,12 +123,30 @@ pub const DEFAULT_SCRAPE_SECS: i64 = 15;
 /// Full parts (every part but the tail) each cap must close.
 pub const MIN_FULL_PARTS: usize = 2;
 
-/// The band the peak charge per sample must fall in, in bytes.
+/// The band the listing's peak charge per sample must fall in, in bytes.
 ///
-/// The bench exists to show that every sample's provenance is charged in full:
+/// The listing decodes nothing per sample, so its peak is [`listing_charge`]:
+/// the held fetch bytes plus the inflated catalog sections, which hold the
+/// encoded provenance columns, about 1 B a sample. Measured 2026-11-18 with
+/// this bin, each peak equal to [`listing_charge`] to the byte: 2.30 B a
+/// sample at the 1 MiB cap and 1.25, 1.06 and 1.03 B at 4, 16 and 64 MiB (the
+/// default caps, 2,500 series over 72 h), where the part is above the
+/// whole-object threshold and the 64 to 76 KiB of held fetch bytes amortise
+/// over more samples as the cap grows; and 11.98 and 8.91 B at the smoke
+/// test's 64 and 256 KiB caps (120 series over 8 h), where the part is fetched
+/// whole and its page bytes are held too. The floor catches a listing that
+/// stops reserving the catalog decode: the held fetch bytes alone are 0.23,
+/// 0.04 and 0.01 B a sample at 4, 16 and 64 MiB. The ceiling catches any
+/// provenance decode charged again, 32 B a sample for the records alone and
+/// 96 B with the columns; 16 B clears the measured 11.98 B.
+pub const LISTING_PEAK_PER_SAMPLE_BAND: (f64, f64) = (1.0, 16.0);
+
+/// The band the sample read's peak charge per sample must fall in, in bytes.
+///
+/// The sample read charges every sample's provenance in full:
 /// [`PROVENANCE_COLUMN_BYTES_PER_SAMPLE`] (64 B) of decoded columns plus a
 /// [`SAMPLE_PROVENANCE_BYTES`] (32 B) record, 96 B a sample, on top of the
-/// catalog decode and the wire bytes the GETs hold. A listing under exactly
+/// catalog decode and the wire bytes the GETs hold. A sample read under exactly
 /// [`upper_bound`] is refused, so with the provenance charged the peak is above
 /// 96 B a sample, and the floor is that 96 B. Measured 2026-11-17 with this
 /// bin: 98.30 B a sample at the
@@ -132,23 +159,31 @@ pub const MIN_FULL_PARTS: usize = 2;
 /// ceiling catches the provenance charged twice, which would add 96 B, to
 /// 193.0 to 204.0 B; 130 B clears the measured 107.98 B and stays well below
 /// that.
-pub const PEAK_PER_SAMPLE_BAND: (f64, f64) = (96.0, 130.0);
+pub const SAMPLE_PEAK_PER_SAMPLE_BAND: (f64, f64) = (96.0, 130.0);
 
 /// The figures every cap entry of the report carries, each exactly once.
-pub const CAP_FIGURES: [&str; 12] = [
+pub const CAP_FIGURES: [&str; 16] = [
     "part_wire_bytes",
     "catalog_decode_bytes",
     "held_fetch_bytes",
     "samples",
     "series",
-    "peak_charge_bytes",
-    "refused_at_bytes",
-    "peak_per_sample_bytes",
-    "upper_bound_bytes",
-    "upper_bound_per_sample_bytes",
-    "peak_minus_upper_bound_bytes",
-    "listing_bound_bytes",
+    "listing_peak_bytes",
+    "listing_refused_at_bytes",
+    "listing_peak_per_sample_bytes",
+    "listing_charge_bytes",
+    "sample_peak_bytes",
+    "sample_refused_at_bytes",
+    "sample_peak_per_sample_bytes",
+    "sample_upper_bound_bytes",
+    "sample_upper_bound_per_sample_bytes",
+    "sample_peak_minus_upper_bound_bytes",
+    "sample_read_bound_bytes",
 ];
+
+/// The pass/fail fields every cap entry carries, each exactly once: whether
+/// each path succeeded under a budget of exactly its bound.
+pub const CAP_FLAGS: [&str; 2] = ["listing_charge_succeeds", "sample_read_bound_succeeds"];
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
@@ -190,8 +225,8 @@ const NATIVE_BUCKETS: u32 = 8;
 pub enum ListingChargeError {
     #[error("{0}")]
     Setup(String),
-    #[error("listing failed with a non-budget error: {0}")]
-    Listing(String),
+    #[error("a listing or sample read failed with a non-budget error: {0}")]
+    Read(String),
 }
 
 fn setup(what: &str, e: impl std::fmt::Display) -> ListingChargeError {
@@ -462,8 +497,26 @@ pub struct L0Bucket {
 
 /// Writes `config`'s history as L0 flushes through `SegmentWriter`.
 pub fn build_bucket(config: &RunConfig) -> Result<L0Bucket, ListingChargeError> {
+    build_bucket_of(config, None)
+}
+
+/// [`build_bucket`] restricted to the series in `keep`, when given: every kept
+/// series writes exactly the samples it writes in the whole bucket, under the
+/// same flushes and writer sequences.
+pub fn build_bucket_of(
+    config: &RunConfig,
+    keep: Option<&HashSet<SeriesId>>,
+) -> Result<L0Bucket, ListingChargeError> {
     config.validate()?;
-    let specs = series_specs(config.series)?;
+    let mut specs = series_specs(config.series)?;
+    if let Some(keep) = keep {
+        specs.retain(|spec| keep.contains(&spec.id));
+    }
+    if specs.is_empty() {
+        return Err(ListingChargeError::Setup(
+            "the bucket keeps no series".to_string(),
+        ));
+    }
     let steps = config.steps();
     let per_flush = config.steps_per_flush();
     let origin = hour_start() - steps * config.scrape_secs * NS_PER_SEC;
@@ -651,8 +704,8 @@ pub struct PartShape {
     /// The decoded length of the catalog sections `SegmentFetcher` reserves
     /// before a catalog decode, each clamped to the reader's section ceiling.
     pub catalog_decode_bytes: u64,
-    /// The wire bytes the listing's GETs hold while the
-    /// catalog decodes ([`held_fetch_bound`]).
+    /// The wire bytes either path's GETs hold while the catalog decodes
+    /// ([`held_fetch_bound`]).
     pub held_fetch_bytes: u64,
     pub samples: u64,
     pub series: u64,
@@ -760,24 +813,35 @@ pub fn held_fetch_bound(
         .saturating_add(run)
 }
 
-/// The upper bound issue #4393 states for a listing's charge over one part:
-/// `(64 + 32) * samples` of provenance plus the catalog decode length.
+/// The listing's charge over one part: the wire bytes its GETs hold
+/// ([`held_fetch_bound`]) plus the catalog sections' decoded length, which the
+/// fetcher reserves before the decode. The decode skips the per-sample
+/// provenance extension, so nothing decoded per sample is added.
+pub fn listing_charge(shape: &PartShape) -> u64 {
+    shape
+        .held_fetch_bytes
+        .saturating_add(shape.catalog_decode_bytes)
+}
+
+/// The upper bound issue #4393 states for a sample read's charge over one
+/// part: `(64 + 32) * samples` of provenance plus the catalog decode length.
 pub fn upper_bound(shape: &PartShape) -> u64 {
     (PROVENANCE_COLUMN_BYTES_PER_SAMPLE + SAMPLE_PROVENANCE_BYTES)
         .saturating_mul(shape.samples)
         .saturating_add(shape.catalog_decode_bytes)
 }
 
-/// [`upper_bound`] plus the wire bytes the listing's GETs hold
+/// [`upper_bound`] plus the wire bytes the sample read's GETs hold
 /// ([`held_fetch_bound`]), which that formula leaves out.
-pub fn listing_bound(shape: &PartShape) -> u64 {
+pub fn sample_read_bound(shape: &PartShape) -> u64 {
     upper_bound(shape).saturating_add(shape.held_fetch_bytes)
 }
 
-/// Lists `part` with every series selected under a fresh budget of `limit`
-/// bytes. `Ok(Some(series))` on success, `Ok(None)` when the budget refused,
-/// an error for anything else.
-pub async fn fetcher_listing(
+/// Reads `part`'s catalog through `SegmentFetcher::fetch_series`, the decode
+/// that charges per-sample provenance, with every series selected under a
+/// fresh budget of `limit` bytes. `Ok(Some(series))` on success, `Ok(None)`
+/// when the budget refused, an error for anything else.
+pub async fn fetcher_sample_read(
     store: &Arc<MemoryStore>,
     part: &SegmentRef,
     limit: u64,
@@ -791,15 +855,59 @@ pub async fn fetcher_listing(
     {
         Ok(entries) => Ok(Some(entries.len())),
         Err(FetchError::FetchMemoryExhausted { .. }) => Ok(None),
-        Err(e) => Err(ListingChargeError::Listing(e.to_string())),
+        Err(e) => Err(ListingChargeError::Read(e.to_string())),
+    }
+}
+
+/// The series ids `part` holds, read with an unlimited budget.
+pub async fn part_series(
+    store: &Arc<MemoryStore>,
+    part: &SegmentRef,
+) -> Result<HashSet<SeriesId>, ListingChargeError> {
+    let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+    SegmentFetcher::new(backend)
+        .fetch_series(tenant_hash(), part, &select_all()?)
+        .await
+        .map(|entries| entries.into_iter().map(|e| e.series_id).collect())
+        .map_err(|e| ListingChargeError::Read(e.to_string()))
+}
+
+/// A store whose catalog resolves exactly one object, byte for byte the part
+/// `part_index` of `compacted`: `config`'s bucket written again with only that
+/// part's series, then compacted at `cap`. The listing measures this store,
+/// so its peak is that one part's, without the series `resolve_series` keeps
+/// from the parts listed before it. Refuses a compaction that closes more
+/// than one part, or one whose content hash is not the measured part's.
+pub async fn isolate_part(
+    config: &RunConfig,
+    cap: u64,
+    compacted: &Compacted,
+    part_index: usize,
+) -> Result<Compacted, ListingChargeError> {
+    let part = compacted.parts.get(part_index).ok_or_else(|| {
+        ListingChargeError::Setup(format!("cap {cap}: no part {part_index} to isolate"))
+    })?;
+    let keep = part_series(&compacted.store, part).await?;
+    let only = build_bucket_of(config, Some(&keep))?;
+    let isolated = compact_at(&only, config, cap).await?;
+    match isolated.parts.as_slice() {
+        [one] if one.content_hash == part.content_hash => Ok(isolated),
+        parts => Err(ListingChargeError::Setup(format!(
+            "cap {cap}: the part's {} series compacted alone into {} parts, not the \
+             measured part {}",
+            keep.len(),
+            parts.len(),
+            part.data_object_key
+        ))),
     }
 }
 
 /// Lists every series of the bucket through `QueryEngine::resolve_series`,
 /// the method the metrics discovery endpoints call, under a fresh budget of
 /// `limit` bytes. Its per-object read is
-/// `SegmentFetcher::list_series_phase_accounted`. `Ok(Some(series))` on
-/// success, `Ok(None)` when the budget refused.
+/// `SegmentFetcher::list_series_phase_accounted`, which skips the per-sample
+/// provenance extension. `Ok(Some(series))` on success, `Ok(None)` when the
+/// budget refused.
 pub async fn engine_listing_succeeds(
     store: &Arc<MemoryStore>,
     config: &RunConfig,
@@ -827,7 +935,7 @@ pub async fn engine_listing_succeeds(
     {
         Ok((series, _stats)) => Ok(Some(series.len())),
         Err(QueryError::Fetch(FetchError::FetchMemoryExhausted { .. })) => Ok(None),
-        Err(e) => Err(ListingChargeError::Listing(e.to_string())),
+        Err(e) => Err(ListingChargeError::Read(e.to_string())),
     }
 }
 
@@ -840,7 +948,7 @@ pub struct SearchOutcome {
     pub probes: u32,
 }
 
-/// The smallest budget limit at which `listing` succeeds, to a 1 %
+/// The smallest budget limit at which `read` succeeds, to a 1 %
 /// resolution: on return `succeeds_at` succeeded, `refused_at` was refused (or
 /// is zero, never tried), and `refused_at` is at least 99 % of `succeeds_at`.
 /// `start` is the first limit tried; the search doubles it until it succeeds,
@@ -848,7 +956,7 @@ pub struct SearchOutcome {
 /// one.
 pub async fn minimal_budget<F, Fut>(
     start: u64,
-    mut listing: F,
+    mut read: F,
 ) -> Result<SearchOutcome, ListingChargeError>
 where
     F: FnMut(u64) -> Fut,
@@ -859,7 +967,7 @@ where
     let mut hi = start.max(1);
     loop {
         probes += 1;
-        if listing(hi).await? {
+        if read(hi).await? {
             break;
         }
         lo = hi;
@@ -872,7 +980,7 @@ where
     while hi - lo > (hi / 100).max(1) {
         let mid = lo + (hi - lo) / 2;
         probes += 1;
-        if listing(mid).await? {
+        if read(mid).await? {
             hi = mid;
         } else {
             lo = mid;
@@ -893,32 +1001,51 @@ pub struct CapFigures {
     pub full_parts: usize,
     pub part_index: usize,
     pub shape: PartShape,
-    pub search: SearchOutcome,
-    pub upper_bound_bytes: u64,
-    pub listing_bound_bytes: u64,
-    /// Whether a listing under a budget of exactly `listing_bound_bytes`
+    /// The listing's search, through `QueryEngine::resolve_series`.
+    pub listing_search: SearchOutcome,
+    /// [`listing_charge`] of the part.
+    pub listing_charge_bytes: u64,
+    /// Whether a listing under a budget of exactly `listing_charge_bytes`
     /// succeeded.
-    pub listing_bound_succeeds: bool,
+    pub listing_charge_succeeds: bool,
+    /// The sample read's search, through `SegmentFetcher::fetch_series`.
+    pub sample_search: SearchOutcome,
+    pub upper_bound_bytes: u64,
+    /// [`sample_read_bound`] of the part.
+    pub sample_read_bound_bytes: u64,
+    /// Whether a sample read under a budget of exactly
+    /// `sample_read_bound_bytes` succeeded.
+    pub sample_read_bound_succeeds: bool,
 }
 
 impl CapFigures {
-    pub fn peak_per_sample(&self) -> f64 {
-        self.search.succeeds_at as f64 / self.shape.samples.max(1) as f64
+    fn per_sample(&self, bytes: u64) -> f64 {
+        bytes as f64 / self.shape.samples.max(1) as f64
+    }
+
+    pub fn listing_peak_per_sample(&self) -> f64 {
+        self.per_sample(self.listing_search.succeeds_at)
+    }
+
+    pub fn sample_peak_per_sample(&self) -> f64 {
+        self.per_sample(self.sample_search.succeeds_at)
     }
 
     pub fn upper_bound_per_sample(&self) -> f64 {
-        self.upper_bound_bytes as f64 / self.shape.samples.max(1) as f64
+        self.per_sample(self.upper_bound_bytes)
     }
 
-    /// How far the peak lies above [`upper_bound`]; negative below it.
-    pub fn peak_minus_upper_bound(&self) -> i64 {
-        let diff = i128::from(self.search.succeeds_at) - i128::from(self.upper_bound_bytes);
+    /// How far the sample read's peak lies above [`upper_bound`]; negative
+    /// below it.
+    pub fn sample_peak_minus_upper_bound(&self) -> i64 {
+        let diff =
+            i128::from(self.sample_search.succeeds_at) - i128::from(self.upper_bound_bytes);
         i64::try_from(diff).unwrap_or(if diff < 0 { i64::MIN } else { i64::MAX })
     }
 }
 
-/// Compacts `bucket` at `cap` and measures the listing charge of its first
-/// part.
+/// Compacts `bucket` at `cap` and measures the listing and sample-read charges
+/// of its first part.
 pub async fn measure_cap(
     bucket: &L0Bucket,
     config: &RunConfig,
@@ -937,44 +1064,83 @@ pub async fn measure_cap(
     let part = &compacted.parts[part_index];
     let shape = part_shape(&compacted.store, part).await?;
     let upper = upper_bound(&shape);
-    let bound = listing_bound(&shape);
+    let charge = listing_charge(&shape);
+    let bound = sample_read_bound(&shape);
     let store = &compacted.store;
-    // Starting at the listing bound makes it the search's first probe, so when
-    // it succeeds the reported peak is at or below it, and `check_report` can
-    // compare the two directly.
-    let search = minimal_budget(bound, |limit| {
-        listing_succeeds(store, part, shape.series, limit)
+    // Starting each search at its path's bound makes that bound the first
+    // probe, so when it succeeds the reported peak is at or below it, and
+    // `check_report` can compare the two directly.
+    let sample_search = minimal_budget(bound, |limit| {
+        sample_read_succeeds(store, part, shape.series, limit)
     })
     .await?;
-    let listing_bound_succeeds = listing_succeeds(store, part, shape.series, bound).await?;
+    let sample_read_bound_succeeds =
+        sample_read_succeeds(store, part, shape.series, bound).await?;
+
+    let isolated = isolate_part(config, cap, &compacted, part_index).await?;
+    let only = &isolated.store;
+    let listing_search = minimal_budget(charge, |limit| {
+        listing_succeeds(only, config, shape.series, limit)
+    })
+    .await?;
+    let listing_charge_succeeds = listing_succeeds(only, config, shape.series, charge).await?;
     Ok(CapFigures {
         cap_bytes: cap,
         parts: compacted.parts.len(),
         full_parts,
         part_index,
         shape,
-        search,
+        listing_search,
+        listing_charge_bytes: charge,
+        listing_charge_succeeds,
+        sample_search,
         upper_bound_bytes: upper,
-        listing_bound_bytes: bound,
-        listing_bound_succeeds,
+        sample_read_bound_bytes: bound,
+        sample_read_bound_succeeds,
     })
 }
 
-/// Whether listing `part` under a budget of `limit` succeeds, returning all
-/// `series` it holds. A listing that returns any other count is an error.
-pub async fn listing_succeeds(
+fn all_series(read: Option<usize>, series: u64, path: &str) -> Result<bool, ListingChargeError> {
+    match read {
+        Some(listed) if listed as u64 == series => Ok(true),
+        Some(listed) => Err(ListingChargeError::Read(format!(
+            "the {path} returned {listed} series of a part holding {series}"
+        ))),
+        None => Ok(false),
+    }
+}
+
+/// Whether a sample read of `part` ([`fetcher_sample_read`]) under a budget of
+/// `limit` succeeds, returning all `series` it holds. A read that returns any
+/// other count is an error.
+pub async fn sample_read_succeeds(
     store: &Arc<MemoryStore>,
     part: &SegmentRef,
     series: u64,
     limit: u64,
 ) -> Result<bool, ListingChargeError> {
-    match fetcher_listing(store, part, limit).await? {
-        Some(listed) if listed as u64 == series => Ok(true),
-        Some(listed) => Err(ListingChargeError::Listing(format!(
-            "listed {listed} series of a part holding {series}"
-        ))),
-        None => Ok(false),
-    }
+    all_series(
+        fetcher_sample_read(store, part, limit).await?,
+        series,
+        "sample read",
+    )
+}
+
+/// Whether a listing of `store` through `QueryEngine::resolve_series`
+/// ([`engine_listing_succeeds`]) under a budget of `limit` succeeds, returning
+/// all `series`. `store` is one [`isolate_part`] returned, so those are the
+/// one part's series. A listing that returns any other count is an error.
+pub async fn listing_succeeds(
+    store: &Arc<MemoryStore>,
+    config: &RunConfig,
+    series: u64,
+    limit: u64,
+) -> Result<bool, ListingChargeError> {
+    all_series(
+        engine_listing_succeeds(store, config, limit).await?,
+        series,
+        "listing",
+    )
 }
 
 /// A whole run: the bucket and every cap's figures, in cap order.
@@ -1023,25 +1189,34 @@ pub fn report_json(report: &RunReport) -> Value {
                 "held_fetch_bytes": c.shape.held_fetch_bytes,
                 "samples": c.shape.samples,
                 "series": c.shape.series,
-                "peak_charge_bytes": c.search.succeeds_at,
-                "refused_at_bytes": c.search.refused_at,
-                "search_probes": c.search.probes,
-                "peak_per_sample_bytes": c.peak_per_sample(),
-                "upper_bound_bytes": c.upper_bound_bytes,
-                "upper_bound_per_sample_bytes": c.upper_bound_per_sample(),
-                "peak_minus_upper_bound_bytes": c.peak_minus_upper_bound(),
-                "listing_bound_bytes": c.listing_bound_bytes,
-                "listing_bound_succeeds": c.listing_bound_succeeds,
+                "listing_peak_bytes": c.listing_search.succeeds_at,
+                "listing_refused_at_bytes": c.listing_search.refused_at,
+                "listing_search_probes": c.listing_search.probes,
+                "listing_peak_per_sample_bytes": c.listing_peak_per_sample(),
+                "listing_charge_bytes": c.listing_charge_bytes,
+                "listing_charge_succeeds": c.listing_charge_succeeds,
+                "sample_peak_bytes": c.sample_search.succeeds_at,
+                "sample_refused_at_bytes": c.sample_search.refused_at,
+                "sample_search_probes": c.sample_search.probes,
+                "sample_peak_per_sample_bytes": c.sample_peak_per_sample(),
+                "sample_upper_bound_bytes": c.upper_bound_bytes,
+                "sample_upper_bound_per_sample_bytes": c.upper_bound_per_sample(),
+                "sample_peak_minus_upper_bound_bytes": c.sample_peak_minus_upper_bound(),
+                "sample_read_bound_bytes": c.sample_read_bound_bytes,
+                "sample_read_bound_succeeds": c.sample_read_bound_succeeds,
             })
         })
         .collect();
     json!({
         "bench": "l1_listing_charge",
-        "issue": 4393,
-        "listing_call": "SegmentFetcher::fetch_series, matcher __name__=~\".+\"",
+        "issues": [4393, 4433],
+        "listing_call": "QueryEngine::resolve_series over a store holding only the part, \
+                         matcher __name__=~\".+\"",
+        "sample_read_call": "SegmentFetcher::fetch_series, matcher __name__=~\".+\"",
         "resolution": "1 % of the peak",
-        "upper_bound_formula": "(64 + 32) * samples + catalog_decode_bytes",
-        "listing_bound_formula": "upper_bound_bytes + held_fetch_bytes",
+        "listing_charge_formula": "held_fetch_bytes + catalog_decode_bytes",
+        "sample_upper_bound_formula": "(64 + 32) * samples + catalog_decode_bytes",
+        "sample_read_bound_formula": "sample_upper_bound_bytes + held_fetch_bytes",
         "bucket": {
             "bucket_series": report.series,
             "scrape_secs": report.config.scrape_secs,
@@ -1052,9 +1227,13 @@ pub fn report_json(report: &RunReport) -> Value {
             "l0_samples": report.l0_samples,
         },
         "bands": {
-            "peak_per_sample_band_bytes": [PEAK_PER_SAMPLE_BAND.0, PEAK_PER_SAMPLE_BAND.1],
-            "peak_at_or_below_listing_bound": true,
-            "peak_non_decreasing_with_samples": true,
+            "listing_peak_per_sample_band_bytes":
+                [LISTING_PEAK_PER_SAMPLE_BAND.0, LISTING_PEAK_PER_SAMPLE_BAND.1],
+            "sample_peak_per_sample_band_bytes":
+                [SAMPLE_PEAK_PER_SAMPLE_BAND.0, SAMPLE_PEAK_PER_SAMPLE_BAND.1],
+            "listing_peak_at_or_below_listing_charge": true,
+            "sample_peak_at_or_below_sample_read_bound": true,
+            "peaks_non_decreasing_with_samples": true,
         },
         "caps": caps,
     })
@@ -1064,7 +1243,8 @@ pub fn report_json(report: &RunReport) -> Value {
 pub fn report_table(report: &RunReport) -> String {
     let mut out = format!(
         "l1_listing_charge: {} series, {} h history in {} L0 flushes ({} samples, {} B)\n\
-         {:>10} {:>5} {:>11} {:>11} {:>9} {:>11} {:>7} {:>12} {:>9} {:>12} {:>9} {:>10}\n",
+         {:>10} {:>5} {:>11} {:>11} {:>9} {:>11} {:>7} {:>12} {:>9} {:>12} {:>9} {:>12} {:>9} \
+         {:>10}\n",
         report.series,
         report.config.history_hours,
         report.l0_objects,
@@ -1077,15 +1257,18 @@ pub fn report_table(report: &RunReport) -> String {
         "fetch B",
         "samples",
         "series",
-        "peak B",
-        "peak/smp",
+        "list B",
+        "list/smp",
+        "sample B",
+        "smpl/smp",
         "bound B",
         "bound/smp",
-        "peak-bound",
+        "smpl-bound",
     );
     for c in &report.caps {
         out.push_str(&format!(
-            "{:>10} {:>5} {:>11} {:>11} {:>9} {:>11} {:>7} {:>12} {:>9.2} {:>12} {:>9.2} {:>10}\n",
+            "{:>10} {:>5} {:>11} {:>11} {:>9} {:>11} {:>7} {:>12} {:>9.2} {:>12} {:>9.2} {:>12} \
+             {:>9.2} {:>10}\n",
             c.cap_bytes,
             c.parts,
             c.shape.wire_bytes,
@@ -1093,26 +1276,61 @@ pub fn report_table(report: &RunReport) -> String {
             c.shape.held_fetch_bytes,
             c.shape.samples,
             c.shape.series,
-            c.search.succeeds_at,
-            c.peak_per_sample(),
+            c.listing_search.succeeds_at,
+            c.listing_peak_per_sample(),
+            c.sample_search.succeeds_at,
+            c.sample_peak_per_sample(),
             c.upper_bound_bytes,
             c.upper_bound_per_sample(),
-            c.peak_minus_upper_bound(),
+            c.sample_peak_minus_upper_bound(),
         ));
     }
     out
 }
 
+/// The report keys of one measured path and the band its figures hold.
+struct PathKeys {
+    path: &'static str,
+    peak: &'static str,
+    refused: &'static str,
+    per_sample: &'static str,
+    band: (f64, f64),
+    bound: &'static str,
+    bound_succeeds: &'static str,
+}
+
+const PATHS: [PathKeys; 2] = [
+    PathKeys {
+        path: "listing",
+        peak: "listing_peak_bytes",
+        refused: "listing_refused_at_bytes",
+        per_sample: "listing_peak_per_sample_bytes",
+        band: LISTING_PEAK_PER_SAMPLE_BAND,
+        bound: "listing_charge_bytes",
+        bound_succeeds: "listing_charge_succeeds",
+    },
+    PathKeys {
+        path: "sample-read",
+        peak: "sample_peak_bytes",
+        refused: "sample_refused_at_bytes",
+        per_sample: "sample_peak_per_sample_bytes",
+        band: SAMPLE_PEAK_PER_SAMPLE_BAND,
+        bound: "sample_read_bound_bytes",
+        bound_succeeds: "sample_read_bound_succeeds",
+    },
+];
+
 /// Checks the rendered report `text` against the bands for exactly `caps`.
-/// Every cap appears once, every figure of [`CAP_FIGURES`] and
-/// `listing_bound_succeeds` appears once per cap in the text, and each is
-/// inside its band:
+/// Every cap appears once, every figure of [`CAP_FIGURES`] and every flag of
+/// [`CAP_FLAGS`] appears once per cap in the text, and for each path, the
+/// listing and the sample read, each figure is inside its band:
 ///
-/// - peak per sample in [`PEAK_PER_SAMPLE_BAND`];
+/// - peak per sample in [`LISTING_PEAK_PER_SAMPLE_BAND`] for the listing and
+///   [`SAMPLE_PEAK_PER_SAMPLE_BAND`] for the sample read;
 /// - the largest refused limit below the peak and within 1 % of it;
-/// - the peak at or below [`listing_bound`], compared directly, beside a
-///   listing under exactly that bound succeeding and no refused limit
-///   reaching it;
+/// - the peak at or below the path's bound ([`listing_charge`],
+///   [`sample_read_bound`]), compared directly, beside a read under exactly
+///   that bound succeeding and no refused limit reaching it;
 /// - the peak non-decreasing as samples per part grow.
 ///
 /// Returns every violation.
@@ -1131,7 +1349,8 @@ pub fn check_report(text: &str, caps: &[u64]) -> Result<(), Vec<String>> {
     // value, so the raw text is counted too.
     for figure in CAP_FIGURES
         .iter()
-        .chain(["cap_bytes", "listing_bound_succeeds"].iter())
+        .chain(CAP_FLAGS.iter())
+        .chain(["cap_bytes"].iter())
     {
         let seen = text.matches(&format!("\"{figure}\":")).count();
         if seen != caps.len() {
@@ -1141,7 +1360,7 @@ pub fn check_report(text: &str, caps: &[u64]) -> Result<(), Vec<String>> {
             ));
         }
     }
-    let mut rows = Vec::new();
+    let mut rows: [Vec<(u64, u64, u64)>; 2] = [Vec::new(), Vec::new()];
     for &cap in caps {
         let matching: Vec<&Value> = entries
             .iter()
@@ -1165,54 +1384,63 @@ pub fn check_report(text: &str, caps: &[u64]) -> Result<(), Vec<String>> {
         if missing {
             continue;
         }
-        let per_sample = figure("peak_per_sample_bytes").unwrap_or(f64::NAN);
-        let (lo, hi) = PEAK_PER_SAMPLE_BAND;
-        if !(lo..=hi).contains(&per_sample) {
-            failures.push(format!(
-                "cap {cap}: peak per sample {per_sample} B outside [{lo}, {hi}]"
-            ));
-        }
-        if entry.get("listing_bound_succeeds").and_then(Value::as_bool) != Some(true) {
-            failures.push(format!(
-                "cap {cap}: the listing does not succeed under the listing bound"
-            ));
-        }
-        let peak = entry.get("peak_charge_bytes").and_then(Value::as_u64);
-        let refused = entry.get("refused_at_bytes").and_then(Value::as_u64);
-        let bound = entry.get("listing_bound_bytes").and_then(Value::as_u64);
         let samples = entry.get("samples").and_then(Value::as_u64);
-        match (peak, refused, bound, samples) {
-            (Some(peak), Some(refused), Some(bound), Some(samples)) => {
-                if refused >= peak || peak - refused > peak / 100 {
-                    failures.push(format!(
-                        "cap {cap}: refused at {refused} B and succeeded at {peak} B is not a \
-                         1 % bracket"
-                    ));
-                }
-                if peak > bound {
-                    failures.push(format!(
-                        "cap {cap}: the peak {peak} B is above the listing bound {bound} B"
-                    ));
-                }
-                if refused >= bound {
-                    failures.push(format!(
-                        "cap {cap}: a {refused} B budget was refused, at or above the listing \
-                         bound {bound} B"
-                    ));
-                }
-                rows.push((cap, samples, peak));
+        for (keys, rows) in PATHS.iter().zip(rows.iter_mut()) {
+            let path = keys.path;
+            let per_sample = figure(keys.per_sample).unwrap_or(f64::NAN);
+            let (lo, hi) = keys.band;
+            if !(lo..=hi).contains(&per_sample) {
+                failures.push(format!(
+                    "cap {cap}: {path} peak per sample {per_sample} B outside [{lo}, {hi}]"
+                ));
             }
-            _ => failures.push(format!("cap {cap}: a byte figure is not an integer")),
+            if entry.get(keys.bound_succeeds).and_then(Value::as_bool) != Some(true) {
+                failures.push(format!(
+                    "cap {cap}: the {path} does not succeed under its bound, {}",
+                    keys.bound
+                ));
+            }
+            let peak = entry.get(keys.peak).and_then(Value::as_u64);
+            let refused = entry.get(keys.refused).and_then(Value::as_u64);
+            let bound = entry.get(keys.bound).and_then(Value::as_u64);
+            match (peak, refused, bound, samples) {
+                (Some(peak), Some(refused), Some(bound), Some(samples)) => {
+                    if refused >= peak || peak - refused > peak / 100 {
+                        failures.push(format!(
+                            "cap {cap}: the {path} refused at {refused} B and succeeded at \
+                             {peak} B is not a 1 % bracket"
+                        ));
+                    }
+                    if peak > bound {
+                        failures.push(format!(
+                            "cap {cap}: the {path} peak {peak} B is above its bound {bound} B"
+                        ));
+                    }
+                    if refused >= bound {
+                        failures.push(format!(
+                            "cap {cap}: the {path} was refused a {refused} B budget, at or above \
+                             its bound {bound} B"
+                        ));
+                    }
+                    rows.push((cap, samples, peak));
+                }
+                _ => failures.push(format!(
+                    "cap {cap}: a {path} byte figure is not an integer"
+                )),
+            }
         }
     }
-    rows.sort_by_key(|&(_, samples, _)| samples);
-    for pair in rows.windows(2) {
-        let ((cap_a, samples_a, peak_a), (cap_b, samples_b, peak_b)) = (pair[0], pair[1]);
-        if peak_b < peak_a {
-            failures.push(format!(
-                "peak fell as samples per part grew: cap {cap_a} ({samples_a} samples) peaks at \
-                 {peak_a} B, cap {cap_b} ({samples_b} samples) at {peak_b} B"
-            ));
+    for (keys, rows) in PATHS.iter().zip(rows.iter_mut()) {
+        rows.sort_by_key(|&(_, samples, _)| samples);
+        for pair in rows.windows(2) {
+            let ((cap_a, samples_a, peak_a), (cap_b, samples_b, peak_b)) = (pair[0], pair[1]);
+            if peak_b < peak_a {
+                failures.push(format!(
+                    "{} peak fell as samples per part grew: cap {cap_a} ({samples_a} samples) \
+                     peaks at {peak_a} B, cap {cap_b} ({samples_b} samples) at {peak_b} B",
+                    keys.path
+                ));
+            }
         }
     }
     if failures.is_empty() {
