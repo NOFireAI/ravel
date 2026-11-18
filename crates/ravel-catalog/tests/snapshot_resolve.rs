@@ -1073,9 +1073,10 @@ async fn missing_head_is_cached_for_ttl_on_resolve_only() {
         .await
         .expect("fold publishes HEAD inside the TTL");
     assert_eq!(report.watermark_hour, Some(hour));
+    let after_fold = 3 + property_head_rereads();
     assert_eq!(
         log.get_count_for(&head),
-        3,
+        after_fold,
         "the fold GETs HEAD although the resolve cached its absence"
     );
     let snap_gets = log.get_count_for("/snap/");
@@ -1084,7 +1085,7 @@ async fn missing_head_is_cached_for_ttl_on_resolve_only() {
     assert_eq!(resolved_segments(&catalog, hour, now_ns).await, 1);
     assert_eq!(
         log.get_count_for(&head),
-        3,
+        after_fold,
         "the absence, stamped before the GET at 0, is served at exactly the TTL"
     );
     assert_eq!(
@@ -1097,13 +1098,28 @@ async fn missing_head_is_cached_for_ttl_on_resolve_only() {
     assert_eq!(resolved_segments(&catalog, hour, now_ns).await, 1);
     assert_eq!(
         log.get_count_for(&head),
-        4,
+        after_fold + 1,
         "past the TTL the resolve GETs HEAD again"
     );
     assert!(
         log.get_count_for("/snap/") > snap_gets,
         "the HEAD published inside the TTL is read and its parts served"
     );
+}
+
+/// HEAD GETs a fold issues beyond its own: one where assertions are
+/// evaluated, the folded-HEAD property's re-read after the CAS.
+fn property_head_rereads() -> usize {
+    let on = std::cell::Cell::new(false);
+    ravel_invariant::inv_sometimes!(
+        {
+            on.set(true);
+            true
+        },
+        "ravel-catalog test: evaluations are captured",
+        ""
+    );
+    usize::from(on.get())
 }
 
 /// Captures the message of every WARN event on this thread.
