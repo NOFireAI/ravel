@@ -291,6 +291,10 @@ async fn with_the_switch_off_the_fold_writes_the_leaves_and_refs_it_wrote_before
         FIXTURE_DATA_BYTES
     );
     assert!(!CatalogConfig::default().metrics_series_index);
+    assert_eq!(
+        CatalogConfig::default().metrics_series_index_max_ratio_ppm,
+        10_000
+    );
     let catalog = Catalog::new(store.clone(), series_config(false)).expect("catalog");
     take_series_build_log_for_test();
     let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
