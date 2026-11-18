@@ -309,9 +309,11 @@ impl SpanIngestRouter {
                     scope_compat.clone(),
                     scope_bucket.clone(),
                 ));
-                let writer_id = rng.new_uuid();
-                let epoch =
-                    u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
+                // Route the identity draw through the shared helper so
+                // `commit/mismatched-identity-idempotent` is not inert for
+                // spans.
+                let (writer_id, epoch) =
+                    crate::router::draw_writer_identity(rng.as_ref(), clock.as_ref());
                 (0..shard_count)
                     .map(|shard| {
                         let (tx, rx) = mpsc::channel(config.channel_depth);
@@ -1613,5 +1615,72 @@ mod tests {
             .find(|s| s.site == ravel_cpu_gate::WriteSite::SpanFlush)
             .expect("span_flush site");
         assert_eq!((site.jobs, site.inline), (shards.len() as u64, 0));
+    }
+
+    const ONE_IDENTITY_ONE_CONTENT: &str = "commit: one commit identity holds one content hash";
+
+    fn one_shard_spans(store: Arc<dyn ObjectStoreBackend>) -> SpanIngestRouter {
+        SpanIngestRouter::new(
+            IngestConfig {
+                shard_count: 1,
+                target_bytes: 1,
+                ..IngestConfig::default()
+            },
+            store,
+            Arc::new(SystemClock),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+        )
+    }
+
+    /// `commit/mismatched-identity-idempotent` pins the writer identity where
+    /// the span router draws it and skips the hash compare. Two routers with
+    /// the production identity source then commit different records (different
+    /// span ids and timestamps) under one commit key, and the second is told
+    /// it published. Fails against drawing the identity inline with
+    /// `rng.new_uuid()`: the mutant never reaches that draw, so the two routers
+    /// pick distinct identities and never collide, leaving the property inert
+    /// for spans.
+    #[tokio::test]
+    async fn mutant_pinned_writer_identity_breaks_one_identity_for_spans() {
+        let Some(_mutant) = crate::router::invariant_capture::scoped_mutant(
+            "commit/mismatched-identity-idempotent",
+        ) else {
+            return;
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let first = one_shard_spans(Arc::clone(&store));
+        let second = one_shard_spans(Arc::clone(&store));
+        let tenant = TenantId::new("spans-one-identity-mutant");
+        let id = trace_id(1);
+        let a = first
+            .write(
+                tenant.clone(),
+                vec![norm_span(id, 1, 1_000)],
+                WriteMode::Strict,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("the first router commits");
+        let b = second
+            .write(
+                tenant.clone(),
+                vec![norm_span(id, 2, 2_000)],
+                WriteMode::Strict,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("the mutant reports the second content published");
+        assert_eq!(a.tokens, b.tokens, "both routers wrote under one identity");
+
+        let evaluations = crate::router::invariant_capture::evaluations(
+            ONE_IDENTITY_ONE_CONTENT,
+            &tenant.hash().to_hex(),
+        );
+        assert!(
+            evaluations.iter().any(|(held, _)| !held),
+            "OneIdentityOneContent never evaluated false under the mutant: {evaluations:?}"
+        );
+        first.shutdown().await;
+        second.shutdown().await;
     }
 }

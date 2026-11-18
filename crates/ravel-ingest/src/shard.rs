@@ -617,8 +617,18 @@ impl FlushCtx {
     /// Runs one flush to its outcome ([`Self::commit_flush`]), then re-reads
     /// abandoned commit keys, so a slow re-read cannot move this flush past
     /// its deadline.
+    ///
+    /// The per-shard off-actor skew (issue #865) brackets only
+    /// [`Self::commit_flush`], the flush proper: the abandoned-key re-reads run
+    /// after that measurement, so a slow re-read does not inflate the figure's
+    /// meaning (the time this flush spent off the actor), and the re-reads are
+    /// themselves bounded to one `EVIDENCE_HEAD_TIMEOUT`.
     async fn run_flush(&self, pinned: PinnedFlush, grant: PublishGrant) {
+        let started_ns = self.clock.now_ns();
         self.commit_flush(pinned, grant).await;
+        let off_actor_ns = self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+        self.metrics
+            .record_shard_off_actor_ns(self.shard, off_actor_ns);
         self.recheck_abandoned_commits().await;
     }
 
@@ -852,7 +862,10 @@ impl FlushCtx {
             }
         };
 
-        match self.publish_with_retry(&record, deadline_ns, &grant).await {
+        match self
+            .publish_with_retry(tenant_hash, &record, deadline_ns, &grant)
+            .await
+        {
             Ok(token) => {
                 // Both PUTs landed: attribute this flush's PUT cost to the
                 // tenant (ADR-0076 decision 2, success-time). `tenant_hash` is
@@ -944,6 +957,12 @@ impl FlushCtx {
     /// [`publish::EVIDENCE_HEAD_TIMEOUT`], evaluates nothing and keeps the
     /// key. Only the instrumented build remembers abandoned keys, so the
     /// default build finds none here.
+    ///
+    /// This is the metrics shard only: the logs and spans shards do not record
+    /// abandoned keys, because their catalog-maintenance workload writes across
+    /// forward clock jumps of +9000 s and more, where a flush still in flight
+    /// at a write timeout could land past the seal on correct code (see the
+    /// note at their commit-PUT abandon sites).
     async fn recheck_abandoned_commits(&self) {
         let due: Vec<AbandonedCommit> = {
             let mut abandoned = self
@@ -958,12 +977,20 @@ impl FlushCtx {
         };
         let lifetime_ns = duration_nanos_saturating(self.config.max_flush_lifetime);
         let mut kept = Vec::with_capacity(due.len());
-        for abandoned in due {
+        // One deadline bounds the whole batch, not each key: the HEADs share a
+        // single `EVIDENCE_HEAD_TIMEOUT` sleep, so a stalled store holds the
+        // flush permit for one timeout rather than one per due key. A key not
+        // judged by the deadline evaluates nothing and is kept.
+        let deadline = self.clock.sleep(publish::EVIDENCE_HEAD_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut due = due.into_iter();
+        while let Some(abandoned) = due.next() {
             let head = tokio::select! {
                 head = self.store.head(&abandoned.commit_key) => head,
-                () = self.clock.sleep(publish::EVIDENCE_HEAD_TIMEOUT) => {
+                () = &mut deadline => {
                     kept.push(abandoned);
-                    continue;
+                    kept.extend(due);
+                    break;
                 }
             };
             let landed_ms = match head {
@@ -1086,7 +1113,10 @@ impl FlushCtx {
         self.metrics.record_abandoned_queue_deadline();
         ravel_invariant::inv_reachable!(
             "commit: flush abandoned",
-            std::collections::BTreeMap::from([("at", "permit queue")])
+            std::collections::BTreeMap::from([
+                ("at", "permit queue".to_owned()),
+                ("tenant", pinned.tenant_hash.to_hex()),
+            ])
         );
         self.ack_waiters(
             waiters,
@@ -1108,7 +1138,10 @@ impl FlushCtx {
         self.metrics.record_abandoned_hour_bound();
         ravel_invariant::inv_reachable!(
             "commit: flush abandoned",
-            std::collections::BTreeMap::from([("at", "hour bound")])
+            std::collections::BTreeMap::from([
+                ("at", "hour bound".to_owned()),
+                ("tenant", pinned.tenant_hash.to_hex()),
+            ])
         );
         self.ack_waiters(
             waiters,
@@ -1268,6 +1301,7 @@ impl FlushCtx {
     /// way, and asks the activation policy before every attempt the same way.
     async fn publish_with_retry(
         &self,
+        tenant_hash: TenantHash,
         record: &CommitRecord,
         deadline_ns: i64,
         grant: &PublishGrant,
@@ -1277,12 +1311,36 @@ impl FlushCtx {
             base_delay: self.config.put_retry_base_delay,
             max_delay: self.config.put_retry_max_delay,
         };
+        // Read only by the abandon-recording assertion below, which the default
+        // build compiles out.
+        let _ = tenant_hash;
         let mut attempt: u32 = 0;
         loop {
-            grant
+            if let Err(refused) = grant
                 .attempt_when_fresh(self.clock.as_ref(), deadline_ns)
                 .await
-                .map_err(PutAbort::Refused)?;
+            {
+                // On a retry iteration (attempt > 0) a commit-record PUT was
+                // already issued this flush; the activation policy now refuses
+                // the retry, but that PUT may still land, so record the key for
+                // the abandon recheck exactly as the Exhausted arm below does.
+                // The first iteration refuses before any PUT, so nothing can
+                // have landed and nothing is recorded.
+                if attempt > 0 {
+                    ravel_invariant::inv_sometimes!(
+                        self.note_abandoned_commit(tenant_hash, record).await,
+                        "commit: an abandoned flush's commit record is absent at the abandon",
+                        std::collections::BTreeMap::from([
+                            ("tenant", tenant_hash.to_hex()),
+                            (
+                                "commit_key",
+                                keys::commit_key_for_record(record).unwrap_or_default(),
+                            ),
+                        ])
+                    );
+                }
+                return Err(PutAbort::Refused(refused));
+            }
             let call =
                 publish::publish_deferring_evidence(self.store.as_ref(), record, &single_attempt);
             let started_ns = self.clock.now_ns();
@@ -3139,12 +3197,14 @@ impl ShardActor {
         let slot = self.shares.enter(tenant_hash);
         let semaphore = Arc::clone(&self.semaphore);
         let ctx = Arc::clone(&self.ctx);
-        // Per-shard skew (issue #865): time the whole flush, which runs here off
-        // the actor (ADR-0067). Bracketing `run_flush` on the injected clock,
-        // rather than inside it, keeps the measurement out of the pinned-identity
-        // path and captures every exit `run_flush` takes, abandonment included.
-        // The permit wait is bracketed separately, before the flush's own span, so
-        // the two never overlap.
+        // Per-shard skew (issue #865): the flush runs here off the actor
+        // (ADR-0067). [`FlushCtx::run_flush`] brackets the flush proper
+        // (`commit_flush`) on the injected clock and records the off-actor
+        // figure itself, so the measurement stays out of the pinned-identity
+        // path, captures every exit the flush takes (abandonment included), and
+        // excludes the abandoned-key re-reads that follow it. The permit wait is
+        // bracketed separately, before the flush's own span, so the two never
+        // overlap.
         let clock = Arc::clone(&self.clock);
         let metrics = Arc::clone(&self.metrics);
         let scope = Arc::clone(&self.scope);
@@ -3253,10 +3313,7 @@ impl ShardActor {
                     }
                 }
             }
-            let started_ns = clock.now_ns();
             ctx.run_flush(pinned, grant).await;
-            let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
-            metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
         self.record_queued_flushes();
     }
@@ -8664,6 +8721,9 @@ mod tests {
         "commit: a commit record never exists without its data object";
     const EVIDENCE_COMPLETES: &str =
         "commit: a commit's data-object evidence read completes before it gives up";
+    const STRICT_METRICS_ACK: &str = "commit: a strict metrics ack names a durable commit record";
+    const STRICT_ACK_COMPLETES: &str =
+        "commit: a strict metrics ack's durable-commit evidence read completes before it gives up";
 
     const NS_PER_MINUTE: i64 = 60 * 1_000_000_000;
 
@@ -8808,6 +8868,69 @@ mod tests {
 
         fn capabilities(&self) -> ravel_object_store::Capabilities {
             self.0.capabilities()
+        }
+    }
+
+    /// Stalls every commit-record HEAD (a `/c/` key) once `stall` is set, so a
+    /// test can let the abandoned keys accumulate with the flag off and then
+    /// stall exactly the re-reads a later flush issues. A stalled HEAD never
+    /// answers; the caller's own `EVIDENCE_HEAD_TIMEOUT` race must end it.
+    struct StallCommitHeadStore {
+        inner: Arc<FaultStore<MemoryStore>>,
+        stall: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for StallCommitHeadStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            if self.stall.load(std::sync::atomic::Ordering::SeqCst) && key.contains("/c/") {
+                std::future::pending().await
+            } else {
+                self.inner.head(key).await
+            }
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
         }
     }
 
@@ -9527,6 +9650,148 @@ mod tests {
         for id in gate.held() {
             assert!(gate.release(id));
         }
+        router.flush_all().await;
+    }
+
+    /// A stalled commit HEAD in the strict-ack evidence read does not hang the
+    /// ack: the read races `EVIDENCE_HEAD_TIMEOUT` on the injected clock and
+    /// evaluates nothing on expiry, while the write still returns its token.
+    /// Fails against the bare `store.head` the fix replaced: the ack would hang
+    /// on the held HEAD forever.
+    #[tokio::test]
+    async fn a_stalled_strict_ack_evidence_read_does_not_hang_the_ack() {
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let stalled = TenantId::new("strict-metrics-ack-stalled");
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        // The first HEAD on the commit prefix is the strict ack's evidence read:
+        // the flush PUTs the commit record and HEADs only the data key before it.
+        let gate = fault_store.hold(Op::Head, Some(commit_prefix(&stalled)), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        provision(store.as_ref(), &stalled).await;
+        let clock = TestClock::new(BASE_NS);
+        let router = deadline_bounded_router(&store, &clock, Duration::from_secs(60));
+
+        let write = spawn_write(&router, &stalled, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(1))
+            .await
+            .expect("the strict ack's evidence read reached the store");
+        assert!(
+            !settles(|| write.is_finished()).await,
+            "the ack waits for the evidence read until the timeout"
+        );
+        clock.advance_ns(i64::try_from(publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"));
+        let receipt = tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("the ack follows the evidence timeout")
+            .expect("write task")
+            .expect("the strict write is acked although its evidence read timed out");
+        assert_eq!(receipt.tokens.len(), 1);
+        let acks = crate::router::invariant_capture::evaluations(
+            STRICT_METRICS_ACK,
+            &stalled.hash().to_hex(),
+        );
+        assert!(
+            acks.is_empty(),
+            "the evidence read evaluated nothing: {acks:?}"
+        );
+        let completes = crate::router::invariant_capture::evaluations(
+            STRICT_ACK_COMPLETES,
+            &stalled.hash().to_hex(),
+        );
+        assert_eq!(completes.len(), 1, "{completes:?}");
+        assert!(!completes[0].0, "the read gave up: {completes:?}");
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        router.flush_all().await;
+    }
+
+    /// A flush's abandoned-key recheck bounds the whole batch by ONE
+    /// `EVIDENCE_HEAD_TIMEOUT`, not one per key: with two stalled re-read HEADs,
+    /// the flush that owns the recheck leaves flight after a single timeout.
+    /// Fails against a per-key deadline (one fresh sleep per key), which needs
+    /// two timeouts for two keys, so after one the flush is still in flight.
+    #[tokio::test]
+    async fn a_recheck_of_several_stalled_keys_is_bounded_by_one_timeout() {
+        use ravel_object_store::fault::{Rule, ScriptedFault};
+
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let a1 = TenantId::new("recheck-batch-abandoned-one");
+        let a2 = TenantId::new("recheck-batch-abandoned-two");
+        let committing = TenantId::new("recheck-batch-committing");
+        let plan = FaultPlan::empty()
+            .with_rule(
+                Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 0 })
+                    .with_key_contains(commit_prefix(&a1))
+                    .with_occurrence(Occurrence::Always),
+            )
+            .with_rule(
+                Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 0 })
+                    .with_key_contains(commit_prefix(&a2))
+                    .with_occurrence(Occurrence::Always),
+            );
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(StallCommitHeadStore {
+            inner: Arc::clone(&fault_store),
+            stall: Arc::clone(&stall),
+        });
+        provision(store.as_ref(), &a1).await;
+        provision(store.as_ref(), &a2).await;
+        provision(store.as_ref(), &committing).await;
+        let clock = TestClock::new(BASE_NS);
+        // No retry budget: each throttled commit PUT abandons at once, with its
+        // record absent, so its key is remembered for the recheck.
+        let router = attempt_bounded_router(&store, &clock, Duration::from_secs(600), 0);
+
+        for (tenant, host) in [(&a1, "h0"), (&a2, "h1")] {
+            let before = router.metrics().snapshot().buffered_points_total;
+            let write = spawn_write(&router, tenant, host, WriteMode::Strict);
+            until(|| router.metrics().snapshot().buffered_points_total > before).await;
+            clock.advance_ns(TICK_ADVANCE_NS);
+            retry_until_finished(&clock, &write).await;
+            let err = write
+                .await
+                .expect("write task")
+                .expect_err("the throttled commit PUT abandons with no retry left");
+            assert!(matches!(err, WriteError::Abandoned(_)), "{err:?}");
+        }
+        assert_eq!(router.metrics().snapshot().abandoned_retry_exhausted, 2);
+
+        // Both abandoned keys are now remembered. Stall every commit HEAD, so
+        // the committing flush's recheck re-reads both against a store that never
+        // answers and must rely on the shared deadline.
+        stall.store(true, std::sync::atomic::Ordering::SeqCst);
+        let before = router.metrics().snapshot().buffered_points_total;
+        let write = spawn_write(&router, &committing, "h2", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total > before).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        // The committing flush takes the permit, commits, and parks in its
+        // recheck holding the in-flight guard.
+        assert!(
+            settles(|| in_flight(&router) == 1).await,
+            "the committing flush is in flight on its stalled recheck"
+        );
+        assert!(
+            !settles(|| in_flight(&router) == 0).await,
+            "the recheck holds the flush in flight before the timeout"
+        );
+        clock.advance_ns(i64::try_from(publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"));
+        assert!(
+            settles(|| in_flight(&router) == 0).await,
+            "one timeout bounds the whole batch of stalled re-reads"
+        );
+        // Let the strict ack's own evidence read give up too, so the write task
+        // ends rather than leaking.
+        clock.advance_ns(i64::try_from(publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"));
+        let _ = tokio::time::timeout(Duration::from_secs(10), write).await;
+        stall.store(false, std::sync::atomic::Ordering::SeqCst);
         router.flush_all().await;
     }
 }

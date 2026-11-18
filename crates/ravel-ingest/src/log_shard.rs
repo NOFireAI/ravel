@@ -1280,6 +1280,11 @@ impl LogFlushCtx {
             }
             Err(PutAbort::Exhausted) => {
                 self.metrics.record_abandoned_retry_exhausted();
+                // NoPublishAfterAbandon is deliberately metrics-shard only: the
+                // catalog-maintenance workload writes logs across forward clock
+                // jumps of +9000 s and more, so a logs flush still in flight
+                // when a write times out could land past the seal on correct
+                // code, which would make the property fire false here.
                 self.ack_waiters(
                     waiters,
                     Err(LogWriteError::Abandoned(
