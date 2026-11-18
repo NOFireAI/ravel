@@ -20,9 +20,13 @@ in the maintenance guide.
 - **Baseline release.** The first release that ships the `sys/compat`
   writer policy together with `ravel-cli` commands that create and
   activate `sys/compat` (ADR-4233 decision 1 and its baseline-release
-  amendment). No published release is the baseline yet: v0.33.0
-  (2026-11-13), the newest release, ships neither the policy nor the
-  `ravel-cli compat` subcommands.
+  amendment). The baseline release is v0.34.0 (2026-11-18), and
+  `compat init` records 0.34 by default. v0.33.0 ships neither the policy
+  nor the `ravel-cli compat` subcommands. v0.34.0 ships the subcommands as
+  a preview: the next release changes the refusal exit code from 2 to 5
+  and adds the required `--writer-roles-can-read-compat` attestation to
+  `compat activate`, and leaves `sys/compat` and every persisted version
+  as v0.34.0 writes them.
 - **Baseline version.** The version a family is written at before any
   activation: the value `compat init` records for it, and the value every
   writer emits while `sys/compat` is absent.

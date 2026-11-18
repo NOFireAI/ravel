@@ -127,7 +127,7 @@ the contract (decision 9, the inventory-completeness row).
 ### 1. The contract starts at a baseline release
 
 The **baseline release** is the first release that ships decisions 2 to 5
-(expected v0.34.0; see the baseline-release amendment below). The contract covers stores and processes from the
+(expected v0.34.0; see the baseline-release amendment below, and the v0.34.0 baseline amendment that names it). The contract covers stores and processes from the
 baseline onward. It replaces ADR-0531 decisions 1 and 2: the window policy
 starts at the baseline, not at v1.0.
 
@@ -1071,6 +1071,7 @@ the commands, `ravel-cli compat init`, `activate`, `certify`, `verify` and
 The baseline release a store records is whatever `compat init` is told
 (`InitConfig::baseline_release_major` and `baseline_release_minor`), so the
 release that ships the commands is the one on record, whatever its number.
+That release is now named: see the v0.34.0 baseline amendment below.
 
 ## Amendment (2026-11-18): the writer-role attestation is its own flag (issue #4423)
 
@@ -1105,3 +1106,24 @@ flag's help name the residual the flag leaves: a writer role not granted
 read on `sys/compat` keeps writing the baseline version to unprovisioned
 paths and to buckets it first touches after the activation, as the
 blind-view amendment describes.
+
+## Amendment (2026-11-18): the baseline release is v0.34.0 (issue #4466)
+
+<!-- amendment-applies: sections="1. The contract starts at a baseline release|Amendment (2026-11-17): the baseline release is the release that ships the compat commands (issue #4250)" pointer="v0.34.0 baseline amendment" -->
+
+The baseline-release amendment defined the baseline as the first release
+that ships decisions 2 to 5 together with the `ravel-cli compat` commands,
+and said no release was the baseline yet. v0.34.0, tagged on 2026-11-18,
+is that release: it ships the `sys/compat` writer policy and `ravel-cli
+compat init`, `activate`, `certify`, `verify` and `status`, and `compat
+init` records 0.34 as the baseline release by default. The frozen
+compatibility corpus `crates/ravel-compat-tests/corpus/v0.34.0/` was
+verified byte-identical against the v0.34.0 release commit.
+
+v0.34.0 ships the commands as a preview. The release after it changes their
+operator interface only: a refusal exits 5 instead of 2, and `compat
+activate` takes `--writer-roles-can-read-compat` as a second required
+attestation (the writer-role attestation amendment above). Neither change
+touches `sys/compat` or any persisted version, so a store adopted by
+v0.34.0 is held to the same contract by every later release, and the
+baseline does not move.
