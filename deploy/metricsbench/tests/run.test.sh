@@ -615,6 +615,7 @@ case "$1" in
         printf 'docker-env up S3S_FS_BIN=%s\n' "${S3S_FS_BIN-<unset>}" >>"${STUB_LOG}"
         printf 'docker-env up RAVEL_SERVER_EXTRA_FLAGS=%s\n' "${RAVEL_SERVER_EXTRA_FLAGS-<unset>}" >>"${STUB_LOG}"
         printf 'docker-env up S3_PREFIX=%s S3_REGION=%s\n' "${METRICSBENCH_S3_BUCKET_PREFIX-<unset>}" "${METRICSBENCH_S3_REGION-<unset>}" >>"${STUB_LOG}"
+        printf 'docker-env up S3_BUCKET_SUFFIXES=%s\n' "${METRICSBENCH_S3_BUCKET_SUFFIXES-<unset>}" >>"${STUB_LOG}"
         # shellcheck disable=SC2086
         reject_flags "${RAVEL_IMAGE-}" ${RAVEL_SERVER_EXTRA_FLAGS-}
         # The background fold builds key-index leaves under
@@ -2369,6 +2370,20 @@ expect_no_log "s: provenance carries no s3s-fs release" "store_release="
 expect_no_log "s: nothing downloads s3s-fs" "s3s-fs-linux"
 check "s: stamps name real S3 and every bucket" 'j("stamps.json")["store_kind"] == "s3" and j("stamps.json")["object_store"] == {"implementation": "s3", "region": "us-east-1", "credentials": "instance-role", "buckets": ["mb-run1-ravel", "mb-run1-mimir-blocks", "mb-run1-mimir-ruler", "mb-run1-mimir-alertmanager"]}'
 check "s: fetch-s3s-fs did not run" '"fetch-s3s-fs" not in j("stamps.json")["steps_completed"] and "query" in j("stamps.json")["steps_completed"]'
+# A full run leaves the bucket suffixes unset, so createbuckets checks all four
+# buckets real-s3.yml names by default, and compose brings up the whole stack.
+# An operator's stray METRICSBENCH_S3_BUCKET_SUFFIXES does not narrow it.
+expect_log "s: createbuckets keeps its four-bucket default" "docker-env up S3_BUCKET_SUFFIXES=<unset>"
+mapfile -t args < <(full_args "${TMP}/s9/out")
+METRICSBENCH_S3_BUCKET_SUFFIXES=ravel run_case s9 "${args[@]}" --real-s3-bucket-prefix mb-run1 --real-s3-region us-east-1
+expect_rc s9 0
+expect_log "s9: a full run unsets a caller's bucket suffixes" "docker-env up S3_BUCKET_SUFFIXES=<unset>"
+if [ "$(grep '^docker-compose-up -d' "${LOG}" | head -1)" = "docker-compose-up -d" ]; then
+  pass "s9: the full real-S3 run brings up the whole stack, Mimir included"
+else
+  fail "s9: the first compose up is $(grep '^docker-compose-up ' "${LOG}" | head -1)"
+fi
+check "s9: the stamps list all four buckets and no ravel_only key" 'j("stamps.json")["object_store"]["buckets"] == ["mb-run1-ravel", "mb-run1-mimir-blocks", "mb-run1-mimir-ruler", "mb-run1-mimir-alertmanager"] and "ravel_only" not in j("stamps.json") and "comparability" not in j("stamps.json")'
 
 # An engine arch with no s3s-fs asset does not matter when no asset is fetched.
 mapfile -t args < <(full_args "${TMP}/s8/out")
@@ -3889,9 +3904,10 @@ expect_err "ro2-band: --rss-band needs the memory step" "--ravel-only with --rss
 MB_STAGE1=1 MB_STAGE1_ARMS=l1 run_stage1 ro2-floor history --ravel-only --folded-catalog-get-floor 64
 expect_rc ro2-floor 65
 expect_err "ro2-floor: a folded-catalog flag is refused even at its default" "--ravel-only with --folded-catalog-get-floor: "
-MB_STAGE1=1 MB_STAGE1_ARMS=l1 run_stage1 ro2-s3 history --ravel-only --real-s3-bucket-prefix mb --real-s3-region us-east-1
-expect_rc ro2-s3 65
-expect_err "ro2-s3: the real-S3 lane is refused" "--ravel-only with --real-s3-bucket-prefix or --real-s3-region: "
+# The real-S3 lane is not one of them (issue #4481): ro7 below runs it.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 run_stage1 ro2-s3 history --ravel-only --real-s3-bucket-prefix mb --real-s3-region us-east-1
+expect_rc ro2-s3 0
+if grep -qF -- "--ravel-only with --real-s3" "${ERR}"; then fail "ro2-s3: the real-S3 lane is still refused"; else pass "ro2-s3: the real-S3 lane is not refused"; fi
 MB_STAGE1=1 MB_STAGE1_ARMS=l1 run_stage1 ro2-diag history --ravel-only --diagnostic-prometheus-max-samples 1000
 expect_rc ro2-diag 65
 expect_err "ro2-diag: the falsification run is refused" "--ravel-only with --diagnostic-prometheus-max-samples: "
@@ -3934,6 +3950,43 @@ expect_rc ro6 70
 expect_err "ro6: the refusal names the step, the watermark and the uncovered hour" "step stage1-l0 failed: refused: readback-l0 would read a catalog that does not cover the ingest: watermark_hour 490001 is before hour 490002, in which the ingest step ended, so ingest hours 490002..=490002 are not in the snapshot"
 check "ro6: the L0 catalog is stamped as not covering the ingest, the read-back refused" 'j("stamps.json")["failed_step"] == "stage1-l0" and j("stamps.json")["ravel_only"]["l0"]["catalog"]["covers_ingest"] is False and j("stamps.json")["ravel_only"]["l0"]["catalog"]["watermark_hour"] == 490001 and j("stamps.json")["ravel_only"]["l0"]["catalog"]["ingest_end_hour"] == 490002 and j("stamps.json")["ravel_only"]["l0"]["readback"].startswith("refused: the l0 catalog does not cover the ingest: watermark_hour 490001 ") and j("stamps.json")["ravel_only"]["l0"]["series_query_ms"] is None'
 expect_no_log "ro6: no read-back on the uncovered catalog" "--readback-only"
+
+# ro7: the Ravel-only shape on the real-S3 lane (issue #4481): Ravel's store
+# on PREFIX-ravel, createbuckets checking that bucket alone, no Mimir, the
+# objects and read-back steps naming the bucket, and the lane stamped.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 run_stage1 ro7 history --ravel-only --real-s3-bucket-prefix mb-run1 --real-s3-region us-east-1
+expect_rc ro7 0
+check "ro7: the Ravel-only steps in order, without fetch-s3s-fs" 'j("stamps.json")["steps_completed"] == ["stage1-flags","up","qualify","image","ready","ingest","stage1-l0-fold","stage1-l0","objects-l0","readback-l0","stage1-l1-compact","stage1-l1-fold","stage1-l1","objects-l1","readback-l1"] and j("stamps.json")["status"] == "passed"'
+expect_no_log "ro7: nothing downloads s3s-fs" "s3s-fs-linux"
+expect_log "ro7: compose up layers real-s3.yml and starts ravel-server" "/real-s3.yml up -d ravel-server"
+expect_log "ro7: compose up gets the prefix and region" "docker-env up S3_PREFIX=mb-run1 S3_REGION=us-east-1"
+# No Mimir: the one full up names ravel-server alone, createbuckets is told to
+# check the Ravel bucket alone, and no call names a Mimir service, port or
+# bucket.
+if python3 -I - "${LOG}" <<'PY'; then
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+ups = [l for l in lines if l.startswith("docker-compose-up ")]
+want = ["docker-compose-up -d ravel-server"] + ["docker-compose-up -d --no-deps --force-recreate ravel-server"] * 2
+ok = (ups == want and "docker-env up S3_BUCKET_SUFFIXES=ravel" in lines
+      and not any("mimir" in l for l in lines))
+sys.exit(0 if ok else 1)
+PY
+  pass "ro7: no Mimir container or bucket: ravel-server alone comes up, createbuckets checks PREFIX-ravel alone, no call names mimir"
+else
+  fail "ro7: compose up lines $(grep '^docker-compose-up ' "${LOG}" | tr '\n' '|'), suffixes $(grep '^docker-env up S3_BUCKET_SUFFIXES=' "${LOG}"), mimir lines $(grep -c mimir "${LOG}")"
+fi
+for s in l0 l1; do
+  expect_log "ro7: objects-${s} lists PREFIX-ravel on the regional endpoint" "real-s3.yml run --rm --no-deps -T --entrypoint aws createbuckets s3api list-objects-v2 --output json --bucket mb-run1-ravel"
+done
+expect_no_log "ro7: no call goes to s3s" "http://s3s:9000"
+expect_log "ro7: the catalog inspect reads through real-s3.yml" "real-s3.yml run --rm --no-deps -T ravel-qualify --store s3 --tenant-hash-unkeyed catalog inspect"
+check "ro7: each state's objects and read-back name PREFIX-ravel" 'all(j("stamps.json")["ravel_only"][s]["objects"]["bucket"] == "mb-run1-ravel" and j("stamps.json")["ravel_only"][s]["objects"]["endpoint"] == "regional AWS endpoint" and j("stamps.json")["ravel_only"][s]["readback"]["bucket"] == "mb-run1-ravel" and j("stamps.json")["ravel_only"][s]["verdict"] == "matched" for s in ("l0", "l1"))'
+check "ro7: the stamps carry the lane, the bucket and the region" 'j("stamps.json")["ravel_only"]["store"] == {"lane": "real-s3", "bucket": "mb-run1-ravel", "region": "us-east-1", "endpoint": "regional AWS endpoint"} and j("stamps.json")["store_kind"] == "s3" and j("stamps.json")["object_store"] == {"implementation": "s3", "region": "us-east-1", "credentials": "instance-role", "buckets": ["mb-run1-ravel"]}'
+check "ro7: still a non-comparable Ravel-only diagnostic" 'j("stamps.json")["comparability"] == "non-comparable" and j("stamps.json")["comparability_reason"] == "Ravel-only diagnostic" and j("stamps.json")["ravel_only"]["enabled"] is True and j("stamps.json")["mimir_readiness"] == "not applicable: Ravel-only diagnostic: no Mimir starts"'
+# ro1 ran on the portable lane: its store stamp says so.
+OUT="${TMP}/ro1/out"
+check "ro1: the portable lane's store is stamped" 'j("stamps.json")["ravel_only"]["store"] == {"lane": "portable", "bucket": "ravel-metricsbench", "region": None, "endpoint": "http://s3s:9000"} and all(j("stamps.json")["ravel_only"][s]["readback"]["bucket"] == "ravel-metricsbench" for s in ("l0", "l1"))'
 
 # zg: a routed HEAD that does not read back as saved refuses the leaf-on fold.
 MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour STUB_HEAD_RESTORE_BROKEN=1 run_stage1 zg ci
@@ -4922,8 +4975,6 @@ launch ro-control "${RO_HIST[@]}" "MB_CONTROL_IMAGE=${IMAGE}" "MB_CONTROL_SOURCE
 expect_launch_refused "MB_RAVEL_ONLY=1 with MB_CONTROL_IMAGE" "MB_RAVEL_ONLY=1 with MB_CONTROL_IMAGE: the control arm compares two Ravel builds over passes the Ravel-only shape does not run"
 launch ro-rss "${RO_HIST[@]}" MB_RSS_BAND=x:1:2
 expect_launch_refused "MB_RAVEL_ONLY=1 with MB_RSS_BAND" "MB_RAVEL_ONLY=1 with MB_RSS_BAND: run.sh --ravel-only refuses --rss-band"
-launch ro-real-s3 "${RO_HIST[@]}" -- mbprefix
-expect_launch_refused "MB_RAVEL_ONLY=1 with a real-s3-prefix" "MB_RAVEL_ONLY=1 with a real-s3-prefix: run.sh --ravel-only refuses the real-S3 lane"
 launch ro-no-objects "${RO_HIST[@]}" MB_OBJECTS_BAND=
 expect_launch_refused "MB_RAVEL_ONLY=1 without MB_OBJECTS_BAND" "MB_RAVEL_ONLY=1 with MB_PROFILE=history needs MB_OBJECTS_BAND set for it; the default is cardinality's"
 launch ro-two MB_RAVEL_ONLY=2
@@ -4954,6 +5005,16 @@ if [ "${rc}" -eq 0 ] && grep -qF 'ec2 run-instances' "${LAUNCH_AWS_LOG}" &&
 else
   fail "launch ro-history: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), env $(launch_env 2>&1)"
 fi
+# A real-s3-prefix with MB_RAVEL_ONLY=1 launches (issue #4481): the box runs
+# the measured Ravel-only run on PREFIX-ravel.
+launch ro-real-s3 "${RO_HIST[@]}" -- mbprefix
+if [ "${rc}" -eq 0 ] && grep -qF 'ec2 run-instances' "${LAUNCH_AWS_LOG}" &&
+  launch_env | grep -qxF 'RAVEL_ONLY=1' && launch_env | grep -qxF 'REAL_S3_PREFIX=mbprefix' &&
+  launch_env | grep -qxF 'PROFILE=history' && launch_env | grep -qxF "RSS_BAND=''"; then
+  pass "launch: MB_RAVEL_ONLY=1 with a real-s3-prefix is accepted and its user data carries RAVEL_ONLY=1 and REAL_S3_PREFIX"
+else
+  fail "launch ro-real-s3: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), env $(launch_env 2>&1)"
+fi
 LAUNCH_KEYS="BUCKET PREFIX SRC_SHA256 BOXRUN_SHA256 HARNESS_COMMIT RAVEL_IMAGE RAVEL_SOURCE_COMMIT ANCHOR_MS PROFILE RSS_BAND OBJECTS_BAND REAL_S3_PREFIX STAGE1 STAGE1_BANDS STAGE1_ARMS CONTROL_IMAGE CONTROL_SOURCE_COMMIT AWS_DEFAULT_REGION "
 launch l1-ci "${CI_L1[@]}" MB_L1_MAX_PART_BYTES=4096
 if [ "${rc}" -eq 0 ] && [ "$(launch_env | cut -d= -f1 | tr '\n' ' ')" = "${LAUNCH_KEYS}L1_MAX_PART_BYTES " ] &&
@@ -4972,6 +5033,57 @@ for c in unset zero; do
     fail "launch ${c}: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), env $(launch_env 2>&1)"
   fi
 done
+
+# --- make-buckets.sh and box-run.sh's bucket set (issue #4481) --------------------
+# make_buckets NAME ARG...: make-buckets.sh ARGs with the aws stub; rc and
+# LAUNCH_AWS_LOG, whose create-bucket calls name the buckets made.
+make_buckets() {
+  local name="$1"
+  shift
+  LAUNCH_AWS_LOG="${TMP}/make-buckets-${name}.aws"
+  LAUNCH_USER_DATA=/dev/null
+  rc=0
+  (
+    export LAUNCH_AWS_LOG LAUNCH_USER_DATA PATH="${LAUNCH_BIN}:${PATH}" AWS_REGION=eu-west-1 \
+      MB_INSTANCE_ROLE_ARN=arn:aws:iam::1:role/r
+    bash "${HERE}/../aws/make-buckets.sh" "$@"
+  ) >/dev/null 2>"${TMP}/make-buckets-${name}.err" || rc=$?
+}
+made_buckets() { sed -n 's/^aws s3api create-bucket --bucket \([^ ]*\) .*/\1/p' "${LAUNCH_AWS_LOG}" | tr '\n' ' '; }
+make_buckets full p p-ci
+if [ "${rc}" -eq 0 ] && [ "$(made_buckets)" = "p-ravel p-mimir-blocks p-mimir-ruler p-mimir-alertmanager p-ci-ravel p-ci-mimir-blocks p-ci-mimir-ruler p-ci-mimir-alertmanager " ]; then
+  pass "make-buckets: a prefix gets the four buckets of a full run, as before"
+else
+  fail "make-buckets full: rc ${rc}, made $(made_buckets)"
+fi
+make_buckets ro --ravel-only p
+if [ "${rc}" -eq 0 ] && [ "$(made_buckets)" = "p-ravel " ] && [ "$(grep -c 'put-bucket-policy --bucket p-ravel ' "${LAUNCH_AWS_LOG}")" -eq 1 ]; then
+  pass "make-buckets: --ravel-only makes PREFIX-ravel alone, with its policy"
+else
+  fail "make-buckets ro: rc ${rc}, made $(made_buckets)"
+fi
+make_buckets ro-noprefix --ravel-only
+if [ "${rc}" -eq 64 ] && [ ! -e "${LAUNCH_AWS_LOG}" ]; then
+  pass "make-buckets: --ravel-only with no prefix is a usage error before any aws call"
+else
+  fail "make-buckets ro-noprefix: rc ${rc}"
+fi
+# The box's bucket summary after the measured run lists the buckets it used.
+for c in full ro; do
+  want="ravel mimir-blocks mimir-ruler mimir-alertmanager"
+  [ "$c" = full ] || want="ravel"
+  got="$( (unset RAVEL_ONLY; [ "$c" = full ] || export RAVEL_ONLY=1; . "${BOXRUN}"; measured_bucket_suffixes) 2>&1)"
+  if [ "${got}" = "${want}" ]; then
+    pass "box-run: the ${c} measured run's bucket summary covers ${want}"
+  else
+    fail "box-run ${c}: measured_bucket_suffixes printed '${got}', want '${want}'"
+  fi
+done
+if grep -qxF '  for s in $(measured_bucket_suffixes); do' "${BOXRUN}"; then
+  pass "box-run: the bucket summary loop reads measured_bucket_suffixes"
+else
+  fail "box-run: the bucket summary loop does not read measured_bucket_suffixes"
+fi
 
 # The band file's profile must be the run's; bad usage is 64.
 run_check profile "${CI_BANDS}" "${TMP}/z/out"
