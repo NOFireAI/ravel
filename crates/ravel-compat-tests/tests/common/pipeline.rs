@@ -388,6 +388,18 @@ pub async fn query_hour(
     shard_count: u32,
     now_ns: i64,
 ) -> Vec<(String, Vec<DecodedSeries>)> {
+    query_hours(store, shard_count, HOUR, 1, now_ns).await
+}
+
+/// The data objects a query over `hours` hours from `first_hour` resolves,
+/// each with its decoded series, in key order.
+pub async fn query_hours(
+    store: Arc<dyn ObjectStoreBackend>,
+    shard_count: u32,
+    first_hour: u32,
+    hours: u32,
+    now_ns: i64,
+) -> Vec<(String, Vec<DecodedSeries>)> {
     let catalog = Catalog::new(
         store.clone(),
         CatalogConfig {
@@ -401,8 +413,8 @@ pub async fn query_hour(
             &hash(),
             Signal::Metrics,
             TimeRange {
-                start_ns: hour_start_ns(),
-                end_ns: hour_start_ns() + HOUR_NS,
+                start_ns: i64::from(first_hour) * HOUR_NS,
+                end_ns: i64::from(first_hour + hours) * HOUR_NS,
             },
             &[],
             now_ns,
