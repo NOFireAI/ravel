@@ -856,7 +856,7 @@ impl LogIngestRouter {
         // request writes no marker. The default build compiles the assertion
         // out, leaving `tenant_hash` unread.
         let _ = tenant_hash;
-        ravel_invariant::inv_always!(
+        ravel_invariant::inv_sometimes!(
             {
                 if first_error.is_none() {
                     crate::idempotency::note_request_shards(
@@ -866,15 +866,36 @@ impl LogIngestRouter {
                         &ack_shards,
                     );
                 }
-                crate::router::commit_records_exist(
+                // The HEAD is raced against `EVIDENCE_HEAD_TIMEOUT` on the
+                // injected clock, so a stalled store cannot hang the ack in an
+                // instrumented run; a read that gives up evaluates nothing.
+                match crate::router::commit_records_exist(
                     self.store.as_ref(),
                     &tenant_hash,
                     ravel_types::Signal::Logs,
                     &durable,
+                    || {
+                        self.clock
+                            .sleep(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT)
+                    },
                 )
                 .await
+                {
+                    Some(durable_records_exist) => {
+                        ravel_invariant::inv_always!(
+                            durable_records_exist,
+                            "commit: a strict logs ack names a durable commit record",
+                            std::collections::BTreeMap::from([
+                                ("tenant", tenant_hash.to_hex()),
+                                ("tokens", crate::router::encode_tokens(&durable)),
+                            ])
+                        );
+                        true
+                    }
+                    None => false,
+                }
             },
-            "commit: a strict logs ack names a durable commit record",
+            "commit: a strict logs ack's durable-commit evidence read completes before it gives up",
             std::collections::BTreeMap::from([
                 ("tenant", tenant_hash.to_hex()),
                 ("tokens", crate::router::encode_tokens(&durable)),

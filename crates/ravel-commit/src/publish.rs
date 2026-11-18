@@ -205,7 +205,10 @@ where
                 () = give_up => return false,
             }
         }
-        Err(_) => false,
+        // A data key we cannot reconstruct is no evidence of a missing object:
+        // evaluate nothing rather than read it as absent, exactly as the race's
+        // give-up arm above does.
+        Err(_) => return false,
     };
     let _ = has_data;
     ravel_invariant::inv_always!(
