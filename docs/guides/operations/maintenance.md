@@ -701,6 +701,10 @@ when a claim is in the way:
 - Avoid `--no-claim` while an erasure request for the tenant is pending.
   Against an erasure of the same bucket the only check left is the re-list
   that each run makes just before it publishes, which leaves a short window.
+  A compaction that publishes inside that window leaves the erased sample
+  readable, with duplicate rows, and no reader reports it: a query returns
+  those rows without an error. Only a rerun of the erasure does, by failing
+  on the bucket's two live records.
 
 `maintain migrate` takes the same claims, prints the same `claims:` line, and
 accepts the same `--no-claim`. Its `--dry-run` also takes no claims, but it is
@@ -721,7 +725,11 @@ A claim does two jobs:
   there can delay an erasure. With the re-list's short window, such a bug
   costs more than wasted work.
 
-The background supervisor's per-unit tick takes claims. So do
+The background supervisor's per-unit tick takes claims. So does the server's
+background migrate (`--background-migrate`), on the same clock and lease as
+the tick but under its own process id, so each stands down for a bucket the
+other holds. The server logs that id at startup, beside its own, in the line
+`background migrate takes bucket claims under its own process id`. So do
 `ravel-cli maintain compact-bucket`, `compact-tenant` and
 `migrate`. `--no-claim` on the
 CLI and `--maintain-claims off` on the server are the two ways to opt a run
@@ -783,12 +791,16 @@ Two flags configure claiming, and a third has no effect:
   encode and PUT the largest L1 segment at a conservative rate logs a startup
   warning and is not refused.
 - `--maintain-claims on|off` (default `on`): `off` disables claiming
-  everywhere on that process. Use it for a store whose qualification record
+  everywhere on that process, for the tick and the background migrate alike.
+  Use it for a store whose qualification record
   predates the CAS probes, or for an emergency. Two racing compactions still
   converge at the compaction record, and the loser pays its merge first. With
   claims off, a compaction and an erasure rewrite of the same bucket are kept
   apart only by the re-list that each runs just before it publishes, which
-  leaves a short window.
+  leaves a short window. A compaction or migration that publishes inside it
+  leaves the erased sample readable, with duplicate rows, and no reader
+  reports it. Only a rerun of the erasure does, by failing on the bucket's
+  two live records.
 - `--maintain-claim-min-input-bytes <BYTES>` (default 64 MiB): has no effect
   and will be removed. With claims on, every bucket is claimed whatever its
   size, because the claim also keeps a compaction and an erasure rewrite of
