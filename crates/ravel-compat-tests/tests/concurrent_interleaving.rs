@@ -2,8 +2,8 @@
 //! (ADR-4233 decision 9). After activation of the drill version N+1, four
 //! tasks run against one store, interleaved at store-call granularity by a
 //! seeded scheduler: `migrate` of the family, a compaction of the hour, an
-//! ingest publish at N+1, and a late publish at N from a writer whose permit
-//! was granted before activation, so inside H of it. No task runs on a thread,
+//! ingest publish at N+1, and a late publish at N -- a raw N flush standing
+//! in for a permit granted inside H of it. No task runs on a thread,
 //! no runtime drives them and nothing waits on a clock: every store call
 //! returns `Pending` once and the scheduler picks the next task to poll from
 //! the seed.
@@ -28,6 +28,7 @@ use ravel_maintain::{
     Bucket, CertifyReport, CompactionOutcome, FamilyMigrateReport, FixedClock, activate,
     compact_bucket,
 };
+use ravel_object_store::fault::Op;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_segment::SegmentVersion;
@@ -40,7 +41,7 @@ use common::pipeline::{
     v7, writable, write_flush,
 };
 use common::sched::{Task, block_on, drive};
-use common::tap::TapStore;
+use common::tap::{TapStore, Write};
 
 const SEEDS: u64 = 64;
 const SHARD: u32 = 0;
@@ -123,6 +124,31 @@ async fn compacted_inputs(store: &dyn ObjectStoreBackend) -> BTreeMap<String, Ve
 struct Tally {
     certified: usize,
     contradicted: usize,
+    /// Seeds where both `migrate` and the compaction attempted a compaction
+    /// record PUT to this bucket's hour, proving the two tasks actually
+    /// overlapped at the publish step rather than one finishing before the
+    /// other started.
+    overlapping_publish: usize,
+}
+
+/// Attempted (not necessarily successful) compaction-record PUTs to
+/// `bucket`'s hour in `writes`. Neither `migrate_bucket_format` nor
+/// `compact_bucket` retries a failed publish, and nothing else in this test
+/// writes a compaction record key, so a count of 2 or more means one
+/// attempt came from each task.
+fn compaction_record_publish_attempts(writes: &[Write], bucket: &Bucket) -> usize {
+    writes
+        .iter()
+        .filter(|w| w.op == Op::Put)
+        .filter(|w| {
+            keys::parse_compaction_record_key(&w.key).is_ok_and(|parsed| {
+                parsed.tenant_hash == bucket.tenant_hash
+                    && parsed.signal == bucket.signal
+                    && parsed.shard == bucket.shard
+                    && parsed.ingest_hour_bucket == bucket.ingest_hour_bucket
+            })
+        })
+        .count()
 }
 
 async fn one_seed(seed: u64, tally: &mut Tally) {
@@ -169,8 +195,11 @@ async fn one_seed(seed: u64, tally: &mut Tally) {
         }),
     ];
     let (done, order) = drive(seed, &|| tap.calls(), tasks);
-    let writes: Vec<String> = tap
-        .take_writes()
+    let raw_writes = tap.take_writes();
+    if compaction_record_publish_attempts(&raw_writes, &bucket) >= 2 {
+        tally.overlapping_publish += 1;
+    }
+    let writes: Vec<String> = raw_writes
         .into_iter()
         .map(|w| format!("{:?} {}", w.op, w.key))
         .collect();
@@ -273,10 +302,18 @@ async fn one_seed(seed: u64, tally: &mut Tally) {
 fn seeded_interleavings_of_migrate_ingest_compaction_and_a_late_write() {
     let mut tally = Tally::default();
     for seed in 0..SEEDS {
-        block_on(seed, one_seed(seed, &mut tally));
+        common::with_seed_context(seed, std::panic::AssertUnwindSafe(|| {
+            block_on(seed, one_seed(seed, &mut tally));
+        }));
     }
     assert!(
         tally.certified > 0 && tally.contradicted > 0,
         "the seeds cover both outcomes: {tally:?}"
+    );
+    assert!(
+        tally.overlapping_publish > 0,
+        "at least one seed must have migrate and the compaction both attempt a \
+         compaction record publish to the hour, or the single-winner check below \
+         never actually exercised the race: {tally:?}"
     );
 }

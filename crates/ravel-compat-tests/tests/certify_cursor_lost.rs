@@ -74,7 +74,12 @@ async fn certifiable() -> (Arc<MemoryStore>, i64) {
 }
 
 /// The census start `S` the stored cursor carries (bytes 13..21, after the
-/// tag, the target and the activation epoch).
+/// tag, the target and the activation epoch). `ravel_maintain`'s
+/// `CertifyCursor` and its `encode_cursor`/`decode_cursor` are private to
+/// that crate, so this mirrors `encode_cursor`'s layout (tag, then
+/// `target_version: u32`, `activated_epoch: u64`, `start_unix_ns: i64`) by
+/// hand rather than calling a decoder; a layout change there fails this
+/// test loudly rather than reading a stale offset silently.
 async fn cursor_start(store: &dyn ObjectStoreBackend) -> i64 {
     let bytes = store
         .get(CURSOR_KEY, GetRange::Full)

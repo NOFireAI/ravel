@@ -98,6 +98,9 @@ async fn a_stale_floor_does_not_certify_while_superseded_n_inputs_remain() {
         ..Flush::v7(0, 0xC0, 4, 4.5)
     };
     write_flush(store.as_ref(), &newer).await;
+    // `classify_floor` is fed a hand-built `FloorObservation` here, not one
+    // the store audit produced; the `certify_at` assertion below is what
+    // carries this row against the real store.
     assert_eq!(
         classify_floor(
             floor,

@@ -372,7 +372,9 @@ async fn one_seed(seed: u64, tally: &mut Tally) {
 fn an_erasure_and_a_pinned_query_during_migrate_complete_at_n_plus_1() {
     let mut tally = Tally::default();
     for seed in 0..SEEDS {
-        block_on(seed, one_seed(seed, &mut tally));
+        common::with_seed_context(seed, std::panic::AssertUnwindSafe(|| {
+            block_on(seed, one_seed(seed, &mut tally));
+        }));
     }
     assert!(
         tally.erasure_published_in_run > 0 && tally.erasure_stood_down_in_run > 0,

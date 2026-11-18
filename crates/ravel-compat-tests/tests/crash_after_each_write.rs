@@ -73,6 +73,14 @@ const STEPS: [Step; 5] = [
 
 /// The steps whose writes are crashed. The sweep passes run unfaulted, so
 /// certify has a store with no v7 member to certify.
+///
+/// Not every write the ADR-4233 row lists is crashed here: the sweep
+/// deletes and the late-write pass's `sys/compat` write are not, because
+/// this test crashes `activate`, `migrate` and `certify` only. The row's
+/// other steps (data PUT, record PUT, provisioning CAS, compat CAS, cursor
+/// write, floor raise, certificate CAS) are still covered, by `migrate` and
+/// `certify`; the migrate cursor itself is only ever deleted with an
+/// unlimited budget, never under a fault here.
 const CRASHED: [Step; 3] = [Step::Activate, Step::Migrate, Step::Certify];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

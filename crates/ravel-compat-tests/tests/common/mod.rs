@@ -136,3 +136,25 @@ pub async fn data_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
         .filter(|k| k.ends_with(".rseg"))
         .collect()
 }
+
+/// Run `f` for `seed`, prefixing its panic message with the seed when it
+/// panics. The shared pipeline helpers (`write_flush`, `query_hour`, and a
+/// seeded test's own helpers such as `compacted_inputs`) panic with
+/// `.expect()`/`.unwrap()` messages that do not themselves name the seed; a
+/// seeded test loop calls every seed through this so a failure still says
+/// which one.
+pub fn with_seed_context<T>(seed: u64, f: impl FnOnce() -> T + std::panic::UnwindSafe) -> T {
+    match std::panic::catch_unwind(f) {
+        Ok(value) => value,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()));
+            match msg {
+                Some(msg) => panic!("seed {seed}: {msg}"),
+                None => panic!("seed {seed}: panicked with a non-string payload"),
+            }
+        }
+    }
+}
