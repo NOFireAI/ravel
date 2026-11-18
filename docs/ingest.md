@@ -298,7 +298,8 @@ about 40 s at the defaults). A row routed later would be acknowledged in
 buffered mode although its undeferred flush trigger would open past the
 horizon, where the scan-set check below holds the flush, and drops it if no
 provisioning read succeeds within the bound of that hold and a read issued
-after the hold was spent did not confirm the view, so in the last `flush_trigger_age_bound` before the horizon a write is refused
+after the hold was spent failed, or `max_flush_lifetime` more passed with no
+read confirming the view, or a teardown drain did not confirm it, so in the last `flush_trigger_age_bound` before the horizon a write is refused
 with the retryable `StaleProvisioningView` (503) and nothing is buffered. That
 refusal covers only the undeferred trigger. A buffer held below
 `--idle-flush-byte-floor` (the ADR-1737 sub-floor hold, about
@@ -307,7 +308,8 @@ tenant flush share or the queued-flush cap, for the flush deferral cap,
 3,559.8 s at the defaults, or longer) can still open past the horizon after its rows
 were acknowledged; it is then held under the bounded stale-view hold, and
 dropped if no provisioning read succeeds within the bound and a read issued
-after the hold was spent did not confirm the view
+after the hold was spent failed, or `max_flush_lifetime` more passed with no
+read confirming the view, or a teardown drain did not confirm it
 (docs/consistency-model.md, acknowledgement case nine). The grace
 window degrades cost under
 store latency, it never converts a genuine shard-count change into silent
@@ -469,9 +471,8 @@ tenant's cached generation history. That view is trusted for `h` only before
   asks again. A read issued after the spend that installs a trusted view
   opens the flush at the next attempt. The buffer is dropped once a read
   issued at or after the spend has failed, or `max_flush_lifetime` has
-  passed since the spend with no read confirming the view: a read issued
-  after the hold was spent did not confirm the view. That attempt drops the
-  buffer unwritten instead of holding it again: strict
+  passed since the spend with no read confirming the view. That attempt drops
+  the buffer unwritten instead of holding it again: strict
   waiters are answered the retryable `Abandoned` (503), dropping the buffer
   refunds its ADR-0069 byte charges, the drop is logged at ERROR, and
   `ravel_ingest_abandoned_stale_provisioning_total` counts it once per

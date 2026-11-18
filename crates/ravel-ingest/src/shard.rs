@@ -2690,8 +2690,10 @@ impl ShardActor {
 
     /// Drops a buffer whose flush was held closed on an untrusted generation
     /// view for `max_flush_lifetime` with no provisioning read succeeding, and
-    /// for which a read issued after that did not confirm the view (issue
-    /// #4363, [`StaleViewHold`]). Nothing is written: strict waiters get
+    /// for which a read issued after the hold was spent failed, or
+    /// `max_flush_lifetime` more passed with no read confirming the view, or a
+    /// teardown drain did not confirm it (issue #4363, [`StaleViewHold`]).
+    /// Nothing is written: strict waiters get
     /// `Abandoned`, and dropping `charges` refunds the byte budget. A teardown
     /// pass drops a spent hold too, rather than writing it in place.
     fn drop_stale_view_flush(&self, tenant_hash: TenantHash, buf: TenantBuf, lag_check: LagCheck) {
@@ -2708,8 +2710,9 @@ impl ShardActor {
             bytes = buf.est_bytes,
             teardown = !matches!(lag_check, LagCheck::Enforced),
             "ravel-ingest: dropping a flush held closed for max_flush_lifetime on a provisioning \
-             view this router cannot trust: a read issued after the hold was spent did not \
-             confirm the view; its rows are not written"
+             view this router cannot trust: a read issued after the hold was spent failed, or \
+             max_flush_lifetime more passed with no read confirming the view, or a teardown \
+             drain did not confirm it; its rows are not written"
         );
         self.ctx.ack_waiters(
             buf.waiters,

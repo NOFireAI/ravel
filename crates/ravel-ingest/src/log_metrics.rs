@@ -92,8 +92,9 @@ pub struct LogIngestMetrics {
     abandoned_hour_bound: AtomicU64,
     /// Buffers dropped at flush open because their provisioning view stayed
     /// untrusted for `max_flush_lifetime` with no provisioning read
-    /// succeeding, and a read issued after the hold was spent did not confirm
-    /// the view (issue #4363): strict waiters get
+    /// succeeding, and a read issued after the hold was spent failed, or
+    /// `max_flush_lifetime` more passed with no read confirming the view, or
+    /// a teardown drain did not confirm it (issue #4363): strict waiters get
     /// [`crate::LogWriteError::Abandoned`], charges are refunded, nothing is
     /// written. Counted once per dropped buffer.
     abandoned_stale_provisioning: AtomicU64,
@@ -379,7 +380,9 @@ pub struct LogIngestMetricsSnapshot {
     pub abandoned_hour_bound: u64,
     /// Buffers dropped because their provisioning view stayed untrusted for
     /// `max_flush_lifetime` with no provisioning read succeeding, and a read
-    /// issued after the hold was spent did not confirm the view (issue #4363).
+    /// issued after the hold was spent failed, or `max_flush_lifetime` more
+    /// passed with no read confirming the view, or a teardown drain did not
+    /// confirm it (issue #4363).
     pub abandoned_stale_provisioning: u64,
     /// Publishes the `sys/compat` activation policy refused, by reason.
     pub compat_publish_refused: CompatRefusalSnapshot,
@@ -741,8 +744,9 @@ impl LogIngestMetrics {
     }
 
     /// One buffer dropped because its provisioning view stayed untrusted for
-    /// `max_flush_lifetime` and a read issued after the hold was spent did not
-    /// confirm the view (issue #4363).
+    /// `max_flush_lifetime` and a read issued after the hold was spent failed,
+    /// or `max_flush_lifetime` more passed with no read confirming the view,
+    /// or a teardown drain did not confirm it (issue #4363).
     pub(crate) fn record_abandoned_stale_provisioning(&self) {
         self.abandoned_stale_provisioning
             .fetch_add(1, Ordering::Relaxed);

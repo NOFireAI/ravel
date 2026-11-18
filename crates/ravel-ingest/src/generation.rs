@@ -480,11 +480,14 @@ pub(crate) async fn reread_and_check<M>(
 
 /// The `Abandoned` message a strict waiter gets when its buffer is dropped
 /// because its flush was held on an untrusted view for `max_flush_lifetime`
-/// and a provisioning read issued after that did not confirm the view (issue
-/// #4363). Nothing from the buffer is written, so a retry stores one copy.
+/// and a provisioning read issued after the hold was spent failed, or
+/// `max_flush_lifetime` more passed with no read confirming the view, or a
+/// teardown drain did not confirm it (issue #4363). Nothing from the buffer is
+/// written, so a retry stores one copy.
 pub(crate) const STALE_VIEW_ABANDONED: &str = "flush dropped: the flush was held on an untrusted \
-     view for max_flush_lifetime and a provisioning read issued after that did not confirm the \
-     view; the rows were not written";
+     view for max_flush_lifetime and a provisioning read issued after the hold was spent failed, \
+     or max_flush_lifetime more passed with no read confirming the view, or a teardown drain did \
+     not confirm it; the rows were not written";
 
 /// A buffer's hold on a generation view the router cannot trust (issue
 /// #4363). The hold starts at the first enforced flush open that finds no

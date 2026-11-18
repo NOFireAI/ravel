@@ -70,8 +70,9 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // Read-modify-write under CAS. ProvisioningRecord accepts {1, 2, 3}
         // after ADR-1746 Release A (the FormatFloor basis fields), and its
         // writer stamps 3 since Release B; {1, 2, 3, 4} after ADR-4233
-        // decision 4 (compat_epoch and compat_fenced_unix_ns, stamped 4 only on
-        // a fenced record). CompatRecord (`sys/compat`, ADR-4233 decision 3)
+        // decision 4 (compat_epoch and compat_fenced_unix_ns; a writer stamps 4
+        // when the record carries either field or is already at 4, see
+        // `stamp_for`). CompatRecord (`sys/compat`, ADR-4233 decision 3)
         // starts at {1}. TenantConfigRecord accepts {1, 2, 3}
         // after ADR-2135's reader-first step (clustering_key and bloom_scope;
         // the writer stamps 2 by default and 3 behind the storage-layout
@@ -79,9 +80,11 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // index_trace_id, stamped 4 behind the same opt-in). MetricMetadataRecord accepts {1, 2} after ADR-0066 R1;
         // AuthTokenMap accepts {1, 2} (managed_by, ADR-0072 #897) and
         // KeyEpochRecord {1}, both as a floor-and-ceiling set since ADR-0066 R2.
-        // GcConfig still carries a ceiling-only gate in its own crate
-        // (ravel-maintain), outside this change's scope: reported, not fixed.
-        // CompactionClaim's reader (ravel-fleet) now refuses to steal or
+        // GcConfig accepts {1, 2} after ADR-1133 decision 4 (head_cache_ttl_ns;
+        // bootstrap writes 1, and `gc-config set` writes 2 when it records a
+        // HEAD cache TTL or the stored object is already at 2), checked
+        // against ravel-maintain's constants by
+        // `gc_config_read_set_matches_its_readers_constants`. CompactionClaim's reader (ravel-fleet) now refuses to steal or
         // overwrite a claim whose format_version is 0 or above its own known
         // version at any age, not only past the 24 h ceiling (ADR-4233
         // decision 4, H8); an ordinary unreadable claim at a known version is
@@ -93,7 +96,7 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         ("TenantConfigRecord", CasMutable(&[1, 2, 3, 4])),
         ("MetricMetadataRecord", CasMutable(&[1, 2])),
         ("AuthTokenMap", CasMutable(&[1, 2])),
-        ("GcConfig", CasMutable(&[1])),
+        ("GcConfig", CasMutable(&[1, 2])),
         ("CompactionClaim", CasMutable(&[1])),
         ("KeyEpochRecord", CasMutable(&[1])),
     ])
@@ -308,10 +311,13 @@ fn a_new_versioned_agents_message_is_detected_as_unclassified() {
 /// here, which is the point: a table that merely restated the constants would
 /// track any change silently and guard nothing.
 ///
-/// The six messages absent from this list are read outside ravel-catalog
-/// (ravel-fleet, ravel-maintain, ravel-server, ravel-ingest). Asserting their
-/// slices against their constants would need a dev-dependency on each of those
-/// crates, so their entries stay literal and are maintained by hand.
+/// The seven messages absent from this list are read outside ravel-catalog
+/// (ravel-fleet, ravel-maintain, ravel-server, ravel-ingest, ravel-ipcrypt).
+/// Asserting their slices against their constants would need a dev-dependency
+/// on each of those crates, so their entries stay literal. `GcConfig`'s is
+/// checked against its reader's constants from source text by
+/// `gc_config_read_set_matches_its_readers_constants`; the other six are
+/// maintained by hand.
 #[test]
 fn catalog_read_sets_match_their_readers_constants() {
     use ravel_catalog as cat;
@@ -358,6 +364,54 @@ fn catalog_read_sets_match_their_readers_constants() {
              A widened gate must be recorded here too (ADR-0066 decision 4)."
         );
     }
+}
+
+/// `GcConfig`'s read set is the closed range its reader in ravel-maintain
+/// accepts, `GC_FORMAT_VERSION_V1..=GC_FORMAT_VERSION`
+/// (`GcConfigValues::from_proto`, which refuses every other version, 0
+/// included). ravel-maintain depends on this crate, so the two constants are
+/// read from its source text, as the proto is, rather than through a
+/// dev-dependency.
+#[test]
+fn gc_config_read_set_matches_its_readers_constants() {
+    let path = format!(
+        "{}/../ravel-maintain/src/gc_config.rs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read the GcConfig reader at {path}: {e}"));
+    let min = u32_const(&source, "GC_FORMAT_VERSION_V1");
+    let max = u32_const(&source, "GC_FORMAT_VERSION");
+    let expected: Vec<u32> = (min..=max).collect();
+
+    let listed = match classification_table().get("GcConfig") {
+        Some(Class::CasMutable(v)) => *v,
+        other => panic!("GcConfig must be classified CasMutable, got {other:?}"),
+    };
+    assert_eq!(
+        listed,
+        expected.as_slice(),
+        "GcConfig: the table's read set disagrees with ravel-maintain's \
+         GC_FORMAT_VERSION_V1..=GC_FORMAT_VERSION (ADR-0066 decision 4)."
+    );
+}
+
+/// The value of the one `pub const NAME: u32 = N;` declaration in `source`.
+fn u32_const(source: &str, name: &str) -> u32 {
+    let decl = format!("pub const {name}: u32 = ");
+    let found: Vec<&str> = source
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(decl.as_str()))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one `{decl}N;` declaration, found {found:?}"
+    );
+    let value = found[0].trim_end_matches(';').trim();
+    value
+        .parse()
+        .unwrap_or_else(|e| panic!("{name} is not a u32 literal ({value:?}): {e}"))
 }
 
 /// Every CasMutable supported set is non-empty and includes version 1 (the
