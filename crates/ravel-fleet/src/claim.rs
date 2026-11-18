@@ -308,8 +308,12 @@ impl ClaimConfig {
 /// are never read by any decision in this module; see [`CompactionClaim`].
 #[derive(Debug, Clone)]
 pub struct ClaimOwner {
-    /// The ADR-0057/0065 startup UUID, the same identity this process's
-    /// `sys/maintain/workers/<process_id>` heartbeat is keyed under.
+    /// The id this claiming task acquires under. A process may claim under
+    /// more than one id, one per concurrent claiming task (ADR-1029, the
+    /// 2026-11-18 amendment): the maintenance tick claims under the
+    /// ADR-0057/0065 startup UUID its `sys/maintain/workers/<process_id>`
+    /// heartbeat is keyed under, and background migrate under its own id,
+    /// which has no heartbeat key.
     pub process_id: Uuid,
     /// Fresh per acquisition, so two successive acquisitions by one process are
     /// distinguishable (which `process_id` alone cannot express).
