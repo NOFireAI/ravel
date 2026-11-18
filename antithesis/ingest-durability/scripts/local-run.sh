@@ -8,14 +8,46 @@
 #   WORKLOAD_EVENTUALLY_AFTER_SECS=N  also run the eventually after N seconds
 #                                     of workload; the run then waits for the
 #                                     driver to exit instead of sleeping.
+#   RAVEL_ANTITHESIS_MUTANT=commit/<stem>  mutant control on the
+#                                     ingest-durability-mutants images: the run
+#                                     passes only if the property that mutant
+#                                     names in
+#                                     formal/tla/commit/antithesis-mutants.tsv
+#                                     was evaluated false at least once.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WL="$(cd "$HERE/.." && pwd)"
 OUT="${1:?out dir}"
 SECS="${2:-300}"
-mkdir -p "$OUT"
+TSV="$WL/../../formal/tla/commit/antithesis-mutants.tsv"
+MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
 export COMPOSE_FILE="$WL/config/docker-compose.yaml:$WL/local/docker-compose.local.yaml"
 export COMPOSE_PROJECT_NAME=ravel-antithesis
+if [ -n "$MUTANT" ]; then
+    expected=$(awk -F'\t' -v m="$MUTANT" '!/^#/ && $2 == m && m ~ /^commit\// { print $3 }' "$TSV")
+    if [ -z "$expected" ]; then
+        echo "refused: $MUTANT is not a mutant listed in $TSV"
+        exit 1
+    fi
+    if [ -n "${WORKLOAD_INJECT_MISSING_RECORD:-}" ]; then
+        echo "refused: WORKLOAD_INJECT_MISSING_RECORD is the plain build's self-check; run it without a mutant"
+        exit 1
+    fi
+    # A server built without antithesis-mutants ignores the selector, and the
+    # run would report a plain run's result.
+    features=$(docker image inspect -f '{{ index .Config.Labels "org.ravel.antithesis.server-features" }}' \
+        ravel-antithesis-server:ingest-durability-mutants 2>/dev/null) || features=""
+    case ",$features," in
+        *,antithesis-mutants,*) ;;
+        *)
+            echo "refused: ravel-antithesis-server:ingest-durability-mutants was not built with antithesis-mutants (features '$features'); run MUTANTS=1 scripts/build.sh"
+            exit 1 ;;
+    esac
+    export RAVEL_ANTITHESIS_MUTANT="$MUTANT"
+    COMPOSE_FILE="$COMPOSE_FILE:$WL/local/docker-compose.mutant.yaml"
+    echo "mutant $MUTANT: expecting \"$expected\" to be violated"
+fi
+mkdir -p "$OUT"
 if [ -n "${WORKLOAD_EVENTUALLY_AFTER_SECS:-}" ]; then
     export WORKLOAD_EVENTUALLY=on
 fi
@@ -82,6 +114,21 @@ jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
     | .[0].message' "$OUT"/sdk-*.jsonl | sort > "$OUT/violated.tsv"
 if [ ! -s "$OUT/assertions.tsv" ]; then
     echo "FAIL: no assertions collected (see $OUT/missing-sdk.txt)"
+    exit 1
+fi
+if [ -n "$MUTANT" ]; then
+    # A broken commit path can also fail other always-properties, such as
+    # the driver's read-backs; those are reported, not gated.
+    others=$(grep -vxF -- "$expected" "$OUT/violated.tsv")
+    if [ -n "$others" ]; then
+        echo "also violated under $MUTANT:"
+        printf '%s\n' "$others"
+    fi
+    if grep -qxF -- "$expected" "$OUT/violated.tsv"; then
+        echo "mutant OK: $MUTANT violated \"$expected\""
+        exit 0
+    fi
+    echo "FAIL: mutant $MUTANT ran, but \"$expected\" was not violated"
     exit 1
 fi
 if [ "${WORKLOAD_INJECT_MISSING_RECORD:-}" = 1 ]; then

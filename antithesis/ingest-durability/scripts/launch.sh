@@ -4,22 +4,44 @@
 # (scripts/import-images.sh). Check the task's compute budget before running.
 #
 # Usage: scripts/launch.sh <max-compute-hours> [description]
+#   RAVEL_ANTITHESIS_MUTANT=commit/<stem>  launch a mutant control run: the
+#       ingest-durability-mutants images (build.sh and import-images.sh with
+#       MUTANTS=1), with the named mutant switched on in ravel1 and ravel2. The
+#       name must be a mutant in formal/tla/commit/antithesis-mutants.tsv; the
+#       run should make that line's property fail (README.md, Mutants).
 set -euo pipefail
 HOURS="${1:?max compute hours}"
 DESC="${2:-ravel ingest durability}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CONFIG="$HERE/../config"
+WL="$(cd "$HERE/.." && pwd)"
+CONFIG="$WL/config"
 CHECKOUT=$(git -C "$HERE" rev-parse HEAD)
+MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
+TSV="$WL/../../formal/tla/commit/antithesis-mutants.tsv"
+TAG=ingest-durability
+TEST_NAME=ravel-ingest-durability
+
+if [ -n "$MUTANT" ]; then
+    # Only a commit mutant listed in the TSV: an unknown name would select
+    # nothing, and the run would pass as a plain run.
+    if ! awk -F'\t' -v m="$MUTANT" '!/^#/ && $2 == m && m ~ /^commit\// { found = 1 } END { exit !found }' "$TSV"; then
+        echo "refused: $MUTANT is not a mutant listed in formal/tla/commit/antithesis-mutants.tsv" >&2
+        exit 1
+    fi
+    TAG=ingest-durability-mutants
+fi
+SERVER_IMAGE="ravel-antithesis-server:$TAG"
+DRIVER_IMAGE="ravel-antithesis-driver:$TAG"
 
 # The run records the commit the images were built from (build.sh stamps it
 # as a label), and the config comes from this checkout, so the two must agree.
-image_ref() {
-    docker image inspect -f '{{ index .Config.Labels "org.ravel.antithesis.ref" }}' "$1" 2>/dev/null
+image_label() {
+    docker image inspect -f "{{ index .Config.Labels \"$2\" }}" "$1" 2>/dev/null
 }
-SERVER_REF=$(image_ref ravel-antithesis-server:ingest-durability) || SERVER_REF=""
-DRIVER_REF=$(image_ref ravel-antithesis-driver:ingest-durability) || DRIVER_REF=""
+SERVER_REF=$(image_label "$SERVER_IMAGE" org.ravel.antithesis.ref) || SERVER_REF=""
+DRIVER_REF=$(image_label "$DRIVER_IMAGE" org.ravel.antithesis.ref) || DRIVER_REF=""
 if [ -z "$SERVER_REF" ] || [ -z "$DRIVER_REF" ] || [ "$SERVER_REF" = "<no value>" ] || [ "$DRIVER_REF" = "<no value>" ]; then
-    echo "refused: an image has no org.ravel.antithesis.ref label; rebuild it with scripts/build.sh" >&2
+    echo "refused: $SERVER_IMAGE or $DRIVER_IMAGE has no org.ravel.antithesis.ref label; rebuild it with scripts/build.sh" >&2
     exit 1
 fi
 if [ "$SERVER_REF" != "$DRIVER_REF" ]; then
@@ -32,6 +54,38 @@ if [ "$SERVER_REF" != "$CHECKOUT" ]; then
 fi
 REF="$SERVER_REF"
 
+if [ -n "$MUTANT" ]; then
+    # A server built without antithesis-mutants ignores the variable, and the
+    # run would pass as a plain run.
+    FEATURES=$(image_label "$SERVER_IMAGE" org.ravel.antithesis.server-features) || FEATURES=""
+    case ",$FEATURES," in
+        *,antithesis-mutants,*) ;;
+        *)
+            echo "refused: $SERVER_IMAGE was not built with antithesis-mutants (features '$FEATURES'); rebuild it with MUTANTS=1 scripts/build.sh" >&2
+            exit 1 ;;
+    esac
+    # The config copy names the -mutants images and sets the selector on the
+    # x-ravel-server anchor, which only ravel1 and ravel2 use. The checked-in
+    # config stays the plain run's.
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    cp -R "$CONFIG/." "$tmp/"
+    awk -v m="$MUTANT" '
+        { sub(/:ingest-durability$/, ":ingest-durability-mutants") }
+        { print }
+        /^    RUST_LOG: info$/ { print "    RAVEL_ANTITHESIS_MUTANT: \"" m "\"" }
+    ' "$CONFIG/docker-compose.yaml" > "$tmp/docker-compose.yaml"
+    selected=$(grep -cxF "    RAVEL_ANTITHESIS_MUTANT: \"$MUTANT\"" "$tmp/docker-compose.yaml") || selected=0
+    plain=$(grep -c ':ingest-durability$' "$tmp/docker-compose.yaml") || plain=0
+    if [ "$selected" -ne 1 ] || [ "$plain" -ne 0 ]; then
+        echo "refused: could not select $MUTANT in the copied config ($selected selector lines, $plain plain image tags)" >&2
+        exit 1
+    fi
+    CONFIG="$tmp"
+    TEST_NAME="$TEST_NAME-mutant"
+    DESC="$DESC (mutant $MUTANT)"
+fi
+
 # SKIP_VALIDATE=1 skips the local validation on a host that cannot run the
 # amd64 images (an Apple Silicon Mac without Rosetta emulation), once the same
 # config was validated on an amd64 host.
@@ -39,7 +93,7 @@ if [ "${SKIP_VALIDATE:-}" != 1 ]; then
     snouty validate "$CONFIG" --timeout 10m
 fi
 snouty launch --launcher basic_test --config "$CONFIG" \
-    --test-name ravel-ingest-durability \
+    --test-name "$TEST_NAME" \
     --description "$DESC" \
     --max-compute-hours "$HOURS" \
     --fault-tolerance high_availability \
@@ -47,4 +101,5 @@ snouty launch --launcher basic_test --config "$CONFIG" \
     --setup-timeout 10m \
     --param attrs.workload=ingest-durability \
     --param attrs.ravel_ref="$REF" \
+    --param attrs.mutant="${MUTANT:-none}" \
     --param attrs.plugin_version=0.1.1
