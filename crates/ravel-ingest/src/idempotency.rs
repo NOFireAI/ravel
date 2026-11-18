@@ -787,10 +787,12 @@ async fn probe_key(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::clock::Clock;
     use proptest::prelude::*;
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, PutMode};
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn tenant(id: &str) -> TenantId {
         TenantId::new(id)
@@ -1867,7 +1869,98 @@ mod tests {
 
     const MARKER_DURABLE: &str =
         "commit: an idempotency marker implies every shard's commit is durable";
+    const MARKER_DURABLE_COMPLETES: &str =
+        "commit: a marker's durability evidence read completes before it gives up";
     const STRICT_LOGS_ACK: &str = "commit: a strict logs ack names a durable commit record";
+
+    /// A stalled commit-record GET does not hang the marker write past the
+    /// timeout: the durability evidence read races `EVIDENCE_HEAD_TIMEOUT` on
+    /// the injected clock and evaluates nothing on expiry, while the marker
+    /// itself still lands. Fails against an unbounded read (a
+    /// `std::future::pending` give-up): the marker write would never return.
+    #[tokio::test]
+    async fn a_stalled_marker_durability_read_does_not_hang_the_marker_write() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let tenant = tenant("marker-stalled-durability");
+        let client_key: &[u8] = b"stalled";
+        let hour = 100u32;
+        let token = ravel_types::CommitToken {
+            shard: 0,
+            writer_id: uuid::Uuid::from_u128(9),
+            epoch: 1,
+            seq: 1,
+            ingest_hour_bucket: hour,
+        };
+        let receipt = IdempotencyReceipt {
+            written_count: 1,
+            commit_token: token.encode(),
+        };
+        let commit_key = ravel_commit::keys::commit_key_for_token(&tenant.hash(), Signal::Logs, &token)
+            .expect("commit key");
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = fault_store.hold(Op::Get, Some(commit_key), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = crate::compat_signal_tests::ManualClock::new();
+
+        let write = tokio::spawn({
+            let store = Arc::clone(&store);
+            let tenant = tenant.clone();
+            let receipt = receipt.clone();
+            let clock = Arc::clone(&clock);
+            async move {
+                write_marker_giving_up(
+                    store.as_ref(),
+                    &tenant,
+                    Signal::Logs,
+                    client_key,
+                    hour,
+                    &receipt,
+                    || clock.sleep(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT),
+                )
+                .await
+            }
+        });
+
+        gate.wait_until_held(1).await;
+        assert!(
+            !write.is_finished(),
+            "the marker write waits for the durability read until the timeout"
+        );
+        clock
+            .advance_ns(
+                i64::try_from(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"),
+            )
+            .await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("the marker write follows the timeout")
+            .expect("write task")
+            .expect("the marker write succeeds");
+        assert!(matches!(outcome, WriteOutcome::Written), "{outcome:?}");
+
+        let markers = crate::router::invariant_capture::evaluations(
+            MARKER_DURABLE,
+            &keyhash32(&tenant, client_key),
+        );
+        assert!(
+            markers.is_empty(),
+            "the durability read evaluated nothing: {markers:?}"
+        );
+        let completes = crate::router::invariant_capture::evaluations(
+            MARKER_DURABLE_COMPLETES,
+            &keyhash32(&tenant, client_key),
+        );
+        assert_eq!(completes.len(), 1, "{completes:?}");
+        assert!(!completes[0].0, "the read gave up: {completes:?}");
+        assert_eq!(gate.held_count(), 1, "the GET is still held");
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+    }
 
     /// One log record on each of `streams` distinct streams.
     fn log_records(streams: u32) -> Vec<ravel_otlp::logs_normalize::NormalizedLogRecord> {

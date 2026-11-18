@@ -8719,6 +8719,9 @@ mod tests {
         "commit: a commit record never exists without its data object";
     const EVIDENCE_COMPLETES: &str =
         "commit: a commit's data-object evidence read completes before it gives up";
+    const STRICT_METRICS_ACK: &str = "commit: a strict metrics ack names a durable commit record";
+    const STRICT_ACK_COMPLETES: &str =
+        "commit: a strict metrics ack's durable-commit evidence read completes before it gives up";
 
     const NS_PER_MINUTE: i64 = 60 * 1_000_000_000;
 
@@ -8863,6 +8866,69 @@ mod tests {
 
         fn capabilities(&self) -> ravel_object_store::Capabilities {
             self.0.capabilities()
+        }
+    }
+
+    /// Stalls every commit-record HEAD (a `/c/` key) once `stall` is set, so a
+    /// test can let the abandoned keys accumulate with the flag off and then
+    /// stall exactly the re-reads a later flush issues. A stalled HEAD never
+    /// answers; the caller's own `EVIDENCE_HEAD_TIMEOUT` race must end it.
+    struct StallCommitHeadStore {
+        inner: Arc<FaultStore<MemoryStore>>,
+        stall: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for StallCommitHeadStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            if self.stall.load(std::sync::atomic::Ordering::SeqCst) && key.contains("/c/") {
+                std::future::pending().await
+            } else {
+                self.inner.head(key).await
+            }
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
         }
     }
 
@@ -9582,6 +9648,145 @@ mod tests {
         for id in gate.held() {
             assert!(gate.release(id));
         }
+        router.flush_all().await;
+    }
+
+    /// A stalled commit HEAD in the strict-ack evidence read does not hang the
+    /// ack: the read races `EVIDENCE_HEAD_TIMEOUT` on the injected clock and
+    /// evaluates nothing on expiry, while the write still returns its token.
+    /// Fails against the bare `store.head` the fix replaced: the ack would hang
+    /// on the held HEAD forever.
+    #[tokio::test]
+    async fn a_stalled_strict_ack_evidence_read_does_not_hang_the_ack() {
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let stalled = TenantId::new("strict-metrics-ack-stalled");
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        // The first HEAD on the commit prefix is the strict ack's evidence read:
+        // the flush PUTs the commit record and HEADs only the data key before it.
+        let gate = fault_store.hold(Op::Head, Some(commit_prefix(&stalled)), Occurrence::Nth(1));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        provision(store.as_ref(), &stalled).await;
+        let clock = TestClock::new(BASE_NS);
+        let router = deadline_bounded_router(&store, &clock, Duration::from_secs(60));
+
+        let write = spawn_write(&router, &stalled, "h0", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_until_held(1))
+            .await
+            .expect("the strict ack's evidence read reached the store");
+        assert!(
+            !settles(|| write.is_finished()).await,
+            "the ack waits for the evidence read until the timeout"
+        );
+        clock.advance_ns(i64::try_from(publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"));
+        let receipt = tokio::time::timeout(Duration::from_secs(10), write)
+            .await
+            .expect("the ack follows the evidence timeout")
+            .expect("write task")
+            .expect("the strict write is acked although its evidence read timed out");
+        assert_eq!(receipt.tokens.len(), 1);
+        let acks = crate::router::invariant_capture::evaluations(
+            STRICT_METRICS_ACK,
+            &stalled.hash().to_hex(),
+        );
+        assert!(acks.is_empty(), "the evidence read evaluated nothing: {acks:?}");
+        let completes = crate::router::invariant_capture::evaluations(
+            STRICT_ACK_COMPLETES,
+            &stalled.hash().to_hex(),
+        );
+        assert_eq!(completes.len(), 1, "{completes:?}");
+        assert!(!completes[0].0, "the read gave up: {completes:?}");
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        router.flush_all().await;
+    }
+
+    /// A flush's abandoned-key recheck bounds the whole batch by ONE
+    /// `EVIDENCE_HEAD_TIMEOUT`, not one per key: with two stalled re-read HEADs,
+    /// the flush that owns the recheck leaves flight after a single timeout.
+    /// Fails against a per-key deadline (one fresh sleep per key), which needs
+    /// two timeouts for two keys, so after one the flush is still in flight.
+    #[tokio::test]
+    async fn a_recheck_of_several_stalled_keys_is_bounded_by_one_timeout() {
+        use ravel_object_store::fault::{Rule, ScriptedFault};
+
+        if !crate::router::invariant_capture::capturing() {
+            return;
+        }
+        let a1 = TenantId::new("recheck-batch-abandoned-one");
+        let a2 = TenantId::new("recheck-batch-abandoned-two");
+        let committing = TenantId::new("recheck-batch-committing");
+        let plan = FaultPlan::empty()
+            .with_rule(
+                Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 0 })
+                    .with_key_contains(commit_prefix(&a1))
+                    .with_occurrence(Occurrence::Always),
+            )
+            .with_rule(
+                Rule::new(Op::Put, ScriptedFault::Throttled { retry_after_ms: 0 })
+                    .with_key_contains(commit_prefix(&a2))
+                    .with_occurrence(Occurrence::Always),
+            );
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(StallCommitHeadStore {
+            inner: Arc::clone(&fault_store),
+            stall: Arc::clone(&stall),
+        });
+        provision(store.as_ref(), &a1).await;
+        provision(store.as_ref(), &a2).await;
+        provision(store.as_ref(), &committing).await;
+        let clock = TestClock::new(BASE_NS);
+        // No retry budget: each throttled commit PUT abandons at once, with its
+        // record absent, so its key is remembered for the recheck.
+        let router = attempt_bounded_router(&store, &clock, Duration::from_secs(600), 0);
+
+        for (tenant, host) in [(&a1, "h0"), (&a2, "h1")] {
+            let before = router.metrics().snapshot().buffered_points_total;
+            let write = spawn_write(&router, tenant, host, WriteMode::Strict);
+            until(|| router.metrics().snapshot().buffered_points_total > before).await;
+            clock.advance_ns(TICK_ADVANCE_NS);
+            retry_until_finished(&clock, &write).await;
+            let err = write
+                .await
+                .expect("write task")
+                .expect_err("the throttled commit PUT abandons with no retry left");
+            assert!(matches!(err, WriteError::Abandoned(_)), "{err:?}");
+        }
+        assert_eq!(router.metrics().snapshot().abandoned_retry_exhausted, 2);
+
+        // Both abandoned keys are now remembered. Stall every commit HEAD, so
+        // the committing flush's recheck re-reads both against a store that never
+        // answers and must rely on the shared deadline.
+        stall.store(true, std::sync::atomic::Ordering::SeqCst);
+        let before = router.metrics().snapshot().buffered_points_total;
+        let write = spawn_write(&router, &committing, "h2", WriteMode::Strict);
+        until(|| router.metrics().snapshot().buffered_points_total > before).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        // The committing flush takes the permit, commits, and parks in its
+        // recheck holding the in-flight guard.
+        assert!(
+            settles(|| in_flight(&router) == 1).await,
+            "the committing flush is in flight on its stalled recheck"
+        );
+        assert!(
+            !settles(|| in_flight(&router) == 0).await,
+            "the recheck holds the flush in flight before the timeout"
+        );
+        clock.advance_ns(i64::try_from(publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"));
+        assert!(
+            settles(|| in_flight(&router) == 0).await,
+            "one timeout bounds the whole batch of stalled re-reads"
+        );
+        // Let the strict ack's own evidence read give up too, so the write task
+        // ends rather than leaking.
+        clock.advance_ns(i64::try_from(publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"));
+        let _ = tokio::time::timeout(Duration::from_secs(10), write).await;
+        stall.store(false, std::sync::atomic::Ordering::SeqCst);
         router.flush_all().await;
     }
 }

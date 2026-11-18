@@ -1873,6 +1873,7 @@ mod tests {
     }
 
     const STRICT_METRICS_ACK: &str = "commit: a strict metrics ack names a durable commit record";
+    const ONE_IDENTITY_ONE_CONTENT: &str = "commit: one commit identity holds one content hash";
 
     /// A one-shard strict-mode router over `store` that flushes on every
     /// write, on a clock that never moves on its own: no flush deadline or
@@ -1959,6 +1960,105 @@ mod tests {
             assert!(gate.release(id));
         }
         router.flush_all().await;
+    }
+
+    /// A key that cannot be constructed is no evidence of a missing record:
+    /// [`commit_records_exist`] returns `None` (evaluate nothing), not
+    /// `Some(false)` as reading an unconstructable key as a NotFound would.
+    /// Non-vacuity: a well-formed token with no object returns `Some(false)`,
+    /// so the function does read the store on a buildable key.
+    #[tokio::test]
+    async fn commit_records_exist_evaluates_nothing_on_a_key_construction_error() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("commit-records-exist-key-error");
+        let hash = tenant.hash();
+        // `format_shard` refuses a shard above 9999, so this token has no key.
+        let unbuildable = CommitToken {
+            shard: 10_000,
+            writer_id: uuid::Uuid::from_u128(1),
+            epoch: 1,
+            seq: 1,
+            ingest_hour_bucket: 7,
+        };
+        assert_eq!(
+            commit_records_exist(
+                store.as_ref(),
+                &hash,
+                Signal::Metrics,
+                std::slice::from_ref(&unbuildable),
+                std::future::pending,
+            )
+            .await,
+            None,
+            "an unconstructable key evaluates nothing"
+        );
+        let absent = CommitToken {
+            shard: 0,
+            writer_id: uuid::Uuid::from_u128(2),
+            epoch: 1,
+            seq: 1,
+            ingest_hour_bucket: 7,
+        };
+        assert_eq!(
+            commit_records_exist(
+                store.as_ref(),
+                &hash,
+                Signal::Metrics,
+                std::slice::from_ref(&absent),
+                std::future::pending,
+            )
+            .await,
+            Some(false),
+            "a buildable token whose record is absent is Some(false)"
+        );
+    }
+
+    /// `commit/mismatched-identity-idempotent` pins the writer identity where
+    /// the metrics router's first generation draws it and skips the hash
+    /// compare. Two routers with the production identity source then commit
+    /// different records under one commit key, and the second is told it
+    /// published. Fails against drawing the first generation's identity inline
+    /// with `rng.new_uuid()` (the mutant then never reaches that draw, so the
+    /// two routers pick distinct identities and never collide).
+    #[tokio::test]
+    async fn mutant_pinned_writer_identity_breaks_metrics_first_generation() {
+        let Some(_mutant) =
+            invariant_capture::scoped_mutant("commit/mismatched-identity-idempotent")
+        else {
+            return;
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let first = flush_every_write(Arc::clone(&store));
+        let second = flush_every_write(Arc::clone(&store));
+        let tenant = TenantId::new("metrics-one-identity-mutant");
+        let a = first
+            .write(
+                tenant.clone(),
+                vec![test_point(&tenant, "cpu", 1_000, 1.0)],
+                WriteMode::Strict,
+                HELD_COMMIT_ACK_BOUND,
+            )
+            .await
+            .expect("the first router commits");
+        let b = second
+            .write(
+                tenant.clone(),
+                vec![test_point(&tenant, "cpu", 2_000, 2.0)],
+                WriteMode::Strict,
+                HELD_COMMIT_ACK_BOUND,
+            )
+            .await
+            .expect("the mutant reports the second content published");
+        assert_eq!(a.tokens, b.tokens, "both routers wrote under one identity");
+
+        let evaluations =
+            invariant_capture::evaluations(ONE_IDENTITY_ONE_CONTENT, &tenant.hash().to_hex());
+        assert!(
+            evaluations.iter().any(|(held, _)| !held),
+            "OneIdentityOneContent never evaluated false under the mutant: {evaluations:?}"
+        );
+        first.shutdown().await;
+        second.shutdown().await;
     }
 }
 
