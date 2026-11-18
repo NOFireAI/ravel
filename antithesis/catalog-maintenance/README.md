@@ -190,7 +190,7 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: sweep deleted a superseded compaction input` | sometimes | `audit` | Evaluated once an audit holds a decoded compaction record: a commit record or data object of one of its inputs was in an earlier LIST, is absent from this one, a GET finds it absent, and no earlier audit counted it. |
 | `catalog: the audit checked the data objects the catalog resolves` | sometimes | `audit` | `rlog footprint` reported at least one data object. |
 | `catalog: a listed commit record decoded through ravel-cli` | sometimes | `audit` | A listed level-0 commit record decoded through `commit decode`. |
-| `catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead` | sometimes | `race_folds`, `eventually` | The skewed `ravel-cli` fold rebuilt HEAD with the hour ahead sealed, and a server's on-demand fold reported a lost CAS after a PUT. |
+| `catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead` | sometimes | `race_folds`, `eventually` | The skewed `ravel-cli` fold rebuilt HEAD with the hour ahead sealed, and the store refused the held server HEAD PUT (`held-result` reports 412 or 409), its version replaced by the skewed fold. |
 | `catalog: a server's compaction record PUT lost to a concurrent compaction` | sometimes | `race_records`, `eventually` | The record key the held server PUT names was in the store before the driver released that PUT. |
 | `catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it` | sometimes | `sweep_unfolded`, `eventually` | HEAD's bytes were the same after both jumps and the servers' sweeps as before the compaction, the record was still there, and the store held at least one of its inputs before the jumps. |
 | `clock: the driver's clock jumped forward` | reachable | `jump_clock`, `eventually` | The jump reached the driver's own clock. |
@@ -317,21 +317,40 @@ moves to the offset it expects.
    225 s is the race's window).
 2. PUT garbage over HEAD through raw S3, so every fold rebuilds from the
    listing and the on-demand fold route passes its rate gate.
-3. Start `ravel-cli catalog fold --json` with its clock 240 s ahead of every
-   other clock (`FAKETIME=+<offset + 240>`), inside the 300 s
-   `clock_skew_allowance` the seal margin is sized for: it seals the hour
-   that seals next, and the servers do not yet.
-4. A fraction into the window the last race's timings give, `POST
-   /api/v1/admin/fold` on `ravel1` and `ravel2`.
-5. A server fold lost to the skewed fold when the CLI rebuilt with the hour
-   ahead sealed and the server answered `lost_cas` after a PUT. Asserted as
-   `catalog: a server fold lost its HEAD CAS to a fold one sealed hour
-   ahead`, and the SUT's own `catalog: fold HEAD CAS lost` is required too.
+3. `s3proxy`: `pass`, then `hold-key <HEAD key>`: the next PUT of the HEAD key
+   from any server is held, unsent, until `release` or 18 s.
+4. `POST /api/v1/admin/fold` on one `--mode all` server (alternating by race
+   number). It reads the garbage HEAD, rebuilds, and sends its HEAD CAS PUT,
+   which the proxy holds. Poll `held` (bounded, well under the hold cap) until
+   it names the HEAD key; a background scheduled fold's HEAD PUT held first is
+   the same race. If none is held in time (the server answered first: nothing
+   eligible, or the on-demand rate gate), `pass` and report the race not
+   reached.
+5. Run `ravel-cli catalog fold --json` to completion with its clock 240 s ahead
+   of every other clock (`FAKETIME=+<offset + 240>`), inside the 300 s
+   `clock_skew_allowance` the seal margin is sized for: it seals the hour that
+   seals next, which the server did not, so it rebuilds a different HEAD. The
+   CLI reaches rustfs directly, not through the proxy, so its CAS lands while
+   the server's PUT is held, replacing the garbage version.
+6. `release`. The held server PUT reaches rustfs after the skewed HEAD landed;
+   its CAS was conditioned on the garbage version, now gone, so rustfs answers
+   `412 Precondition Failed` (or `409`). Clean code reports `lost_cas` and
+   retries; the mutant proceeds as if it had won, and the SUT's `catalog: a
+   fold reports as folded only a HEAD the store holds` goes false. Read
+   `held-result`, then `pass`.
+7. A server fold lost to the skewed fold when the CLI rebuilt with the hour
+   ahead sealed and `held-result` reports a 412 (or 409) for the HEAD key; a
+   200 never counts, and the server's own answer (`lost_cas`, or `published`
+   under the mutant) is kept only in the details. Asserted as `catalog: a
+   server fold lost its HEAD CAS to a fold one sealed hour ahead`, and the
+   SUT's own `catalog: fold HEAD CAS lost` is required too.
 
 Why legitimate: a clock 240 s ahead is inside the skew the seal margin
 allows, so the skewed fold seals nothing an acknowledged write can still land
-in, and two folds of one HEAD racing their CAS is the TLA model's fold
-interleaving.
+in. A store answering one PUT late, below the server's 20 s request timeout,
+while a concurrent fold the skew allowance permits publishes, is a delay the
+system must survive; two folds of one HEAD racing their CAS is the TLA model's
+fold interleaving.
 
 ### The record race (`compaction-loser-overwrites`)
 
@@ -403,9 +422,14 @@ keeps every input, because HEAD still names it.
 The proxy (`driver/src/proxy.rs`, `driver/src/bin/s3_proxy.rs`) forwards
 every byte unchanged, Host header included, so each SigV4 signature still
 verifies at rustfs, and parses only request heads, to frame bodies and to
-match a PUT's key against the rules. Only PUTs are judged. A killed or
-restarted proxy has no rules, so a race it interrupts leaves the servers on
-the plain path and the race reports not reached.
+match a PUT's key against the rules: `hold-record` and `hold-key <key>` hold
+one PUT until `release`, and `refuse-records`/`refuse-key <key>` answer it 503
+unsent. A held `hold-key` PUT is forwarded on a dedicated upstream connection
+so the proxy can read its response status, and `held-result` reports that
+`<key> <status>`, which the fold race reads to tell a lost CAS (412/409) from a
+win (200). Only PUTs are judged. A killed or restarted proxy has no rules, so a
+race it interrupts leaves the servers on the plain path and the race reports
+not reached.
 
 ## Mutants
 

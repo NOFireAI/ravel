@@ -34,8 +34,9 @@
 #
 # Every ravel-server container reaches rustfs through s3proxy, which forwards
 # every byte unchanged until the driver sets a rule over its control port: hold
-# one compaction record PUT, or refuse record PUTs or one key's PUTs, for the
-# forced races (README.md, "The forced races"). init, the driver and its
+# one compaction record PUT or one key's PUT (reading that PUT's upstream status
+# back), or refuse record PUTs or one key's PUTs, for the forced races
+# (README.md, "The forced races"). init, the driver and its
 # ravel-cli reach rustfs directly. s3proxy signs nothing and keeps no
 # wall-clock state, so it runs on the real clock; a killed s3proxy is a
 # network outage between the servers and the store, and restarts with no
