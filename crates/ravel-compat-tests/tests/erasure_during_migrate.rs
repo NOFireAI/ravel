@@ -16,10 +16,14 @@
 //! This outcome holds only with claims on (`claiming` below puts both tasks
 //! under `Coordination::On`) and with the store clock aligned to the claim
 //! clock (the `store.set_clock_ms` call in `one_seed`). With claims off
-//! (`--maintain-claims off`) or against the unclaimed background migrate, the
-//! erased sample is served instead; that race is tracked separately as
-//! issue #4449, with the unclaimed background migrate itself as issue #4448.
-//! This test does not exercise either mode.
+//! (`--maintain-claims off`) the erased sample is served instead; that race is
+//! tracked separately as issue #4449, and neither test here exercises it.
+//!
+//! The second test runs the same race against the maintain process's
+//! background migrate unit (`--background-migrate`, issue #4448), with its
+//! configuration built the way the server builds it: the base configuration
+//! joined to the claim protocol through
+//! `CompactorConfig::with_claim_participant`, not a hand-set participant.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -35,9 +39,10 @@ use ravel_catalog::read_floors_from_store;
 use ravel_commit::{erasure, keys, signal};
 use ravel_maintain::claim_guard::ClaimSleeper;
 use ravel_maintain::{
-    Bucket, CertifyReport, ClaimParticipant, Clock, CompactorConfig, Coordination,
-    ErasureRewriteOutcome, FamilyMigrateReport, FixedClock, MaintainMemo, NoLeases,
-    PendingErasureRequest, PublishOutcome, activate, erasure_rewrite_bucket,
+    BackgroundMigrateOutcome, Bucket, CertifyReport, ClaimParticipant, Clock, CompactorConfig,
+    Coordination, ErasureRewriteOutcome, FamilyMigrateReport, FixedClock, MaintainError,
+    MaintainMemo, MigrateBudget, NoLeases, NotMigratedReason, PendingErasureRequest,
+    PublishOutcome, activate, background_migrate_unit, erasure_rewrite_bucket,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
@@ -383,5 +388,219 @@ fn an_erasure_and_a_pinned_query_during_migrate_complete_at_n_plus_1() {
         tally.erasure_published_in_run > 0 && tally.erasure_stood_down_in_run > 0,
         "the seeds cover an erasure that publishes during the migrate and one that stands \
          down for it: {tally:?}"
+    );
+}
+
+/// The background migrate unit's configuration as the maintain process builds
+/// it from `base`: the compactor configuration with `--maintain-claims` on and
+/// no participant, joined to the claim protocol as process `process` on the
+/// unit's own `clock`.
+fn background_config(base: &CompactorConfig, process: u128, clock: &FixedClock) -> CompactorConfig {
+    base.with_claim_participant(
+        ClaimParticipant::new(
+            Uuid::from_u128(process),
+            Arc::new(clock.clone()) as Arc<dyn Clock>,
+        )
+        .with_sleeper(Arc::new(NoWait)),
+    )
+    .into_owned()
+}
+
+/// One background migrate unit for the tenant's metrics `rseg` family, toward
+/// its active version, reading `clock`.
+async fn background_migrate(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    clock: &FixedClock,
+) -> ravel_maintain::Result<BackgroundMigrateOutcome> {
+    background_migrate_unit(
+        store,
+        clock,
+        config,
+        hash(),
+        Signal::Metrics,
+        FAMILY_RSEG,
+        1,
+        MigrateBudget::unlimited(),
+    )
+    .await
+}
+
+/// The erasure rerun at `now_ns`, failing the seed when the bucket holds two
+/// live records (a migration record published beside the erasure's).
+fn erase_rerun(
+    seed: u64,
+    context: &str,
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    pending: &[PendingErasureRequest],
+    now_ns: i64,
+) -> ErasureRewriteOutcome {
+    match block_on(seed, erase(store, config, pending, now_ns)) {
+        Ok(outcome) => outcome,
+        Err(MaintainError::MultipleLiveRecords { live_keys, .. }) => {
+            panic!("{context}: the bucket ends with two live records: {live_keys:?}")
+        }
+        Err(e) => panic!("{context}: erasure rerun: {e}"),
+    }
+}
+
+#[derive(Debug, Default)]
+struct BackgroundTally {
+    erasure_published_in_run: usize,
+    migrate_stood_down_for_claim: usize,
+}
+
+async fn background_seed(seed: u64, tally: &mut BackgroundTally) {
+    let store = Arc::new(MemoryStore::with_page_size(2));
+    let clock = Arc::new(ManualClock::new(sealed_now_ns()));
+    let [a, b, victim] = flushes();
+    for flush in [&a, &b, &victim] {
+        write_flush(store.as_ref(), flush).await;
+    }
+    provision(store.as_ref(), 1).await;
+    init(store.as_ref(), &clock).await;
+    activate(
+        store.as_ref(),
+        Some(&compat_keys()),
+        clock.as_ref(),
+        &writable(),
+        &activate_request(None),
+    )
+    .await
+    .expect("activate");
+    let base = compactor_config(store.clone(), clock.clone()).await;
+    assert_eq!(
+        (base.coordination, base.claim_participant.is_none()),
+        (Coordination::On, true),
+        "seed {seed}: the base is the server's: claims on, no participant yet"
+    );
+    let unit_clock = FixedClock::new(sealed_now_ns());
+    let migrate_config = background_config(&base, 1, &unit_clock);
+    let erase_config = claiming(base.clone(), 2, sealed_now_ns());
+    let pending = pending(&victim);
+    let survivors = [&a, &b].map(sample).to_vec();
+
+    #[derive(Debug)]
+    enum Done {
+        Migrate(ravel_maintain::Result<BackgroundMigrateOutcome>),
+        Erase(ravel_maintain::Result<ErasureRewriteOutcome>),
+    }
+    store.set_clock_ms(u64::try_from(sealed_now_ns() / 1_000_000).expect("ms"));
+    let tap = TapStore::yielding(store.clone());
+    let tasks: Vec<Task<'_, Done>> = vec![
+        Box::pin(async {
+            Done::Migrate(background_migrate(&tap, &migrate_config, &unit_clock).await)
+        }),
+        Box::pin(async {
+            Done::Erase(erase(&tap, &erase_config, &pending, sealed_now_ns()).await)
+        }),
+    ];
+    let (done, order) = drive(seed, &|| tap.calls(), tasks);
+    let writes: Vec<String> = tap
+        .take_writes()
+        .into_iter()
+        .map(|w| format!("{:?} {}", w.op, w.key))
+        .collect();
+    let context =
+        format!("seed {seed}: finish order {order:?}, outcomes {done:#?}, writes {writes:#?}");
+    let mut erasure_published = false;
+    for outcome in &done {
+        match outcome {
+            Done::Migrate(Err(e)) => panic!("{context}: background migrate failed: {e}"),
+            Done::Erase(Err(e)) => panic!("{context}: erasure failed: {e}"),
+            Done::Erase(Ok(ErasureRewriteOutcome::Rewritten {
+                publish: PublishOutcome::Published,
+                ..
+            })) => erasure_published = true,
+            Done::Migrate(Ok(BackgroundMigrateOutcome::Walked { report, .. }))
+                if report.not_migrated.iter().any(|bucket| {
+                    matches!(bucket.reason, NotMigratedReason::ClaimSkipped { .. })
+                }) =>
+            {
+                tally.migrate_stood_down_for_claim += 1;
+            }
+            Done::Erase(Ok(_)) | Done::Migrate(Ok(_)) => {}
+        }
+    }
+    if erasure_published {
+        tally.erasure_published_in_run += 1;
+        assert_eq!(
+            samples(&block_on(
+                seed,
+                query_hour(store.clone(), 1, sealed_now_ns())
+            )),
+            survivors,
+            "{context}: once the erasure published, the hour reads every sample but the erased \
+             one, exactly once"
+        );
+    }
+
+    let lease = i64::try_from(base.claim_lease_duration.as_nanos()).expect("lease fits");
+    let mut rounds = 0;
+    loop {
+        let later = sealed_now_ns() + (rounds + 1) * (lease + SECOND_NS);
+        store.set_clock_ms(u64::try_from(later / 1_000_000).expect("ms"));
+        let erased = erase_rerun(
+            seed,
+            &context,
+            store.as_ref(),
+            &claiming(base.clone(), 2, later),
+            &pending,
+            later,
+        );
+        let later_clock = FixedClock::new(later);
+        block_on(
+            seed,
+            background_migrate(
+                store.as_ref(),
+                &background_config(&base, 1, &later_clock),
+                &later_clock,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("{context}: background migrate rerun: {e}"));
+        let floor = block_on(seed, rseg_floor(store.as_ref()));
+        let nothing_to_erase = matches!(
+            erased,
+            ErasureRewriteOutcome::AlreadyApplied | ErasureRewriteOutcome::NoApplicableRequests
+        );
+        if nothing_to_erase && floor == Some(drill()) {
+            break;
+        }
+        rounds += 1;
+        assert!(
+            rounds < MAX_ROUNDS,
+            "{context}: no convergence after {rounds} rounds: erasure {erased:?}, floor {floor:?}"
+        );
+    }
+    assert_eq!(
+        samples(&block_on(
+            seed,
+            query_hour(store.clone(), 1, sealed_now_ns())
+        )),
+        survivors,
+        "{context}: the hour reads every sample but the erased one, exactly once"
+    );
+}
+
+/// A claimed erasure beside the background migrate unit, configured as the
+/// maintain process configures it, over 32 seeded interleavings: no seed ends
+/// with two live records in the bucket, and no query returns the erased
+/// sample.
+#[test]
+fn an_erasure_beside_background_migrate_never_leaves_two_live_records() {
+    let mut tally = BackgroundTally::default();
+    for seed in 0..SEEDS {
+        common::with_seed_context(
+            seed,
+            std::panic::AssertUnwindSafe(|| {
+                block_on(seed, background_seed(seed, &mut tally));
+            }),
+        );
+    }
+    assert!(
+        tally.erasure_published_in_run > 0 && tally.migrate_stood_down_for_claim > 0,
+        "the seeds cover an erasure that publishes during the background migrate and a \
+         background migrate that stands down for the erasure's claim: {tally:?}"
     );
 }
