@@ -70,6 +70,11 @@ const DECODES_PER_AUDIT: usize = 16;
 const SETUP_BUDGET: Duration = Duration::from_secs(600);
 /// Acked writes verified by one token read in the eventually.
 const TOKEN_BATCH: usize = 20;
+/// How long a fold race waits for a server HEAD PUT to be held after the
+/// on-demand fold is posted: well under the proxy's hold cap, so the hold does
+/// not lapse before the skewed fold and the release.
+const FOLD_HELD_WAIT: Duration = Duration::from_secs(10);
+const _: () = assert!(FOLD_HELD_WAIT.as_secs() < proxy::HOLD_CAP.as_secs());
 /// Fold races the eventually runs until a server fold is overtaken.
 const FOLD_RACES_EVENTUALLY: u32 = 6;
 /// Record races the eventually runs until a server's record PUT loses.
@@ -236,8 +241,6 @@ struct Shared {
     /// The client and token of the on-demand fold route.
     admin: reqwest::blocking::Client,
     token: String,
-    /// The last fold race's skewed-fold and mean server-fold seconds.
-    fold_race_timings: Mutex<(f64, f64)>,
     /// Fold races run; numbers each one's HEAD garbage.
     fold_races: AtomicU64,
     /// Whether a server fold lost its HEAD CAS to the skewed fold.
@@ -908,26 +911,30 @@ impl Shared {
     }
 
     /// One fold race (README.md, "The forced races"): nudge every clock to
-    /// just before an hour seals, overwrite HEAD with garbage, start a
-    /// `ravel-cli` fold whose clock runs `race::FOLD_SKEW_S` ahead, and
-    /// `delay_frac` into the window the last race's timings give, post an
-    /// on-demand fold to each `--mode all` server. The garbage HEAD makes
-    /// every fold rebuild and lets the on-demand route past its rate gate.
-    /// The caller holds the gate's write guard: nothing else moves the clock
-    /// or HEAD's bytes meanwhile. Returns whether a server fold lost its HEAD
-    /// CAS to the skewed fold.
-    fn fold_race(&self, delay_frac: f64, reason: &str) -> bool {
+    /// just before an hour seals, overwrite HEAD with garbage, hold the next
+    /// PUT of the HEAD key at the s3proxy, and post an on-demand fold to one
+    /// `--mode all` server so it rebuilds and tries to publish HEAD, the held
+    /// PUT. Once that PUT is held, run a `ravel-cli` fold whose clock runs
+    /// `race::FOLD_SKEW_S` ahead to completion: it rebuilds with the hour ahead
+    /// sealed and lands its HEAD CAS directly on rustfs, replacing the garbage
+    /// version. Releasing the held PUT then makes rustfs refuse it (412/409),
+    /// since its CAS was conditioned on the garbage version. The garbage HEAD
+    /// makes every fold rebuild and lets the on-demand route past its rate
+    /// gate. The caller holds the gate's write guard: nothing else moves the
+    /// clock or HEAD's bytes meanwhile. Returns whether a server fold lost its
+    /// HEAD CAS to the skewed fold.
+    fn fold_race(&self, reason: &str) -> bool {
         let Some(head_key) = lock(&self.head_key).clone() else {
             println!("fold race: no HEAD key known yet");
             return false;
         };
         if !self.nudge(
-            clock::fold_race_nudge_s(now_ns() / 1_000_000_000),
+            clock::fold_race_nudge_s(now_ns() / NS_PER_SECOND),
             "fold race",
         ) {
             return false;
         }
-        let now_s = now_ns() / 1_000_000_000;
+        let now_s = now_ns() / NS_PER_SECOND;
         let Some((seal, ahead_hour)) = clock::fold_race_seal(now_s)
             .and_then(|seal| Some((seal, clock::sealed_watermark_hour(seal)?)))
         else {
@@ -942,81 +949,98 @@ impl Shared {
             println!("fold race: overwriting HEAD: {e}");
             return false;
         }
+        if self
+            .proxy_cmd("pass")
+            .and_then(|_| self.proxy_cmd(&format!("hold-key {head_key}")))
+            .is_err()
+        {
+            return false;
+        }
+        let node = (n as usize) % self.ravel.nodes.len();
         let skewed = format!("+{}", *lock(&self.offset_s) + race::FOLD_SKEW_S);
-        let (cli_s, server_s) = *lock(&self.fold_race_timings);
-        let delay_s = race::server_delay_s(cli_s, server_s, delay_frac);
-        let started = Instant::now();
-        let ((cli_out, cli_took), servers) = std::thread::scope(|scope| {
-            let cli = scope.spawn(|| {
-                let out = self.cli.run_env(
+        let (cli, head_result, (server_result, server_took), reached) =
+            std::thread::scope(|scope| {
+                let server = scope.spawn(move || {
+                    let t = Instant::now();
+                    (self.admin_fold(node), t.elapsed())
+                });
+                let deadline = Instant::now() + FOLD_HELD_WAIT;
+                let mut held = false;
+                while Instant::now() < deadline {
+                    if self
+                        .proxy_cmd("held")
+                        .ok()
+                        .and_then(|r| proxy::parse_held(&r))
+                        .is_some_and(|(k, _)| k == head_key)
+                    {
+                        held = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let join_server = |h: std::thread::ScopedJoinHandle<'_, _>| {
+                    h.join().unwrap_or_else(|_| {
+                        (Err("the post thread panicked".to_string()), Duration::ZERO)
+                    })
+                };
+                if !held {
+                    // The server answered first: nothing eligible, or the
+                    // on-demand rate gate; no HEAD PUT was held in time.
+                    let _ = self.proxy_cmd("pass");
+                    return (None, None, join_server(server), false);
+                }
+                // The skewed fold reaches rustfs directly, not through the
+                // proxy, so its CAS lands while the server PUT is held.
+                let started = Instant::now();
+                let cli_out = self.cli.run_env(
                     &self.args(&["catalog", "fold", "--shards", "4", "--json"]),
                     CLI_TIMEOUT_S,
                     &[("FAKETIME", skewed.as_str())],
                 );
-                (out, started.elapsed())
+                let cli_took = started.elapsed();
+                let _ = self.proxy_cmd("release");
+                let server = join_server(server);
+                let head_result = self
+                    .proxy_cmd("held-result")
+                    .ok()
+                    .and_then(|r| proxy::parse_held_result(&r));
+                let _ = self.proxy_cmd("pass");
+                (Some((cli_out, cli_took)), head_result, server, true)
             });
-            std::thread::sleep(Duration::from_secs_f64(delay_s));
-            let posts: Vec<_> = (0..self.ravel.nodes.len())
-                .map(|node| {
-                    scope.spawn(move || {
-                        let t = Instant::now();
-                        (self.admin_fold(node), t.elapsed())
-                    })
-                })
-                .collect();
-            let servers: Vec<_> = posts
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        (Err("the post thread panicked".to_string()), Duration::ZERO)
-                    })
-                })
-                .collect();
-            let cli = cli.join().unwrap_or_else(|_| {
-                (
-                    cli::Output {
-                        code: None,
-                        stdout: String::new(),
-                        stderr: "the fold thread panicked".to_string(),
-                    },
-                    Duration::ZERO,
-                )
-            });
-            (cli, servers)
-        });
-        let cli_fold = race::parse_cli_fold(&cli_out.stdout);
-        let answered: Vec<f64> = servers
-            .iter()
-            .filter(|(r, _)| r.is_ok())
-            .map(|(_, took)| took.as_secs_f64())
-            .collect();
-        if cli_out.ok() && !answered.is_empty() {
-            let mean = answered.iter().sum::<f64>() / answered.len() as f64;
-            *lock(&self.fold_race_timings) = (cli_took.as_secs_f64(), mean);
-        }
-        let folds: Vec<Option<race::ServerFold>> = servers
-            .iter()
-            .map(|(r, _)| r.as_ref().ok().and_then(|b| race::parse_server_fold(b)))
-            .collect();
-        let won = cli_fold.as_ref().is_some_and(|c| {
-            folds
-                .iter()
-                .flatten()
-                .any(|s| race::overtaken(c, s, ahead_hour))
-        });
+        let cli_fold = cli
+            .as_ref()
+            .and_then(|(out, _)| race::parse_cli_fold(&out.stdout));
+        // Only a held PUT of the HEAD key, refused by the store, counts.
+        let head_cas_status = head_result
+            .as_ref()
+            .filter(|(k, _)| *k == head_key)
+            .map(|(_, status)| *status);
+        let server_fold = server_result
+            .as_ref()
+            .ok()
+            .and_then(|b| race::parse_server_fold(b));
+        let won = cli_fold
+            .as_ref()
+            .is_some_and(|c| race::overtaken(c, head_cas_status, ahead_hour));
         let details = json!({
             "reason": reason,
             "race": n,
             "seal_s": seal,
             "ahead_hour": ahead_hour,
             "skew_s": race::FOLD_SKEW_S,
-            "server_delay_s": delay_s,
-            "cli_s": cli_took.as_secs_f64(),
-            "cli": cli_fold.as_ref().map(|c| format!("{c:?}")).unwrap_or_else(|| cli_out.summary()),
-            "servers": servers.iter().map(|(r, took)| match r {
-                Ok(body) => format!("{body} ({:.1} s)", took.as_secs_f64()),
+            "reached": reached,
+            "cli_s": cli.as_ref().map(|(_, took)| took.as_secs_f64()),
+            "cli": cli_fold.as_ref().map(|c| format!("{c:?}"))
+                .or_else(|| cli.as_ref().map(|(out, _)| out.summary())),
+            "head_cas_status": head_cas_status,
+            "server_s": server_took.as_secs_f64(),
+            "server": match &server_result {
+                Ok(body) => server_fold
+                    .as_ref()
+                    .map(|f| format!("{f:?}"))
+                    .unwrap_or_else(|| body.clone()),
                 Err(e) => e.clone(),
-            }).collect::<Vec<_>>(),
+            },
         });
         println!("fold race: {details}");
         assert_sometimes!(
@@ -1703,12 +1727,11 @@ impl Workload {
         if !tc.draw(gs::weighted_booleans(0.03)) {
             return;
         }
-        let frac = f64::from(tc.draw(gs::integers::<u32>().min_value(1).max_value(9))) / 10.0;
         let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
         if s.stopping.load(Ordering::SeqCst) {
             return;
         }
-        s.fold_race(frac, "drawn");
+        s.fold_race("drawn");
     }
 
     #[rule(groups = ["main"], weight = 1)]
@@ -1844,11 +1867,11 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     if lock(&s.head_key).is_none() {
         let _ = s.inspect_json();
     }
-    for attempt in 0..FOLD_RACES_EVENTUALLY {
+    for _ in 0..FOLD_RACES_EVENTUALLY {
         if s.fold_overtaken.load(Ordering::SeqCst) {
             break;
         }
-        s.fold_race(f64::from(attempt % 3 + 1) / 4.0, "eventually");
+        s.fold_race("eventually");
     }
     for _ in 0..RECORD_RACES_EVENTUALLY {
         if s.record_lost.load(Ordering::SeqCst) {
@@ -2173,7 +2196,6 @@ fn main(tc: TestCase) {
         offset_s: Mutex::new(0),
         admin,
         token,
-        fold_race_timings: Mutex::new((0.0, 0.0)),
         fold_races: AtomicU64::new(0),
         fold_overtaken: AtomicBool::new(false),
         proxy,

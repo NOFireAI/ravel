@@ -140,9 +140,10 @@ pub fn next_seal_s(now_s: u64) -> u64 {
 }
 
 /// The fold race starts at least this long before the seal it straddles, so
-/// a server fold posted up to `race::MAX_SERVER_DELAY_S` after the start
-/// still reads its clock before the seal.
-const FOLD_RACE_TAIL_S: u64 = 60;
+/// a server fold that reads its clock up to `race::MAX_SERVER_DELAY_S` (plus a
+/// margin) after the start still reads it before the seal, and so builds a
+/// pre-seal HEAD the skewed fold can overtake.
+const FOLD_RACE_TAIL_S: u64 = crate::race::MAX_SERVER_DELAY_S + 20;
 /// And at most this long before it, so the skewed fold, `FOLD_SKEW_S` ahead,
 /// reads its clock past the seal with this much to spare.
 const FOLD_RACE_LEAD_S: u64 = crate::race::FOLD_SKEW_S - 15;
@@ -246,7 +247,7 @@ mod tests {
     #[test]
     fn a_fold_race_in_its_window_straddles_the_seal() {
         let skew = crate::race::FOLD_SKEW_S;
-        let delay = crate::race::MAX_SERVER_DELAY_S as u64;
+        let delay = crate::race::MAX_SERVER_DELAY_S;
         let start = 1_800_000_000;
         let mut inside = 0;
         for now in start..start + 3600 {
