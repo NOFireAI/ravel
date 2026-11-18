@@ -749,7 +749,10 @@ async fn an_entry_over_the_held_allowance_is_read_by_range_to_the_same_leaves() 
     );
     let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
     assert_eq!(held_head.parts[0].blake3, head.parts[0].blake3);
-    assert_eq!(stored_series_leaves(store.as_ref(), &head.parts[0]).await, held);
+    assert_eq!(
+        stored_series_leaves(store.as_ref(), &head.parts[0]).await,
+        held
+    );
 }
 
 /// A series no published entry holds any more: hour `KIDX_HOUR + 1` of
