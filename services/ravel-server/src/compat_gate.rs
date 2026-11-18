@@ -21,11 +21,23 @@
 //! neither marker (a pre-ADR-0050 bucket), is refused, which is how an
 //! unsupported upgrade path (skipping the release that carried both readers)
 //! is refused before it modifies anything.
+//!
+//! [`enforce`] itself is read-only. On a fresh store with a deployment key,
+//! startup follows it with [`bootstrap_fresh_store`], the one write this
+//! module makes: a create-only `sys/compat`, before `sys/tenancy` or anything
+//! else is written. An unkeyed fresh store gets no `sys/compat`, so the
+//! next start of the same release is refused with `sys/tenancy` and no
+//! `sys/compat`.
+
+use std::collections::BTreeMap;
 
 use ravel_catalog::compat::{
-    COMPAT_KEY, CompatError, CompatKeys, finalization_pending, read_compat,
+    COMPAT_KEY, CompatError, CompatKeys, create_compat, finalization_pending, read_compat,
 };
+use ravel_maintain::DEFAULT_PUBLISH_LIFETIME_NS;
+use ravel_maintain::compat_init::{CompatInitError, InitConfig, baseline_record};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
+use ravel_proto::sys::v1 as sysproto;
 
 use crate::tenancy::{TENANCY_MARKER_KEY, TENANT_PREFIX, bucket_has_tenant_data};
 
@@ -45,14 +57,21 @@ pub const RETIRED_READERS: &[RetiredReader] = &[];
 /// maintenance outage does not stop processes from restarting.
 pub const WATERMARK_WARN_AGE_NS: i64 = 7 * 24 * 3_600 * 1_000_000_000;
 
+/// The baseline release a fresh-store bootstrap records: v0.34, the default
+/// of `ravel-cli compat init`.
+pub const BOOTSTRAP_BASELINE_RELEASE: (u32, u32) = (0, 34);
+
 /// Why the gate let the process start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateOutcome {
     /// This build retires no reader; nothing was read.
     NoRetiredReader,
     /// Neither `sys/compat` nor `sys/tenancy` exists and the store holds no
-    /// `t/` data: a fresh store. Nothing writes `sys/compat` on this outcome
-    /// yet (issue #4483).
+    /// `t/` data: a fresh store. With a deployment key, startup then runs
+    /// [`bootstrap_fresh_store`] before any other write, so the next start
+    /// finds a certified `sys/compat`; without one it writes nothing here.
+    /// Only a build with a non-empty [`RETIRED_READERS`] reaches this
+    /// outcome.
     Fresh,
     /// Every retired family carries a current certificate.
     Certified { families: Vec<CertifiedFamily> },
@@ -143,6 +162,15 @@ pub enum CompatGateError {
         watermark_unix_ns: i64,
         certified_unix_ns: i64,
     },
+    #[error("could not build {COMPAT_KEY} for a fresh store: {0}")]
+    BootstrapRecord(#[source] CompatInitError),
+    #[error("could not create {COMPAT_KEY} on a fresh store: {0}")]
+    BootstrapCreate(#[source] CompatError),
+    #[error(
+        "{COMPAT_KEY} existed when this process tried to create it on a fresh store, and was \
+         gone when it re-read it; refusing to start"
+    )]
+    BootstrapVanished,
 }
 
 /// Run the gate for `retired` against `store`. Read-only. `deployment_key` is
@@ -172,7 +200,15 @@ pub async fn enforce(
         // fresh or refused is decided exactly as above.
         return without_compat(store).await;
     };
+    check_record(&record, retired, now_unix_ns)
+}
 
+/// The per-family rules of the gate, applied to a `sys/compat` record.
+fn check_record(
+    record: &sysproto::CompatRecord,
+    retired: &[RetiredReader],
+    now_unix_ns: i64,
+) -> Result<GateOutcome, CompatGateError> {
     let mut families = Vec::with_capacity(retired.len());
     for reader in retired {
         let family = reader.family;
@@ -225,6 +261,105 @@ pub async fn enforce(
         });
     }
     Ok(GateOutcome::Certified { families })
+}
+
+/// What [`bootstrap_fresh_store`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bootstrap {
+    /// This build retires no reader; nothing was read or written.
+    NoRetiredReader,
+    /// No deployment key is configured, so nothing can MAC `sys/compat`;
+    /// nothing was written, exactly as before the bootstrap existed.
+    Unkeyed,
+    /// This process created `sys/compat`.
+    Created,
+    /// `sys/compat` already existed when the create ran (a concurrent fresh
+    /// start, or an earlier attempt of this one whose acknowledgement was
+    /// lost), and the record it found passes the gate.
+    Existing,
+}
+
+/// Bring a store the gate found fresh into the compatibility contract, so
+/// the next start of this release is not refused for lacking `sys/compat`.
+///
+/// Runs only for a non-empty `retired` set and only with a deployment key;
+/// otherwise it sends no request. It must run before anything else writes to
+/// the store, `sys/tenancy` included. The write is create-only: a lost race
+/// leaves the existing record untouched, re-reads it, and starts only if the
+/// gate accepts it. `census_unix_ns` is the time the gate took before the
+/// `t/` LIST that found the store empty.
+pub async fn bootstrap_fresh_store(
+    store: &dyn ObjectStoreBackend,
+    deployment_key: Option<&[u8; 32]>,
+    retired: &[RetiredReader],
+    census_unix_ns: i64,
+) -> Result<Bootstrap, CompatGateError> {
+    if retired.is_empty() {
+        return Ok(Bootstrap::NoRetiredReader);
+    }
+    let Some(key) = deployment_key else {
+        return Ok(Bootstrap::Unkeyed);
+    };
+    let record = bootstrap_record(retired, census_unix_ns)?;
+    check_record(&record, retired, census_unix_ns)?;
+    let keys = CompatKeys::from_file_keys(&[*key]).map_err(CompatGateError::BootstrapCreate)?;
+    match create_compat(store, &keys, record).await {
+        Ok(_) => Ok(Bootstrap::Created),
+        Err(CompatError::AlreadyExists { .. }) => {
+            let Some((existing, _)) = read_compat(store, &keys)
+                .await
+                .map_err(CompatGateError::CompatUnreadable)?
+            else {
+                return Err(CompatGateError::BootstrapVanished);
+            };
+            check_record(&existing, retired, census_unix_ns)?;
+            Ok(Bootstrap::Existing)
+        }
+        Err(err) => Err(CompatGateError::BootstrapCreate(err)),
+    }
+}
+
+/// The record a fresh-store bootstrap creates: the record `compat init`
+/// writes on an empty store (every known family at its baseline write
+/// version, `compat_epoch` 0, the baseline release, `P` at its default),
+/// plus, for each retired family, what `compat certify` and a late-write pass
+/// leave on an empty store. That is a certificate at the family's active
+/// version over an empty census (no members, no buckets, the digest of the
+/// empty tenant set) dated `census_unix_ns`, and a watermark one nanosecond
+/// past it: the least the gate accepts, so the daily late-write pass in
+/// `--mode maintain` checks every write after the empty LIST.
+pub fn bootstrap_record(
+    retired: &[RetiredReader],
+    census_unix_ns: i64,
+) -> Result<sysproto::CompatRecord, CompatGateError> {
+    let config = InitConfig {
+        baseline_release_major: BOOTSTRAP_BASELINE_RELEASE.0,
+        baseline_release_minor: BOOTSTRAP_BASELINE_RELEASE.1,
+        max_publish_lifetime_ns: DEFAULT_PUBLISH_LIFETIME_NS,
+    };
+    let mut record =
+        baseline_record(&config, &BTreeMap::new()).map_err(CompatGateError::BootstrapRecord)?;
+    let empty_tenant_set = blake3::Hasher::new().finalize().as_bytes().to_vec();
+    for reader in retired {
+        let family = reader.family;
+        let Some(entry) = record
+            .families
+            .iter_mut()
+            .find(|entry| entry.family == family)
+        else {
+            return Err(CompatGateError::FamilyAbsent { family });
+        };
+        entry.certificate = Some(sysproto::Certificate {
+            version: entry.active_write_version,
+            certified_unix_ns: census_unix_ns,
+            member_count: 0,
+            newest_created_unix_ns: 0,
+            buckets_scanned: 0,
+            tenant_set_digest: empty_tenant_set.clone(),
+        });
+        entry.late_writes_verified_through_unix_ns = census_unix_ns.saturating_add(1);
+    }
+    Ok(record)
 }
 
 /// The outcome for a store without `sys/compat`: fresh only when it also has

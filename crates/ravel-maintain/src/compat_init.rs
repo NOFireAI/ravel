@@ -358,8 +358,10 @@ fn already_initialized(
 }
 
 /// The record `init` writes: every known family at this build's baseline
-/// write version, never activated, epoch 0.
-fn baseline_record(
+/// write version, never activated, epoch 0. `adopted` is empty on an empty
+/// store, which is also the record a retired-reader server builds when it
+/// bootstraps a fresh store.
+pub fn baseline_record(
     config: &InitConfig,
     adopted: &BTreeMap<(String, u32), u64>,
 ) -> Result<sysproto::CompatRecord, CompatInitError> {

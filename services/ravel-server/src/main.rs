@@ -249,6 +249,7 @@ async fn main() -> anyhow::Result<()> {
     //    naming the fix that fits this mode and the refused request.
     let ravel_server::startup_retry::StartupStoreState {
         retired_reader_gate: _,
+        compat_bootstrap: _,
         tenancy: resolved_tenancy,
         static_tenants: fold_tenants,
         gc,
@@ -1146,6 +1147,9 @@ mod tests {
             concat!("gc_config::bootstrap_", "at_startup("),
             concat!("compat_gate::", "enforce("),
             concat!("startup_retry::enforce_", "retired_reader_gate("),
+            concat!("compat_gate::bootstrap_", "fresh_store("),
+            concat!("startup_retry::bootstrap_", "fresh_compat("),
+            concat!("startup_retry::run_startup_", "store_gates("),
         ] {
             assert_eq!(main_src.matches(direct).count(), 0, "{direct}");
         }
@@ -1272,10 +1276,20 @@ mod tests {
         assert!(call_end < start);
 
         const CHECKS: &str = include_str!("startup_retry.rs");
-        let body = &CHECKS[CHECKS
-            .find(concat!("pub async fn run_startup_", "store_checks("))
-            .expect("the checks function")..];
-        let body = &body[..body.find("\n}\n").expect("function closes")];
+        let function = |signature: &str| {
+            let body = &CHECKS[CHECKS.find(signature).expect("the function")..];
+            &body[..body.find("\n}\n").expect("function closes")]
+        };
+        let checks = function(concat!("pub async fn run_startup_", "store_checks("));
+        let gates_call = concat!("run_startup_", "store_gates(retry");
+        assert_eq!(checks.matches(gates_call).count(), 1);
+        let gates_at = checks.find(gates_call).expect("checked above");
+        let install = checks
+            .find(concat!("install_tenant_", "hash_scheme("))
+            .expect("the scheme install");
+        assert!(gates_at < install);
+
+        let body = function(concat!("pub async fn run_startup_", "store_gates("));
         let gate = concat!("enforce_retired_", "reader_gate(");
         assert_eq!(body.matches(gate).count(), 1);
         let gate_at = body.find(gate).expect("checked above");
@@ -1283,19 +1297,36 @@ mod tests {
         let protection = body
             .find(concat!("bucket_protection::enforce_", "at_startup_on("))
             .expect("the bucket-protection gate");
+        let bootstrap = concat!("bootstrap_fresh_", "compat(");
+        assert_eq!(body.matches(bootstrap).count(), 1);
+        let bootstrap_at = body.find(bootstrap).expect("checked above");
+        assert!(
+            body[..bootstrap_at]
+                .ends_with(concat!("GateOutcome::Fresh => Some(\n", "            ")),
+            "the bootstrap runs on a fresh outcome only"
+        );
         let tenancy = body
             .find(concat!("resolve_", "tenancy(retry"))
             .expect("tenancy pinning");
-        let install = body
-            .find(concat!("install_tenant_", "hash_scheme("))
-            .expect("the scheme install");
-        assert!(protection < gate_at && gate_at < tenancy && tenancy < install);
-        // The gate's one call outside its own definition is that one.
+        assert!(protection < gate_at && gate_at < bootstrap_at && bootstrap_at < tenancy);
+        // Each step's one call outside its own definition is that one.
         let non_test = &CHECKS[..CHECKS.find("\n#[cfg(test)]").expect("test module")];
         assert_eq!(non_test.matches(gate).count(), 2, "definition and one call");
         assert_eq!(
+            non_test.matches(bootstrap).count(),
+            2,
+            "definition and one call"
+        );
+        assert_eq!(non_test.matches(gates_call).count(), 1);
+        assert_eq!(
             non_test
                 .matches(concat!("compat_gate::", "enforce("))
+                .count(),
+            1
+        );
+        assert_eq!(
+            non_test
+                .matches(concat!("compat_gate::", "bootstrap_fresh_store("))
                 .count(),
             1
         );
