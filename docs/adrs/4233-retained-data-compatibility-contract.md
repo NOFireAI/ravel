@@ -542,8 +542,9 @@ For a class A family:
     `late_writes_verified_through_unix_ns`, set to `S` by `certify`. A pass
     that completes CAS-writes its start time there only when that is later
     than the stored value, so the watermark never moves back when passes
-    finish out of order. A pass interrupted by its budget and resumed keeps
-    the start of its first run, the earliest, like `certify`'s `S`.
+    finish out of order. A pass interrupted by its budget and resumed
+    (withdrawn by the late-write budget correction below) keeps the start of
+    its first run, the earliest, like `certify`'s `S`.
   - The late-write pass lists the commit prefixes (commit, compaction and
     rewrite records) of every signal of F and GETs only the records whose
     `LastModified` is after the watermark minus `clock_skew_allowance`; every
@@ -553,7 +554,8 @@ For a class A family:
     and the bucket's writes are refused; `compat verify` reports it.
   - The pass runs as a daily maintenance unit (any maintain process; the
     CAS makes concurrent passes harmless) and on demand as `ravel-cli compat
-    verify`, under `--compat-check-budget`. It costs one LIST of every
+    verify`, under `--compat-check-budget` (there is no such flag: see the
+    late-write budget correction below). It costs one LIST of every
     commit page of those signals and one GET per record landed since the
     watermark.
   - The retired-reader release at startup refuses when the certificate is
@@ -561,19 +563,23 @@ For a class A family:
     advanced past `S` (the procedure runs `compat verify` from the release
     that reads both versions before installing it). A watermark older than
     7 days only warns and sets `ravel_compat_late_write_watermark_age_seconds`,
-    so a long maintenance outage does not stop processes from restarting.
+    so a long maintenance outage does not stop processes from restarting
+    (the gauge is rendered in maintain mode only: see the late-write budget
+    correction below).
   - A late write is never a silent wrong answer: its object fails closed
     typed at read time and the retention version hold keeps it. The remedy
     is to roll back to the release that reads both versions, `migrate`, and
     re-certify.
 - **Fresh stores, for the retired-reader release only.** A release whose
   reader for F no longer admits N treats a store with no `sys/compat` and
-  no `sys/tenancy` as fresh and bootstraps it, and refuses to start on one
-  with `sys/tenancy` and no `sys/compat`. This is how an unsupported upgrade
-  path, including skipping the release that carried both readers, is
-  refused before it modifies anything. The baseline and every release that
-  retires no reader run on a store without `sys/compat` as decision 1
-  says.
+  no `sys/tenancy` as fresh and bootstraps it (see the unmarked-bucket
+  amendment below: such a store that holds data under `t/` is refused, and
+  nothing writes `sys/compat` on a fresh store yet, issue #4483), and
+  refuses to start on one with `sys/tenancy` and no `sys/compat`. This is
+  how an unsupported upgrade path, including skipping the release that
+  carried both readers, is refused before it modifies anything. The
+  baseline and every release that retires no reader run on a store without
+  `sys/compat` as decision 1 says.
 - **What keeps it true.** Baseline-or-later writers stop starting to encode
   objects below the active version within `H` and stop publishing them within
   `H + P + T_req`, and once F is certified `--write-below-format-floor` is
@@ -1127,3 +1133,46 @@ attestation (the writer-role attestation amendment above). Neither change
 touches `sys/compat` or any persisted version, so a store adopted by
 v0.34.0 is held to the same contract by every later release, and the
 baseline does not move.
+
+## Amendment (2026-11-18): correction to decision 7, the late-write pass budget and gauge (issue #4399)
+
+<!-- amendment-applies: sections="7. Retiring a reader requires a certificate that stays checkable" pointer="late-write budget correction" -->
+<!-- amendment-supersedes: phrase="interrupted by its budget and resumed" pointer="late-write budget correction" -->
+<!-- amendment-supersedes: phrase="under `--compat-check-budget`" pointer="late-write budget correction" -->
+
+Correction to decision 7 (late-write pass budget and gauge). There is no
+'--compat-check-budget'. A late-write pass is not resumable: it runs to
+completion or writes nothing, and only a completed pass advances the
+watermark, to its own start time. The sentence about a pass interrupted by
+its budget is withdrawn. The maintain unit runs the pass per certified
+family on the first tick after a certificate and then once the watermark is
+a day old; a failed pass leaves the watermark, so it reruns from the start
+on the next tick. Each attempt costs one LIST of every commit page of the
+family's signals plus one GET per record whose 'LastModified' is after the
+watermark minus 'clock_skew_allowance'. No object is read twice within a
+pass, and unexamined records never fall behind the watermark. Operators
+watch 'ravel_compat_late_write_watermark_age_seconds{family}': now minus
+the watermark, computed at scrape time, rendered in maintain mode only,
+absent without a certificate. The startup gate in other modes only logs the
+7-day warning.
+
+## Amendment (2026-11-18): the unmarked-bucket refusal (issue #4399)
+
+<!-- amendment-applies: sections="7. Retiring a reader requires a certificate that stays checkable" pointer="unmarked-bucket amendment" -->
+
+Decision 7's "Fresh stores" paragraph took a store with no `sys/compat` and
+no `sys/tenancy` as fresh. A bucket written before ADR-0050 carries tenant
+data under `t/` and neither marker, so that test admitted it, and a release
+that retired a reader would have started on data it may not read. The
+retired-reader gate now also lists `t/` when both markers are absent (one
+LIST, first page only) and refuses with `TenantDataWithoutMarkers`, naming
+`ravel-cli compat init`, when that page holds an object or a continuation
+token. A LIST that fails with a non-transient error, or keeps failing through
+the startup retries for transient ones, refuses too. The refusal comes before any write, like
+the `sys/tenancy` without `sys/compat` refusal. A store with neither marker
+and nothing under `t/` is still fresh and starts.
+
+This amendment narrows which stores are fresh; it does not change what
+happens to one. Nothing writes `sys/compat` on a fresh outcome today, so a
+fresh store is not yet bootstrapped into the contract as the paragraph says;
+issue #4483 tracks that bootstrap.

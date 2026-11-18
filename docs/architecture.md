@@ -151,10 +151,11 @@ The retired-reader gate (ADR-4233 decision 7) runs in every mode, after the
 bucket-protection read and before `sys/tenancy` is pinned, because pinning
 writes `sys/tenancy` on a fresh store and the gate tells a fresh store from
 an unadopted one by that marker's absence. It HEADs `sys/compat` and, when
-that is absent, HEADs `sys/tenancy`. When `sys/compat` is present and the
-process has a deployment key, it GETs `sys/compat`, and when `sys/compat` was
-deleted between that HEAD and the GET, it HEADs `sys/tenancy` too; without a
-deployment key it refuses before the GET. A build that retires no reader, which is every build
+that is absent, HEADs `sys/tenancy` and, when that is absent too, LISTs the
+first page of `t/`. When `sys/compat` is present and the process has a
+deployment key, it GETs `sys/compat`, and when `sys/compat` was deleted
+between that HEAD and the GET, it sends the `sys/tenancy` HEAD and the `t/`
+LIST too; without a deployment key it refuses before the GET. A build that retires no reader, which is every build
 today, sends no request here.
 
 A transient store error does not count as a wrong answer. A transient store
@@ -194,13 +195,15 @@ marker, a scheme, key or policy mismatch, pre-ADR data that the configured
 `--shards` would hide, a refused credential, and every retired-reader gate
 refusal: a family with no certificate or one below the oldest version the
 build reads, a contradicted certificate, a late-write watermark not past the
-census, `sys/compat` present with no deployment key to authenticate it, and
-`sys/tenancy` present without `sys/compat`, and a `sys/compat` that the
-gate cannot read for any other reason than a transient store error: one
-whose MAC does not verify under the deployment key, one that does not
-decode, or a GET that fails with a non-retryable store error. A transient
-store error inside the gate, on its HEADs or on the `sys/compat` read,
-retries like any other. A marker or record that the server creates during
+census, `sys/compat` present with no deployment key to authenticate it,
+`sys/tenancy` present without `sys/compat`, data under `t/` with neither
+`sys/tenancy` nor `sys/compat` (`TenantDataWithoutMarkers`), and a
+`sys/compat` that the gate cannot read for any other reason than a
+transient store error: one whose MAC does not verify under the deployment
+key, one that does not decode, or a GET that fails with a non-retryable
+store error. A transient store error inside the gate, on its HEADs, its
+`t/` LIST or the `sys/compat` read, retries like any other; a `t/` LIST
+that fails with a non-retryable store error refuses at once. A marker or record that the server creates during
 these reads is written create-if-absent or under compare-and-swap, and every
 retry starts again from the read. So a write
 that landed before an ambiguous failure reads back as present on the next

@@ -332,9 +332,10 @@ gives each command's flags and report fields.
   reader starts, in every mode, only when the family carries an
   uncontradicted certificate at or above the oldest version it reads with
   the late-write watermark past the certified time. It treats a store with
-  neither `sys/compat` nor `sys/tenancy` as fresh, and refuses one with
-  `sys/tenancy` and no `sys/compat`. No current release has retired a
-  reader, so the gate's reader set is empty.
+  neither `sys/compat` nor `sys/tenancy` and nothing under `t/` as fresh,
+  and refuses one with `sys/tenancy` and no `sys/compat`, or with data
+  under `t/` and neither marker. No current release has retired a reader,
+  so the gate's reader set is empty.
 - **Readers** fail closed with a typed error on a version they do not
   admit. ADR-4233 decision 4's hazard table lists, site by site, how the
   baseline refuses or holds an object written by a newer build instead of

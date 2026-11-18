@@ -1511,7 +1511,15 @@ provisioning record once the family's floor has reached the active version,
 and reports a refused run as an outcome rather than an error. While
 `sys/compat` marks the family's certificate `contradicted`, it walks the
 bucket even when the floor has reached the active version: a late write
-landed below the floor, so the floor no longer proves the bucket clean.
+landed below the floor, so the floor no longer proves the bucket clean. It
+walks a contradicted family once per certificate and late-write watermark:
+a walk that drains with no bucket held and whose re-audit finds no
+straggler records the certificate version, certification time and
+watermark it ran under at the
+migrate cursor key, and later calls skip the family (a cursor GET, no LIST)
+until one of the three changes. A walk that leaves a straggler, such as a
+late write in an hour not yet sealed, records nothing, so the next call
+walks again. A failed read of that record walks the family.
 
 ### Compat maintenance units
 
@@ -1547,6 +1555,8 @@ examined, new watermark) and per finished or pending finalization, and one
 `contradicted` and finalization-pending state of each certified family also
 render on the maintain process's `/metrics` as
 `ravel_compat_late_write_watermark_seconds`,
+`ravel_compat_late_write_watermark_age_seconds` (scrape time minus the
+watermark; above 25 hours, passes are not completing),
 `ravel_compat_certificate_contradicted` and
 `ravel_compat_certify_finalization_pending`
 ([observability guide](../observability.md#format-write-policy-ravel_compat_)).
@@ -2596,10 +2606,15 @@ family entry carries a certificate at or above the
 oldest version it reads, the certificate is not `contradicted`, and the
 late-write watermark is past the certified time. Otherwise the process
 exits before serving, with an error naming the family and the remedy. A
-bucket with neither `sys/compat` nor `sys/tenancy` is a fresh store and
-starts. A bucket with `sys/tenancy` and no `sys/compat` is refused with an
-error naming `ravel-cli compat init`, which adopts the store from the
-release that reads both versions. `sys/compat` without a configured
+bucket with neither `sys/compat` nor `sys/tenancy` and nothing under `t/`
+is a fresh store and starts. A bucket with `sys/tenancy` and no
+`sys/compat`, or with data under `t/` and neither marker (a bucket written
+before the tenancy marker existed), is refused with an error naming
+`ravel-cli compat init`, which adopts the store from the release that reads
+both versions. The gate checks for `t/` data with one LIST of its first
+page; a failed LIST refuses, after the startup retries when the error is
+transient.
+`sys/compat` without a configured
 `--tenant-hash-key-file` is refused too, because the certificates cannot be
 authenticated. A watermark more than 7 days old logs a `WARN` line and
 still starts.

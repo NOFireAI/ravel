@@ -94,7 +94,9 @@ pub struct ActivateRequest {
     /// Recorded as the family's `activated_by`.
     pub activated_by: String,
     /// The operator's attestation that every writer role's credentials can
-    /// read `sys/compat` (ADR-4233 decision 3). `false` refuses.
+    /// read `sys/compat` (ADR-4233 decision 3). `false` refuses. The CLI sets
+    /// it from `--writer-roles-can-read-compat` alone (the writer-role flag
+    /// amendment).
     pub writer_roles_can_read_compat: bool,
     /// Tenants named by the alert rules file. Their leases are parked on an
     /// `rlog` activation even when no alert key exists for them yet.
