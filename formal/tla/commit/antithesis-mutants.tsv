@@ -1,0 +1,12 @@
+# negative cfg stem	mutant (an inv_mutant! name)	property it must make false
+ack-before-commit	commit/ack-before-commit	commit: a strict metrics ack names a durable commit record
+at-least-once-duplicate-reachable	none: an obligation the model must violate, not a broken switch (ADR-4326 decision 1); the run reaches it as the driver's sometimes "a stored log record was found more than once"
+commit-before-data	commit/commit-before-data	commit: a commit record never exists without its data object
+deadline-reachable	none: an obligation the model must violate, not a broken switch (ADR-4326 decision 1); the run reaches it as "commit: flush abandoned" in crates/ravel-ingest/src/shard.rs
+marker-before-all-shards	commit/marker-before-all-shards	commit: an idempotency marker implies every shard's commit is durable
+mismatched-identity-idempotent	commit/mismatched-identity-idempotent	commit: one commit identity holds one content hash
+no-cross-shard-atomicity	none: an obligation the model must violate, not a broken switch (ADR-4326 decision 1); the run reaches it as "logs ingest: a write committed on some shards before a sibling shard failed" and its metrics counterpart in services/ravel-server
+put-commit-lost-response-reachable	none: an obligation the model must violate, not a broken switch (ADR-4326 decision 1); the run reaches the commit record retry as "commit: put retried" in crates/ravel-ingest/src/shard.rs (that site does not tell a lost response from a failed put)
+put-data-lost-response-reachable	none: an obligation the model must violate, not a broken switch (ADR-4326 decision 1); the run reaches the data object retry as "commit: put retried" in crates/ravel-ingest/src/shard.rs (that site does not tell a lost response from a failed put)
+query-reads-uncommitted-data	none: QueryReadsDataDirectly breaks NoUncommittedDataVisible, a query-path invariant that ADR-4326 decision 2 leaves out of the commit area's scope and decision 3 gives no mutant
+transient-failure-reachable	none: an obligation the model must violate, not a broken switch (ADR-4326 decision 1); the run reaches it as "commit: put retried" in crates/ravel-ingest/src/shard.rs
