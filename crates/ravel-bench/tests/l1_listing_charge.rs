@@ -151,7 +151,11 @@ async fn one_part() -> (RunConfig, Compacted, PartShape) {
     // Above the whole-object threshold: the open GET holds the 64 KiB tail and
     // the catalog run, not the part's pages.
     assert_eq!(
-        (shape.wire_bytes, shape.held_fetch_bytes, shape.catalog_decode_bytes),
+        (
+            shape.wire_bytes,
+            shape.held_fetch_bytes,
+            shape.catalog_decode_bytes
+        ),
         (1_202_303, 69_014, 242_523)
     );
     assert_eq!((shape.samples, shape.series), (230_400, 120));
@@ -353,7 +357,10 @@ async fn check_report_rejects_missing_duplicate_and_out_of_band_figures() {
         let out_of_band = edit(&|e| {
             e.insert(per_sample.into(), 250.0.into());
         });
-        fails_alone(&out_of_band, &format!("cap {cap}: {path} peak per sample 250"));
+        fails_alone(
+            &out_of_band,
+            &format!("cap {cap}: {path} peak per sample 250"),
+        );
         let refused_above_bound = edit(&|e| {
             let at = e[bound].as_u64().expect("bound");
             let top = e[peak].as_u64().expect("peak").max(at + 1);

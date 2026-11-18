@@ -1038,8 +1038,7 @@ impl CapFigures {
     /// How far the sample read's peak lies above [`upper_bound`]; negative
     /// below it.
     pub fn sample_peak_minus_upper_bound(&self) -> i64 {
-        let diff =
-            i128::from(self.sample_search.succeeds_at) - i128::from(self.upper_bound_bytes);
+        let diff = i128::from(self.sample_search.succeeds_at) - i128::from(self.upper_bound_bytes);
         i64::try_from(diff).unwrap_or(if diff < 0 { i64::MIN } else { i64::MAX })
     }
 }
@@ -1074,8 +1073,7 @@ pub async fn measure_cap(
         sample_read_succeeds(store, part, shape.series, limit)
     })
     .await?;
-    let sample_read_bound_succeeds =
-        sample_read_succeeds(store, part, shape.series, bound).await?;
+    let sample_read_bound_succeeds = sample_read_succeeds(store, part, shape.series, bound).await?;
 
     let isolated = isolate_part(config, cap, &compacted, part_index).await?;
     let only = &isolated.store;
@@ -1424,9 +1422,7 @@ pub fn check_report(text: &str, caps: &[u64]) -> Result<(), Vec<String>> {
                     }
                     rows.push((cap, samples, peak));
                 }
-                _ => failures.push(format!(
-                    "cap {cap}: a {path} byte figure is not an integer"
-                )),
+                _ => failures.push(format!("cap {cap}: a {path} byte figure is not an integer")),
             }
         }
     }
