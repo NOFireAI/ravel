@@ -1302,8 +1302,10 @@ pub struct KeyIndexStats {
     /// Parts with no leaf for the signal and field; their segments go to
     /// tier 1.
     pub parts_uncovered: u64,
-    /// Parts whose worst-case leaf GETs exceed the tier-1 probe's cost for
-    /// their segments in the routed snapshot, 2 GETs a segment; their
+    /// Parts whose worst-case leaf GETs exceed the tier-1 cost of their
+    /// segments in the routed snapshot, each segment charged by
+    /// `ravel_query::key_index_route::TierOneCost` (1 GET for a segment tier 1
+    /// reads whole at or under that type's bound, 2 for any other); their
     /// segments go to tier 1 with no leaf GET.
     pub parts_over_tier_one: u64,
     /// Parts past the leaf GET or part ceiling; their segments go to tier 1.

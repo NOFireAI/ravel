@@ -5862,13 +5862,15 @@ own tier-1 probe's cost over the statement's window, is not probed and
 counts in `partsOverTierOne`, not `partsUncovered`. Each segment is charged
 by `TierOneCost` from its `object_size`: 1 GET when tier 1 reads it whole in
 one GET without a KEY_IDX probe (at or under the logs fetcher's
-`block_range_threshold`, 512 KiB by default, or the spans fetcher's
-`trace_probe_bytes`, 8 KiB by default), 2 otherwise, ADR-2707 decision 5's
+`block_range_threshold`, 512 KiB by default and capped there for the
+charge, or the spans fetcher's `trace_probe_bytes`, 8 KiB by default), 2
+otherwise, ADR-2707 decision 5's
 conservative per-object probe cost (ADR-3692's per-segment tier-1 cost
 amendment;
 `a_part_of_small_objects_dearer_than_their_whole_reads_goes_to_tier_one`,
 `a_mixed_part_is_admitted_at_its_tier_one_cost_and_not_one_get_past`,
-`the_whole_read_band_ends_at_the_block_range_threshold`)
+`the_whole_read_band_ends_at_the_block_range_threshold`,
+`tier_one_cost_caps_the_logs_whole_read_bound`)
 (`a_part_costing_more_than_its_tier_one_probe_is_left_to_tier_one`,
 `a_part_with_few_segments_in_the_routed_snapshot_is_left_to_tier_one`,
 `the_same_part_with_every_segment_in_the_routed_snapshot_is_admitted`). The

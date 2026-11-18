@@ -416,7 +416,9 @@ async fn fixture_of(objects: usize) -> Arc<dyn ObjectStoreBackend> {
 
 /// `POST /api/v1/sql` over `store`. Every object is above the fetchers'
 /// thresholds, so a segment the router leaves uncovered takes the tier-1
-/// probe.
+/// probe. The spans fetcher keeps the default `trace_probe_bytes` (8 KiB):
+/// the spans lane's `2 x 36 = 72` assumes every fixture span object is above
+/// it, so each is charged 2.
 fn serve(store: Arc<dyn ObjectStoreBackend>) -> Router {
     let logs = LogSegmentFetcher::new(store.clone())
         .with_suffix_len(1024)
