@@ -9,7 +9,8 @@
 #
 # BUCKETS. Bucket names are global on real S3, so this file names none: the
 # operator creates <prefix>-ravel, <prefix>-mimir-blocks, <prefix>-mimir-ruler
-# and <prefix>-mimir-alertmanager before the run, in the region given.
+# and <prefix>-mimir-alertmanager before the run, in the region given. A
+# Ravel-only run (run.sh --ravel-only) needs <prefix>-ravel alone.
 #
 # CREDENTIALS. Both engines take the EC2 instance role from the instance
 # metadata service and no key appears here. The containers sit one hop behind
@@ -23,7 +24,10 @@ services:
 
   # Keeps its place as the one-shot Mimir and ravel-qualify wait on, but creates
   # nothing: it exits non-zero when a bucket is missing, unreadable or already
-  # holds an object, since an earlier run's data would be measured.
+  # holds an object, since an earlier run's data would be measured. It checks
+  # the four buckets above unless METRICSBENCH_S3_BUCKET_SUFFIXES names others:
+  # run.sh --ravel-only sets it to "ravel", since Mimir never starts there and
+  # its buckets need not exist.
   createbuckets:
     depends_on: !reset []
     environment:
@@ -33,7 +37,7 @@ services:
       AWS_DEFAULT_REGION: ${METRICSBENCH_S3_REGION:?set METRICSBENCH_S3_REGION to the buckets region}
     entrypoint: >
       /bin/sh -c "
-      for b in ravel mimir-blocks mimir-ruler mimir-alertmanager; do
+      for b in ${METRICSBENCH_S3_BUCKET_SUFFIXES:-ravel mimir-blocks mimir-ruler mimir-alertmanager}; do
         n=$$(aws s3api list-objects-v2 --bucket ${METRICSBENCH_S3_BUCKET_PREFIX:?set METRICSBENCH_S3_BUCKET_PREFIX}-$$b --max-keys 1 --no-paginate --query KeyCount --output text) || exit 1;
         [ $$n = 0 ] || { echo bucket $$b is not empty; exit 1; };
       done"
