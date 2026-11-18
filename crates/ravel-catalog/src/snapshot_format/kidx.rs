@@ -227,9 +227,10 @@ pub const KEY_INDEX_MAX_PROBED_PARTS: usize = 1_024;
 /// 66,560 at k >= 64. It is an absolute cap on one pass, charging each part
 /// as if the set sat in one slice; admission charges each part's real worst
 /// case against it and refunds the GETs a probed part did not issue, so its
-/// worst-case division is the fewest parts it admits. Separately, a part
-/// whose worst case exceeds two GETs for each of its segments in the routed
-/// snapshot, its tier-1 probe's cost, is not probed.
+/// worst-case division is the fewest parts it admits. Separately, a logs or
+/// spans part whose worst case exceeds the tier-1 cost of its segments in
+/// the routed snapshot (ravel-query's `TierOneCost`: 1 GET for a segment
+/// tier 1 reads whole, 2 otherwise) is not probed.
 ///
 /// The logs and spans consumers route a key set in one pass. The metrics
 /// label-value route (ADR-3694's per-value routing amendment) routes one
