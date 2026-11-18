@@ -19,7 +19,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ravel_catalog::compat::{
-    CompatClock, CompatKeys, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN, read_compat,
+    CompatClock, CompatKeys, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN, finalization_pending,
+    read_compat,
 };
 use ravel_maintain::{
     ActivateError, ActivateOutcome, ActivateRequest, CertifyRefusal, CertifyReport, CertifyTimings,
@@ -33,10 +34,14 @@ use serde_json::{Value, json};
 
 /// Success: the command ran and nothing refused it.
 pub const EXIT_OK: i32 = 0;
-/// A precondition refused the command; nothing durable was written. Unkeyed
-/// store, a missing attestation, an unwritable version, the certify time gate,
-/// and every other library refusal land here.
-pub const EXIT_REFUSED: i32 = 2;
+/// A precondition refused the command. Unkeyed store, a missing attestation,
+/// an unwritable version, the certify time gate, a held member, and every
+/// other library refusal land here; a certify refusal can leave the census
+/// cursor for a rerun to resume. Not 2, which clap exits with on
+/// a usage error before the command runs, and not 1, the exit of an error the
+/// command returns (a store fault, an exhausted CAS retry, a malformed value),
+/// so a script can tell a refusal from both.
+pub const EXIT_REFUSED: i32 = 5;
 /// A below-certified-version member or a late write contradicts the family:
 /// `certify` returned `Contradicted`, or `verify` found late writes.
 pub const EXIT_CONTRADICTED: i32 = 3;
@@ -264,6 +269,11 @@ pub struct ActivateArgs {
     /// every pre-baseline (v0.33.x) process is terminated before the first
     /// activation above the baseline. Activation refuses without it.
     pub pre_baseline_processes_terminated: bool,
+    /// The operator attestation (ADR-4233 blind-view amendment): every writer
+    /// role can read `sys/compat`. An IAM grant that must hold at every
+    /// activation, the library's `writer_roles_can_read_compat`; activation
+    /// refuses without it.
+    pub writer_roles_can_read_compat: bool,
     /// The operator identity recorded in the family entry's `activated_by`.
     pub activated_by: String,
     /// Tenants named by the alert rules file whose leases are parked on an
@@ -281,10 +291,28 @@ pub const PRE_BASELINE_RESIDUAL: &str = "a pre-baseline (v0.33.x) maintain proce
      history and audit objects by age with no version hold; no fence and no late-write pass \
      detects that deletion, so terminating every pre-baseline process is the only control";
 
+/// The residual the `--writer-roles-can-read-compat` attestation leaves: the
+/// CLI cannot check an IAM grant, so a writer role that was not granted read
+/// on `sys/compat` never sees the activation.
+pub const WRITER_ROLE_RESIDUAL: &str = "the flag is an attestation the CLI cannot check: a writer role not granted read on \
+     sys/compat keeps writing the baseline version to unprovisioned paths and to buckets it \
+     first touches after the activation";
+
+/// The `--writer-roles-can-read-compat` refusal, for the library's
+/// [`ActivateError::WriterRolesCannotReadCompat`].
+fn writer_role_refusal() -> String {
+    format!(
+        "activate requires --writer-roles-can-read-compat: every writer role must be able to \
+         read sys/compat at every activation, or a writer that cannot read it never sees the \
+         activation (ADR-4233). Residual even with the flag: {WRITER_ROLE_RESIDUAL}"
+    )
+}
+
 /// `compat activate --family F --version N+1` (ADR-4233 decision 3). Refuses
-/// unless `--pre-baseline-processes-terminated` is given, passes that
-/// attestation into the library's `writer_roles_can_read_compat`, and records
-/// it in the family entry's `activated_by`.
+/// unless both attestations are given: `--pre-baseline-processes-terminated`,
+/// which only the CLI checks, and `--writer-roles-can-read-compat`, which
+/// alone sets the library's `writer_roles_can_read_compat`. Both are recorded
+/// in the family entry's `activated_by`.
 ///
 /// `writable` is this build's writable-version table; the dispatch passes
 /// [`WritableVersions::current`]. The baseline build writes one version per
@@ -298,27 +326,34 @@ pub async fn activate(
     args: ActivateArgs,
 ) -> anyhow::Result<CompatOutcome> {
     if !args.pre_baseline_processes_terminated {
-        // Refuse before any read or write. The library would also refuse
-        // (the attestation feeds `writer_roles_can_read_compat`), but the CLI
-        // states the prerequisite and its residual in the operator's words.
+        // Refuse before any read or write, naming the other attestation too
+        // when it is also missing.
+        let also = if args.writer_roles_can_read_compat {
+            String::new()
+        } else {
+            format!(" Also missing: {}", writer_role_refusal())
+        };
         return Ok(CompatOutcome::refused(format!(
             "activate requires --pre-baseline-processes-terminated: ADR-4233 decision 4 rests the \
              guarantee for pre-baseline processes on terminating every one before the first \
-             activation above the baseline. Residual even with the flag: {PRE_BASELINE_RESIDUAL}"
+             activation above the baseline. Residual even with the flag: \
+             {PRE_BASELINE_RESIDUAL}.{also}"
         )));
     }
 
-    // The attestation is recorded in `activated_by`; no sys/compat field is
-    // added for it (a new field would be a proto change needing its own ADR).
+    // Both attestations are recorded in `activated_by`; no sys/compat field
+    // is added for them (a new field would be a proto change needing its own
+    // ADR). Without the writer-role attestation the library refuses before
+    // any write, so this string is stored only when both were given.
     let activated_by = format!(
-        "{}; attests: pre-baseline-processes-terminated",
+        "{}; attests: pre-baseline-processes-terminated, writer-roles-can-read-compat",
         args.activated_by
     );
     let request = ActivateRequest {
         family: args.family.clone(),
         version: args.version,
         activated_by,
-        writer_roles_can_read_compat: args.pre_baseline_processes_terminated,
+        writer_roles_can_read_compat: args.writer_roles_can_read_compat,
         alert_rule_tenants: args.alert_rule_tenants,
         clock_skew_allowance_ns: args.clock_skew_allowance_ns,
         resume_from: None,
@@ -402,8 +437,10 @@ fn render_activate(report: &ravel_maintain::ActivateReport) -> CompatOutcome {
 
 fn classify_activate_error(err: ActivateError) -> anyhow::Result<CompatOutcome> {
     match err {
+        ActivateError::WriterRolesCannotReadCompat => {
+            Ok(CompatOutcome::refused(writer_role_refusal()))
+        }
         ActivateError::Unkeyed
-        | ActivateError::WriterRolesCannotReadCompat
         | ActivateError::RecordAbsent
         | ActivateError::FamilyNotInRecord { .. }
         | ActivateError::NotWritable { .. }
@@ -636,7 +673,12 @@ fn certify_refusal_reason(refusal: &CertifyRefusal) -> String {
             "sys/compat was replaced during the certificate CAS; rerun to resume the cursor"
                 .to_string()
         }
-        CertifyRefusal::ConcurrentCertify => "another certify run owns the cursor".to_string(),
+        CertifyRefusal::ConcurrentCertify => {
+            "another certify run created or replaced the certify cursor first, so this run's \
+             conditional write on it failed; nothing holds the cursor, and a rerun resumes from \
+             whatever cursor is there"
+                .to_string()
+        }
     }
 }
 
@@ -746,10 +788,10 @@ fn render_absent(command: &str) -> CompatOutcome {
     )
 }
 
-/// The per-family rendering shared by `verify` and `status`. `finalization
-/// pending` is derived (a certificate present whose `certified_unix_ns` is
-/// above the watermark), the same condition `certify` reports as
-/// `FinalizationPending`.
+/// The per-family rendering shared by `verify` and `status`.
+/// `finalization_pending` is [`finalization_pending`]: an uncontradicted
+/// certificate whose watermark is not strictly past `certified_unix_ns`, the
+/// condition the retired-reader gate refuses and the maintain job reports.
 fn render_snapshot(
     command: &str,
     record: &sysproto::CompatRecord,
@@ -782,9 +824,7 @@ fn render_snapshot(
             ),
             None => ("certificate=none".to_string(), Value::Null),
         };
-        let finalization_pending = family.certificate.as_ref().is_some_and(|cert| {
-            family.late_writes_verified_through_unix_ns < cert.certified_unix_ns
-        });
+        let finalization_pending = finalization_pending(family);
         text.push_str(&format!(
             "  {}: active_write_version={} activated_epoch={} fence_complete_unix_ns={} \
              contradicted={} watermark_unix_ns={} {} finalization_pending={}\n",
@@ -898,11 +938,12 @@ mod tests {
 
     // ---- activate ----
 
-    fn activate_args(terminated: bool) -> ActivateArgs {
+    fn activate_args(terminated: bool, writer_roles: bool) -> ActivateArgs {
         ActivateArgs {
             family: FAMILY_RSEG.to_string(),
             version: 8,
             pre_baseline_processes_terminated: terminated,
+            writer_roles_can_read_compat: writer_roles,
             activated_by: "operator".to_string(),
             alert_rule_tenants: Vec::new(),
             clock_skew_allowance_ns: 60 * 1_000_000_000,
@@ -927,7 +968,7 @@ mod tests {
             Some(keys()),
             T0,
             two_wide_rseg(),
-            activate_args(false),
+            activate_args(false, true),
         )
         .await
         .expect("activate returns a typed refusal");
@@ -936,6 +977,10 @@ mod tests {
         assert!(
             reason.contains("pre-baseline-processes-terminated"),
             "reason names the prerequisite flag: {reason}"
+        );
+        assert!(
+            !reason.contains("--writer-roles-can-read-compat"),
+            "the writer-role attestation was given: {reason}"
         );
         // Nothing was activated: rseg stays at the baseline.
         let st = status(store, Some(keys())).await.expect("status");
@@ -962,7 +1007,7 @@ mod tests {
             Some(keys()),
             T0,
             WritableVersions::current(),
-            activate_args(true),
+            activate_args(true, true),
         )
         .await
         .expect("activate returns a typed refusal");
@@ -985,7 +1030,7 @@ mod tests {
             Some(keys()),
             T0,
             two_wide_rseg(),
-            activate_args(true),
+            activate_args(true, true),
         )
         .await
         .expect("activate runs");
@@ -1004,10 +1049,85 @@ mod tests {
             .clone();
         assert_eq!(rseg["active_write_version"], 8);
         let activated_by = rseg["activated_by"].as_str().expect("activated_by");
-        assert!(
-            activated_by.contains("pre-baseline-processes-terminated"),
-            "activated_by records the attestation: {activated_by}"
+        assert_eq!(
+            activated_by,
+            "operator; attests: pre-baseline-processes-terminated, writer-roles-can-read-compat",
+            "activated_by records both attestations"
         );
+    }
+
+    async fn rseg_status(store: Arc<dyn ObjectStoreBackend>) -> Value {
+        let st = status(store, Some(keys())).await.expect("status");
+        st.json()["families"]
+            .as_array()
+            .expect("families")
+            .iter()
+            .find(|f| f["family"] == FAMILY_RSEG)
+            .expect("rseg")
+            .clone()
+    }
+
+    /// `--pre-baseline-processes-terminated` alone does not attest the
+    /// writer-role grant: the library's `WriterRolesCannotReadCompat` refuses,
+    /// and the refusal names the flag and its residual. Nothing is activated.
+    #[tokio::test]
+    async fn pre_baseline_attestation_alone_refuses_with_the_writer_role_reason() {
+        let store = store();
+        init(store.clone(), Some(keys()), T0, init_config())
+            .await
+            .expect("init");
+        let out = activate(
+            store.clone(),
+            Some(keys()),
+            T0,
+            two_wide_rseg(),
+            activate_args(true, false),
+        )
+        .await
+        .expect("activate returns a typed refusal");
+        assert_eq!(out.exit_code, EXIT_REFUSED, "json: {}", out.json());
+        let reason = out.json()["reason"].as_str().expect("reason");
+        assert_eq!(reason, writer_role_refusal());
+        assert!(
+            reason.starts_with("activate requires --writer-roles-can-read-compat:"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(
+                "keeps writing the baseline version to unprovisioned paths and to buckets it \
+                 first touches after the activation"
+            ),
+            "the refusal names the residual: {reason}"
+        );
+        let rseg = rseg_status(store).await;
+        assert_eq!(rseg["active_write_version"], 7);
+        assert_eq!(rseg["activated_epoch"], 0);
+    }
+
+    /// With neither attestation the refusal names both flags.
+    #[tokio::test]
+    async fn activate_without_either_attestation_names_both_flags() {
+        let store = store();
+        init(store.clone(), Some(keys()), T0, init_config())
+            .await
+            .expect("init");
+        let out = activate(
+            store.clone(),
+            Some(keys()),
+            T0,
+            two_wide_rseg(),
+            activate_args(false, false),
+        )
+        .await
+        .expect("activate returns a typed refusal");
+        assert_eq!(out.exit_code, EXIT_REFUSED);
+        let reason = out.json()["reason"].as_str().expect("reason");
+        assert!(
+            reason.starts_with("activate requires --pre-baseline-processes-terminated:"),
+            "{reason}"
+        );
+        assert!(reason.contains(&writer_role_refusal()), "{reason}");
+        assert_eq!(rseg_status(store).await["active_write_version"], 7);
     }
 
     // ---- certify ----
@@ -1032,7 +1152,7 @@ mod tests {
             Some(keys()),
             T0,
             two_wide_rseg(),
-            activate_args(true),
+            activate_args(true, true),
         )
         .await
         .expect("activate");
@@ -1065,6 +1185,20 @@ mod tests {
         assert!(reason.contains("unkeyed"), "reason: {reason}");
     }
 
+    /// `ConcurrentCertify` is a lost conditional write on the cursor, not a
+    /// lock another run holds: the reason says so and that a rerun resumes.
+    #[test]
+    fn concurrent_certify_reason_names_the_lost_conditional_write() {
+        let reason = certify_refusal_reason(&CertifyRefusal::ConcurrentCertify);
+        assert_eq!(
+            reason,
+            "another certify run created or replaced the certify cursor first, so this run's \
+             conditional write on it failed; nothing holds the cursor, and a rerun resumes from \
+             whatever cursor is there"
+        );
+        assert!(!reason.contains("owns"), "{reason}");
+    }
+
     /// The full sequence through the CLI: init adopts, activate raises rseg to
     /// 8 and completes its fence walk, certify (after the time gate, over an
     /// empty corpus with nothing to migrate) writes the certificate, and
@@ -1088,32 +1222,114 @@ mod tests {
         assert_eq!(out.json()["outcome"], "certified");
         assert_eq!(out.json()["version"], 8);
 
-        // verify runs the late-write pass and reports the certificate.
-        let out = verify(
-            store.clone(),
-            Some(keys()),
-            now_certify,
-            Some(FAMILY_RSEG.to_string()),
-            60 * 1_000_000_000,
-        )
-        .await
-        .expect("verify runs");
-        assert_eq!(out.exit_code, EXIT_OK, "json: {}", out.json());
-        let rseg = out.json()["families"]
-            .as_array()
-            .expect("families")
-            .iter()
-            .find(|f| f["family"] == FAMILY_RSEG)
-            .expect("rseg")
-            .clone();
-        assert_eq!(rseg["certificate"]["version"], 8);
-        assert_eq!(rseg["contradicted"], false);
-        // The pass advanced the watermark to its start, clearing the pending
-        // finalization the bare certificate CAS leaves.
-        assert_eq!(rseg["finalization_pending"], false, "rseg: {rseg}");
+        // verify runs the late-write pass and reports the certificate. A pass
+        // that starts at the certificate's own instant leaves the watermark
+        // equal to `certified_unix_ns`, which the retired-reader gate does not
+        // accept, so finalization is still pending; one that starts later
+        // advances the watermark past it and clears it.
+        for (now_verify, pending) in [(now_certify, true), (now_certify + 1, false)] {
+            let out = verify(
+                store.clone(),
+                Some(keys()),
+                now_verify,
+                Some(FAMILY_RSEG.to_string()),
+                60 * 1_000_000_000,
+            )
+            .await
+            .expect("verify runs");
+            assert_eq!(out.exit_code, EXIT_OK, "json: {}", out.json());
+            let rseg = out.json()["families"]
+                .as_array()
+                .expect("families")
+                .iter()
+                .find(|f| f["family"] == FAMILY_RSEG)
+                .expect("rseg")
+                .clone();
+            assert_eq!(rseg["certificate"]["version"], 8);
+            assert_eq!(rseg["certificate"]["certified_unix_ns"], now_certify);
+            assert_eq!(rseg["watermark_unix_ns"], now_verify);
+            assert_eq!(rseg["contradicted"], false);
+            assert_eq!(rseg["finalization_pending"], pending, "rseg: {rseg}");
+        }
     }
 
     // ---- verify / status ----
+
+    const CERTIFIED: i64 = T0 + HOUR_NS;
+
+    /// A store whose rseg entry carries a certificate at [`CERTIFIED`] with
+    /// the given watermark and `contradicted` flag.
+    async fn certified_store(watermark: i64, contradicted: bool) -> Arc<dyn ObjectStoreBackend> {
+        let store = store();
+        ravel_catalog::compat::create_compat(
+            store.as_ref(),
+            &keys(),
+            sysproto::CompatRecord {
+                format_version: ravel_catalog::compat::COMPAT_FORMAT_VERSION,
+                families: vec![sysproto::CompatFamily {
+                    family: FAMILY_RSEG.to_string(),
+                    active_write_version: 8,
+                    certificate: Some(sysproto::Certificate {
+                        version: 8,
+                        certified_unix_ns: CERTIFIED,
+                        ..Default::default()
+                    }),
+                    late_writes_verified_through_unix_ns: watermark,
+                    contradicted,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create sys/compat");
+        store
+    }
+
+    /// `finalization_pending` in `status` and `verify` is the retired-reader
+    /// gate's refusal: true while an uncontradicted certificate's watermark is
+    /// at or below `certified_unix_ns`, false once it is strictly past, and
+    /// false for a contradicted certificate whatever its watermark. Fails a
+    /// strict `<` (the equality row) and a test that ignores `contradicted`
+    /// (the contradicted rows).
+    #[tokio::test]
+    async fn finalization_pending_matches_the_gate_at_the_boundary() {
+        let cases = [
+            (CERTIFIED - 1, false, true),
+            (CERTIFIED, false, true),
+            (CERTIFIED + 1, false, false),
+            (CERTIFIED - 1, true, false),
+            (CERTIFIED, true, false),
+        ];
+        for (watermark, contradicted, pending) in cases {
+            let store = certified_store(watermark, contradicted).await;
+            let label = format!("watermark {watermark} contradicted {contradicted}");
+
+            let st = status(store.clone(), Some(keys())).await.expect("status");
+            assert_eq!(
+                st.json()["families"][0]["finalization_pending"],
+                pending,
+                "{label}"
+            );
+            assert!(
+                st.text
+                    .contains(&format!("finalization_pending={pending}\n")),
+                "{label}: {}",
+                st.text
+            );
+
+            // A non-class-A filter runs no pass, so verify renders the same
+            // record through its own path.
+            let vf = verify(store, Some(keys()), T0, Some("csnap".to_string()), 0)
+                .await
+                .expect("verify");
+            assert_eq!(
+                vf.json()["families"][0]["finalization_pending"],
+                pending,
+                "{label}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn status_refuses_unkeyed_store() {

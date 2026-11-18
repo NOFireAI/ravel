@@ -35,7 +35,8 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use ravel_catalog::compat::{
-    CompatKeys, CompatView, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN, read_compat,
+    CompatKeys, CompatView, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN,
+    certificate_finalization_pending, finalization_pending, read_compat,
 };
 use ravel_catalog::provisioning_key;
 use ravel_maintain::compat_policy::part_family;
@@ -204,8 +205,7 @@ impl CertificateState {
             certified_unix_ns: certificate.certified_unix_ns,
             watermark_unix_ns,
             contradicted: entry.contradicted,
-            finalization_pending: !entry.contradicted
-                && watermark_unix_ns <= certificate.certified_unix_ns,
+            finalization_pending: finalization_pending(entry),
         })
     }
 
@@ -324,7 +324,11 @@ async fn run_family(
         FinalizeStep::Contradicted => false,
         FinalizeStep::Ran(CertifyReport::FinalizationPending { .. }) => true,
         FinalizeStep::Ran(CertifyReport::Certified { .. }) => false,
-        _ => !state.contradicted && state.watermark_unix_ns <= state.certified_unix_ns,
+        _ => certificate_finalization_pending(
+            state.contradicted,
+            state.watermark_unix_ns,
+            state.certified_unix_ns,
+        ),
     };
     FamilyUnitReport {
         family,

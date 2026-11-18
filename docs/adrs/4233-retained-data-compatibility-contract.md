@@ -880,7 +880,9 @@ The decision is narrowed as follows, by owner decision (delegated):
   `compat activate` must refuse unless the operator attests it with
   `--pre-baseline-processes-terminated`. The attestation is recorded in
   the family entry's existing `activated_by` field; no field is added to
-  `sys/compat`.
+  `sys/compat`. That flag attests the termination only; the writer-role
+  attestation is a second required flag, recorded the same way (see the
+  writer-role flag amendment below).
 - **The fence is defence in depth, with a narrowed claim.** Against a
   pre-baseline process that outlives the rollout anyway, the provisioning
   and lease fences claim exactly this: its request admission refuses once
@@ -903,7 +905,9 @@ The decision is narrowed as follows, by owner decision (delegated):
   by age with no version hold after an activation; no fence and no pass
   detects a deletion, so the prerequisite is its only control. `compat
   activate`'s help and the operator procedure must name this residual next to
-  the attestation flag.
+  the attestation flag, `--pre-baseline-processes-terminated` (the
+  writer-role flag amendment below adds a second attestation flag with its
+  own residual).
 - **The baseline's own writers.** The baseline's metadata sink,
   idempotency markers and `enc` writer carry no compat gate. That is safe
   only because none of those formats is an activation family in this ADR
@@ -1033,7 +1037,9 @@ writer role's credentials can read `sys/compat`, and refuses
 (`WriterRolesCannotReadCompat`) without the attestation. `ravel-cli compat
 activate` takes it from `--pre-baseline-processes-terminated`, the flag
 that also attests the termination prerequisite; it has no separate flag
-for it. The shipped roles in `deploy/iam` grant `s3:GetObject` on
+for it (superseded: it now takes its own required flag,
+`--writer-roles-can-read-compat`; see the writer-role flag amendment
+below). The shipped roles in `deploy/iam` grant `s3:GetObject` on
 `sys/compat` to the gateway, query and maintain roles.
 
 ## Amendment (2026-11-17): the kidx read set is {1,2,3} (issue #4250)
@@ -1065,3 +1071,37 @@ the commands, `ravel-cli compat init`, `activate`, `certify`, `verify` and
 The baseline release a store records is whatever `compat init` is told
 (`InitConfig::baseline_release_major` and `baseline_release_minor`), so the
 release that ships the commands is the one on record, whatever its number.
+
+## Amendment (2026-11-18): the writer-role attestation is its own flag (issue #4423)
+
+<!-- amendment-applies: sections="Amendment (2026-11-17): the pre-baseline fence is defence in depth; the prerequisite is the guarantee (issue #4243)|Amendment (2026-11-17): the blind-view exemption and the writer-role attestation (issue #4250)" pointer="writer-role flag amendment" -->
+<!-- amendment-supersedes: phrase="it has no separate flag for it" pointer="writer-role flag amendment" -->
+
+The blind-view amendment had `ravel-cli compat activate` take the
+writer-role attestation from `--pre-baseline-processes-terminated`. One
+flag then attested two facts, the termination prerequisite and an IAM
+grant, so an operator who attested the first had attested the second
+without being asked, and the library's `WriterRolesCannotReadCompat`
+refusal could not be reached through the CLI.
+
+The approver the owner delegated ADR-4233 to ruled on 2026-11-17, and
+posted the ruling on issue #4423:
+
+- `compat activate` takes a separate required flag,
+  `--writer-roles-can-read-compat`: the attestation that every writer
+  role can read `sys/compat`, an IAM grant that must hold at every
+  activation.
+- `ActivateRequest.writer_roles_can_read_compat` is set from that flag
+  alone. `--pre-baseline-processes-terminated` attests the termination
+  prerequisite only.
+- Both attestations are recorded in the family entry's existing
+  `activated_by` field, as `<operator>; attests:
+  pre-baseline-processes-terminated, writer-roles-can-read-compat`. No
+  field is added to `sys/compat`.
+
+Without either flag the command refuses before it reads `sys/compat`.
+The CLI cannot check an IAM grant, so the writer-role refusal and the
+flag's help name the residual the flag leaves: a writer role not granted
+read on `sys/compat` keeps writing the baseline version to unprovisioned
+paths and to buckets it first touches after the activation, as the
+blind-view amendment describes.

@@ -21,7 +21,9 @@
 //! upgrade path (skipping the release that carried both readers) is refused
 //! before it modifies anything.
 
-use ravel_catalog::compat::{COMPAT_KEY, CompatError, CompatKeys, read_compat};
+use ravel_catalog::compat::{
+    COMPAT_KEY, CompatError, CompatKeys, finalization_pending, read_compat,
+};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 
 use crate::tenancy::TENANCY_MARKER_KEY;
@@ -194,7 +196,7 @@ pub async fn enforce(
             });
         }
         let watermark_unix_ns = entry.late_writes_verified_through_unix_ns;
-        if watermark_unix_ns <= certificate.certified_unix_ns {
+        if finalization_pending(entry) {
             return Err(CompatGateError::WatermarkNotPastCensus {
                 family,
                 watermark_unix_ns,
@@ -402,6 +404,33 @@ mod tests {
                     }]
                 }
             );
+        }
+    }
+
+    /// `finalization_pending`, which `compat status`, `compat verify` and the
+    /// maintain job report, is true exactly when the gate refuses a current
+    /// certificate for its watermark: at, one below and one past
+    /// `certified_unix_ns`, contradicted or not.
+    #[tokio::test]
+    async fn finalization_pending_is_the_gate_watermark_refusal() {
+        for watermark in [CERTIFIED_NS - 1, CERTIFIED_NS, CERTIFIED_NS + 1] {
+            for contradicted in [false, true] {
+                let family = entry(Some(certificate(8)), watermark, contradicted);
+                let pending = finalization_pending(&family);
+                let refused = matches!(
+                    gate(&store_with(vec![family]).await).await,
+                    Err(CompatGateError::WatermarkNotPastCensus { .. })
+                );
+                assert_eq!(
+                    pending, refused,
+                    "watermark {watermark} contradicted {contradicted}"
+                );
+                assert_eq!(
+                    pending,
+                    !contradicted && watermark <= CERTIFIED_NS,
+                    "watermark {watermark} contradicted {contradicted}"
+                );
+            }
         }
     }
 

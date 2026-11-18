@@ -52,8 +52,8 @@ use std::ops::Range;
 
 use bytes::Bytes;
 use ravel_catalog::compat::{
-    COMPAT_KEY, CompatError, CompatKeys, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN, read_compat,
-    update_compat,
+    COMPAT_KEY, CompatError, CompatKeys, FAMILY_RLOG, FAMILY_RSEG, FAMILY_RSPAN,
+    certificate_finalization_pending, read_compat, update_compat,
 };
 use ravel_catalog::{
     CompatFenceOutcome, FloorBasis, ProvisioningError, provisioning_key, raise_compat_fence,
@@ -813,7 +813,20 @@ pub async fn certify(
             // the finalizing cursor and let a fresh census run for the retry.
             delete_cursor(store, &cursor_key, pending_version).await;
             stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
-        } else if entry.late_writes_verified_through_unix_ns > certificate.certified_unix_ns {
+        } else if certificate_finalization_pending(
+            entry.contradicted,
+            entry.late_writes_verified_through_unix_ns,
+            certificate.certified_unix_ns,
+        ) {
+            // The certificate is written but its finalization is pending a
+            // late-write pass. Keep the cursor and report it rather than
+            // raising on stale census numbers or masking it as AlreadyCertified.
+            return Ok(CertifyReport::FinalizationPending {
+                version: certificate.version,
+                certified_unix_ns: certificate.certified_unix_ns,
+                watermark_unix_ns: entry.late_writes_verified_through_unix_ns,
+            });
+        } else {
             // The raises finish only once a late-write pass that started after
             // the CAS found nothing (the watermark passes `certified_unix_ns`
             // only then, since `late_write_pass` advances it to its own start).
@@ -838,15 +851,6 @@ pub async fn certify(
                 return Ok(report);
             }
             stored = read_certify_cursor(store, &cursor_key, signals.len()).await?;
-        } else {
-            // The certificate is written but its finalization is pending a
-            // late-write pass. Keep the cursor and report it rather than
-            // raising on stale census numbers or masking it as AlreadyCertified.
-            return Ok(CertifyReport::FinalizationPending {
-                version: certificate.version,
-                certified_unix_ns: certificate.certified_unix_ns,
-                watermark_unix_ns: entry.late_writes_verified_through_unix_ns,
-            });
         }
     }
 
@@ -3443,6 +3447,89 @@ mod tests {
         assert!(!cursor_present(&*inner).await);
         let entry = rlog_entry(&*inner).await;
         assert_eq!(entry.certificate.expect("cert").certified_unix_ns, NOW1);
+    }
+
+    /// A resumed `certify` reports `FinalizationPending` exactly when
+    /// ravel-catalog's `finalization_pending` holds for the entry it resumes
+    /// from: with the watermark equal to `certified_unix_ns` both say pending,
+    /// and one nanosecond past it both say finished.
+    ///
+    /// DISTINGUISHING: a resume that decided inline with `watermark >=
+    /// certified_unix_ns` would finish the raises at equality and report
+    /// `Certified` while the predicate reports pending.
+    #[tokio::test]
+    async fn certify_finalization_pending_is_the_catalog_predicate_at_equality() {
+        let inner = new_store();
+        seed_compat(&*inner, FAMILY_RLOG, V_LOG).await;
+        provision_fenced(&*inner, tenant(), Signal::Logs, 1).await;
+        seed_log(&inner, tenant(), 0, 1, 1_000).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("put down".to_string()))
+                .with_key_contains(provisioning_key(&tenant(), Signal::Logs)),
+        );
+        let faulted = FaultStore::new(inner.clone(), plan);
+        let result = certify(
+            &faulted,
+            &ckeys(),
+            NOW1,
+            FAMILY_RLOG,
+            V_LOG,
+            timings(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(faulted.fault_count(Op::Put, FaultKind::Permanent), 1);
+        assert!(cursor_present(&*inner).await);
+
+        for (watermark, expect_pending) in [(NOW1, true), (NOW1 + 1, false)] {
+            update_compat(&*inner, &ckeys(), |record| {
+                let entry = record
+                    .families
+                    .iter_mut()
+                    .find(|f| f.family == FAMILY_RLOG)
+                    .expect("rlog");
+                entry.late_writes_verified_through_unix_ns = watermark;
+                Ok(())
+            })
+            .await
+            .expect("set watermark");
+            let entry = rlog_entry(&*inner).await;
+            assert_eq!(
+                entry.certificate.as_ref().expect("cert").certified_unix_ns,
+                NOW1
+            );
+            assert_eq!(entry.late_writes_verified_through_unix_ns, watermark);
+            let pending = ravel_catalog::compat::finalization_pending(&entry);
+            assert_eq!(pending, expect_pending, "watermark {watermark}");
+
+            let report = certify_rlog(&*inner, NOW1 + HOUR, V_LOG, None).await;
+            assert_eq!(
+                matches!(report, CertifyReport::FinalizationPending { .. }),
+                pending,
+                "watermark {watermark}: {report:?}"
+            );
+            let floor = rlog_floor(&*inner, tenant(), Signal::Logs).await;
+            if pending {
+                assert_eq!(
+                    report,
+                    CertifyReport::FinalizationPending {
+                        version: V_LOG,
+                        certified_unix_ns: NOW1,
+                        watermark_unix_ns: NOW1,
+                    }
+                );
+                assert_eq!(floor, None);
+                assert!(cursor_present(&*inner).await);
+            } else {
+                assert!(
+                    matches!(report, CertifyReport::Certified { version: V_LOG, .. }),
+                    "{report:?}"
+                );
+                assert_eq!(floor, Some(V_LOG));
+                assert!(!cursor_present(&*inner).await);
+            }
+        }
     }
 
     /// A late-write pass whose certificate is replaced while it runs writes
