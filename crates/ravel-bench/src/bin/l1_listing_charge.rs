@@ -1,31 +1,44 @@
-//! Measures the memory-budget charge of a series listing over one L1 metrics
-//! part at several part caps (issue #4393), so `--max-l1-part-bytes` can be
-//! chosen from a measured figure.
+//! Measures the memory-budget charge of reading one L1 metrics part's catalog
+//! at several part caps (issues #4393 and #4433), on two paths, so
+//! `--max-l1-part-bytes` can be chosen from a measured figure:
+//!
+//! - the series listing, `QueryEngine::resolve_series`, which the metrics
+//!   discovery endpoints call and which skips per-sample provenance;
+//! - the sample read, `SegmentFetcher::fetch_series`, the catalog decode the
+//!   PromQL and SQL sample paths run, which decodes and charges it.
 //!
 //! The bin writes one shard bucket shaped like the MetricsBench `history`
 //! profile (2,500 series at a 15 s scrape: gauges, counters, classic histogram
 //! series and 10 % native histograms) as L0 flushes onto a `MemoryStore`,
 //! compacts it through ravel-maintain's metrics L1 build at each cap, and
-//! binary-searches the smallest `MemoryBudget` limit under which a listing of
-//! the first full part with `__name__=~".+"` succeeds, to 1 %. The library
-//! module, `ravel_bench::l1_listing_charge`, documents the shape, the listing
-//! call and the bands.
+//! binary-searches, for each path, the smallest `MemoryBudget` limit under
+//! which a read of the first full part with `__name__=~".+"` succeeds, to 1 %.
+//! The listing runs over a store holding only that part. The library module,
+//! `ravel_bench::l1_listing_charge`, documents the shape, both calls and the
+//! bands.
 //!
 //! Per cap it reports:
 //!
 //! - the part's wire bytes;
 //! - its catalog sections' decoded length;
+//! - the wire bytes either path's GETs hold during the decode;
 //! - its samples and series;
-//! - the peak charge (the minimal succeeding budget) and that peak per sample;
-//! - the upper bound issue #4393 states, `(64 + 32) * samples + catalog
-//!   decode length`, and how far the peak lies above it;
-//! - the wire bytes the listing's GETs hold during the decode, which that
-//!   formula leaves out, and the listing bound, the formula plus those bytes.
+//! - the listing's peak charge (the minimal succeeding budget), that peak per
+//!   sample, and the listing charge it is checked against, the held fetch
+//!   bytes plus the catalog decode length;
+//! - the sample read's peak charge and that peak per sample;
+//! - the upper bound issue #4393 states for the sample read, `(64 + 32) *
+//!   samples + catalog decode length`, how far the sample read's peak lies
+//!   above it, and the sample-read bound, that formula plus the held fetch
+//!   bytes it leaves out.
 //!
-//! The bands are peak per sample in [96, 130] B (the full 96 B of per-sample
-//! provenance must be charged, and not doubled), the peak at or below the
-//! listing bound, and the peak non-decreasing as samples per part grow. A cap
-//! that closes fewer than two full parts is refused; raise `--history-hours`.
+//! The bands are listing peak per sample in [1, 16] B (no per-sample decode
+//! charged; the held fetch bytes and inflated catalog sections are all of it),
+//! sample-read peak per sample in [96, 130] B (the full 96 B of per-sample
+//! provenance must be charged, and not doubled), each peak at or below its
+//! path's bound, and each path's peak non-decreasing as samples per part grow.
+//! A cap that closes fewer than two full parts is refused; raise
+//! `--history-hours`.
 //!
 //! ```text
 //! cargo run --release -p ravel-bench --bin l1_listing_charge
