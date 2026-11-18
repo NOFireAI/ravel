@@ -60,6 +60,11 @@ x-faketime-done: &faketime-done
 x-ravel-server: &ravel-server
   image: ravel-antithesis-server:catalog-maintenance
   platform: linux/amd64
+  # ravel-server installs its SIGTERM handler only after its startup store
+  # reads (#4438), and as PID 1 it would ignore SIGTERM until then. init runs
+  # it under an init process that forwards the signal, so a stop during the
+  # startup retry still stops it.
+  init: true
   entrypoint: ["/faketime/run", "/usr/local/bin/ravel-antithesis-entrypoint"]
   environment:
     <<: [*ravel-store, *faketime-env]
@@ -130,6 +135,12 @@ services:
       - "all"
       - "--store"
       - "s3"
+      # ravel-server retries its startup store reads while the store returns a
+      # retryable error, up to this deadline (#4325). Nothing restarts a
+      # container that exits here, so it is far longer than the 15 s default,
+      # which is sized for a Kubernetes liveness probe.
+      - "--startup-store-deadline"
+      - "300s"
       - "--listen-http"
       - "0.0.0.0:4318"
       - "--listen-grpc"
@@ -167,6 +178,9 @@ services:
       - "maintain"
       - "--store"
       - "s3"
+      # The same startup deadline as the --mode all nodes, for the same reason.
+      - "--startup-store-deadline"
+      - "300s"
       - "--listen-http"
       - "0.0.0.0:4318"
       - "--shards"
