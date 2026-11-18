@@ -2687,6 +2687,27 @@ impl Default for CompactorConfig {
 }
 
 impl CompactorConfig {
+    /// This configuration taking bucket claims as `participant`: the one way a
+    /// background caller (the maintenance tick, background migrate) joins the
+    /// claim protocol, so every compaction, migration and erasure rewrite it
+    /// drives contends for the same per-bucket claim (ADR-1029, the 2026-10-03
+    /// amendment). `participant` is installed only when [`Self::coordination`]
+    /// is on and no participant is installed yet; otherwise this configuration
+    /// is returned unchanged, so with coordination off the caller takes no
+    /// claims.
+    pub fn with_claim_participant(
+        &self,
+        participant: ClaimParticipant,
+    ) -> std::borrow::Cow<'_, CompactorConfig> {
+        if self.coordination == Coordination::Off || self.claim_participant.is_some() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        std::borrow::Cow::Owned(CompactorConfig {
+            claim_participant: Some(participant),
+            ..self.clone()
+        })
+    }
+
     /// The cores one merge unit may use (ADR-3853 D4, core share amendment):
     /// the host's `cores` divided by [`Self::unit_concurrency`], at least 1.
     /// [`Self::level1_workers`] derives `W1` at or under it.
@@ -2892,6 +2913,47 @@ mod tests {
     fn the_default_input_read_concurrency_is_32() {
         assert_eq!(DEFAULT_INPUT_READ_CONCURRENCY, 32);
         assert_eq!(CompactorConfig::default().input_read_concurrency, 32);
+    }
+
+    /// `with_claim_participant` installs the participant only when coordination
+    /// is on and the slot is empty: with coordination off the caller takes no
+    /// claims, and a participant the caller already installed is kept.
+    #[test]
+    fn a_claim_participant_is_installed_only_with_coordination_on_and_none_installed() {
+        let participant = |id| {
+            ClaimParticipant::new(
+                Uuid::from_u128(id),
+                Arc::new(crate::clock::FixedClock::new(0)) as Arc<dyn crate::clock::Clock>,
+            )
+        };
+        let installed = |config: &CompactorConfig| {
+            config
+                .claim_participant
+                .as_ref()
+                .map(ClaimParticipant::process_id)
+        };
+
+        let on = CompactorConfig::default();
+        assert_eq!(on.coordination, Coordination::On);
+        assert_eq!(
+            installed(&on.with_claim_participant(participant(1))),
+            Some(Uuid::from_u128(1))
+        );
+
+        let off = CompactorConfig {
+            coordination: Coordination::Off,
+            ..CompactorConfig::default()
+        };
+        assert_eq!(installed(&off.with_claim_participant(participant(1))), None);
+
+        let preset = CompactorConfig {
+            claim_participant: Some(participant(2)),
+            ..CompactorConfig::default()
+        };
+        assert_eq!(
+            installed(&preset.with_claim_participant(participant(1))),
+            Some(Uuid::from_u128(2))
+        );
     }
 
     /// Issue #3878: L1 parts are written at zstd level 3 by default.

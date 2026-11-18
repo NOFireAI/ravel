@@ -2441,6 +2441,20 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
     .await
 }
 
+/// `compactor` taking bucket claims as this process (`worker`'s process id) on
+/// `clock`, or unchanged when `--maintain-claims off` set coordination off or
+/// the caller already installed a participant. The maintenance tick and the
+/// background migrate both build their configuration here, from the one
+/// process clock, so a compaction, an erasure rewrite and a migration of one
+/// bucket all contend for its claim (ADR-1029, the 2026-10-03 amendment).
+pub(crate) fn claiming<'a>(
+    compactor: &'a CompactorConfig,
+    worker: &WorkerSet,
+    clock: Arc<dyn Clock>,
+) -> std::borrow::Cow<'a, CompactorConfig> {
+    compactor.with_claim_participant(ClaimParticipant::new(worker.process_id(), clock))
+}
+
 /// [`run_tick_with_clock`], also handing the scheduled fold the hours this
 /// tick's superseded-input sweeps held because the live catalog HEAD still
 /// names their superseded inputs
@@ -2478,22 +2492,11 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
     // compacts or rewrites for erasure takes the claim, whatever its size
     // (ADR-1029, the compaction-fence amendment).
     //
-    // It is installed only when the caller left the slot empty, and on a clone
+    // It is installed only with coordination on and the slot empty, on a clone
     // of this tick's own clock, so the claim decisions read the same time as
     // the rest of the tick.
-    let coordinated;
-    let compactor = if compactor.claim_participant.is_none() {
-        coordinated = CompactorConfig {
-            claim_participant: Some(ClaimParticipant::new(
-                worker.process_id(),
-                Arc::new(clock.clone()) as Arc<dyn Clock>,
-            )),
-            ..compactor.clone()
-        };
-        &coordinated
-    } else {
-        compactor
-    };
+    let compactor = claiming(compactor, worker, Arc::new(clock.clone()));
+    let compactor = compactor.as_ref();
 
     // Record this tenant's owned units from the ownership gate alone, before
     // anything that can fail. Ownership is a pure function of

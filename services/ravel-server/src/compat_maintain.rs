@@ -383,6 +383,11 @@ async fn run_background_migrate(
     // every lifetime, so it cannot run on a spawned task; it runs to
     // completion on a blocking thread driven by this runtime instead.
     let job = ctx.clone();
+    // The walk's migrations publish into buckets the maintenance tick compacts
+    // and rewrites for erasure, so they take the same bucket claim, as the same
+    // participant on the same clock.
+    let compactor =
+        crate::maintain::claiming(&ctx.compactor, &ctx.worker, ctx.clock.clone()).into_owned();
     let runtime = tokio::runtime::Handle::current();
     let walked = tokio::task::spawn_blocking(move || {
         runtime.block_on(async move {
@@ -391,7 +396,7 @@ async fn run_background_migrate(
                 let outcome = background_migrate_unit(
                     job.store.as_ref(),
                     job.clock.as_ref(),
-                    &job.compactor,
+                    &compactor,
                     tenant,
                     signal,
                     family,
