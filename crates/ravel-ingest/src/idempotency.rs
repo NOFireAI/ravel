@@ -401,6 +401,39 @@ pub async fn write_marker(
     ingest_hour_bucket: u32,
     receipt: &IdempotencyReceipt,
 ) -> Result<WriteOutcome, MarkerWriteError> {
+    // No injected clock reaches this public entry point (ravel-server calls it
+    // directly), so bound the instrumented-build evidence read on the real
+    // timer. In-crate callers that hold an injected clock use
+    // [`write_marker_giving_up`] so their tests run in virtual time.
+    write_marker_giving_up(
+        store,
+        tenant_id,
+        signal,
+        client_key,
+        ingest_hour_bucket,
+        receipt,
+        || tokio::time::sleep(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT),
+    )
+    .await
+}
+
+/// [`write_marker`], with the marker-durability evidence read raced against
+/// the future `give_up` returns: a read that loses the race evaluates
+/// nothing. The outer `inv_sometimes!` keeps the whole evidence read inside an
+/// assertion the default build compiles out.
+pub(crate) async fn write_marker_giving_up<G, F>(
+    store: &dyn ObjectStoreBackend,
+    tenant_id: &TenantId,
+    signal: Signal,
+    client_key: &[u8],
+    ingest_hour_bucket: u32,
+    receipt: &IdempotencyReceipt,
+    give_up: G,
+) -> Result<WriteOutcome, MarkerWriteError>
+where
+    G: FnOnce() -> F,
+    F: std::future::Future<Output = ()>,
+{
     let key = marker_key(tenant_id, signal, client_key, ingest_hour_bucket);
     let body = encode_marker(receipt)?;
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&body));
@@ -417,13 +450,38 @@ pub async fn write_marker(
                 "commit: idempotency marker written",
                 std::collections::BTreeMap::from([("marker_key", key.clone())])
             );
-            ravel_invariant::inv_always!(
-                receipt_commits_are_durable(store, tenant_id, signal, receipt).await,
-                "commit: an idempotency marker implies every shard's commit is durable",
+            // The shard-set half of the property is only checked for logs,
+            // where `note_request_shards` records the request's dispatch; for
+            // metrics and spans only the row-count half evaluates, so the
+            // details say which, and the property does not claim what it does
+            // not check.
+            let shard_set = if signal == Signal::Logs {
+                "request-dispatch"
+            } else {
+                "receipt-tokens (row-count check only)"
+            };
+            let _ = &give_up;
+            ravel_invariant::inv_sometimes!(
+                match receipt_commits_are_durable(store, tenant_id, signal, receipt, give_up).await {
+                    Some(commits_are_durable) => {
+                        ravel_invariant::inv_always!(
+                            commits_are_durable,
+                            "commit: an idempotency marker implies every shard's commit is durable",
+                            std::collections::BTreeMap::from([
+                                ("marker_key", key.clone()),
+                                ("commit_token", receipt.commit_token.clone()),
+                                ("written_count", receipt.written_count.to_string()),
+                                ("shard_set", shard_set.to_owned()),
+                            ])
+                        );
+                        true
+                    }
+                    None => false,
+                },
+                "commit: a marker's durability evidence read completes before it gives up",
                 std::collections::BTreeMap::from([
                     ("marker_key", key.clone()),
                     ("commit_token", receipt.commit_token.clone()),
-                    ("written_count", receipt.written_count.to_string()),
                 ])
             );
             Ok(WriteOutcome::Written)
@@ -530,44 +588,67 @@ fn request_shards(
 /// MarkerImpliesAllShardsDurable, read from the store: every shard the
 /// request was dispatched to has a token in `receipt` whose commit record is
 /// in `store` and was written by that shard, and the records together carry
-/// at least `written_count` rows. A read error other than NotFound is no
-/// evidence of absence and passes. Only an invariant condition calls this,
-/// and the default build compiles it out.
+/// at least `written_count` rows.
+///
+/// The shard set comes from [`request_shards`], which only the logs path
+/// feeds through [`note_request_shards`]; for metrics and spans it falls back
+/// to the receipt's own tokens, so only the row-count half is a real check
+/// there (the shard-set half is self-fulfilling). The caller stamps which
+/// signal this was into the assertion's details.
+///
+/// `Some(true)` when the durability holds, `Some(false)` when it does not,
+/// and `None` when the evidence read evaluated nothing: the GETs are raced
+/// against `give_up` (the caller passes an `EVIDENCE_HEAD_TIMEOUT` sleep), and
+/// one still running when that future completes evaluates nothing rather than
+/// hang the marker write. A read error other than NotFound is no evidence of
+/// absence and passes. Only an invariant condition calls this, and the
+/// default build compiles it out.
 #[allow(dead_code)]
-async fn receipt_commits_are_durable(
+async fn receipt_commits_are_durable<G, F>(
     store: &dyn ObjectStoreBackend,
     tenant_id: &TenantId,
     signal: Signal,
     receipt: &IdempotencyReceipt,
-) -> bool {
+    give_up: G,
+) -> Option<bool>
+where
+    G: FnOnce() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let give_up = give_up();
+    tokio::pin!(give_up);
     let tenant_hash = tenant_id.hash();
     let mut tokens = Vec::new();
     for encoded in receipt.commit_token.split(',').filter(|t| !t.is_empty()) {
         let Ok(token) = ravel_types::CommitToken::decode(encoded) else {
-            return false;
+            return Some(false);
         };
         tokens.push(token);
     }
     let mut committed: u64 = 0;
     for shard in request_shards(&tenant_hash, signal, receipt, &tokens) {
         let Some(token) = tokens.iter().find(|t| t.shard == shard) else {
-            return false;
+            return Some(false);
         };
         let Ok(key) = ravel_commit::keys::commit_key_for_token(&tenant_hash, signal, token) else {
-            return false;
+            return Some(false);
         };
-        match store.get(&key, ravel_object_store::GetRange::Full).await {
+        let got = tokio::select! {
+            got = store.get(&key, ravel_object_store::GetRange::Full) => got,
+            () = &mut give_up => return None,
+        };
+        match got {
             Ok(object) => match ravel_commit::record::decode(&object.data) {
                 Ok(record) if record.shard == shard => {
                     committed = committed.saturating_add(record.sample_count);
                 }
-                Ok(_) | Err(_) => return false,
+                Ok(_) | Err(_) => return Some(false),
             },
-            Err(StoreError::NotFound) => return false,
-            Err(_) => return true,
+            Err(StoreError::NotFound) => return Some(false),
+            Err(_) => return Some(true),
         }
     }
-    committed >= receipt.written_count
+    Some(committed >= receipt.written_count)
 }
 
 /// Look up a marker for a retried request by probing the exact marker key

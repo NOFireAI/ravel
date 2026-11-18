@@ -4828,11 +4828,8 @@ impl Catalog {
             .await?
         else {
             // Satisfied with zero segments (ADR-0019 decision 3).
-            ravel_invariant::inv_always!(
-                self.token_record_absent(tenant, signal, token, false).await,
-                "commit: a commit token never resolves to a stale answer",
-                token_answer_details(tenant, signal, token, "tombstoned")
-            );
+            self.assert_token_never_stale(tenant, signal, token, false, "tombstoned")
+                .await;
             return Ok(());
         };
         let token_identity = token_identity(token);
@@ -4856,11 +4853,14 @@ impl Catalog {
                 continue;
             }
             if names_input(&record.inputs, &token_identity) {
-                ravel_invariant::inv_always!(
-                    self.token_record_absent(tenant, signal, token, false).await,
-                    "commit: a commit token never resolves to a stale answer",
-                    token_answer_details(tenant, signal, token, "superseded by compaction")
-                );
+                self.assert_token_never_stale(
+                    tenant,
+                    signal,
+                    token,
+                    false,
+                    "superseded by compaction",
+                )
+                .await;
                 for part in &record.parts {
                     let segment_ref = build_l1_segment_ref(record, part, ckey)?;
                     if !out.contains_key(&segment_ref.data_object_key) {
@@ -4883,11 +4883,8 @@ impl Catalog {
         if let Some((rkey, record)) =
             bucket.live_rewrite_naming(&superseded_records, &token_identity)?
         {
-            ravel_invariant::inv_always!(
-                self.token_record_absent(tenant, signal, token, false).await,
-                "commit: a commit token never resolves to a stale answer",
-                token_answer_details(tenant, signal, token, "superseded by rewrite")
-            );
+            self.assert_token_never_stale(tenant, signal, token, false, "superseded by rewrite")
+                .await;
             for part in &record.parts {
                 let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
                 if !out.contains_key(&segment_ref.data_object_key) {
@@ -4902,12 +4899,46 @@ impl Catalog {
             return Ok(());
         }
 
-        ravel_invariant::inv_always!(
-            self.token_record_absent(tenant, signal, token, true).await,
-            "commit: a commit token never resolves to a stale answer",
-            token_answer_details(tenant, signal, token, "unsatisfiable")
-        );
+        self.assert_token_never_stale(tenant, signal, token, true, "unsatisfiable")
+            .await;
         Err(unsatisfiable_token(token))
+    }
+
+    /// Asserts TokenNeverServesStale for a token whose answer claims its record
+    /// is absent (`reason` names which: tombstoned, superseded, unsatisfiable).
+    /// [`token_record_absent`](Self::token_record_absent) returns `None` when it
+    /// could not construct a key, and that evaluates nothing rather than reading
+    /// an unconstructable key as a present record; the outer `inv_sometimes!`
+    /// keeps the whole evidence read inside an assertion the default build
+    /// compiles out.
+    #[allow(dead_code)]
+    async fn assert_token_never_stale(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        nor_tombstone: bool,
+        reason: &str,
+    ) {
+        let _ = (tenant, signal, token, nor_tombstone, reason);
+        ravel_invariant::inv_sometimes!(
+            match self
+                .token_record_absent(tenant, signal, token, nor_tombstone)
+                .await
+            {
+                Some(record_absent) => {
+                    ravel_invariant::inv_always!(
+                        record_absent,
+                        "commit: a commit token never resolves to a stale answer",
+                        token_answer_details(tenant, signal, token, reason)
+                    );
+                    true
+                }
+                None => false,
+            },
+            "commit: a commit token's stale-answer evidence read evaluated",
+            token_answer_details(tenant, signal, token, reason)
+        );
     }
 
     /// Whether the commit record `token` names is absent from the store,
@@ -4915,8 +4946,10 @@ impl Catalog {
     /// a tombstoned, superseded or unsatisfiable answer for a token whose
     /// record was not found claims. Raw HEADs, outside the query's
     /// accounting; a read error other than NotFound is no evidence of
-    /// presence and passes. Only an invariant condition calls this, and the
-    /// default build compiles it out.
+    /// presence and passes. `None` when a key could not be constructed, which
+    /// is no evidence either way and evaluates nothing, as the HEAD-error arm
+    /// of a flush's abandoned-key recheck does. Only an invariant condition
+    /// calls this, and the default build compiles it out.
     #[allow(dead_code)]
     async fn token_record_absent(
         &self,
@@ -4924,22 +4957,22 @@ impl Catalog {
         signal: Signal,
         token: &CommitToken,
         nor_tombstone: bool,
-    ) -> bool {
+    ) -> Option<bool> {
         let Ok(commit_key) = keys::commit_key_for_token(tenant, signal, token) else {
-            return false;
+            return None;
         };
         if self.store.head(&commit_key).await.is_ok() {
-            return false;
+            return Some(false);
         }
         if !nor_tombstone {
-            return true;
+            return Some(true);
         }
         let Ok(tombstone_key) =
             keys::retention_tombstone_key(tenant, signal, token.shard, token.ingest_hour_bucket)
         else {
-            return false;
+            return None;
         };
-        self.store.head(&tombstone_key).await.is_err()
+        Some(self.store.head(&tombstone_key).await.is_err())
     }
 
     /// Whether `out` serves the rows of a token whose commit record is

@@ -617,8 +617,18 @@ impl FlushCtx {
     /// Runs one flush to its outcome ([`Self::commit_flush`]), then re-reads
     /// abandoned commit keys, so a slow re-read cannot move this flush past
     /// its deadline.
+    ///
+    /// The per-shard off-actor skew (issue #865) brackets only
+    /// [`Self::commit_flush`], the flush proper: the abandoned-key re-reads run
+    /// after that measurement, so a slow re-read does not inflate the figure's
+    /// meaning (the time this flush spent off the actor), and the re-reads are
+    /// themselves bounded to one `EVIDENCE_HEAD_TIMEOUT`.
     async fn run_flush(&self, pinned: PinnedFlush, grant: PublishGrant) {
+        let started_ns = self.clock.now_ns();
         self.commit_flush(pinned, grant).await;
+        let off_actor_ns = self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
+        self.metrics
+            .record_shard_off_actor_ns(self.shard, off_actor_ns);
         self.recheck_abandoned_commits().await;
     }
 
@@ -852,7 +862,10 @@ impl FlushCtx {
             }
         };
 
-        match self.publish_with_retry(&record, deadline_ns, &grant).await {
+        match self
+            .publish_with_retry(tenant_hash, &record, deadline_ns, &grant)
+            .await
+        {
             Ok(token) => {
                 // Both PUTs landed: attribute this flush's PUT cost to the
                 // tenant (ADR-0076 decision 2, success-time). `tenant_hash` is
@@ -944,6 +957,12 @@ impl FlushCtx {
     /// [`publish::EVIDENCE_HEAD_TIMEOUT`], evaluates nothing and keeps the
     /// key. Only the instrumented build remembers abandoned keys, so the
     /// default build finds none here.
+    ///
+    /// This is the metrics shard only: the logs and spans shards do not record
+    /// abandoned keys, because their catalog-maintenance workload writes across
+    /// forward clock jumps of +9000 s and more, where a flush still in flight
+    /// at a write timeout could land past the seal on correct code (see the
+    /// note at their commit-PUT abandon sites).
     async fn recheck_abandoned_commits(&self) {
         let due: Vec<AbandonedCommit> = {
             let mut abandoned = self
@@ -958,12 +977,21 @@ impl FlushCtx {
         };
         let lifetime_ns = duration_nanos_saturating(self.config.max_flush_lifetime);
         let mut kept = Vec::with_capacity(due.len());
-        for abandoned in due {
+        // One deadline bounds the whole batch, not each key: the HEADs share a
+        // single `EVIDENCE_HEAD_TIMEOUT` sleep, so a stalled store holds the
+        // flush permit for one timeout rather than one per due key. A key not
+        // judged by the deadline evaluates nothing and is kept.
+        let deadline = self.clock.sleep(publish::EVIDENCE_HEAD_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut due = due.into_iter();
+        loop {
+            let Some(abandoned) = due.next() else { break };
             let head = tokio::select! {
                 head = self.store.head(&abandoned.commit_key) => head,
-                () = self.clock.sleep(publish::EVIDENCE_HEAD_TIMEOUT) => {
+                () = &mut deadline => {
                     kept.push(abandoned);
-                    continue;
+                    kept.extend(due);
+                    break;
                 }
             };
             let landed_ms = match head {
@@ -1086,7 +1114,10 @@ impl FlushCtx {
         self.metrics.record_abandoned_queue_deadline();
         ravel_invariant::inv_reachable!(
             "commit: flush abandoned",
-            std::collections::BTreeMap::from([("at", "permit queue")])
+            std::collections::BTreeMap::from([
+                ("at", "permit queue".to_owned()),
+                ("tenant", pinned.tenant_hash.to_hex()),
+            ])
         );
         self.ack_waiters(
             waiters,
@@ -1108,7 +1139,10 @@ impl FlushCtx {
         self.metrics.record_abandoned_hour_bound();
         ravel_invariant::inv_reachable!(
             "commit: flush abandoned",
-            std::collections::BTreeMap::from([("at", "hour bound")])
+            std::collections::BTreeMap::from([
+                ("at", "hour bound".to_owned()),
+                ("tenant", pinned.tenant_hash.to_hex()),
+            ])
         );
         self.ack_waiters(
             waiters,
@@ -1268,6 +1302,7 @@ impl FlushCtx {
     /// way, and asks the activation policy before every attempt the same way.
     async fn publish_with_retry(
         &self,
+        tenant_hash: TenantHash,
         record: &CommitRecord,
         deadline_ns: i64,
         grant: &PublishGrant,
@@ -1279,10 +1314,31 @@ impl FlushCtx {
         };
         let mut attempt: u32 = 0;
         loop {
-            grant
+            if let Err(refused) = grant
                 .attempt_when_fresh(self.clock.as_ref(), deadline_ns)
                 .await
-                .map_err(PutAbort::Refused)?;
+            {
+                // On a retry iteration (attempt > 0) a commit-record PUT was
+                // already issued this flush; the activation policy now refuses
+                // the retry, but that PUT may still land, so record the key for
+                // the abandon recheck exactly as the Exhausted arm below does.
+                // The first iteration refuses before any PUT, so nothing can
+                // have landed and nothing is recorded.
+                if attempt > 0 {
+                    ravel_invariant::inv_sometimes!(
+                        self.note_abandoned_commit(tenant_hash, record).await,
+                        "commit: an abandoned flush's commit record is absent at the abandon",
+                        std::collections::BTreeMap::from([
+                            ("tenant", tenant_hash.to_hex()),
+                            (
+                                "commit_key",
+                                keys::commit_key_for_record(record).unwrap_or_default(),
+                            ),
+                        ])
+                    );
+                }
+                return Err(PutAbort::Refused(refused));
+            }
             let call =
                 publish::publish_deferring_evidence(self.store.as_ref(), record, &single_attempt);
             let started_ns = self.clock.now_ns();
@@ -3139,12 +3195,14 @@ impl ShardActor {
         let slot = self.shares.enter(tenant_hash);
         let semaphore = Arc::clone(&self.semaphore);
         let ctx = Arc::clone(&self.ctx);
-        // Per-shard skew (issue #865): time the whole flush, which runs here off
-        // the actor (ADR-0067). Bracketing `run_flush` on the injected clock,
-        // rather than inside it, keeps the measurement out of the pinned-identity
-        // path and captures every exit `run_flush` takes, abandonment included.
-        // The permit wait is bracketed separately, before the flush's own span, so
-        // the two never overlap.
+        // Per-shard skew (issue #865): the flush runs here off the actor
+        // (ADR-0067). [`FlushCtx::run_flush`] brackets the flush proper
+        // (`commit_flush`) on the injected clock and records the off-actor
+        // figure itself, so the measurement stays out of the pinned-identity
+        // path, captures every exit the flush takes (abandonment included), and
+        // excludes the abandoned-key re-reads that follow it. The permit wait is
+        // bracketed separately, before the flush's own span, so the two never
+        // overlap.
         let clock = Arc::clone(&self.clock);
         let metrics = Arc::clone(&self.metrics);
         let scope = Arc::clone(&self.scope);
@@ -3253,10 +3311,7 @@ impl ShardActor {
                     }
                 }
             }
-            let started_ns = clock.now_ns();
             ctx.run_flush(pinned, grant).await;
-            let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
-            metrics.record_shard_off_actor_ns(shard, off_actor_ns);
         });
         self.record_queued_flushes();
     }

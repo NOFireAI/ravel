@@ -534,6 +534,10 @@ impl SpanFlushCtx {
             }
             Err(PutAbort::Exhausted) => {
                 self.metrics.record_abandoned_retry_exhausted();
+                // NoPublishAfterAbandon is deliberately metrics-shard only (see
+                // the same note in `log_shard.rs`): a logs/spans flush in flight
+                // when a write times out can land past the seal on correct code,
+                // so the property is not evaluated here.
                 self.ack_waiters(
                     waiters,
                     Err(SpanWriteError::Abandoned(

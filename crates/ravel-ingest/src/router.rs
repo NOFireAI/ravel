@@ -153,13 +153,37 @@ impl Submitted<'_> {
         }
 
         // Every token about to reach the caller names a commit record in the
-        // store; a HEAD is the evidence, not the shard's ack. The default
-        // build compiles the assertion out, leaving `tenant_hash` unread.
+        // store; a HEAD is the evidence, not the shard's ack. The HEAD is
+        // raced against `EVIDENCE_HEAD_TIMEOUT` on the injected clock, so a
+        // stalled store cannot hang the ack in an instrumented run; a read
+        // that gives up evaluates nothing. The outer `inv_sometimes!` keeps
+        // the whole evidence read inside an assertion the default build
+        // compiles out, leaving `tenant_hash` and `durable` unread.
         let _ = tenant_hash;
-        ravel_invariant::inv_always!(
-            commit_records_exist(router.store.as_ref(), &tenant_hash, router.signal, &durable)
-                .await,
-            "commit: a strict metrics ack names a durable commit record",
+        ravel_invariant::inv_sometimes!(
+            match commit_records_exist(
+                router.store.as_ref(),
+                &tenant_hash,
+                router.signal,
+                &durable,
+                || router.clock.sleep(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT),
+            )
+            .await
+            {
+                Some(durable_records_exist) => {
+                    ravel_invariant::inv_always!(
+                        durable_records_exist,
+                        "commit: a strict metrics ack names a durable commit record",
+                        std::collections::BTreeMap::from([
+                            ("tenant", tenant_hash.to_hex()),
+                            ("tokens", encode_tokens(&durable)),
+                        ])
+                    );
+                    true
+                }
+                None => false,
+            },
+            "commit: a strict metrics ack's durable-commit evidence read completes before it gives up",
             std::collections::BTreeMap::from([
                 ("tenant", tenant_hash.to_hex()),
                 ("tokens", encode_tokens(&durable)),
@@ -194,24 +218,41 @@ impl Submitted<'_> {
 }
 
 /// Whether every token's commit record is in `store`: a HEAD of its key that
-/// does not answer NotFound. Only invariant conditions call this, and the
+/// does not answer NotFound. `Some(true)` when every token's record is
+/// present, `Some(false)` when one answered NotFound, and `None` when the
+/// evidence read evaluated nothing: a key it could not construct is no
+/// evidence of absence, and a HEAD still running when `give_up`'s future
+/// completes (the caller passes an `EVIDENCE_HEAD_TIMEOUT` sleep on the
+/// injected clock) must not hang the strict ack. The whole batch shares the
+/// one `give_up` deadline. Only invariant conditions call this, and the
 /// default build compiles those out.
 #[allow(dead_code)]
-pub(crate) async fn commit_records_exist(
+pub(crate) async fn commit_records_exist<G, F>(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
     signal: Signal,
     tokens: &[CommitToken],
-) -> bool {
+    give_up: G,
+) -> Option<bool>
+where
+    G: FnOnce() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    let give_up = give_up();
+    tokio::pin!(give_up);
     for token in tokens {
         let Ok(key) = ravel_commit::keys::commit_key_for_token(tenant_hash, signal, token) else {
-            return false;
+            return None;
         };
-        if matches!(store.head(&key).await, Err(StoreError::NotFound)) {
-            return false;
+        let head = tokio::select! {
+            head = store.head(&key) => head,
+            () = &mut give_up => return None,
+        };
+        if matches!(head, Err(StoreError::NotFound)) {
+            return Some(false);
         }
     }
-    true
+    Some(true)
 }
 
 /// The writer identity under the `commit/mismatched-identity-idempotent`
@@ -510,9 +551,10 @@ impl IngestRouter {
                     scope_compat.clone(),
                     scope_bucket.clone(),
                 ));
-                let writer_id = rng.new_uuid();
-                let epoch =
-                    u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
+                // Route the first generation's identity draw through the same
+                // helper as a respawn, so `commit/mismatched-identity-idempotent`
+                // is not inert for generation 0.
+                let (writer_id, epoch) = draw_writer_identity(rng.as_ref(), clock.as_ref());
                 (0..shard_count)
                     .map(|shard| {
                         let (tx, rx) = mpsc::channel(config.channel_depth);

@@ -309,9 +309,11 @@ impl SpanIngestRouter {
                     scope_compat.clone(),
                     scope_bucket.clone(),
                 ));
-                let writer_id = rng.new_uuid();
-                let epoch =
-                    u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
+                // Route the identity draw through the shared helper so
+                // `commit/mismatched-identity-idempotent` is not inert for
+                // spans.
+                let (writer_id, epoch) =
+                    crate::router::draw_writer_identity(rng.as_ref(), clock.as_ref());
                 (0..shard_count)
                     .map(|shard| {
                         let (tx, rx) = mpsc::channel(config.channel_depth);
