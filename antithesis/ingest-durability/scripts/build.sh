@@ -83,10 +83,18 @@ check_mutants() {
     if [ -z "$MUTANT_NAMES" ]; then
         echo "FAIL $image: no commit mutant listed in formal/tla/commit/antithesis-mutants.tsv"; return 1
     fi
-    dir=$(mktemp -d)
-    cid=$(docker create "$image")
-    docker cp "$cid:/symbols/ravel-server" "$dir/ravel-server" > /dev/null
+    dir=$(mktemp -d) || { echo "FAIL $image: no temporary directory"; return 1; }
+    # This function runs inside `check_mutants ... || rc=1`, where set -e is
+    # off, so each step that must succeed says so: otherwise a failed
+    # extraction leaves no file, every grep misses, and the plain build's
+    # "no mutant names" check passes without having read the binary.
+    cid=$(docker create "$image") || { echo "FAIL $image: docker create failed"; rm -rf "$dir"; return 1; }
+    if ! docker cp "$cid:/symbols/ravel-server" "$dir/ravel-server" > /dev/null; then
+        docker rm "$cid" > /dev/null 2>&1
+        echo "FAIL $image: could not extract /symbols/ravel-server"; rm -rf "$dir"; return 1
+    fi
     docker rm "$cid" > /dev/null
+    [ -s "$dir/ravel-server" ] || { echo "FAIL $image: extracted /symbols/ravel-server is empty"; rm -rf "$dir"; return 1; }
     for name in $MUTANT_NAMES; do
         if grep -qaF -- "$name" "$dir/ravel-server"; then
             found=$((found + 1))
