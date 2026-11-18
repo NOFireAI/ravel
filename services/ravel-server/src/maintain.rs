@@ -1488,7 +1488,7 @@ pub fn spawn(
         &store,
         &compactor,
         &worker,
-        rng.new_uuid(),
+        rng.as_ref(),
         &clock,
         &fallback_allow,
     );
@@ -1541,13 +1541,15 @@ pub fn spawn(
 }
 
 /// The [`crate::compat_maintain`] context, or `None` when the process has no
-/// compat policy or no `sys/compat` keys (an unkeyed bucket).
-fn compat_maintain_context(
+/// compat policy or no `sys/compat` keys (an unkeyed bucket). Background
+/// migrate's claim process id is drawn here from `rng`, never taken from
+/// `worker`, whose id the maintenance tick claims as.
+pub(crate) fn compat_maintain_context(
     config: &MaintenanceTaskConfig,
     store: &Arc<dyn ObjectStoreBackend>,
     compactor: &Arc<CompactorConfig>,
     worker: &Arc<WorkerSet>,
-    migrate_claim_process_id: Uuid,
+    rng: &dyn RngSource,
     clock: &Arc<dyn Clock>,
     fallback_allow: &Option<Vec<TenantHash>>,
 ) -> Option<crate::compat_maintain::CompatMaintainContext> {
@@ -1560,6 +1562,7 @@ fn compat_maintain_context(
         }
         return None;
     };
+    let migrate_claim_process_id = rng.new_uuid();
     if config.compat.background_migrate.is_some() {
         tracing::info!(
             process_id = %worker.process_id(),
@@ -2461,6 +2464,9 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
 /// The two run concurrently, so each passes its own `process_id`: a
 /// participant reclaims a claim held under its own id without waiting for it
 /// to expire, and a shared id would let one take a bucket the other holds.
+/// For the same reason a pre-installed participant must not be shared by
+/// concurrent callers: background migrate clears it before calling this, so
+/// only the tick keeps one.
 pub(crate) fn claiming(
     compactor: &CompactorConfig,
     process_id: Uuid,

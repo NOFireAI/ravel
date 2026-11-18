@@ -390,13 +390,16 @@ async fn run_background_migrate(
     let job = ctx.clone();
     // The walk's migrations publish into buckets the maintenance tick compacts
     // and rewrites for erasure, so they take the same bucket claim on the same
-    // clock, under this walk's own process id.
-    let compactor = crate::maintain::claiming(
-        &ctx.compactor,
-        ctx.migrate_claim_process_id,
-        ctx.clock.clone(),
-    )
-    .into_owned();
+    // clock, under this walk's own process id. A participant already in the
+    // configuration is dropped first, so the walk never claims under the
+    // tick's.
+    let unclaimed = CompactorConfig {
+        claim_participant: None,
+        ..CompactorConfig::clone(&ctx.compactor)
+    };
+    let compactor =
+        crate::maintain::claiming(&unclaimed, ctx.migrate_claim_process_id, ctx.clock.clone())
+            .into_owned();
     let runtime = tokio::runtime::Handle::current();
     let walked = tokio::task::spawn_blocking(move || {
         runtime.block_on(async move {
@@ -1223,7 +1226,9 @@ mod tests {
     /// erasure passes claim as. A participant reclaims a claim held under its
     /// own process id without waiting for it to expire, so a walk claiming as
     /// the tick's process id would take the bucket from a running erasure pass
-    /// of the same process and migrate it.
+    /// of the same process and migrate it. It stands down too when the
+    /// configuration already carries a participant under the worker id: the
+    /// walk installs its own rather than reusing that one.
     #[tokio::test]
     async fn background_migrate_stands_down_for_a_claim_the_ticks_process_id_holds() {
         let now = NOW1 + 10 * HOUR;
@@ -1235,14 +1240,14 @@ mod tests {
         let clock = FixedClock::new(now);
         let mut ctx = context(store.clone(), &clock);
         crate::compat::refresh_once(&ctx.view).await;
-        ctx.compactor = Arc::new(CompactorConfig {
+        let base = CompactorConfig {
             compat_policy: Some(ravel_maintain::MaintainCompatPolicy::new(
                 ctx.view.clone(),
                 Arc::new(ViewClock(clock.clone())),
             )),
             claim_lease_duration: lease,
             ..CompactorConfig::default()
-        });
+        };
 
         store.set_clock_ms(u64::try_from((now - 1_000_000_000) / 1_000_000).expect("ms"));
         let tick = ravel_maintain::claim_guard::ClaimGuard::new(
@@ -1259,34 +1264,95 @@ mod tests {
             ravel_maintain::claim_guard::Acquire::Acquired
         ));
 
-        let mut report = CompatMaintainReport::default();
-        run_background_migrate(
-            &ctx,
-            &[ctx.worker.process_id()],
-            BACKGROUND_MIGRATE_BUDGET,
-            &mut report,
+        let ticks_participant =
+            ravel_maintain::ClaimParticipant::new(ctx.worker.process_id(), ctx.clock.clone());
+        for preinstalled in [None, Some(ticks_participant)] {
+            let label = if preinstalled.is_some() {
+                "participant pre-installed under the worker id"
+            } else {
+                "no participant pre-installed"
+            };
+            ctx.compactor = Arc::new(CompactorConfig {
+                claim_participant: preinstalled,
+                ..base.clone()
+            });
+            let mut report = CompatMaintainReport::default();
+            run_background_migrate(
+                &ctx,
+                &[ctx.worker.process_id()],
+                BACKGROUND_MIGRATE_BUDGET,
+                &mut report,
+            )
+            .await;
+            assert_eq!(report.migrate_error, None, "{label}");
+            let [unit] = report.migrate.as_slice() else {
+                panic!("{label}: one provisioned signal, one unit: {report:?}");
+            };
+            let Ok(BackgroundMigrateOutcome::Walked { report: walk, .. }) = &unit.outcome else {
+                panic!(
+                    "{label}: the walk stands down rather than going on to the rewrite: {report:?}"
+                );
+            };
+            assert_eq!(
+                (walk.buckets_migrated, walk.not_migrated.len()),
+                (0, 1),
+                "{label}, commit {commit}: {walk:?}"
+            );
+            assert!(
+                matches!(
+                    walk.not_migrated[0].reason,
+                    ravel_maintain::NotMigratedReason::ClaimSkipped {
+                        reason: ravel_maintain::ClaimSkipReason::HeldByAnother
+                    }
+                ),
+                "{label}: {walk:?}"
+            );
+        }
+    }
+
+    /// The context the server spawns background migrate with claims under an
+    /// id drawn from the process RNG, not the worker id the maintenance tick
+    /// claims as: a context that reused the worker id would let the walk
+    /// reclaim a bucket the tick holds.
+    #[tokio::test]
+    async fn the_spawned_context_draws_a_migrate_claim_id_apart_from_the_worker_id() {
+        let clock = FixedClock::new(NOW1);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let view = CompatView::new(store.clone(), ckeys(), Arc::new(ViewClock(clock.clone())));
+        let compactor = Arc::new(CompactorConfig {
+            compat_policy: Some(ravel_maintain::MaintainCompatPolicy::new(
+                view,
+                Arc::new(ViewClock(clock.clone())),
+            )),
+            ..CompactorConfig::default()
+        });
+        let config = crate::maintain::MaintenanceTaskConfig {
+            compat: CompatMaintainConfig {
+                keys: Some(ckeys()),
+                background_migrate: Some(BACKGROUND_MIGRATE_BUDGET),
+                ..CompatMaintainConfig::default()
+            },
+            ..crate::maintain::MaintenanceTaskConfig::default()
+        };
+        let worker = Arc::new(WorkerSet::new(0, Duration::from_secs(60), 3, 1));
+        let clock: Arc<dyn Clock> = Arc::new(clock);
+        const SEED: u64 = 4448;
+
+        let ctx = crate::maintain::compat_maintain_context(
+            &config,
+            &store,
+            &compactor,
+            &worker,
+            &ravel_commit::rng::SeededRng::new(SEED),
+            &clock,
+            &None,
         )
-        .await;
-        assert_eq!(report.migrate_error, None);
-        let [unit] = report.migrate.as_slice() else {
-            panic!("one provisioned signal, one unit: {report:?}");
-        };
-        let Ok(BackgroundMigrateOutcome::Walked { report: walk, .. }) = &unit.outcome else {
-            panic!("the walk stands down rather than going on to the rewrite: {report:?}");
-        };
+        .expect("a keyed process with a compat policy spawns compat maintenance");
+
+        assert_ne!(ctx.migrate_claim_process_id, ctx.worker.process_id());
         assert_eq!(
-            (walk.buckets_migrated, walk.not_migrated.len()),
-            (0, 1),
-            "commit {commit}: {walk:?}"
-        );
-        assert!(
-            matches!(
-                walk.not_migrated[0].reason,
-                ravel_maintain::NotMigratedReason::ClaimSkipped {
-                    reason: ravel_maintain::ClaimSkipReason::HeldByAnother
-                }
-            ),
-            "{walk:?}"
+            ctx.migrate_claim_process_id,
+            ravel_commit::rng::RngSource::new_uuid(&ravel_commit::rng::SeededRng::new(SEED)),
         );
     }
 
