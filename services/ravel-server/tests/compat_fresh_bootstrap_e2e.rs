@@ -21,7 +21,7 @@ use ravel_catalog::compat::{
 use ravel_maintain::DEFAULT_PUBLISH_LIFETIME_NS;
 use ravel_maintain::compat_init::{InitConfig, baseline_record, baseline_version};
 use ravel_object_store::fault::{
-    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
+    FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, Rule, ScriptedFault, Sequence,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
@@ -220,14 +220,13 @@ async fn a_second_start_on_a_store_the_first_start_found_empty_is_not_refused() 
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
 
     let first = start(&store, keyed(), NOW_NS).await.expect("first start");
-    assert_eq!(first.retired_reader_gate, GateOutcome::Fresh);
-    assert_eq!(first.compat_bootstrap, Some(Bootstrap::Created));
-    assert_bootstrapped(&stored_compat(store.as_ref()).await, NOW_NS);
     assert!(store.head(TENANCY_KEY).await.is_ok());
-
     let second = start(&store, keyed(), NOW_NS + HOUR_NS)
         .await
         .expect("second start");
+
+    assert_eq!(first.retired_reader_gate, GateOutcome::Fresh);
+    assert_eq!(first.compat_bootstrap, Some(Bootstrap::Created));
     assert_eq!(second.retired_reader_gate, certified_at(NOW_NS));
     assert_eq!(second.compat_bootstrap, None);
     assert_bootstrapped(&stored_compat(store.as_ref()).await, NOW_NS);
@@ -252,7 +251,13 @@ async fn a_start_whose_compat_create_fails_leaves_the_store_fresh() {
     ));
     let store: Arc<dyn ObjectStoreBackend> = fault.clone();
 
-    let err = refusal(start(&store, keyed(), NOW_NS).await);
+    let first = start(&store, keyed(), NOW_NS).await;
+    let after_first = every_object(fault.inner()).await;
+    let retried = start(&store, keyed(), NOW_NS + HOUR_NS)
+        .await
+        .expect("the next start finds the store fresh");
+
+    let err = refusal(first);
     assert!(
         matches!(
             err.downcast_ref::<CompatGateError>(),
@@ -261,11 +266,7 @@ async fn a_start_whose_compat_create_fails_leaves_the_store_fresh() {
         "{err:?}"
     );
     assert_eq!(fault.fault_count(Op::Put, FaultKind::Permanent), 1);
-    assert_eq!(every_object(fault.inner()).await, Vec::new());
-
-    let retried = start(&store, keyed(), NOW_NS + HOUR_NS)
-        .await
-        .expect("the next start finds the store fresh");
+    assert_eq!(after_first, Vec::new());
     assert_eq!(retried.retired_reader_gate, GateOutcome::Fresh);
     assert_eq!(retried.compat_bootstrap, Some(Bootstrap::Created));
 
@@ -273,6 +274,14 @@ async fn a_start_whose_compat_create_fails_leaves_the_store_fresh() {
         .await
         .expect("third start");
     assert_eq!(third.retired_reader_gate, certified_at(NOW_NS + HOUR_NS));
+}
+
+/// Waits until `n` creates of `sys/compat` are held, failing rather than
+/// hanging when fewer ever arrive.
+async fn creates_held(held: &GateHandle, n: usize) {
+    tokio::time::timeout(Duration::from_secs(30), held.wait_until_held(n))
+        .await
+        .unwrap_or_else(|_| panic!("{n} sys/compat creates never arrived"));
 }
 
 /// Two fresh starts racing on one empty store both start: one creates
@@ -290,7 +299,7 @@ async fn two_concurrent_fresh_starts_both_start_on_one_sys_compat() {
         tokio::spawn(async move { start(&store, keyed(), census).await })
     });
     // Both starts found the store fresh and reached their create.
-    held.wait_until_held(2).await;
+    creates_held(&held, 2).await;
     for (id, _, key) in held.held_details() {
         assert_eq!(key, COMPAT_KEY);
         assert!(held.release(id));
@@ -338,7 +347,7 @@ async fn a_lost_create_against_an_uncertified_record_refuses_and_leaves_it() {
         let store = Arc::clone(&store);
         tokio::spawn(async move { start(&store, keyed(), NOW_NS).await })
     };
-    held.wait_until_held(1).await;
+    creates_held(&held, 1).await;
     let mut uncertified = bootstrap_record(&retired(), NOW_NS).expect("record");
     for family in &mut uncertified.families {
         family.certificate = None;
