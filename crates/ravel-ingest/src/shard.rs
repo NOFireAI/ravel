@@ -9692,7 +9692,10 @@ mod tests {
             STRICT_METRICS_ACK,
             &stalled.hash().to_hex(),
         );
-        assert!(acks.is_empty(), "the evidence read evaluated nothing: {acks:?}");
+        assert!(
+            acks.is_empty(),
+            "the evidence read evaluated nothing: {acks:?}"
+        );
         let completes = crate::router::invariant_capture::evaluations(
             STRICT_ACK_COMPLETES,
             &stalled.hash().to_hex(),

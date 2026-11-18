@@ -462,7 +462,8 @@ where
             };
             let _ = &give_up;
             ravel_invariant::inv_sometimes!(
-                match receipt_commits_are_durable(store, tenant_id, signal, receipt, give_up).await {
+                match receipt_commits_are_durable(store, tenant_id, signal, receipt, give_up).await
+                {
                     Some(commits_are_durable) => {
                         ravel_invariant::inv_always!(
                             commits_are_durable,
@@ -1899,8 +1900,9 @@ mod tests {
             written_count: 1,
             commit_token: token.encode(),
         };
-        let commit_key = ravel_commit::keys::commit_key_for_token(&tenant.hash(), Signal::Logs, &token)
-            .expect("commit key");
+        let commit_key =
+            ravel_commit::keys::commit_key_for_token(&tenant.hash(), Signal::Logs, &token)
+                .expect("commit key");
         let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let gate = fault_store.hold(Op::Get, Some(commit_key), Occurrence::Nth(1));
         let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
@@ -1932,7 +1934,8 @@ mod tests {
         );
         clock
             .advance_ns(
-                i64::try_from(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT.as_nanos()).expect("fits"),
+                i64::try_from(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT.as_nanos())
+                    .expect("fits"),
             )
             .await;
         let outcome = tokio::time::timeout(Duration::from_secs(10), write)

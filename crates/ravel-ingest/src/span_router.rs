@@ -1642,9 +1642,9 @@ mod tests {
     /// for spans.
     #[tokio::test]
     async fn mutant_pinned_writer_identity_breaks_one_identity_for_spans() {
-        let Some(_mutant) =
-            crate::router::invariant_capture::scoped_mutant("commit/mismatched-identity-idempotent")
-        else {
+        let Some(_mutant) = crate::router::invariant_capture::scoped_mutant(
+            "commit/mismatched-identity-idempotent",
+        ) else {
             return;
         };
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

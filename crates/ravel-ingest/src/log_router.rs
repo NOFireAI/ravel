@@ -874,7 +874,10 @@ impl LogIngestRouter {
                     &tenant_hash,
                     ravel_types::Signal::Logs,
                     &durable,
-                    || self.clock.sleep(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT),
+                    || {
+                        self.clock
+                            .sleep(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT)
+                    },
                 )
                 .await
                 {

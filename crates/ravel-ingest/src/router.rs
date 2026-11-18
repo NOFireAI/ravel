@@ -166,7 +166,9 @@ impl Submitted<'_> {
                 &tenant_hash,
                 router.signal,
                 &durable,
-                || router.clock.sleep(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT),
+                || router
+                    .clock
+                    .sleep(ravel_commit::publish::EVIDENCE_HEAD_TIMEOUT),
             )
             .await
             {
