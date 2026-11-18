@@ -6404,27 +6404,33 @@ impl Catalog {
                     // failed to land. A Valid HEAD's bytes carry folder_id and
                     // created_unix_ns, so its version does not recur.
                     ravel_invariant::inv_always_if_known!(
-                        match self.store().get(&head_key, GetRange::Full).await {
-                            Ok(got) if cas_acked => match &put_mode {
-                                PutMode::CasVersion(conditioned) => {
-                                    if matches!(head_state, HeadState::Corrupt { .. }) {
-                                        None
-                                    } else {
-                                        Some(got.version != *conditioned)
+                        {
+                            let reread = self.store().get(&head_key, GetRange::Full).await;
+                            counters.get_requests += 1;
+                            match reread {
+                                Ok(got) if cas_acked => match &put_mode {
+                                    PutMode::CasVersion(conditioned) => {
+                                        if matches!(head_state, HeadState::Corrupt { .. }) {
+                                            None
+                                        } else {
+                                            Some(got.version != *conditioned)
+                                        }
                                     }
+                                    PutMode::CreateIfAbsent | PutMode::Overwrite => Some(true),
+                                },
+                                Ok(got) => {
+                                    snapshot_format::decode_head(&got.data).ok().map(|stored| {
+                                        canonical_head_digest(&stored)
+                                            .is_ok_and(|digest| digest == head_digest)
+                                    })
                                 }
-                                PutMode::CreateIfAbsent | PutMode::Overwrite => Some(true),
-                            },
-                            Ok(got) => snapshot_format::decode_head(&got.data)
-                                .ok()
-                                .map(|stored| canonical_head_digest(&stored)
-                                    .is_ok_and(|digest| digest == head_digest)),
-                            Err(StoreError::NotFound) if cas_acked => match &put_mode {
-                                PutMode::CreateIfAbsent => Some(false),
-                                PutMode::CasVersion(_) | PutMode::Overwrite => None,
-                            },
-                            Err(StoreError::NotFound) => Some(false),
-                            Err(_) => None,
+                                Err(StoreError::NotFound) if cas_acked => match &put_mode {
+                                    PutMode::CreateIfAbsent => Some(false),
+                                    PutMode::CasVersion(_) | PutMode::Overwrite => None,
+                                },
+                                Err(StoreError::NotFound) => Some(false),
+                                Err(_) => None,
+                            }
                         },
                         "catalog: a fold reports as folded only a HEAD the store holds",
                         std::collections::BTreeMap::from([
@@ -12489,16 +12495,18 @@ pub(crate) mod tests {
             &["cpu"],
         )
         .await;
+        let first_folder = Uuid::new_v4();
         let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .fold(&tenant(), Signal::Metrics, first_folder, now_1, &[], None)
             .await
             .expect("first fold");
         assert!(!first.no_op);
         assert_eq!(first.entry_count, 1);
         assert!(first.postings_built);
         // HEAD get (absent) + 1 tenant-config read + 1 commit-record load +
-        // 1 segment fetch to decode the sole entry's names.
-        assert_eq!(first.get_requests, 4);
+        // 1 segment fetch to decode the sole entry's names, besides the
+        // folded-HEAD property's re-read where it is evaluated.
+        assert_eq!(first.get_requests - head_rereads(first_folder), 4);
 
         let now_2 = now_at_seal(12);
         publish_real_segment(
@@ -12511,8 +12519,9 @@ pub(crate) mod tests {
             &["mem"],
         )
         .await;
+        let second_folder = Uuid::new_v4();
         let second = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .fold(&tenant(), Signal::Metrics, second_folder, now_2, &[], None)
             .await
             .expect("second fold");
         assert!(!second.rebuilt, "a valid HEAD must fold incrementally");
@@ -12523,7 +12532,7 @@ pub(crate) mod tests {
         // load + 1 new commit-record load + 1 new segment fetch = 6: the first
         // fold's "cpu" entry is neither re-loaded from the part nor re-decoded
         // from its segment.
-        assert_eq!(second.get_requests, 6);
+        assert_eq!(second.get_requests - head_rereads(second_folder), 6);
     }
 
     /// `FoldReport.get_requests` must equal the store's real observed GET count
@@ -12544,10 +12553,11 @@ pub(crate) mod tests {
     async fn fold_report_get_requests_equals_observed_store_gets() {
         // One rebuild fold over a fresh instrumented store holding a single
         // sealed segment. Returns (FoldReport.get_requests, the store's real GET
-        // calls issued during the fold only). Publishing happens on the inner
-        // store before it is wrapped, so only the fold's own requests are
-        // measured.
-        async fn measured(enforce: bool) -> (u64, u64) {
+        // calls issued during the fold only, the HEAD re-reads the folded-HEAD
+        // property issued among them, as counted from its captured
+        // evaluations). Publishing happens on the inner store before it is
+        // wrapped, so only the fold's own requests are measured.
+        async fn measured(enforce: bool) -> (u64, u64, u64) {
             let inner = MemoryStore::new();
             let now = now_at_seal(10);
             publish_real_segment(
@@ -12570,49 +12580,49 @@ pub(crate) mod tests {
                 }
             };
 
+            let folder_id = Uuid::new_v4();
             let before = store.metrics().snapshot();
             let report = catalog
-                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+                .fold(&tenant(), Signal::Metrics, folder_id, now, &[], None)
                 .await
                 .expect("fold");
             let after = store.metrics().snapshot();
 
             assert!(!report.no_op);
             assert!(report.rebuilt);
-            // Where assertions are evaluated, the folded-HEAD property re-reads
-            // HEAD once after the CAS; that GET is the instrumentation's, not
-            // the fold's, so the report leaves it out.
-            let instrumentation = u64::from(capturing());
             (
                 report.get_requests,
-                after.get.calls - before.get.calls - instrumentation,
+                after.get.calls - before.get.calls,
+                head_rereads(folder_id),
             )
         }
 
         // Enforcement off: the report must equal the store's real GET count.
         // The scan set is a single shard 0 either way (implicit generation 0 at
         // shard_count 1), so the GETs are HEAD (absent) + tenant-config +
-        // commit-record load + segment fetch = 4.
-        let (off_report, off_observed) = measured(false).await;
+        // commit-record load + segment fetch = 4, plus any re-read of HEAD
+        // where the folded-HEAD property is evaluated, which the report counts
+        // too.
+        let (off_report, off_observed, off_rereads) = measured(false).await;
         assert_eq!(
             off_report, off_observed,
             "with enforcement off the report must equal the store's observed GETs"
         );
-        assert_eq!(off_observed, 4);
+        assert_eq!(off_observed - off_rereads, 4);
 
         // Enforcement on: `read_scan_generations` funnels exactly one extra GET
         // (the provisioning-record read, NotFound here but still one request)
         // through `guarded_get`. That is the GET issue #770 dropped; the report
         // must now equal the store's real count on this path too.
-        let (on_report, on_observed) = measured(true).await;
+        let (on_report, on_observed, on_rereads) = measured(true).await;
         assert_eq!(
             on_report, on_observed,
             "with enforcement on the report must equal the store's observed GETs"
         );
-        assert_eq!(on_observed, 5);
+        assert_eq!(on_observed - on_rereads, 5);
         assert_eq!(
-            on_observed,
-            off_observed + 1,
+            on_observed - on_rereads,
+            off_observed - off_rereads + 1,
             "enforcement issues exactly one extra GET, the provisioning read"
         );
     }
@@ -13490,6 +13500,13 @@ pub(crate) mod tests {
     }
 
     const FOLDED_HEAD_HELD: &str = "catalog: a fold reports as folded only a HEAD the store holds";
+
+    /// The HEAD re-reads the folded-HEAD property issued for the fold by
+    /// `folder_id`, as counted from its captured evaluations; 0 where
+    /// assertions compile out, which issue no re-read.
+    fn head_rereads(folder_id: Uuid) -> u64 {
+        evaluations(FOLDED_HEAD_HELD, &folder_id.to_string()).len() as u64
+    }
 
     /// True in the invariants lane, where assertion sites record evaluations.
     fn capturing() -> bool {
@@ -16513,7 +16530,20 @@ pub(crate) mod tests {
 
         publish_segment(&inner, 0, Uuid::new_v4(), 6, H - 1, now_inside(H) + 1).await;
         let later = now_inside(H) + 5 * 60 * 1_000_000_000;
-        let next = fold_sealing(&catalog, later, None).await;
+        let folder_id = Uuid::new_v4();
+        let next = catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Metrics,
+                folder_id,
+                later,
+                &[],
+                None,
+                &RefoldRequest::new(),
+                None,
+            )
+            .await
+            .expect("fold");
         assert!(!next.no_op, "the late commit is folded: {next:?}");
         assert!(!next.rebuilt, "{next:?}");
         assert_eq!(next.entry_count, 5, "{next:?}");
@@ -16526,11 +16556,16 @@ pub(crate) mod tests {
         );
         // HEAD and the tenant config, each of the previous HEAD's parts once
         // (`covering` of them in the pre-check, the rest in the main load),
-        // then both commit records in the reconciled bucket H - 1.
+        // then both commit records in the reconciled bucket H - 1, besides
+        // the folded-HEAD property's re-read where it is evaluated.
         let parts = part_keys.len() as u64;
         assert_eq!(parts, 4);
         assert_eq!(covering, 2);
-        assert_eq!(next.get_requests, 2 + parts + 2, "{next:?}");
+        assert_eq!(
+            next.get_requests - head_rereads(folder_id),
+            2 + parts + 2,
+            "{next:?}"
+        );
     }
 
     /// The compact-then-seal order: hour `H - 1` was compacted before the

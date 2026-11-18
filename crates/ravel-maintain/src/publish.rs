@@ -80,8 +80,8 @@ pub fn conserve_exact() -> impl ConservationPredicate {
 /// this run began (for the abandonment deadline); `created_unix_ns` on the
 /// record is stamped from the clock at publish time (the supersession-horizon
 /// anchor). This is the compaction entry point; the shared rewrite
-/// primitive ([`crate::rewrite`]) calls [`publish_record_with_conservation`]
-/// with its own predicate.
+/// primitive ([`crate::rewrite`]) calls `publish_identities_with_conservation`
+/// and `publish_superseding_record` with its own predicate.
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_record(
     store: &dyn ObjectStoreBackend,
@@ -145,7 +145,9 @@ pub async fn publish_record_with_conservation(
 
 /// [`publish_record_with_conservation`] with the record's input identities
 /// given: `identities` is what the record names, one per entry of `inputs`,
-/// whose sample counts the parts must conserve.
+/// whose sample counts the parts must conserve. An `identities` whose length
+/// differs from `inputs`' is refused with [`MaintainError::Invariant`] before
+/// the conservation gate, and nothing is written.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_identities_with_conservation(
     store: &dyn ObjectStoreBackend,
@@ -159,6 +161,14 @@ pub(crate) async fn publish_identities_with_conservation(
     start_ns: i64,
     conservation: impl ConservationPredicate,
 ) -> Result<PublishOutcome> {
+    if identities.len() != inputs.len() {
+        return Err(MaintainError::Invariant(format!(
+            "compaction record over {} inputs would name {} input identities; \
+             nothing written",
+            inputs.len(),
+            identities.len()
+        )));
+    }
     publish_compaction_record(
         store,
         config,
@@ -709,6 +719,46 @@ pub(crate) mod tests {
             assert_eq!(outcome, PublishOutcome::Published);
             let listed = list_all(&store, "").await.expect("list");
             assert_eq!(listed.len(), 1, "exactly the record object: {listed:?}");
+        }
+    }
+
+    /// A record whose identities do not pair one-to-one with the inputs whose
+    /// sample counts the gate sums is refused with the typed error, before the
+    /// conservation gate (the counts here conserve) and before any PUT, in both
+    /// directions.
+    #[tokio::test]
+    async fn identities_not_one_per_input_refuse_publish() {
+        let bucket = bucket(Signal::Metrics);
+        let inputs = vec![input(1, 10, &bucket), input(2, 7, &bucket)];
+        let parts = vec![part(0, 17)];
+        let all = input_identities(&inputs);
+        for identities in [all[..1].to_vec(), [all.clone(), all[..1].to_vec()].concat()] {
+            let store = MemoryStore::new();
+            let count = identities.len();
+            let err = publish_identities_with_conservation(
+                &store,
+                &CompactorConfig::default(),
+                &FixedClock::new(1),
+                &bucket,
+                &inputs,
+                identities,
+                &[7u8; 32],
+                &parts,
+                1,
+                conserve_exact(),
+            )
+            .await
+            .expect_err("a record not naming one identity per input must not publish");
+            match err {
+                MaintainError::Invariant(message) => assert!(
+                    message.contains(&format!(
+                        "over 2 inputs would name {count} input identities"
+                    )),
+                    "{message}"
+                ),
+                other => panic!("expected Invariant, got {other:?}"),
+            }
+            assert!(list_all(&store, "").await.expect("list").is_empty());
         }
     }
 
