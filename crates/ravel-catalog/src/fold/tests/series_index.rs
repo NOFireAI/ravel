@@ -433,20 +433,6 @@ async fn the_series_fields_hold_exactly_the_fixture_series() {
             METRICS_SERIES_LABEL_FIELD,
         ]
     );
-    let label_value = &part.key_index[1];
-    assert_eq!(hex_encode(&label_value.blake3), GOLDEN_LABEL_VALUE_BLAKE3);
-    let series_bytes: u64 = part
-        .key_index
-        .iter()
-        .filter(|leaf| is_series_index_field(Signal::Metrics, &leaf.field))
-        .map(|leaf| leaf.size)
-        .sum();
-    assert_eq!(series_bytes, FIXTURE_SERIES_LEAF_BYTES);
-    assert_eq!(
-        report.key_index_leaf_bytes_written,
-        FIXTURE_SERIES_LEAF_BYTES + GOLDEN_LABEL_VALUE_SIZE
-    );
-
     // The key convention the router reads, pinned on one series.
     assert_eq!(skey(&A), 0xcf50_f3a7_5e72_bdfa);
     let leaves = series_leaves(store.as_ref(), part).await;
@@ -498,6 +484,20 @@ async fn the_series_fields_hold_exactly_the_fixture_series() {
         ])
     );
     assert!(leaves.uncovered.values().all(Vec::is_empty), "{leaves:?}");
+
+    let label_value = &part.key_index[1];
+    assert_eq!(hex_encode(&label_value.blake3), GOLDEN_LABEL_VALUE_BLAKE3);
+    let series_bytes: u64 = part
+        .key_index
+        .iter()
+        .filter(|leaf| is_series_index_field(Signal::Metrics, &leaf.field))
+        .map(|leaf| leaf.size)
+        .sum();
+    assert_eq!(series_bytes, FIXTURE_SERIES_LEAF_BYTES);
+    assert_eq!(
+        report.key_index_leaf_bytes_written,
+        FIXTURE_SERIES_LEAF_BYTES + GOLDEN_LABEL_VALUE_SIZE
+    );
 }
 
 /// Folds the fixture with the series switch on at `ppm`.

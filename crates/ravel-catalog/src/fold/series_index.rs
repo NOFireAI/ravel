@@ -694,7 +694,7 @@ impl SeriesIndexEntries {
     }
 }
 
-/// The three fields of `series`, dropping every series no entry holds: the
+/// The three fields of `series`, each of which some entry holds: the
 /// classes are the distinct entry sets, numbered in ascending order of their
 /// smallest member `skey`; `series_label` maps each pair to its ascending
 /// `skey`s, `series_class` each `skey` to its class, and `class_objects`
@@ -708,9 +708,6 @@ fn series_index_entries(
     let mut pair_postings: BTreeMap<Key8, Vec<u64>> = BTreeMap::new();
     let mut series_class = Vec::new();
     for (skey, acc) in series {
-        if acc.entries.is_empty() {
-            continue;
-        }
         let set: Vec<u64> = acc.entries.into_iter().collect();
         let class = match class_of_set.get(&set) {
             Some(&class) => class,
