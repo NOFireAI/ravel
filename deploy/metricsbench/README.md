@@ -1940,8 +1940,9 @@ cases):
   in place of `--rss-band`. Launch refuses it with 64 without
   `MB_STAGE1=1 MB_STAGE1_ARMS=l1`, on a profile other than `history` and
   `ci`, with `MB_CONTROL_IMAGE`, with `MB_RSS_BAND`, with a real-s3-prefix,
-  and without `MB_OBJECTS_BAND`. `MB_STAGE1=1` on `history` needs it. `0`
-  or unset changes nothing.
+  and without `MB_OBJECTS_BAND` or `MB_STAGE1_BANDS`, which it needs even on
+  `ci`: the shipped ci band file is for a four-engine run. `MB_STAGE1=1` on
+  `history` needs it. `0` or unset changes nothing.
 
 The #3941 series-listing measurement launches on the portable lane, with
 `MB_STAGE1_BANDS` naming a band file pre-registered for `history` (none

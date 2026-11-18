@@ -60,6 +60,10 @@ case "$ravel_only" in
      [ -z "$real_s3_prefix" ] || { echo "MB_RAVEL_ONLY=1 with a real-s3-prefix: run.sh --ravel-only refuses the real-S3 lane" >&2; exit 64; }
      [ -z "${MB_RSS_BAND:-}" ] || { echo "MB_RAVEL_ONLY=1 with MB_RSS_BAND: run.sh --ravel-only refuses --rss-band" >&2; exit 64; }
      [ -n "${MB_OBJECTS_BAND:-}" ] || { echo "MB_RAVEL_ONLY=1 with MB_PROFILE=$profile needs MB_OBJECTS_BAND set for it; the default is cardinality's" >&2; exit 64; }
+     # The shipped ci Stage 1 band file is pre-registered for a four-engine
+     # run; a Ravel-only run stamps its Stage 1 compare figures skipped, so
+     # it fails that file. Every Ravel-only launch names its own band file.
+     [ -n "${MB_STAGE1_BANDS:-}" ] || { echo "MB_RAVEL_ONLY=1 needs MB_STAGE1_BANDS, a band file pre-registered for the Ravel-only shape; the ci default is for a four-engine run" >&2; exit 64; }
      ;;
   *) echo "MB_RAVEL_ONLY must be 1, 0 or unset, not '$ravel_only'" >&2; exit 64;;
 esac
@@ -72,7 +76,9 @@ if [ -z "$ravel_only" ] && [ "$profile" != cardinality ] && { [ -z "${MB_RSS_BAN
   exit 64
 fi
 # run.sh refuses the same values, but only after the box has built the
-# harness and run the ci smoke.
+# harness and run the ci smoke. The history case is narrower here than in
+# run.sh: run.sh accepts history with the l1 arm alone, launch.sh also
+# requires MB_RAVEL_ONLY=1.
 stage1=${MB_STAGE1:-}
 case "$stage1" in
   ''|0) stage1="" ;;

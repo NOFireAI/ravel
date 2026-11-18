@@ -133,7 +133,8 @@ function of the anchor and the seed.
   about 4 h to spare; raise it for anything longer;
 - `MB_INSTANCE_TYPE`;
 - `MB_STAGE1`, `1` to run the ADR-3694 Stage 1 steps in both the ci smoke and
-  the measured run (`cardinality` or `ci` only; `launch.sh` refuses another
+  the measured run (`cardinality` or `ci`, and `history` only with
+  `MB_RAVEL_ONLY=1` and `MB_STAGE1_ARMS=l1`; `launch.sh` refuses another
   profile, and any value other than `1`, `0` or unset, with exit 64). The
   steps, the records and the band check are in
   [deploy/metricsbench/README.md](../../deploy/metricsbench/README.md),
@@ -166,10 +167,25 @@ function of the anchor and the seed.
   right after the pending pass; no ravel-server flag turns compaction off, so
   each of its ticks also runs retention, compaction and the GC and catalog
   sweeps over the tenant. The nightly workflow sets none of them.
+- `MB_RAVEL_ONLY`, `1` to run the measured run as `run.sh --ravel-only`: Ravel
+  alone, the series-listing read-back on the L0 catalog, then the l1 arm's
+  compaction and the read-back again on L1. The ci smoke stays a full
+  four-engine run. `launch.sh` refuses it with exit 64 on a profile other
+  than `history` or `ci`, without `MB_STAGE1=1` and `MB_STAGE1_ARMS=l1`, with
+  a control image, with `MB_RSS_BAND` (the shape takes no memory band), with
+  a real-S3 prefix (`run.sh --ravel-only` refuses the real-S3 lane), and
+  without `MB_OBJECTS_BAND` or `MB_STAGE1_BANDS`. The shipped ci Stage 1 band
+  file is pre-registered for a four-engine run, so a Ravel-only launch names
+  its own band file even on `ci`;
+- `MB_L1_MAX_PART_BYTES`, a positive integer that `box-run.sh` passes to the
+  measured run's l1 compaction as `--max-l1-part-bytes`. It needs
+  `MB_STAGE1=1` with `l1` in `MB_STAGE1_ARMS`; `launch.sh` refuses it
+  otherwise, and any value that is not a positive integer, with exit 64.
 
 Both bands default only for `cardinality`. Another profile's count and memory
 differ, so `launch.sh` refuses a different `MB_PROFILE` unless both bands
-are set, and chosen in that run's pre-registration.
+are set, and chosen in that run's pre-registration. A Ravel-only launch takes
+`MB_OBJECTS_BAND` alone.
 
 A `cardinality` run takes 8 to 10 h. R4 took 8.7 h, F4 9.25 h.
 

@@ -4928,6 +4928,10 @@ launch ro-no-objects "${RO_HIST[@]}" MB_OBJECTS_BAND=
 expect_launch_refused "MB_RAVEL_ONLY=1 without MB_OBJECTS_BAND" "MB_RAVEL_ONLY=1 with MB_PROFILE=history needs MB_OBJECTS_BAND set for it; the default is cardinality's"
 launch ro-two MB_RAVEL_ONLY=2
 expect_launch_refused "MB_RAVEL_ONLY=2" "MB_RAVEL_ONLY must be 1, 0 or unset, not '2'"
+# ci exempts MB_STAGE1_BANDS for a four-engine run, whose band file a
+# Ravel-only run cannot satisfy, so a Ravel-only launch names its own.
+launch ro-ci-no-bands MB_PROFILE=ci MB_OBJECTS_BAND=1:2 MB_RAVEL_ONLY=1 MB_STAGE1=1 MB_STAGE1_ARMS=l1
+expect_launch_refused "MB_RAVEL_ONLY=1 on ci without MB_STAGE1_BANDS" "MB_RAVEL_ONLY=1 needs MB_STAGE1_BANDS, a band file pre-registered for the Ravel-only shape; the ci default is for a four-engine run"
 launch history-stage1 "${HIST[@]}" MB_STAGE1=1 MB_STAGE1_ARMS=l1
 expect_launch_refused "MB_STAGE1=1 on history without MB_RAVEL_ONLY" "MB_STAGE1=1 with MB_PROFILE=history needs MB_RAVEL_ONLY=1 MB_STAGE1_ARMS=l1"
 CI_L1=(MB_PROFILE=ci MB_RSS_BAND=x:1:2 MB_OBJECTS_BAND=1:2 MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour,l1)
