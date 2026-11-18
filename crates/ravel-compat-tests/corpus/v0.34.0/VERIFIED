@@ -1,0 +1,19 @@
+verified byte-identical against the v0.34.0 release; appended at release, as
+PROVENANCE asks.
+
+tag:            v0.34.0
+tag commit:     1d926be6aa770d817adfb4cc3c060da437f20553
+checked commit: 392bdf38ace5864de0959ffb193c8efe749a67f9
+  (chore(release): prepare 0.34.0. The two commits between it and the tag
+  change CHANGELOG.md only, so every writer crate tree is the same at the
+  tag.)
+method:         full regeneration and diff, fleet task 5dc17d47 (amd64)
+  - the committed corpus reads exactly (cargo test --test corpus, exit 0);
+  - a fresh regeneration with RAVEL_COMPAT_CORPUS_RELEASE=v0.34.0 diffs empty
+    against the committed files (diff -r -x PROVENANCE);
+  - two regenerations match byte for byte.
+  The tree-hash fast path did not apply: the version bump changes the
+  ravel-segment and ravel-rspan trees through their fuzz lockfiles, and
+  ravel-ingest changed after PROVENANCE was written.
+result:         pass
+record:         #4317 comment 6966765464
