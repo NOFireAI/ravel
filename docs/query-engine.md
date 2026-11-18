@@ -1300,8 +1300,10 @@ three per-part metrics key-index fields (leaf format version 3, posting kind
 for the first two): `series_label` maps a `name=value` pair to the ascending
 series keys carrying it, `series_class` maps a series key to its class, and
 `class_objects` maps a class ordinal (`key8_i64`) to the entries holding it.
-A series key is its 8-byte `key8` read as a big-endian `u64`. No fold writes
-these fields yet (W1), so on folded data today the route does not run.
+A series key is its 8-byte `key8` read as a big-endian `u64`. The fold
+writes these fields only behind `CatalogConfig::metrics_series_index`, off by
+default (docs/catalog-and-mvcc.md, "Per-part key-index leaves"), so without
+it the route does not run on folded data.
 
 `route_metric_statement` (`key_index_route::series`) runs first, the
 label-value route second over what the series route left, and the

@@ -361,6 +361,9 @@ async fn the_metrics_series_index_flag_reaches_the_fold_and_the_rebuild() {
     assert_eq!(report.parts_rebuilt, 1, "{report:?}");
     assert_eq!(report.leaves_written, 3, "{report:?}");
     assert_eq!(report.series_index_parts_over_cap, 0, "{report:?}");
-    assert!(printed.contains("series_index_parts_over_cap: 0\n"), "{printed}");
+    assert!(
+        printed.contains("series_index_parts_over_cap: 0\n"),
+        "{printed}"
+    );
     assert_eq!(kidx_objects(&off).await, 4);
 }

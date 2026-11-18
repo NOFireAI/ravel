@@ -40,8 +40,8 @@ use crate::fold::{
     BuiltPartKeyIndex, HeadState, HeldLabelDicts, KeyIndexBuildCaller, KeyIndexBuildLimits,
     KeyIndexSectionHold, MAX_HEAD_CAS_ATTEMPTS, RequestCounters, SeriesIndexLimits,
     SeriesIndexOutcome, build_part_key_index, build_part_series_index, declared_key_index_fields,
-    head_object_key, is_series_index_field, key_index_leaf_limits,
-    metrics_label_index_leaf_bytes_cap, merge_series_index, newer_leaf_refusal,
+    head_object_key, is_series_index_field, key_index_leaf_limits, merge_series_index,
+    metrics_label_index_leaf_bytes_cap, newer_leaf_refusal,
 };
 use crate::snapshot_format::{
     self, key_index_leaf_format_version, key_index_leaf_prefix_range,

@@ -258,7 +258,10 @@ async fn load_series_carry(
         {
             return Err(format!("previous {name:?} leaf has another key type").into());
         }
-        if slices.iter().any(|leaf| leaf.part_blake3 != source.part.blake3) {
+        if slices
+            .iter()
+            .any(|leaf| leaf.part_blake3 != source.part.blake3)
+        {
             return Err(format!("field {name:?}: a leaf ref names another part").into());
         }
         select_key_index_slice(refs, name, &[0u8; 8])

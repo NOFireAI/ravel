@@ -1491,7 +1491,10 @@ async fn promql_query_range_routes_on_a_fold_built_series_index() {
     let on_gets = on.sealed_gets();
     for seq in 0..OBJECTS as usize {
         if HOLDERS.contains(&(seq as u64)) {
-            assert_eq!(on_gets[seq], off_gets[seq], "holder {seq} is read as before");
+            assert_eq!(
+                on_gets[seq], off_gets[seq],
+                "holder {seq} is read as before"
+            );
         } else {
             assert_eq!(on_gets[seq], 0, "non-holder {seq} is never opened");
         }

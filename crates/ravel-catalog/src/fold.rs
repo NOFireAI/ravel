@@ -55,12 +55,12 @@ use crate::snapshot_format::{
 use crate::tenant_config::DeclaredTypedColumn;
 
 mod series_index;
+pub(crate) use series_index::{
+    BuiltSeriesIndex, SeriesIndexLimits, SeriesIndexOutcome, build_part_series_index,
+    is_series_index_field,
+};
 #[cfg(test)]
 pub(crate) use series_index::{SeriesBuildRecord, take_series_build_log_for_test};
-pub(crate) use series_index::{
-    BuiltSeriesIndex, SeriesIndexLimits, SeriesIndexOutcome,
-    build_part_series_index, is_series_index_field,
-};
 
 /// RSEG section kinds needed to decode a segment's catalog
 /// (docs/segment-format.md `SectionKind`). Kinds 1/2 are v1
@@ -426,7 +426,9 @@ pub struct FoldReport {
     /// entry, that hold no key-index leaf ref for at least one field the
     /// tenant's key-index set names at fold time: the declared logs fields,
     /// spans `trace_id`, metrics `label_value` under
-    /// [`CatalogConfig::metrics_label_index`](crate::CatalogConfig::metrics_label_index),
+    /// [`CatalogConfig::metrics_label_index`](crate::CatalogConfig::metrics_label_index)
+    /// and the three series-index fields under
+    /// [`CatalogConfig::metrics_series_index`](crate::CatalogConfig::metrics_series_index),
     /// whether or not a metrics erasure request is pending. The fold never
     /// builds leaves for a part it carries (ADR-3939 decision 2), so such a
     /// part keeps its refs until `ravel-cli catalog fold --rebuild-key-index`
@@ -3238,9 +3240,7 @@ async fn fetch_verified_leaf(
     part_entry_count: u64,
     leaf: &SnapshotKeyIndexLeafRef,
     counters: &mut RequestCounters,
-    verify: impl FnOnce(
-        &[u8],
-    ) -> Result<KeyIndexLeafSummary, snapshot_format::KeyIndexLeafRejection>,
+    verify: impl FnOnce(&[u8]) -> Result<KeyIndexLeafSummary, snapshot_format::KeyIndexLeafRejection>,
 ) -> Result<(KeyIndexLeafSummary, Bytes), CarryFailure> {
     counters.get_requests += 1;
     counters.key_index_leaf_gets += 1;
@@ -3262,11 +3262,9 @@ async fn fetch_verified_leaf(
     {
         return Err(CarryFailure::Newer(newer_leaf_refusal(&leaf.key, version)));
     }
-    let summary = verify(&got.data).map_err(|e| {
-        match e.newer_version(signal) {
-            Some(version) => CarryFailure::Newer(newer_leaf_refusal(&leaf.key, version)),
-            None => CarryFailure::Unusable(format!("leaf {}: {e}", leaf.key)),
-        }
+    let summary = verify(&got.data).map_err(|e| match e.newer_version(signal) {
+        Some(version) => CarryFailure::Newer(newer_leaf_refusal(&leaf.key, version)),
+        None => CarryFailure::Unusable(format!("leaf {}: {e}", leaf.key)),
     })?;
     let expected = SnapshotKeyIndexLeafRef {
         key: String::new(),
@@ -7446,9 +7444,7 @@ impl Catalog {
                     held.offer(ordinal, || {
                         metrics_label_value_from_object(tenant, &data, &location)
                     });
-                    held.offer_series(ordinal, || {
-                        series_index::entry_series_of_catalog(&series)
-                    });
+                    held.offer_series(ordinal, || series_index::entry_series_of_catalog(&series));
                 }
                 Ok(names)
             }) {

@@ -6193,12 +6193,8 @@ mod tests {
         };
         assert!(!try_parse(&[]).expect("parses"), "off by default");
         assert!(try_parse(&["--metrics-series-index"]).expect("parses"));
-        assert!(
-            try_parse(&["--key-index-leaves", "--metrics-series-index"]).expect("parses")
-        );
-        assert!(
-            try_parse(&["--rebuild-key-index", "--metrics-series-index"]).expect("parses")
-        );
+        assert!(try_parse(&["--key-index-leaves", "--metrics-series-index"]).expect("parses"));
+        assert!(try_parse(&["--rebuild-key-index", "--metrics-series-index"]).expect("parses"));
         assert!(
             try_parse(&["--metrics-series-index", "--no-metrics-label-index"]).is_err(),
             "the series index needs the label index"

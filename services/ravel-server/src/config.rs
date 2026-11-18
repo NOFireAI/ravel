@@ -7585,10 +7585,7 @@ impl Cli {
                     "no_fold_metrics_label_index",
                     "--no-fold-metrics-label-index",
                 ),
-                (
-                    "fold_metrics_series_index",
-                    "--fold-metrics-series-index",
-                ),
+                ("fold_metrics_series_index", "--fold-metrics-series-index"),
             ] {
                 if passed(id) {
                     return Err(Self::command().error(

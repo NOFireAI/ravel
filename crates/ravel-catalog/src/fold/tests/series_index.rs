@@ -423,7 +423,10 @@ async fn the_series_fields_hold_exactly_the_fixture_series() {
     assert_eq!(head.parts.len(), 1);
     let part = &head.parts[0];
     assert_eq!(hex_encode(&part.blake3), GOLDEN_PART_BLAKE3);
-    assert_eq!(part_ordinals(store.as_ref(), part).await, fixture_ordinals());
+    assert_eq!(
+        part_ordinals(store.as_ref(), part).await,
+        fixture_ordinals()
+    );
     assert_eq!(
         leaf_fields(part),
         vec![
@@ -460,10 +463,7 @@ async fn the_series_fields_hold_exactly_the_fixture_series() {
     assert_eq!(
         leaves.label,
         BTreeMap::from([
-            (
-                pair(METRIC_NAME_LABEL, CPU_SECONDS),
-                skeys(&[A, B, E, F])
-            ),
+            (pair(METRIC_NAME_LABEL, CPU_SECONDS), skeys(&[A, B, E, F])),
             (pair(METRIC_NAME_LABEL, HTTP_REQUESTS), skeys(&[C, D])),
             (pair("instance", "i0"), skeys(&[A, C])),
             (pair("instance", "i1"), skeys(&[B, F])),
@@ -659,7 +659,10 @@ async fn a_failed_catalog_read_leaves_the_entry_uncovered_in_all_three_fields() 
     ] {
         assert_eq!(leaves.uncovered[field], vec![w3], "{field}");
     }
-    assert_eq!(leaves.uncovered[METRICS_LABEL_VALUE_FIELD], Vec::<u64>::new());
+    assert_eq!(
+        leaves.uncovered[METRICS_LABEL_VALUE_FIELD],
+        Vec::<u64>::new()
+    );
     // F, C, D, B, A, E by key. Writer 7 holds A and B, so B no longer
     // shares F's entry set and each series has a class of its own.
     assert_eq!(
@@ -833,7 +836,10 @@ pub(super) async fn assert_series_leaves_carried_equal_from_scratch() {
             ranged: vec![0, 1, 2, 3, 4, 5],
         }]
     );
-    assert_eq!(scratch_report.key_index_ranged_gets, 12, "{scratch_report:?}");
+    assert_eq!(
+        scratch_report.key_index_ranged_gets, 12,
+        "{scratch_report:?}"
+    );
     assert_eq!(scratch_part.blake3, carried_part.blake3);
     assert_eq!(scratch, carried, "from scratch");
 
