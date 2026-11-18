@@ -460,7 +460,9 @@ where
             } else {
                 "receipt-tokens (row-count check only)"
             };
-            let _ = &give_up;
+            // Both are read only inside the assertion below, which the default
+            // build compiles out.
+            let _ = (&give_up, shard_set);
             ravel_invariant::inv_sometimes!(
                 match receipt_commits_are_durable(store, tenant_id, signal, receipt, give_up).await
                 {

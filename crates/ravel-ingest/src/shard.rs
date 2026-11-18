@@ -984,8 +984,7 @@ impl FlushCtx {
         let deadline = self.clock.sleep(publish::EVIDENCE_HEAD_TIMEOUT);
         tokio::pin!(deadline);
         let mut due = due.into_iter();
-        loop {
-            let Some(abandoned) = due.next() else { break };
+        while let Some(abandoned) = due.next() {
             let head = tokio::select! {
                 head = self.store.head(&abandoned.commit_key) => head,
                 () = &mut deadline => {
@@ -1312,6 +1311,9 @@ impl FlushCtx {
             base_delay: self.config.put_retry_base_delay,
             max_delay: self.config.put_retry_max_delay,
         };
+        // Read only by the abandon-recording assertion below, which the default
+        // build compiles out.
+        let _ = tenant_hash;
         let mut attempt: u32 = 0;
         loop {
             if let Err(refused) = grant
