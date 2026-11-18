@@ -14,6 +14,15 @@ install.** The operator watches HorizontalPodAutoscalers from startup. Without
 the new permissions, reconciles of every RavelCluster are delayed by up to
 about a minute per failed watch. See the first entry under Changed.
 
+**Known issue: keep maintenance claims on wherever erasures run (#4449).**
+With `--maintain-claims off` on a maintain process, or with `ravel-cli
+maintain compact-bucket`, `compact-tenant` or `migrate` run with `--no-claim`
+beside a live fleet, an
+erasure that races a compaction or migrate of the same bucket can leave the
+erased sample served and some rows returned twice. With claims on, the
+default, the two are fenced. 0.33.0 has the same race; the fix is planned
+for 0.35.0.
+
 ### Added
 
 - **`stats.phases` reports a `fetch` phase for TopK late materialization's
