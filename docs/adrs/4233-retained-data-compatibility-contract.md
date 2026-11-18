@@ -1167,7 +1167,8 @@ that retired a reader would have started on data it may not read. The
 retired-reader gate now also lists `t/` when both markers are absent (one
 LIST, first page only) and refuses with `TenantDataWithoutMarkers`, naming
 `ravel-cli compat init`, when that page holds an object or a continuation
-token. A failed LIST refuses too. The refusal comes before any write, like
+token. A LIST that fails with a non-transient error, or keeps failing through
+the startup retries for transient ones, refuses too. The refusal comes before any write, like
 the `sys/tenancy` without `sys/compat` refusal. A store with neither marker
 and nothing under `t/` is still fresh and starts.
 
