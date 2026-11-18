@@ -15,10 +15,15 @@ written.
 | `init` | Creates the bucket and runs `ravel-cli store qualify`, then exits. |
 | `ravel1`, `ravel2` | `ravel-server --mode all`: ingest, SQL, and the scheduled fold every 15 s. |
 | `maint1`, `maint2` | `ravel-server --mode maintain`: the scheduled fold every 15 s, and compaction, retention and the sweep every 20 s. |
+| `s3proxy` | The `s3-proxy` binary of the driver image. Every ravel-server container reaches rustfs through it (`RAVEL_S3_ENDPOINT=http://s3proxy:9000`); `init`, the driver and its `ravel-cli` reach rustfs directly. It forwards every byte unchanged until the driver sets a rule over its control port (`s3proxy:9001`); see "The forced races". |
 | `driver` | The workload. The only container excluded from faults, and the only writer of the clock offset file. |
 
-Every container except `faketime` starts through `/faketime/run`, under
-libfaketime; see "The clock jump" and "The sweep jumps" below.
+Every container except `faketime` and `s3proxy` starts through
+`/faketime/run`, under libfaketime; see "The clock jump" and "The sweep jumps"
+below. `s3proxy` signs nothing and keeps no wall-clock state, so the real
+clock serves it. It is a container of its own, not a thread of the driver,
+because the driver is excluded from faults: a killed `s3proxy` is a network
+outage between the servers and the store, and it restarts with no rules.
 
 Does `--mode all` run maintenance? Only the fold. `Mode::runs_scheduled_fold`
 is true for `all` and `maintain`. Compaction, retention and the sweep
@@ -91,9 +96,12 @@ compaction record is seen the workload jumps the clock twice more.
 | `sweep` | `ravel-cli maintain sweep --tenant cm-tenant --signal logs --shard <0..3>`, which deletes what the GC rules allow. |
 | `jump_clock` | Rarely, once at least `CLOCK_JUMP_MIN_ACKED` (20) live writes are acked and no write is in flight, moves every clock forward by `CLOCK_JUMP_SECS`. Once per timeline. After that jump and once an audit decoded a compaction record, the same rule instead takes the sweep jumps below, also once per timeline. |
 | `corrupt_head` | Rarely, PUTs garbage over the HEAD through raw S3. A read then falls back to listing and the next fold rebuilds HEAD. |
+| `race_folds` | Rarely, once HEAD is known: one fold race ("The forced races"). |
+| `race_records` | Rarely, once HEAD is known: one record race ("The forced races"). |
+| `sweep_unfolded` | Rarely, once HEAD is known and at most once per timeline: the unfolded-record sweep ("The forced races"). |
 | `audit` | The store audit below. |
 | `check_bounds` | The upper-bound check below, on one node. |
-| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, folds, compacts, audits, takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, runs the full multiset check and ends the timeline. |
+| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs up to six fold races until a server fold lost its CAS, up to three record races until a server's record PUT lost, and the unfolded-record sweep unless one already reached its situation, then folds, compacts, audits, takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, runs the full multiset check and ends the timeline. |
 
 ### The multiset checks
 
@@ -182,6 +190,9 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: sweep deleted a superseded compaction input` | sometimes | `audit` | Evaluated once an audit holds a decoded compaction record: a commit record or data object of one of its inputs was in an earlier LIST, is absent from this one, a GET finds it absent, and no earlier audit counted it. |
 | `catalog: the audit checked the data objects the catalog resolves` | sometimes | `audit` | `rlog footprint` reported at least one data object. |
 | `catalog: a listed commit record decoded through ravel-cli` | sometimes | `audit` | A listed level-0 commit record decoded through `commit decode`. |
+| `catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead` | sometimes | `race_folds`, `eventually` | The skewed `ravel-cli` fold rebuilt HEAD with the hour ahead sealed, and a server's on-demand fold reported a lost CAS after a PUT. |
+| `catalog: a server's compaction record PUT lost to a concurrent compaction` | sometimes | `race_records`, `eventually` | The record key the held server PUT names was in the store before the driver released that PUT. |
+| `catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it` | sometimes | `sweep_unfolded`, `eventually` | HEAD's bytes were the same after both jumps and the servers' sweeps as before the compaction, the record was still there, and the store held at least one of its inputs before the jumps. |
 | `clock: the driver's clock jumped forward` | reachable | `jump_clock`, `eventually` | The jump reached the driver's own clock. |
 | `clock: the clocks jumped past the sweep's protection horizon and pinned-query window` | reachable | `jump_clock`, `eventually` | Both sweep jumps reached the driver's own clock. |
 | `catalog: an on-demand sweep succeeded` | reachable | `sweep`, the sweep jumps, `eventually` | `maintain sweep` exited 0. |
@@ -271,9 +282,130 @@ compaction record was published`, `clock: the clocks jumped past the sweep's
 protection horizon and pinned-query window` and `catalog: sweep deleted a
 superseded compaction input` held; and all six clock probes (`date` in
 rustfs, ravel1, ravel2, maint1 and maint2, and the `Last-Modified` rustfs
-stamps on a probe PUT) read at least the three jumps' total minus 60 s ahead
-of the host.
+stamps on a probe PUT) read at least the total of the three jumps and every
+forced-race move ("The forced races") minus 60 s ahead of the host.
 The last line is `clock jump: PASS` or `clock jump: FAIL`.
+
+## The forced races
+
+Three mutants change what a server does only in a situation that faults
+and the planned jumps alone rarely or never produce: `lost-cas-proceeds`
+needs a fold that loses its HEAD CAS to a HEAD it did not build,
+`compaction-loser-overwrites` needs a compaction record PUT that loses to a
+concurrent compaction of the same bucket, and
+`sweep-superseded-no-head-gate` needs a full sweep pass past a compaction
+record's protection horizon and pinned-query window while HEAD has not
+folded the record. Each mutant's property is evaluated only there, so a run
+that never gets there passes the mutant (ADR-4326 decision 3). The driver
+forces each situation with a rule (`race_folds`, `race_records`,
+`sweep_unfolded`), runs each again in the `eventually` until it was reached
+once, and asserts reaching it as a sometimes-assertion that `local-run.sh`
+requires in a plain run.
+
+Every step is something the system must survive anyway: every clock moves
+forward together, never back; a `ravel-cli` maintenance run happens
+concurrently with the servers', which the CLI documents as safe; a store
+answers some PUTs late or refuses them. Each rule holds the driver's write
+gate throughout, so no live write and no planned jump lands inside a race.
+Each clock move outside the planned jumps prints `clock: moved forward by
+<N> s outside the planned jumps (<reason>)`, and the local loop adds those
+moves to the offset it expects.
+
+### The fold race (`lost-cas-proceeds`)
+
+1. Move every clock forward so the next fold seal is 150 s away (60 to
+   225 s is the race's window).
+2. PUT garbage over HEAD through raw S3, so every fold rebuilds from the
+   listing and the on-demand fold route passes its rate gate.
+3. Start `ravel-cli catalog fold --json` with its clock 240 s ahead of every
+   other clock (`FAKETIME=+<offset + 240>`), inside the 300 s
+   `clock_skew_allowance` the seal margin is sized for: it seals the hour
+   that seals next, and the servers do not yet.
+4. A fraction into the window the last race's timings give, `POST
+   /api/v1/admin/fold` on `ravel1` and `ravel2`.
+5. A server fold lost to the skewed fold when the CLI rebuilt with the hour
+   ahead sealed and the server answered `lost_cas` after a PUT. Asserted as
+   `catalog: a server fold lost its HEAD CAS to a fold one sealed hour
+   ahead`, and the SUT's own `catalog: fold HEAD CAS lost` is required too.
+
+Why legitimate: a clock 240 s ahead is inside the skew the seal margin
+allows, so the skewed fold seals nothing an acknowledged write can still land
+in, and two folds of one HEAD racing their CAS is the TLA model's fold
+interleaving.
+
+### The record race (`compaction-loser-overwrites`)
+
+1. Find a `(hour, shard)` bucket of the current or previous hour with two or
+   more level-0 commit records and no compaction record, after up to 16 live
+   writes if none has one.
+2. `s3proxy`: `pass`, then `hold-record`: the next PUT of a compaction record
+   key from any server is held, unsent, until `release` or 18 s.
+3. Move every clock forward until that hour is sealed for compaction (hour
+   end + `max_flush_lifetime + clock_skew_allowance`, 3900 s, plus 30 s).
+   `maint1`/`maint2` compact it and send the record's create-only PUT, which
+   the proxy holds.
+4. Poll `held` every 250 ms for up to 120 s. A held PUT of another key, or
+   one older than 6 s when first seen, is released and the next one held.
+5. Run `ravel-cli maintain compact-bucket --shard <s> --hour <h> --no-claim`
+   on the held record's bucket. It plans from the same sealed inputs and
+   publishes the same record key with its own `created` time.
+6. Once the CLI finished or the held PUT is 14 s old, GET the record key,
+   then `release`. The server's create-only PUT reaches rustfs after the
+   CLI's and answers `AlreadyExists`; clean code GETs the winner and
+   converges, the mutant PUTs its own bytes over it, and the SUT's
+   `catalog: a published compaction record is never replaced` goes false.
+7. `pass`. Asserted as `catalog: a server's compaction record PUT lost to a
+   concurrent compaction` when the record was in the store before the
+   release.
+
+Why legitimate: the hold is a network delay of one request after the
+sender's last LIST, shorter than the server's 20 s request timeout. Two
+compactions of one sealed bucket racing to its create-only record PUT is the
+interleaving the TLA model and `--no-claim` both allow: the record's
+create-if-absent decides the winner.
+
+### The unfolded-record sweep (`sweep-superseded-no-head-gate`)
+
+1. Find a compactable bucket as above.
+2. `s3proxy`: `pass`, then `refuse-records`: every server's compaction record
+   PUT answers `503 SlowDown`.
+3. Move every clock forward until the hour is sealed for the fold (hour end
+   + 4800 s, plus 30 s), fold through `ravel-cli` until HEAD's watermark
+   reaches the hour, and check the bucket is still compactable (the servers'
+   compactions published nothing).
+4. `s3proxy`: `refuse-key <HEAD key>`: every server's HEAD PUT answers 503,
+   so no server fold can fold a new record into HEAD. GET HEAD's bytes.
+5. `ravel-cli maintain compact-bucket --no-claim` publishes the bucket's one
+   record. Decode its inputs (`commit decode-compaction`) and LIST the
+   tenant prefix.
+6. Move every clock forward by `CLOCK_SWEEP_HORIZON_JUMP_SECS` (91200 s),
+   past the record's protection horizon, and wait 150 s: the servers' sweeps
+   pass the horizon. Clean code finds the inputs named by HEAD and keeps them;
+   the mutant takes the HEAD gate as clear and writes their unnamed-since
+   markers.
+7. Move every clock forward by 22200 s: past the 4830 s pinned-query window
+   since those markers, and past `DEFAULT_INTERIOR_REVERIFY_NS` (6 h), so the
+   next pass of each `maint` process is a full-keyspace sweep that reaches the
+   record's hour, now interior. Wait up to 150 s, ending early when an input
+   is gone. The mutant deletes one, and the SUT's `catalog: a sweep never
+   deletes an object the current HEAD names` goes false.
+8. Assert `catalog: the clocks passed a compaction record's protection horizon
+   and pinned-query window while HEAD had not folded it` when HEAD's bytes did
+   not change, the record is still there and the store held some input
+   before the jumps. Run the store audit, whose `catalog: every object HEAD
+   names exists` also catches a deleted input. Then `pass`.
+
+Why legitimate: refused PUTs are store faults the servers must tolerate, the
+clocks only move forward, and the CLI compaction is an ordinary concurrent
+compaction. The deleting pass is the servers' own scheduled sweep. Clean code
+keeps every input, because HEAD still names it.
+
+The proxy (`driver/src/proxy.rs`, `driver/src/bin/s3_proxy.rs`) forwards
+every byte unchanged, Host header included, so each SigV4 signature still
+verifies at rustfs, and parses only request heads, to frame bodies and to
+match a PUT's key against the rules. Only PUTs are judged. A killed or
+restarted proxy has no rules, so a race it interrupts leaves the servers on
+the plain path and the race reports not reached.
 
 ## Mutants
 
@@ -300,10 +432,11 @@ literal, so either literal going false counts. The `.tsv` names the first.
 Only the four ravel-server containers run a mutant. The driver's on-demand
 fold, compaction and sweep go through `ravel-cli`, which no image builds
 with `antithesis-mutants`, so a mutant fires only in the servers' scheduled
-folds (all four) and in `maint1`/`maint2`'s compaction and sweep. The sweep
-and corrupt-HEAD mutants need a sweep that reaches a delete, so they fire
-only after the sweep jumps ("The sweep jumps"); the corrupt-HEAD one also
-needs the driver's `corrupt_head` rule to land before a scheduled sweep.
+folds (all four) and in `maint1`/`maint2`'s compaction and sweep. The corrupt-HEAD mutant
+needs a sweep that reaches a delete, so it fires only after the sweep jumps
+("The sweep jumps"), and needs the driver's `corrupt_head` rule to land
+before a scheduled sweep. The lost-CAS, record-overwrite and sweep mutants
+need the situations "The forced races" put the servers in.
 
 `MUTANTS=1 scripts/build.sh` builds the mutant images:
 `ravel-antithesis-server:catalog-maintenance-mutants`, whose ravel-server is
@@ -347,33 +480,76 @@ self-check and a mutant run cannot be combined.
 description and `--param attrs.mutant=<name>`; a plain run passes
 `attrs.mutant=none`.
 
+## The expected set
+
+The ravel-server binary in the server image carries every area's
+assertions, not only the catalog's: the `commit: ` always-type assertions
+are registered in it, and Antithesis counts one that no process
+reached as failing. This workload drives the catalog area only, so it is
+judged against the areas it owns (ADR-4326, per-workload amendment):
+
+- the areas whose mutants `formal/tla/catalog/antithesis-mutants.tsv` names
+  (the part of the mutant column before `/`, today `catalog`), matched as the
+  literal prefix `<area>: `;
+- every assertion the workload's own driver declares (`sdk-driver.jsonl`),
+  which covers the `clock: ` literals.
+
+The prefix is the exact test: every catalog literal in the SUT
+(`crates/ravel-catalog/src/fold.rs`, `crates/ravel-maintain/src/{publish,
+sweep,reachability}.rs`) starts with `catalog: `, and every driver literal
+with `catalog: ` or `clock: `. The sixth column of
+`formal/tla/catalog/traceability.md` is not: it names only the properties
+that carry a TLA invariant, not the reachability and exploration assertions
+around them.
+
+`local-run.sh` splits `never-hit.tsv` into `never-hit-owned.tsv`, each line
+a gate failure, and `never-hit-other-areas.tsv`, printed under "not this
+workload's" and never a failure.
+
+Triage of an Antithesis report applies the same rule. An always-type
+assertion that "was never hit" and starts with neither an owned prefix nor
+`clock: ` (the `commit: ` ones, for example) is another workload's to reach;
+note it and move on. A violated assertion is a finding whatever its area,
+since a false evaluation means the code reached it, and so is an owned one
+never hit.
+
 ## Build, run locally, launch
 
 The same steps as ingest-durability, from this directory's `scripts/`:
 
 - `scripts/build.sh [server|driver|all]`. The driver's build context is
   `antithesis/` and it copies `ravel-cli` from the server image, so build the
-  server first.
+  server first. The driver image also carries `s3-proxy`, which the
+  instrumentation check covers like `driver`.
 - `scripts/local-run.sh <out-dir> [seconds]` starts the stack under the
   run's compose file, runs the workload for `seconds` (default 240) before
   the driver's forced `eventually`, and exits 0 only if all of these hold:
   - `faketime` and `init` exited 0, and setup completed within 900 s;
   - the driver was still running after setup, then exited 0 having logged
     `eventually: ending the timeline`;
-  - every other container is running or exited 0;
-  - the offset file holds the three jumps' total, and every clock probe read
-    a number at least that total minus 60 s ahead of the host
-    (`clock-probe.txt`);
+  - every other container (`s3proxy` included) is running or exited 0;
+  - the offset file holds the total of the three jumps and every move the
+    driver's log reports as `clock: moved forward by <N> s outside the
+    planned jumps`, and every clock probe read a number at least that total
+    minus 60 s ahead of the host (`clock-probe.txt`);
   - every container's SDK output was collected;
-  - no always-type assertion was violated (`violated.tsv`), and none that
-    must be hit was never hit (`never-hit.tsv`);
+  - no always-type assertion was violated (`violated.tsv`), and none of this
+    workload's that must be hit was never hit (`never-hit-owned.tsv`; see
+    "The expected set" below);
   - `catalog: the workload starts`, `clock: the driver's clock jumped
     forward`, `catalog: a sealed seeded hour was folded into HEAD`, `clock:
     an hour ingested live was sealed by a fold`, `catalog: a compaction
     record was published`, `clock: the clocks jumped past the sweep's
     protection horizon and pinned-query window`, `catalog: an on-demand
     sweep succeeded` and `catalog: sweep deleted a superseded compaction
-    input` each held.
+    input` each held, and so did each forced race's situation ("The forced
+    races"): `catalog: fold HEAD CAS lost`, `catalog: a server fold lost
+    its HEAD CAS to a fold one sealed hour ahead`, `catalog: a server's
+    compaction record PUT lost to a concurrent compaction` and `catalog: the
+    clocks passed a compaction record's protection horizon and pinned-query
+    window while HEAD had not folded it`.
+- The local loop's bound on the driver's run after setup is `seconds` plus
+  4200 s: the `eventually` runs the forced races before its fold.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
   self-check. The model expects one seeded record moved to another write, so
   `catalog: compaction preserves the acked multiset` must appear in
@@ -429,4 +605,6 @@ The driver adds `arrow-array`, `arrow-schema` and `parquet` (major version
 59, the major the repository root's Cargo.lock pins at 59.3.0) to write the
 seed file. The driver has its own Cargo.lock, which resolves them to 59.3.3.
 It reuses the ingest-durability driver's model and client through a path
-dependency.
+dependency. It names `reqwest` 0.13 (`blocking`, `json`) directly, for the
+fold race's on-demand fold posts; the ingest-durability driver already
+builds that version with those features, so the lock gains no new package.
