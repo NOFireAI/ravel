@@ -1115,6 +1115,100 @@ mod tests {
         assert_eq!(floor(store.as_ref()).await, Some(V_SEG));
     }
 
+    /// Background migrate takes the bucket claim the maintenance tick takes, as
+    /// this process on the process clock, and takes none with
+    /// `--maintain-claims off`.
+    ///
+    /// A bucket holds a commit below the active version, and another process
+    /// holds its claim, written by the store's clock one second before the
+    /// process clock reads. With claims on, the walk stands down for that live
+    /// claim. With claims off it takes no claim and goes on to the rewrite.
+    ///
+    /// DISTINGUISHING, wrong implementations this rules out:
+    ///  1. a walk run on the base configuration, which carries no participant,
+    ///     never stands down: the claims-on assertion fails.
+    ///  2. a participant on the wall clock, years past the holder's lease,
+    ///     steals the claim instead of standing down: the claims-on assertion
+    ///     fails.
+    ///  3. a walk that turns coordination on whatever `--maintain-claims` says
+    ///     stands down with claims off too: the claims-off assertion fails.
+    #[tokio::test]
+    async fn background_migrate_takes_the_ticks_claim_unless_claims_are_off() {
+        let now = NOW1 + 10 * HOUR;
+        let lease = Duration::from_secs(300);
+        let store = Arc::new(MemoryStore::with_page_size(2));
+        seed_rseg(&store).await;
+        let commit = seed_commit(&store, V_SEG - 1, NOW1).await;
+        let hour = u32::try_from(NOW1 / HOUR).expect("hour");
+        store.set_clock_ms(u64::try_from((now - 1_000_000_000) / 1_000_000).expect("ms"));
+        let holder = ravel_maintain::claim_guard::ClaimGuard::new(
+            &ravel_maintain::Bucket::new(tenant(), Signal::Metrics, 0, hour),
+            &ravel_maintain::ClaimParticipant::new(
+                Uuid::from_u128(0xC1A1),
+                Arc::new(FixedClock::new(now)) as Arc<dyn Clock>,
+            ),
+            ravel_fleet::claim::ClaimConfig {
+                lease_duration: lease,
+                ..ravel_fleet::claim::ClaimConfig::default()
+            },
+            None,
+        );
+        assert!(matches!(
+            holder
+                .acquire(store.as_ref())
+                .await
+                .expect("holder acquires"),
+            ravel_maintain::claim_guard::Acquire::Acquired
+        ));
+
+        let clock = FixedClock::new(now);
+        let mut ctx = context(store.clone(), &clock);
+        crate::compat::refresh_once(&ctx.view).await;
+        let base = CompactorConfig {
+            compat_policy: Some(ravel_maintain::MaintainCompatPolicy::new(
+                ctx.view.clone(),
+                Arc::new(ViewClock(clock.clone())),
+            )),
+            claim_lease_duration: lease,
+            ..CompactorConfig::default()
+        };
+        let stood_down = |report: &CompatMaintainReport| {
+            let [unit] = report.migrate.as_slice() else {
+                panic!("one provisioned signal, one unit: {report:?}");
+            };
+            match &unit.outcome {
+                Ok(BackgroundMigrateOutcome::Walked { report, .. }) => {
+                    report.not_migrated.iter().any(|bucket| {
+                        matches!(
+                            bucket.reason,
+                            ravel_maintain::NotMigratedReason::ClaimSkipped { .. }
+                        )
+                    })
+                }
+                _ => false,
+            }
+        };
+        let live = [ctx.worker.process_id()];
+
+        for (claims, stands_down) in [
+            (crate::config::MaintainClaimsArg::On, true),
+            (crate::config::MaintainClaimsArg::Off, false),
+        ] {
+            ctx.compactor = Arc::new(CompactorConfig {
+                coordination: claims.mode(),
+                ..base.clone()
+            });
+            let mut report = CompatMaintainReport::default();
+            run_background_migrate(&ctx, &live, BACKGROUND_MIGRATE_BUDGET, &mut report).await;
+            assert_eq!(report.migrate_error, None);
+            assert_eq!(
+                stood_down(&report),
+                stands_down,
+                "--maintain-claims {claims:?}, commit {commit}: {report:?}"
+            );
+        }
+    }
+
     /// A contradicted certificate is never finalization-pending, even with its
     /// watermark at the certified time: certify starts a census on it rather
     /// than finishing floor raises. A state that dropped the `contradicted`
