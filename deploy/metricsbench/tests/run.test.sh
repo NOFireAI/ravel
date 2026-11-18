@@ -445,7 +445,17 @@
 #                                       box-run.sh, sourced: the band file
 #                                       per profile (refused for cardinality
 #                                       without MB_STAGE1_BANDS) and
-#                                       stage1_check's status and kept output
+#                                       stage1_check's status and kept output;
+#                                       ci_smoke's and measured_run's run.sh
+#                                       argv and MB_L1_MAX_PART_BYTES with
+#                                       RAVEL_ONLY and L1_MAX_PART_BYTES set,
+#                                       0 and unset
+#                                       launch.sh with an aws stub: each
+#                                       MB_RAVEL_ONLY and MB_L1_MAX_PART_BYTES
+#                                       refusal exits 64 before any aws call;
+#                                       the history Ravel-only launch's user
+#                                       data; the env block's keys unchanged
+#                                       without them
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -4781,6 +4791,183 @@ if grep -qxF '  stage1_check /mb/out-run "$run_bands" || check=$?' "${BOXRUN}" &
 else
   fail "box-run: the measured run's band check or its exits are not wired"
 fi
+
+# --- box-run.sh's two run.sh invocations (issue #4476) -----------------------------
+# box_runs NAME [VAR=VALUE ...]: ci_smoke and measured_run from a scratch tree
+# whose deploy/metricsbench/run.sh is a stub writing its argv, one per line, to
+# NAME-ci.argv and NAME-measured.argv, and its MB_L1_MAX_PART_BYTES to .env.
+box_runs() {
+  local name="$1"
+  shift
+  BOX_RUNS="${TMP}/box-runs-${name}"
+  mkdir -p "${BOX_RUNS}/deploy/metricsbench"
+  cat >"${BOX_RUNS}/deploy/metricsbench/run.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"${BOX_RUN_LOG}.argv"
+printf 'MB_L1_MAX_PART_BYTES=%s\n' "${MB_L1_MAX_PART_BYTES-<unset>}" >"${BOX_RUN_LOG}.env"
+STUB
+  chmod +x "${BOX_RUNS}/deploy/metricsbench/run.sh"
+  (
+    cd "${BOX_RUNS}" || exit 1
+    unset RAVEL_ONLY L1_MAX_PART_BYTES STAGE1_ARMS CONTROL_IMAGE CONTROL_SOURCE_COMMIT MB_L1_MAX_PART_BYTES
+    export RAVEL_IMAGE=img RAVEL_SOURCE_COMMIT=src PROFILE=history ANCHOR_MS=1 RSS_BAND=rss OBJECTS_BAND=1:2
+    [ "$#" -eq 0 ] || export "$@"
+    . "${BOXRUN}"
+    BOX_RUN_LOG="${BOX_RUNS}/ci" ci_smoke --real-s3-bucket-prefix p-ci --real-s3-region r
+    BOX_RUN_LOG="${BOX_RUNS}/measured" measured_run --real-s3-bucket-prefix p --real-s3-region r
+  ) >"${BOX_RUNS}.out" 2>&1
+}
+box_argv() { tr '\n' ' ' <"${BOX_RUNS}/$1.argv" 2>/dev/null; }
+BOX_CI_ARGV="--profile ci --ravel-image img --ravel-source-commit src --bin-dir target/release --out-dir /mb/out-ci --real-s3-bucket-prefix p-ci --real-s3-region r "
+BOX_MEASURED_HEAD="--profile history --ravel-image img --ravel-source-commit src --bin-dir target/release --out-dir /mb/out-run --anchor-ms 1"
+box_runs ro RAVEL_ONLY=1 L1_MAX_PART_BYTES=1048576
+if [ "$(box_argv measured)" = "${BOX_MEASURED_HEAD} --ravel-only --ravel-objects-band 1:2 --real-s3-bucket-prefix p --real-s3-region r " ] &&
+  grep -qxF 'MB_L1_MAX_PART_BYTES=1048576' "${BOX_RUNS}/measured.env"; then
+  pass "box-run: RAVEL_ONLY=1 runs the measured profile with --ravel-only in place of --rss-band, and L1_MAX_PART_BYTES reaches it as MB_L1_MAX_PART_BYTES"
+else
+  fail "box-run ro measured: argv '$(box_argv measured)', env $(cat "${BOX_RUNS}/measured.env" 2>&1), out $(cat "${BOX_RUNS}.out")"
+fi
+if [ "$(box_argv ci)" = "${BOX_CI_ARGV}" ] && grep -qxF 'MB_L1_MAX_PART_BYTES=<unset>' "${BOX_RUNS}/ci.env"; then
+  pass "box-run: with RAVEL_ONLY=1 the ci smoke still runs without --ravel-only or MB_L1_MAX_PART_BYTES"
+else
+  fail "box-run ro ci: argv '$(box_argv ci)', env $(cat "${BOX_RUNS}/ci.env" 2>&1)"
+fi
+for c in unset zero; do
+  if [ "$c" = unset ]; then box_runs "${c}"; else box_runs "${c}" RAVEL_ONLY=0; fi
+  if [ "$(box_argv measured)" = "${BOX_MEASURED_HEAD} --rss-band rss --ravel-objects-band 1:2 --real-s3-bucket-prefix p --real-s3-region r " ] &&
+    grep -qxF 'MB_L1_MAX_PART_BYTES=' "${BOX_RUNS}/measured.env" &&
+    [ "$(box_argv ci)" = "${BOX_CI_ARGV}" ] && grep -qxF 'MB_L1_MAX_PART_BYTES=<unset>' "${BOX_RUNS}/ci.env"; then
+    pass "box-run: RAVEL_ONLY ${c} leaves both argvs as before, --rss-band on the measured run and MB_L1_MAX_PART_BYTES empty"
+  else
+    fail "box-run ${c}: measured '$(box_argv measured)', ci '$(box_argv ci)', out $(cat "${BOX_RUNS}.out")"
+  fi
+done
+if grep -qxF 'ci_smoke ${ci_args[@]+"${ci_args[@]}"} || code=$?' "${BOXRUN}" &&
+  grep -qxF 'measured_run ${store_args[@]+"${store_args[@]}"} || code=$?' "${BOXRUN}"; then
+  pass "box-run: the box runs ci_smoke and measured_run"
+else
+  fail "box-run: the box does not run ci_smoke and measured_run"
+fi
+
+# --- launch.sh's MB_RAVEL_ONLY and MB_L1_MAX_PART_BYTES (issue #4476) --------------
+# An aws stub logs every call and keeps the user data run-instances is given,
+# so a refusal is proved to come before any aws call by an absent log.
+LAUNCH="${HERE}/../aws/launch.sh"
+LAUNCH_BIN="${TMP}/launch-bin"
+mkdir -p "${LAUNCH_BIN}"
+cat >"${LAUNCH_BIN}/aws" <<'STUB'
+#!/usr/bin/env bash
+printf 'aws %s\n' "$*" >>"${LAUNCH_AWS_LOG}"
+prev=""
+for a in "$@"; do
+  [ "${prev}" != --user-data ] || cp "${a#file://}" "${LAUNCH_USER_DATA}"
+  prev="${a}"
+done
+case "$1 $2" in
+  "ssm get-parameter") echo ami-stub ;;
+  "ec2 run-instances") echo i-stub ;;
+esac
+STUB
+chmod +x "${LAUNCH_BIN}/aws"
+# launch NAME [VAR=VALUE ...] [-- real-s3-prefix]: launch.sh with the required
+# variables and no other MB_ one; rc, LAUNCH_ERR, LAUNCH_AWS_LOG and
+# LAUNCH_USER_DATA.
+launch() {
+  local name="$1" prefix=()
+  shift
+  local vars=()
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = -- ]; then
+      prefix=("$2")
+      break
+    fi
+    vars+=("$1")
+    shift
+  done
+  LAUNCH_ERR="${TMP}/launch-${name}.err"
+  LAUNCH_AWS_LOG="${TMP}/launch-${name}.aws"
+  LAUNCH_USER_DATA="${TMP}/launch-${name}.user-data"
+  rc=0
+  (
+    unset MB_PROFILE MB_STAGE1 MB_STAGE1_BANDS MB_STAGE1_ARMS MB_CONTROL_IMAGE MB_CONTROL_SOURCE_COMMIT \
+      MB_RAVEL_ONLY MB_L1_MAX_PART_BYTES MB_RSS_BAND MB_OBJECTS_BAND MB_REPO AWS_DEFAULT_REGION AWS_PROFILE
+    export LAUNCH_AWS_LOG LAUNCH_USER_DATA PATH="${LAUNCH_BIN}:${PATH}" AWS_REGION=eu-west-1 \
+      MB_RESULTS_BUCKET=results MB_SUBNET_ID=subnet MB_SECURITY_GROUP_ID=sg MB_INSTANCE_PROFILE=role
+    [ "${#vars[@]}" -eq 0 ] || export "${vars[@]}"
+    bash "${LAUNCH}" HEAD "${IMAGE}" "${COMMIT}" "${ANCHOR}" t ${prefix[@]+"${prefix[@]}"}
+  ) >/dev/null 2>"${LAUNCH_ERR}" || rc=$?
+}
+# expect_launch_refused NAME MESSAGE: exit 64, MESSAGE on stderr, no aws call.
+expect_launch_refused() {
+  if [ "${rc}" -eq 64 ] && grep -qxF "$2" "${LAUNCH_ERR}" && [ ! -e "${LAUNCH_AWS_LOG}" ]; then
+    pass "launch $1: refused with 64 before any aws call"
+  else
+    fail "launch $1: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), aws calls $(cat "${LAUNCH_AWS_LOG}" 2>/dev/null)"
+  fi
+}
+# The history bands are set throughout, so no refusal below is the missing
+# band one.
+HIST=(MB_PROFILE=history MB_RSS_BAND=x:1:2 MB_OBJECTS_BAND=1:2 MB_STAGE1_BANDS=deploy/metricsbench/stage1-bands.ci.json)
+RO_HIST=(MB_PROFILE=history MB_OBJECTS_BAND=1:2 MB_STAGE1_BANDS=deploy/metricsbench/stage1-bands.ci.json MB_RAVEL_ONLY=1 MB_STAGE1=1 MB_STAGE1_ARMS=l1)
+RO_NEEDS="MB_RAVEL_ONLY=1 runs the Stage 1 l1 arm alone and needs MB_STAGE1=1 MB_STAGE1_ARMS=l1"
+launch ro-no-stage1 "${HIST[@]}" MB_RAVEL_ONLY=1
+expect_launch_refused "MB_RAVEL_ONLY=1 without MB_STAGE1" "${RO_NEEDS}"
+launch ro-no-arms "${HIST[@]}" MB_RAVEL_ONLY=1 MB_STAGE1=1
+expect_launch_refused "MB_RAVEL_ONLY=1 without MB_STAGE1_ARMS" "${RO_NEEDS}"
+launch ro-two-arms "${HIST[@]}" MB_RAVEL_ONLY=1 MB_STAGE1=1 MB_STAGE1_ARMS=l1,erasure
+expect_launch_refused "MB_RAVEL_ONLY=1 with MB_STAGE1_ARMS=l1,erasure" "${RO_NEEDS}"
+launch ro-cardinality MB_RAVEL_ONLY=1 MB_STAGE1=1 MB_STAGE1_ARMS=l1 MB_STAGE1_BANDS=deploy/metricsbench/stage1-bands.cardinality.json
+expect_launch_refused "MB_RAVEL_ONLY=1 on cardinality" "MB_RAVEL_ONLY=1 runs on the history and ci profiles only, not MB_PROFILE=cardinality"
+launch ro-control "${RO_HIST[@]}" "MB_CONTROL_IMAGE=${IMAGE}" "MB_CONTROL_SOURCE_COMMIT=${COMMIT}"
+expect_launch_refused "MB_RAVEL_ONLY=1 with MB_CONTROL_IMAGE" "MB_RAVEL_ONLY=1 with MB_CONTROL_IMAGE: the control arm compares two Ravel builds over passes the Ravel-only shape does not run"
+launch ro-rss "${RO_HIST[@]}" MB_RSS_BAND=x:1:2
+expect_launch_refused "MB_RAVEL_ONLY=1 with MB_RSS_BAND" "MB_RAVEL_ONLY=1 with MB_RSS_BAND: run.sh --ravel-only refuses --rss-band"
+launch ro-real-s3 "${RO_HIST[@]}" -- mbprefix
+expect_launch_refused "MB_RAVEL_ONLY=1 with a real-s3-prefix" "MB_RAVEL_ONLY=1 with a real-s3-prefix: run.sh --ravel-only refuses the real-S3 lane"
+launch ro-no-objects "${RO_HIST[@]}" MB_OBJECTS_BAND=
+expect_launch_refused "MB_RAVEL_ONLY=1 without MB_OBJECTS_BAND" "MB_RAVEL_ONLY=1 with MB_PROFILE=history needs MB_OBJECTS_BAND set for it; the default is cardinality's"
+launch ro-two MB_RAVEL_ONLY=2
+expect_launch_refused "MB_RAVEL_ONLY=2" "MB_RAVEL_ONLY must be 1, 0 or unset, not '2'"
+launch history-stage1 "${HIST[@]}" MB_STAGE1=1 MB_STAGE1_ARMS=l1
+expect_launch_refused "MB_STAGE1=1 on history without MB_RAVEL_ONLY" "MB_STAGE1=1 with MB_PROFILE=history needs MB_RAVEL_ONLY=1 MB_STAGE1_ARMS=l1"
+CI_L1=(MB_PROFILE=ci MB_RSS_BAND=x:1:2 MB_OBJECTS_BAND=1:2 MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour,l1)
+for v in 0 -1 abc 01 1.5; do
+  launch "l1-bytes-${v}" "${CI_L1[@]}" "MB_L1_MAX_PART_BYTES=${v}"
+  expect_launch_refused "MB_L1_MAX_PART_BYTES=${v}" "MB_L1_MAX_PART_BYTES must be a positive integer, not '${v}'"
+done
+L1_NEEDS="MB_L1_MAX_PART_BYTES sets the l1 arm's compaction and needs MB_STAGE1=1 with l1 in MB_STAGE1_ARMS"
+launch l1-bytes-no-arm MB_PROFILE=ci MB_RSS_BAND=x:1:2 MB_OBJECTS_BAND=1:2 MB_STAGE1=1 MB_STAGE1_ARMS=extra-hour MB_L1_MAX_PART_BYTES=1048576
+expect_launch_refused "MB_L1_MAX_PART_BYTES without the l1 arm" "${L1_NEEDS}"
+launch l1-bytes-no-stage1 MB_PROFILE=ci MB_RSS_BAND=x:1:2 MB_OBJECTS_BAND=1:2 MB_L1_MAX_PART_BYTES=1048576
+expect_launch_refused "MB_L1_MAX_PART_BYTES without MB_STAGE1" "${L1_NEEDS}"
+# launch_env: the keys and values of the user data's /mb/env block, one per line.
+launch_env() { sed -n "/^cat >\/mb\/env <<'ENV'\$/,/^ENV\$/p" "${LAUNCH_USER_DATA}" | sed '1d;$d'; }
+launch ro-history "${RO_HIST[@]}" MB_L1_MAX_PART_BYTES=1048576
+if [ "${rc}" -eq 0 ] && grep -qF 'ec2 run-instances' "${LAUNCH_AWS_LOG}" &&
+  launch_env | grep -qxF 'RAVEL_ONLY=1' && launch_env | grep -qxF 'L1_MAX_PART_BYTES=1048576' &&
+  launch_env | grep -qxF 'PROFILE=history' && launch_env | grep -qxF 'STAGE1_ARMS=l1' && launch_env | grep -qxF "RSS_BAND=''"; then
+  pass "launch: the history Ravel-only launch is accepted and its user data carries RAVEL_ONLY=1, L1_MAX_PART_BYTES and no RSS band"
+else
+  fail "launch ro-history: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), env $(launch_env 2>&1)"
+fi
+LAUNCH_KEYS="BUCKET PREFIX SRC_SHA256 BOXRUN_SHA256 HARNESS_COMMIT RAVEL_IMAGE RAVEL_SOURCE_COMMIT ANCHOR_MS PROFILE RSS_BAND OBJECTS_BAND REAL_S3_PREFIX STAGE1 STAGE1_BANDS STAGE1_ARMS CONTROL_IMAGE CONTROL_SOURCE_COMMIT AWS_DEFAULT_REGION "
+launch l1-ci "${CI_L1[@]}" MB_L1_MAX_PART_BYTES=4096
+if [ "${rc}" -eq 0 ] && [ "$(launch_env | cut -d= -f1 | tr '\n' ' ')" = "${LAUNCH_KEYS}L1_MAX_PART_BYTES " ] &&
+  launch_env | grep -qxF 'L1_MAX_PART_BYTES=4096'; then
+  pass "launch: MB_L1_MAX_PART_BYTES on ci reaches the user data alone, with no RAVEL_ONLY"
+else
+  fail "launch l1-ci: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), env $(launch_env 2>&1)"
+fi
+# Unset or 0, the env block holds the keys it held before these variables.
+for c in unset zero; do
+  if [ "$c" = unset ]; then launch "${c}" MB_PROFILE=ci MB_RSS_BAND=x:1:2 MB_OBJECTS_BAND=1:2 -- mbprefix; else launch "${c}" MB_PROFILE=ci MB_RSS_BAND=x:1:2 MB_OBJECTS_BAND=1:2 MB_RAVEL_ONLY=0 -- mbprefix; fi
+  if [ "${rc}" -eq 0 ] && [ "$(launch_env | cut -d= -f1 | tr '\n' ' ')" = "${LAUNCH_KEYS}" ] &&
+    launch_env | grep -qxF 'RSS_BAND=x:1:2' && launch_env | grep -qxF 'REAL_S3_PREFIX=mbprefix'; then
+    pass "launch: MB_RAVEL_ONLY ${c} renders the env block as before, RSS band and real-s3-prefix kept"
+  else
+    fail "launch ${c}: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), env $(launch_env 2>&1)"
+  fi
+done
 
 # The band file's profile must be the run's; bad usage is 64.
 run_check profile "${CI_BANDS}" "${TMP}/z/out"

@@ -1929,6 +1929,30 @@ undigested control image with 64, and the box pulls the control image
 beside the main one. The nightly workflow sets none of them: the arms run
 on an AWS box only.
 
+Two more launch variables reach the measured run alone, and the ci smoke
+stays a full four-engine run (run.test.sh, the `box-run` and `launch`
+cases):
+
+- `MB_L1_MAX_PART_BYTES=N` is passed as `MB_L1_MAX_PART_BYTES`. Launch
+  refuses with 64 a value that is not a positive integer, and the variable
+  without `l1` in `MB_STAGE1_ARMS`.
+- `MB_RAVEL_ONLY=1` runs the measured profile with `--ravel-only` (below)
+  in place of `--rss-band`. Launch refuses it with 64 without
+  `MB_STAGE1=1 MB_STAGE1_ARMS=l1`, on a profile other than `history` and
+  `ci`, with `MB_CONTROL_IMAGE`, with `MB_RSS_BAND`, with a real-s3-prefix,
+  and without `MB_OBJECTS_BAND`. `MB_STAGE1=1` on `history` needs it. `0`
+  or unset changes nothing.
+
+The #3941 series-listing measurement launches on the portable lane, with
+`MB_STAGE1_BANDS` naming a band file pre-registered for `history` (none
+ships here):
+
+```sh
+MB_PROFILE=history MB_STAGE1=1 MB_STAGE1_ARMS=l1 MB_RAVEL_ONLY=1 \
+  MB_STAGE1_BANDS=<band file> MB_OBJECTS_BAND=<MIN:MAX> \
+  deploy/metricsbench/aws/launch.sh <harness-commit> <ravel-image@sha256:...> <ravel-source-commit> <anchor-ms> <label>
+```
+
 Timings on `cardinality`: one warm
 Stage 1 pass over the corpus takes about 3.4 h; a full Stage 1 with every
 arm on takes about 32 h, most of it the erasure arm's seal wait and rewrite;
