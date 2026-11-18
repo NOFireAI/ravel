@@ -2200,8 +2200,9 @@ impl LogShardActor {
             bytes = buf.est_bytes,
             teardown = !matches!(lag_check, LagCheck::Enforced),
             "ravel-ingest: dropping a flush held closed for max_flush_lifetime on a provisioning \
-             view this router cannot trust: a read issued after the hold was spent did not \
-             confirm the view; its records are not written"
+             view this router cannot trust: a read issued after the hold was spent failed, or \
+             max_flush_lifetime more passed with no read confirming the view, or a teardown \
+             drain did not confirm it; its records are not written"
         );
         self.ctx.ack_waiters(
             buf.waiters,

@@ -1150,8 +1150,9 @@ held at the store.
 <!-- amendment-applies: sections="Amendment (2026-10-03): the scan-set check at flush open (issue #2410)" pointer="stale-view hold amendment" -->
 
 A fail-closed hold is now bounded by `max_flush_lifetime` with no successful
-provisioning read, and then, once a read issued after the hold was spent did
-not confirm the view, dropped and counted, by owner decision on #4363. The
+provisioning read, and then, once a read issued after the hold was spent
+failed, or `max_flush_lifetime` more passed with no read confirming the view,
+dropped and counted, by owner decision on #4363. The
 shard actor still never waits on the store outside a drain (Consequences).
 
 The scan-set amendment kept a buffer whose flush found no trusted generation
@@ -1196,10 +1197,10 @@ check opens the flush like any other verdict, and the refreshed stamp clears
 the hold. Nothing extra is counted; the read's GET is an ordinary
 provisioning read.
 
-**The drop.** The buffer is dropped at the first attempt that finds a read
-issued at or after the spend has failed, or that `max_flush_lifetime` has
-passed since the spend with no read confirming the view: a read issued
-after the hold was spent did not confirm the view. No `seq` is pinned and no
+**The drop.** The buffer is dropped at the first attempt that finds that the
+read it recorded after the spend, or a later one, has failed, or that
+`max_flush_lifetime` has passed since the spend with no read confirming the
+view. No `seq` is pinned and no
 data or commit store call is made. Every strict
 waiter on the buffer is answered the retryable `Abandoned` (503) with a
 message saying the rows were not written, so a retry stores one copy. Dropping
@@ -1216,7 +1217,7 @@ cannot be read for `max_flush_lifetime`.
 the scan-set amendment's bounded re-read: once per tenant per drain it joins
 or starts a read and waits at most `max_flush_lifetime` for it, and the same
 drop rule then applies to what it saw. A drain that finds the hold already
-past its drop reads nothing and drops at once. A drain is the only place the
+past its drop waits on no read and drops at once. A drain is the only place the
 actor waits on a provisioning read.
 
 **Teardown.** A shutdown or channel-close drain that still cannot confirm the
