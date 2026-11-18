@@ -606,7 +606,8 @@ async fn a_pending_erasure_request_builds_no_series_leaf() {
 /// and the new one from the postings build's bytes. Writer 3's catalog GET
 /// fails (`FaultStore`, its counter asserted), so its entry is uncovered in
 /// all three fields and C and D lose it from their entry sets, while its
-/// `label_value` coverage, carried, is untouched.
+/// `label_value` coverage, carried, is untouched. The next advance reads it
+/// again and covers it.
 #[tokio::test]
 async fn a_failed_catalog_read_leaves_the_entry_uncovered_in_all_three_fields() {
     let inner = recording_store();
@@ -691,6 +692,64 @@ async fn a_failed_catalog_read_leaves_the_entry_uncovered_in_all_three_fields() 
             (5, vec![2]),
         ])
     );
+    assert_eq!(report.key_index_uncovered_entries, 3, "{report:?}");
+
+    // The next advance carries every entry the leaves cover and reads
+    // writer 3, which they list as uncovered, by range again: its two GETs
+    // pass now, and it is covered.
+    publish_series_object(inner.as_ref(), 1, 8, KIDX_HOUR + 2, &[C], SAMPLES).await;
+    take_series_build_log_for_test();
+    let report = fold_through(&on, Signal::Metrics, KIDX_HOUR + 2).await;
+    assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+    assert_eq!(
+        take_series_build_log_for_test(),
+        vec![SeriesBuildRecord {
+            carried: vec![0, 1, 2, 4, 5, 6],
+            held: vec![7],
+            ranged: vec![3],
+        }]
+    );
+    assert_eq!(report.key_index_ranged_gets, 2, "{report:?}");
+    assert_eq!(report.key_index_uncovered_entries, 0, "{report:?}");
+    let head = read_signal_head(inner.as_ref(), Signal::Metrics).await;
+    let leaves = series_leaves(inner.as_ref(), &head.parts[0]).await;
+    assert!(leaves.uncovered.values().all(Vec::is_empty), "{leaves:?}");
+    assert_eq!(leaves.objects[&1], vec![3, 4, 5, 7], "C's entries");
+    assert_eq!(leaves.objects[&2], vec![3, 4], "D's entries");
+}
+
+/// With an allowance too small to hold any entry's series
+/// (`key_index_build_max_pairs` 1), the build reads every entry by range, a
+/// footer suffix GET and a catalog GET each, and writes the same series
+/// leaves as the build that read them from held bytes.
+#[tokio::test]
+async fn an_entry_over_the_held_allowance_is_read_by_range_to_the_same_leaves() {
+    let (held_store, _, held_head) = fold_fixture_at_ppm(10_000).await;
+    let held = stored_series_leaves(held_store.as_ref(), &held_head.parts[0]).await;
+
+    let store = recording_store();
+    publish_series_fixture(store.as_ref()).await;
+    let catalog = Catalog::new(
+        store.clone(),
+        CatalogConfig {
+            key_index_build_max_pairs: 1,
+            ..series_config(true)
+        },
+    )
+    .expect("catalog");
+    take_series_build_log_for_test();
+    fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+    assert_eq!(
+        take_series_build_log_for_test(),
+        vec![SeriesBuildRecord {
+            carried: vec![],
+            held: vec![],
+            ranged: vec![0, 1, 2, 3, 4, 5],
+        }]
+    );
+    let head = read_signal_head(store.as_ref(), Signal::Metrics).await;
+    assert_eq!(held_head.parts[0].blake3, head.parts[0].blake3);
+    assert_eq!(stored_series_leaves(store.as_ref(), &head.parts[0]).await, held);
 }
 
 /// A series no published entry holds any more: hour `KIDX_HOUR + 1` of
@@ -928,4 +987,68 @@ async fn rebuild_key_index_attaches_the_three_series_fields() {
         stored_series_leaves(store.as_ref(), part).await,
         stored_series_leaves(folded_store.as_ref(), &folded_head.parts[0]).await
     );
+}
+
+/// The repair's two refusals for the series fields: a ranged GET that fails
+/// (writer 3's catalog GET, `FaultStore`, its counter asserted) defers the
+/// part with no series leaf PUT and no ref attached, and a part over the
+/// series cap (5,349 ppm, a cap of 1,025 bytes against 1,026) is counted in
+/// `series_index_parts_over_cap` and gains no ref.
+#[tokio::test]
+async fn rebuild_key_index_defers_a_failed_read_and_counts_a_part_over_the_cap() {
+    let inner = recording_store();
+    let records = publish_series_fixture(inner.as_ref()).await;
+    let writer_3 = keys::reconstruct_data_key(&records[2]).expect("data key");
+    let off = Catalog::new(inner.clone(), series_config(false)).expect("catalog");
+    fold_through(&off, Signal::Metrics, KIDX_HOUR).await;
+
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&inner),
+        FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("catalog GET refused".into()),
+            )
+            .with_key_contains(writer_3.as_str())
+            .with_occurrence(Occurrence::Nth(2)),
+        ),
+    ));
+    let on = Catalog::new(store.clone(), series_config(true)).expect("catalog");
+    let report = on
+        .rebuild_key_index(
+            &tenant(),
+            Signal::Metrics,
+            &crate::KeyIndexRebuildOptions::default(),
+        )
+        .await
+        .expect("rebuild");
+    assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+    assert_eq!(report.parts_deferred, 1, "{report:?}");
+    assert_eq!(report.parts_rebuilt, 0, "{report:?}");
+    assert_eq!(report.leaves_written, 0, "{report:?}");
+    let head = read_signal_head(inner.as_ref(), Signal::Metrics).await;
+    assert_eq!(leaf_fields(&head.parts[0]), vec![METRICS_LABEL_VALUE_FIELD]);
+
+    let capped = Catalog::new(
+        inner.clone(),
+        CatalogConfig {
+            metrics_series_index_max_ratio_ppm: 5_349,
+            ..series_config(true)
+        },
+    )
+    .expect("catalog");
+    let report = capped
+        .rebuild_key_index(
+            &tenant(),
+            Signal::Metrics,
+            &crate::KeyIndexRebuildOptions::default(),
+        )
+        .await
+        .expect("rebuild");
+    assert_eq!(report.series_index_parts_over_cap, 1, "{report:?}");
+    assert_eq!(report.parts_over_cap, 0, "{report:?}");
+    assert_eq!(report.parts_rebuilt, 0, "{report:?}");
+    assert_eq!(report.leaves_written, 0, "{report:?}");
+    let head = read_signal_head(inner.as_ref(), Signal::Metrics).await;
+    assert_eq!(leaf_fields(&head.parts[0]), vec![METRICS_LABEL_VALUE_FIELD]);
 }
