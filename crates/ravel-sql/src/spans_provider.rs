@@ -43,7 +43,7 @@ use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates
 use ravel_query::key_index_route::KeySet;
 use ravel_query::key_index_route::{
     BudgetRefused, LeafDecodeBudget, LeafDecodeGuard, RouteFigures, RouteInput, SegmentRoute,
-    route, route_with_max_parts,
+    TierOneCost, route, route_with_max_parts,
 };
 use ravel_query::span_fetcher::{SpanLeafRangeReader, trace_ids_key_set, trace_key_set};
 use ravel_types::accounting::QueryAccounting;
@@ -396,6 +396,7 @@ impl SpansTableProvider {
             reader: &reader,
             budget: &budget,
             limits: KeyIndexLeafLimits::default(),
+            tier_one: TierOneCost::for_spans(&self.fetcher),
         };
         let (routes, figures) = match ctx.max_probed_parts {
             Some(max_parts) => route_with_max_parts(input, max_parts).await,

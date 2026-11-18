@@ -11,8 +11,8 @@
 //!
 //! A part's worst case is `1 + min(k_s, 2^bucket_bits, B_run)` per leaf
 //! slice the key set touches, `k_s` the slice's own key count. A part whose
-//! worst case exceeds 2 GETs for each of its segments in the routed snapshot,
-//! the tier-1 probe's cost for those segments, is left
+//! worst case exceeds the tier-1 cost of its segments in the routed snapshot,
+//! each segment charged by [`TierOneCost`] from its `object_size`, is left
 //! [`SegmentRoute::Uncovered`] with no leaf GET (ADR-3692's key-set ceiling
 //! amendment). The others are admitted in descending
 //! `entry_count`, ties by descending `watermark_hour`, while the next part's
@@ -57,7 +57,9 @@ use ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::{Signal, TenantHash};
 
+use crate::LogSegmentFetcher;
 use crate::phase_accounting::PhaseAccounting;
+use crate::span_fetcher::SpanSegmentFetcher;
 
 mod series;
 
@@ -149,8 +151,8 @@ pub struct RouteFigures {
     /// Parts with no leaf for the field.
     pub parts_uncovered: u64,
     /// Parts left to tier 1 because their worst-case leaf GET count exceeds
-    /// the tier-1 probe's cost for their segments in the routed snapshot,
-    /// 2 GETs a segment.
+    /// the tier-1 cost of their segments in the routed snapshot, each
+    /// segment charged by [`TierOneCost`].
     pub parts_over_tier_one: u64,
     /// Parts the leaf GET or part ceiling left unprobed.
     pub parts_beyond_ceiling: u64,
@@ -290,6 +292,8 @@ pub struct RouteInput<'a> {
     pub reader: &'a dyn LeafRangeReader,
     pub budget: &'a dyn LeafDecodeBudget,
     pub limits: KeyIndexLeafLimits,
+    /// The bound the caller's tier-1 read uses to charge each segment.
+    pub tier_one: TierOneCost,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -309,9 +313,72 @@ pub enum RouteError {
 }
 
 /// Ranged GETs the tier-1 probe issues per object (ADR-2707 decision 5;
-/// three as measured on spans, two being the conservative value), charged
-/// for each of a part's segments in the routed snapshot.
-const TIER_ONE_GETS_PER_ENTRY: u64 = 2;
+/// three as measured on spans, two being the conservative value): the charge
+/// for a segment tier 1 probes, and the most any one segment is charged.
+const TIER_ONE_MAX_GETS_PER_SEGMENT: u64 = 2;
+
+/// The tier-1 GETs one segment costs, from the object-size bound under which
+/// the caller's tier-1 read takes the whole object in its first GET.
+///
+/// Worst case to worst case, per signal and `object_size` band (`B` the
+/// logs fetcher's `block_range_threshold`, `P` its `plan_whole_object_bound`,
+/// `T` the spans fetcher's `trace_probe_bytes`):
+///
+/// | signal | band | tier-1 GETs | charged | source |
+/// |---|---|---|---|---|
+/// | logs | `size <= B` | 1, the whole object, no KEY_IDX probe | 1 | `log_fetcher.rs` `key_probe_reads` (`object_size > self.block_range_threshold`); ravel-server `sql_logs_key_index_probe_bound.rs` `objects_at_or_under_the_threshold_are_read_whole_unprobed` |
+/// | logs | `B < size <= P` | footer suffix (+ chase), KEY_IDX prefix, buckets, then the whole object on a hit | 2 | `log_fetcher.rs` `probe_segment_keyed` and `plan_segment_keyed_with`; `sql_logs_key_index_probe_bound.rs` `sub_break_even_objects_the_scan_plans_are_probed` |
+/// | logs | `size > P` | the same probe, then a planned block read | 2 | `sql_logs_key_index_probe_bound.rs` `keyed_objects_the_scan_skips_are_probed_not_planned` |
+/// | spans | `size <= T` | 1, the tail probe covers the object and every later read slices it | 1 | `span_fetcher.rs` `ranged_trace_scan` (`probe_len = self.trace_probe_bytes.min(size)`), `key_index_read`, `section_bytes` |
+/// | spans | `size > T` | tail probe (+ chase), KEY_IDX reads, block runs | 2 | `span_fetcher.rs` `ranged_trace_scan`; `trace_lookup_reads_only_the_trace_block_span` |
+///
+/// The bound is `B`, not `P`: between them tier 1 still probes KEY_IDX. A
+/// probed segment is charged the ADR's conservative 2 whatever its band,
+/// below the probe's own worst case of 4 (tail, chase, KEY_IDX prefix,
+/// bucket: `keyed_objects_the_scan_skips_are_probed_not_planned`), so the
+/// comparison leans toward tier 1 on probed segments.
+/// The whole-object read after a KEY_IDX hit is not charged: below `P` a
+/// tier-2 block answer opens the object whole too, so it cancels, and above
+/// `P` both routes read the routed blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierOneCost {
+    /// `None` when every segment is probed.
+    whole_object_bound: Option<u64>,
+}
+
+impl TierOneCost {
+    /// Every segment charged [`TIER_ONE_MAX_GETS_PER_SEGMENT`].
+    pub const PROBE_ONLY: TierOneCost = TierOneCost {
+        whole_object_bound: None,
+    };
+
+    /// The logs tier-1 read of `fetcher`: whole and unprobed at or under its
+    /// [`LogSegmentFetcher::block_range_threshold`].
+    #[must_use]
+    pub fn for_logs(fetcher: &LogSegmentFetcher) -> Self {
+        TierOneCost {
+            whole_object_bound: Some(fetcher.block_range_threshold()),
+        }
+    }
+
+    /// The spans trace lookup of `fetcher`: one GET at or under its
+    /// [`SpanSegmentFetcher::trace_probe_bytes`].
+    #[must_use]
+    pub fn for_spans(fetcher: &SpanSegmentFetcher) -> Self {
+        TierOneCost {
+            whole_object_bound: Some(fetcher.trace_probe_bytes()),
+        }
+    }
+
+    /// The charge for one segment of `object_size` bytes, a probed segment
+    /// charged `probed`.
+    fn segment_gets(self, object_size: u64, probed: u64) -> u64 {
+        match self.whole_object_bound {
+            Some(bound) if object_size <= bound => 1,
+            _ => probed,
+        }
+    }
+}
 
 /// The admission bounds of one routing pass. [`route`] computes them from
 /// the key set with [`Ceiling::for_keys`]; tests use smaller ones. The leaf
@@ -321,10 +388,10 @@ const TIER_ONE_GETS_PER_ENTRY: u64 = 2;
 struct Ceiling {
     leaf_gets: u64,
     parts: usize,
-    /// A part is admitted only when its worst case is at most its segment
-    /// count in the routed snapshot times this: the tier-1 probe's cost for
-    /// those segments.
-    gets_per_entry: u64,
+    /// The charge for a segment tier 1 probes. A part is admitted only when
+    /// its worst case is at most the tier-1 cost of its segments in the
+    /// routed snapshot.
+    gets_per_segment: u64,
 }
 
 impl Ceiling {
@@ -338,7 +405,7 @@ impl Ceiling {
         Ceiling {
             leaf_gets: KEY_INDEX_MAX_PROBED_PARTS as u64 * per_part,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
-            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
+            gets_per_segment: TIER_ONE_MAX_GETS_PER_SEGMENT,
         }
     }
 }
@@ -347,7 +414,7 @@ impl Ceiling {
 const ADR_CEILING: Ceiling = Ceiling {
     leaf_gets: KEY_INDEX_LEAF_GET_CEILING as u64,
     parts: KEY_INDEX_MAX_PROBED_PARTS,
-    gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
+    gets_per_segment: TIER_ONE_MAX_GETS_PER_SEGMENT,
 };
 
 const _: () = assert!(Ceiling::for_keys(1).leaf_gets == ADR_CEILING.leaf_gets);
@@ -667,6 +734,8 @@ async fn route_values_masked(
                 reader: input.reader,
                 budget: input.budget,
                 limits: input.limits,
+                // Metrics passes keep the flat per-segment charge.
+                tier_one: TierOneCost::PROBE_ONLY,
             };
             let mask = part_masks.and(value_parts.get(*value)).map(Vec::as_slice);
             async move { (i, route_under_masked(pass, ceiling, totals, mask).await) }
@@ -795,23 +864,29 @@ async fn route_under_masked(
             input.parts.origin.len()
         )));
     }
-    // Each part's segments in the snapshot this pass routes: what tier 1
-    // would probe for it.
-    let mut segments_in_snapshot = vec![0u64; input.parts.parts.len()];
-    for origin in input.parts.origin.iter().flatten() {
-        let Some(slot) = segments_in_snapshot.get_mut(origin.part as usize) else {
+    // Each part's tier-1 cost over its segments in the snapshot this pass
+    // routes, 0 for a part with none.
+    let mut tier_one_gets = vec![0u64; input.parts.parts.len()];
+    for (origin, segment) in input.parts.origin.iter().zip(&input.snapshot.segments) {
+        let Some(origin) = origin else {
+            continue;
+        };
+        let Some(slot) = tier_one_gets.get_mut(origin.part as usize) else {
             return Err(RouteError::InvalidInput(format!(
                 "segment origin names part {} of {}",
                 origin.part,
                 input.parts.parts.len()
             )));
         };
-        *slot += 1;
+        let gets = input
+            .tier_one
+            .segment_gets(segment.object_size, ceiling.gets_per_segment);
+        *slot = slot.saturating_add(gets);
     }
     if let Some(mask) = part_mask {
-        for (part, segments) in segments_in_snapshot.iter_mut().enumerate() {
+        for (part, gets) in tier_one_gets.iter_mut().enumerate() {
             if mask.get(part) != Some(&true) {
-                *segments = 0;
+                *gets = 0;
             }
         }
     }
@@ -830,14 +905,7 @@ async fn route_under_masked(
     charge
         .leaf
         .set_access_intent(input.accounting.key_index().access_intent());
-    let answered = route_parts(
-        &input,
-        ceiling,
-        &segments_in_snapshot,
-        &charge.leaf,
-        &mut figures,
-    )
-    .await;
+    let answered = route_parts(&input, ceiling, &tier_one_gets, &charge.leaf, &mut figures).await;
     let leaf = charge.leaf.snapshot();
     drop(charge);
     figures.leaf_get_requests = leaf.s3_requests(AccountedOp::Get);
@@ -929,20 +997,20 @@ fn plan_part<'a>(
 async fn route_parts(
     input: &RouteInput<'_>,
     ceiling: Ceiling,
-    segments_in_snapshot: &[u64],
+    tier_one_gets: &[u64],
     leaf_accounting: &QueryAccounting,
     figures: &mut RouteFigures,
 ) -> Result<BTreeMap<usize, PartAnswer>, RouteError> {
     let mut plans: Vec<PartPlan<'_>> = Vec::new();
     for (part, handle) in input.parts.parts.iter().enumerate() {
-        let segments = segments_in_snapshot[part];
-        if segments == 0 {
+        let tier_one = tier_one_gets[part];
+        if tier_one == 0 {
             continue;
         }
         match plan_part(part, handle, input.key_set) {
-            // Dearer than the tier-1 probe of the part's segments in this
-            // snapshot: tier 1 answers it instead.
-            Ok(Some(plan)) if plan.worst_gets > segments.saturating_mul(ceiling.gets_per_entry) => {
+            // Dearer than tier 1 over the part's segments in this snapshot:
+            // tier 1 answers it instead.
+            Ok(Some(plan)) if plan.worst_gets > tier_one => {
                 figures.parts_over_tier_one += 1;
             }
             Ok(Some(plan)) => plans.push(plan),

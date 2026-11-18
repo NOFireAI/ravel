@@ -363,6 +363,13 @@ impl SpanSegmentFetcher {
         self
     }
 
+    /// The tail probe length of the ranged trace path: an object no larger
+    /// than this is read in that one GET.
+    #[must_use]
+    pub fn trace_probe_bytes(&self) -> u64 {
+        self.trace_probe_bytes
+    }
+
     /// Runs the block decodes of [`fetch`](Self::fetch) and
     /// [`fetch_accounted`](Self::fetch_accounted), and of a columnar scan
     /// drained through [`SpanColumnarScan::next_block_on_gate`], on `gate`
