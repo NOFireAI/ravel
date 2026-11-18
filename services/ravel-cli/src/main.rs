@@ -3008,6 +3008,24 @@ enum CatalogCommand {
         /// nothing there. With it a metrics rebuild is refused.
         #[arg(long)]
         no_metrics_label_index: bool,
+        /// Turn on the metrics series index (ADR-4146 decision 2). With
+        /// `--signal metrics`, a fold with the key-index leaf build and the
+        /// `label_value` leaf on also builds three fields for every part it
+        /// re-encodes: `series_label`, `series_class` and `class_objects`,
+        /// from each object's SERIES_IDS and stored label sets, at leaf
+        /// format version 3. An object the fold's name postings fetched
+        /// whole is read from those bytes, an entry a previous part's series
+        /// leaves cover is carried from them, and any other entry costs a
+        /// footer suffix GET (a second footer GET when the footer is larger
+        /// than the 8 KiB suffix) and one GET of its catalog sections. A part
+        /// whose three fields would pass 1% of its objects' bytes gets none of
+        /// them (`metrics_series_index_parts_over_cap`). While any metrics
+        /// erasure request is pending, no series leaf is built. With
+        /// `--rebuild-key-index` it attaches the three fields to every part
+        /// that lacks them (`series_index_parts_over_cap`). Off by default.
+        /// Refused with `--no-metrics-label-index`.
+        #[arg(long, conflicts_with = "no_metrics_label_index")]
+        metrics_series_index: bool,
         /// Instead of folding, attach key-index leaves to the parts already in
         /// HEAD that lack a ref for a declared field (ADR-2707 decision 4,
         /// "Lifecycle"; docs/catalog-and-mvcc.md "Rollout"). Each such part is
@@ -3549,11 +3567,12 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     key_index_build_max_pairs,
                     key_index_repair_hold_bytes,
                     no_metrics_label_index,
+                    metrics_series_index,
                     json,
                     tenant_kms,
                     ..
                 },
-        } => catalog::rebuild_key_index_at_budget(
+        } => catalog::rebuild_key_index_with_series_index(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -3565,6 +3584,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             key_index_build_max_pairs,
             key_index_repair_hold_bytes,
             !no_metrics_label_index,
+            metrics_series_index,
             json,
         )
         .await
@@ -3580,13 +3600,14 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     key_index_leaves,
                     key_index_build_max_pairs,
                     no_metrics_label_index,
+                    metrics_series_index,
                     snapshot_part_max_entries,
                     retention_default,
                     json,
                     tenant_kms,
                     ..
                 },
-        } => catalog::fold_with_retention_default(
+        } => catalog::fold_with_metrics_series_index(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -3598,6 +3619,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             key_index_leaves,
             key_index_build_max_pairs,
             !no_metrics_label_index,
+            metrics_series_index,
             snapshot_part_max_entries
                 .map(usize::try_from)
                 .transpose()
@@ -6144,6 +6166,39 @@ mod tests {
         assert!(parse(&["--no-metrics-label-index"]));
         assert!(parse(&["--key-index-leaves", "--no-metrics-label-index"]));
         assert!(parse(&["--rebuild-key-index", "--no-metrics-label-index"]));
+    }
+
+    /// `catalog fold --metrics-series-index` (ADR-4146 decision 2) is off
+    /// unless passed, parses beside `--key-index-leaves` and
+    /// `--rebuild-key-index`, and is refused beside `--no-metrics-label-index`,
+    /// without which it would change nothing.
+    #[test]
+    fn catalog_fold_metrics_series_index_flag() {
+        let try_parse = |extra: &[&str]| {
+            let argv = ["ravel", "catalog", "fold", "--tenant", "acme"]
+                .iter()
+                .chain(extra)
+                .copied()
+                .collect::<Vec<_>>();
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Command::Catalog {
+                    command:
+                        super::CatalogCommand::Fold {
+                            metrics_series_index,
+                            ..
+                        },
+                } => metrics_series_index,
+                _ => panic!("expected the catalog fold subcommand"),
+            })
+        };
+        assert!(!try_parse(&[]).expect("parses"), "off by default");
+        assert!(try_parse(&["--metrics-series-index"]).expect("parses"));
+        assert!(try_parse(&["--key-index-leaves", "--metrics-series-index"]).expect("parses"));
+        assert!(try_parse(&["--rebuild-key-index", "--metrics-series-index"]).expect("parses"));
+        assert!(
+            try_parse(&["--metrics-series-index", "--no-metrics-label-index"]).is_err(),
+            "the series index needs the label index"
+        );
     }
 
     /// `catalog fold --rebuild-key-index` (ADR-2707 decision 4): `--field`

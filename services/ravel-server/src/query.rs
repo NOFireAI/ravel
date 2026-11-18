@@ -354,6 +354,7 @@ pub fn build_catalog_for_server(
             build_key_index_leaves: config.fold.build_key_index_leaves,
             key_index_build_max_pairs: config.fold.key_index_build_max_pairs,
             metrics_label_index: config.fold.metrics_label_index,
+            metrics_series_index: config.fold.metrics_series_index,
             ..server_catalog_config_base()
         },
         store,
@@ -2611,6 +2612,29 @@ mod catalog_cache_tests {
             crate::FoldTaskConfig::default().metrics_label_index,
             "the metrics leaf build is on by default"
         );
+    }
+
+    /// ADR-4146 decision 2: `--fold-metrics-series-index` reaches the
+    /// catalog the folds run with, and the default is off.
+    #[test]
+    fn build_catalog_for_server_maps_the_metrics_series_index_switch() {
+        for enabled in [false, true] {
+            let config = crate::ServerConfig {
+                fold: crate::FoldTaskConfig {
+                    build_key_index_leaves: true,
+                    metrics_series_index: enabled,
+                    ..crate::FoldTaskConfig::default()
+                },
+                cpu_gate_permits: Default::default(),
+                ..server_config()
+            };
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let catalog = build_catalog_for_server(store, &config, 7_200_000_000_000)
+                .expect("catalog builds");
+            assert_eq!(catalog.config().metrics_series_index, enabled);
+        }
+        assert!(!crate::FoldTaskConfig::default().metrics_series_index);
+        assert!(!ravel_catalog::CatalogConfig::default().metrics_series_index);
     }
 
     /// `--fold-key-index-build-max-pairs` reaches the catalog the folds run

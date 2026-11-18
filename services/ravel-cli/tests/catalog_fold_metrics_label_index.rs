@@ -4,7 +4,8 @@
 //! fold and the rebuild run with, a fold with `--no-key-index-leaves` is not
 //! refused and builds nothing, and a metrics rebuild with the opt-out
 //! is refused. Each case maps the opt-out to the catalog switch as
-//! `catalog fold` does, as its negation.
+//! `catalog fold` does, as its negation. `--metrics-series-index` (ADR-4146)
+//! reaches the fold and the rebuild the same way.
 //!
 //! Driven in-process against one `MemoryStore` per case, for the reason
 //! `tests/catalog_signal.rs` gives.
@@ -277,4 +278,92 @@ async fn the_metrics_label_index_opt_out_reaches_the_rebuild() {
     assert!(printed.contains("erasure_list_requests: 1\n"), "{printed}");
     assert_eq!(report.erasure_get_requests, 0, "{report:?}");
     assert!(printed.contains("erasure_get_requests: 0\n"), "{printed}");
+}
+
+/// Four objects in one sealed hour, enough data bytes that the three series
+/// fields of their part stay under the default 1% cap.
+async fn publish_series_fixture(store: &MemoryStore) {
+    let created = now_ns() - SEALED_AGE_NS;
+    for (writer_seq, region) in [(1, "east"), (2, "west"), (3, "east"), (4, "north")] {
+        publish_metrics(store, writer_seq, region, created).await;
+    }
+}
+
+/// `catalog fold --metrics-series-index` (ADR-4146 decision 2) reaches the
+/// fold: off by default, a metrics fold writes the `label_value` leaf alone;
+/// with the flag it writes the three series-index leaves beside it and prints
+/// `metrics_series_index_parts_over_cap: 0`. With `--rebuild-key-index` the
+/// flag attaches the three fields to the part the switch-off fold wrote.
+#[tokio::test]
+async fn the_metrics_series_index_flag_reaches_the_fold_and_the_rebuild() {
+    assert!(!ravel_catalog::CatalogConfig::default().metrics_series_index);
+    let fold = |store: Arc<MemoryStore>, series: bool| {
+        catalog::fold_with_metrics_series_index(
+            store as Arc<dyn ObjectStoreBackend>,
+            MEMORY,
+            TENANT,
+            1,
+            SignalArg::Metrics,
+            None,
+            false,
+            true,
+            ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+            true,
+            series,
+            None,
+            None,
+            now_ns(),
+            false,
+        )
+    };
+    let on = Arc::new(MemoryStore::new());
+    publish_series_fixture(&on).await;
+    let (report, printed) = fold(on.clone(), true).await.expect("fold with the flag");
+    assert_eq!(report.key_index_leaves_written, 4, "{report:?}");
+    assert_eq!(report.metrics_series_index_parts_over_cap, 0, "{report:?}");
+    assert_eq!(kidx_objects(&on).await, 4);
+    assert!(
+        printed.contains("metrics_series_index_parts_over_cap: 0\n"),
+        "{printed}"
+    );
+
+    let off = Arc::new(MemoryStore::new());
+    publish_series_fixture(&off).await;
+    let (report, _) = fold(off.clone(), false).await.expect("fold without it");
+    assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+    assert_eq!(kidx_objects(&off).await, 1);
+
+    let (report, printed) = catalog::rebuild_key_index_with_series_index(
+        off.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        TENANT,
+        1,
+        SignalArg::Metrics,
+        None,
+        250_000,
+        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        None,
+        true,
+        true,
+        false,
+    )
+    .await
+    .expect("rebuild with the flag");
+    assert_eq!(
+        report.fields,
+        vec![
+            "label_value".to_string(),
+            "series_label".to_string(),
+            "series_class".to_string(),
+            "class_objects".to_string(),
+        ]
+    );
+    assert_eq!(report.parts_rebuilt, 1, "{report:?}");
+    assert_eq!(report.leaves_written, 3, "{report:?}");
+    assert_eq!(report.series_index_parts_over_cap, 0, "{report:?}");
+    assert!(
+        printed.contains("series_index_parts_over_cap: 0\n"),
+        "{printed}"
+    );
+    assert_eq!(kidx_objects(&off).await, 4);
 }
