@@ -345,6 +345,39 @@ self-check and a mutant run cannot be combined.
 description and `--param attrs.mutant=<name>`; a plain run passes
 `attrs.mutant=none`.
 
+## The expected set
+
+The ravel-server binary in the server image carries every area's
+assertions, not only the catalog's: the `commit: ` always-type assertions
+are registered in it, and Antithesis counts one that no process
+reached as failing. This workload drives the catalog area only, so it is
+judged against the areas it owns (ADR-4326, per-workload amendment):
+
+- the areas whose mutants `formal/tla/catalog/antithesis-mutants.tsv` names
+  (the part of the mutant column before `/`, today `catalog`), matched as the
+  literal prefix `<area>: `;
+- every assertion the workload's own driver declares (`sdk-driver.jsonl`),
+  which covers the `clock: ` literals.
+
+The prefix is the exact test: every catalog literal in the SUT
+(`crates/ravel-catalog/src/fold.rs`, `crates/ravel-maintain/src/{publish,
+sweep,reachability}.rs`) starts with `catalog: `, and every driver literal
+with `catalog: ` or `clock: `. The sixth column of
+`formal/tla/catalog/traceability.md` is not: it names only the properties
+that carry a TLA invariant, not the reachability and exploration assertions
+around them.
+
+`local-run.sh` splits `never-hit.tsv` into `never-hit-owned.tsv`, each line
+a gate failure, and `never-hit-other-areas.tsv`, printed under "not this
+workload's" and never a failure.
+
+Triage of an Antithesis report applies the same rule. An always-type
+assertion that "was never hit" and starts with neither an owned prefix nor
+`clock: ` (the `commit: ` ones, for example) is another workload's to reach;
+note it and move on. A violated assertion is a finding whatever its area,
+since a false evaluation means the code reached it, and so is an owned one
+never hit.
+
 ## Build, run locally, launch
 
 The same steps as ingest-durability, from this directory's `scripts/`:
@@ -363,8 +396,9 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     a number at least that total minus 60 s ahead of the host
     (`clock-probe.txt`);
   - every container's SDK output was collected;
-  - no always-type assertion was violated (`violated.tsv`), and none that
-    must be hit was never hit (`never-hit.tsv`);
+  - no always-type assertion was violated (`violated.tsv`), and none of this
+    workload's that must be hit was never hit (`never-hit-owned.tsv`; see
+    "The expected set" below);
   - `catalog: the workload starts`, `clock: the driver's clock jumped
     forward`, `catalog: a sealed seeded hour was folded into HEAD`, `clock:
     an hour ingested live was sealed by a fold`, `catalog: a compaction

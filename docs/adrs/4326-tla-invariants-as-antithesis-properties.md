@@ -55,7 +55,8 @@ flowchart LR
   `inv_always!` there. Its predicate reads evidence the guarded step did not
   itself produce: the store call's result or a re-read, never a flag the same
   code just set. `assert_always` also fails when never reached, so it is the
-  default. `inv_always_or_unreachable!` is allowed only on a guard that only a
+  default; that guarantee is judged per workload (see the per-workload
+  amendment below). `inv_always_or_unreachable!` is allowed only on a guard that only a
   fault reaches, and its row then also names an `inv_reachable!`. A site
   whose re-read can fail to tell uses `inv_always_if_known!` (see the #4335
   amendment below).
@@ -187,7 +188,9 @@ one hour above it. Twenty-nine runs at that rate cost about 29 hours beyond
 their caps, so the rerun reserve is 15 hours, not 24, and the epic plans to the
 whole of the raised budget. A further rerun beyond that reserve needs the
 owner's go. The #4335 amendment below brings the mutant count to 20; the
-twentieth mutant's Antithesis run is not priced here.
+twentieth mutant's Antithesis run is not priced here. "Every new SUT
+assertion reached" counts only the areas a workload owns (see the
+per-workload amendment below).
 
 Runs are priced per workload config, of which decision 4 defines five
 (ingest-durability; catalog-maintenance and its lifecycle and reshard
@@ -401,3 +404,19 @@ Decision 7 prices 19 mutant runs. With this correction there are 20, and the
 twentieth run (a 12-hour cap and about one hour of overshoot) is not in the
 plan of about 452 hours. It comes out of the rerun reserve or needs the
 owner's go, as a rerun beyond the reserve does.
+
+## Amendment (2026-11-18): per-workload expected set (#4336)
+
+<!-- amendment-applies: sections="1. One invariant, one carrier|7. Budget" pointer="per-workload amendment" -->
+
+The workload images build one ravel-server binary, and since #4444 it carries
+the instrumentation of every area. So `assert_always`'s guarantee that a
+property is reached (decision 1), and the clean-smoke band "every new SUT
+assertion reached" (decision 7), are judged per workload, against the areas
+that workload owns: an area is owned by the workload its
+`formal/tla/<area>/antithesis-mutants.tsv` mutants run on, and a workload's
+own driver assertions are its own. An always-assertion of an area the
+workload does not own is expected to go unreached there. It is listed, apart
+from the gated ones, and is never counted as a failure, in the local loop and
+in the triage of an Antithesis report alike. The workload that owns that area
+answers for reaching it. Owner decision, 2026-11-18.

@@ -267,7 +267,35 @@ jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
 jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
     | select(.[0].assert_type == "always" and .[0].must_hit and (any(.hit) | not))
     | .[0].message' "$OUT"/sdk-*.jsonl | sort > "$OUT/never-hit.tsv"
-while IFS= read -r m; do fail "always-type assertion never hit: $m"; done < "$OUT/never-hit.tsv"
+# The ravel-server binary carries every area's assertions, and this workload
+# drives only the areas it owns (ADR-4326, per-workload amendment): the areas
+# whose mutants the .tsv names, as the literal prefix `<area>: `, and every
+# assertion of this workload's own driver (the `clock: ` ones among them). An
+# unreached always-assertion of another area is listed, never failed.
+owned_areas=$(awk -F '\t' '!/^#/ && $2 ~ /^[a-z0-9-]+\// { sub(/\/.*/, "", $2); print $2 }' "$TSV" | sort -u)
+[ -n "$owned_areas" ] || abort "could not read the owned areas from $TSV"
+jq -r '.antithesis_assert.message // empty' "$OUT/sdk-driver.jsonl" | sort -u > "$OUT/driver-assertions.txt" \
+    || abort "could not read the driver's assertions"
+[ -s "$OUT/driver-assertions.txt" ] || abort "the driver declared no assertions"
+: > "$OUT/never-hit-owned.tsv"
+: > "$OUT/never-hit-other-areas.tsv"
+while IFS= read -r m; do
+    mine=""
+    for area in $owned_areas; do
+        case "$m" in "$area: "*) mine=1 ;; esac
+    done
+    grep -qxF -- "$m" "$OUT/driver-assertions.txt" && mine=1
+    if [ -n "$mine" ]; then
+        echo "$m" >> "$OUT/never-hit-owned.tsv"
+    else
+        echo "$m" >> "$OUT/never-hit-other-areas.tsv"
+    fi
+done < "$OUT/never-hit.tsv"
+while IFS= read -r m; do fail "always-type assertion never hit: $m"; done < "$OUT/never-hit-owned.tsv"
+if [ -s "$OUT/never-hit-other-areas.tsv" ]; then
+    echo "not this workload's (owned: $(tr '\n' ' ' <<< "$owned_areas")and the driver's own), unreached and not gated:"
+    sed 's/^/  /' "$OUT/never-hit-other-areas.tsv"
+fi
 for m in "${REQUIRED[@]}"; do
     hits=$(awk -F '\t' -v m="$m" '$4 == m { print $3 }' "$OUT/assertions.tsv")
     [ -n "$hits" ] && [ "$hits" -gt 0 ] || fail "required assertion never held: $m"
