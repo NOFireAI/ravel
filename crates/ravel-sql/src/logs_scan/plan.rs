@@ -635,6 +635,7 @@ async fn route_segments(ctx: &PartitionCtx, segments: &[SegmentRef]) -> DFResult
         reader: &reader,
         budget: &budget,
         limits: KeyIndexLeafLimits::default(),
+        tier_one: ravel_query::key_index_route::TierOneCost::for_logs(&ctx.fetcher),
     };
     let (routes, figures) = match route_ctx.max_probed_parts {
         Some(max_parts) => route_with_max_parts(input, max_parts).await,

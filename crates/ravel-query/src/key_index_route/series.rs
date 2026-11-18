@@ -42,7 +42,7 @@ use ravel_types::accounting::{AccountedOp, QueryAccounting};
 
 use super::{
     ADR_CEILING, LeafCharge, LeafDecodeGuard, LeafReadError, PROBE_CONCURRENCY, ROUTE_TOTALS,
-    RouteError, RouteTotals, SliceStart, TIER_ONE_GETS_PER_ENTRY, ValueRouteFigures,
+    RouteError, RouteTotals, SliceStart, TIER_ONE_MAX_GETS_PER_SEGMENT, ValueRouteFigures,
     ValueRouteInput, ValueRouting, leaf_rejected, route_values_masked,
 };
 
@@ -1048,7 +1048,7 @@ async fn run_pass(
         .iter()
         .map(|(leaf_ref, keys)| slice_worst_gets(leaf_ref, keys.len() as u64))
         .sum();
-    if worst > segments.saturating_mul(TIER_ONE_GETS_PER_ENTRY) {
+    if worst > segments.saturating_mul(TIER_ONE_MAX_GETS_PER_SEGMENT) {
         return Ok(PassRun::PartDeclined(SeriesDecline::OverTierOne));
     }
     let request = KeyIndexLeafRequest {

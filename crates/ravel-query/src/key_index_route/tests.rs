@@ -390,6 +390,7 @@ fn input<'a>(
         reader,
         budget,
         limits: KeyIndexLeafLimits::default(),
+        tier_one: TierOneCost::PROBE_ONLY,
     }
 }
 
@@ -456,7 +457,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 /// The ADR bounds without the per-part tier-1 test, for fixtures whose
 /// parts hold fewer entries than their leaf reads.
 const UNBOUNDED: Ceiling = Ceiling {
-    gets_per_entry: u64::MAX,
+    gets_per_segment: u64::MAX,
     ..ADR_CEILING
 };
 
@@ -512,14 +513,14 @@ proptest! {
         extra_keys in prop_oneof![3 => Just(0usize), 1 => 0usize..=1018],
         ceiling_gets in prop_oneof![Just(KEY_INDEX_LEAF_GET_CEILING as u64), 1u64..=150],
         ceiling_parts in 1usize..=6,
-        gets_per_entry in prop_oneof![Just(TIER_ONE_GETS_PER_ENTRY), Just(u64::MAX)],
+        gets_per_segment in prop_oneof![Just(TIER_ONE_MAX_GETS_PER_SEGMENT), Just(u64::MAX)],
         budget_max in prop::option::weighted(0.2, 64u64..4096),
     ) {
         let key_type = if id16 { KeyType::Id16 } else { KeyType::Str };
         let mut query = present_keys.clone();
         query.extend((0..extra_keys).map(|i| 1000 + i as u16));
         let keys = key_set(key_type, &query);
-        let ceiling = Ceiling { leaf_gets: ceiling_gets, parts: ceiling_parts, gets_per_entry };
+        let ceiling = Ceiling { leaf_gets: ceiling_gets, parts: ceiling_parts, gets_per_segment };
         let budget = ThresholdBudget::new(budget_max.unwrap_or(u64::MAX));
         let (fx, run) = block_on(async {
             let fx = fixture(&specs, &recents, key_type).await;
@@ -652,7 +653,7 @@ async fn ceiling_admits_the_largest_parts_in_order() {
         Ceiling {
             leaf_gets: KEY_INDEX_LEAF_GET_CEILING as u64,
             parts: 2,
-            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
+            gets_per_segment: TIER_ONE_MAX_GETS_PER_SEGMENT,
         },
     )
     .await;
@@ -670,7 +671,7 @@ async fn ceiling_admits_the_largest_parts_in_order() {
         Ceiling {
             leaf_gets: 2,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
-            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
+            gets_per_segment: TIER_ONE_MAX_GETS_PER_SEGMENT,
         },
     )
     .await;
@@ -708,7 +709,7 @@ async fn refunded_gets_admit_the_next_part() {
         Ceiling {
             leaf_gets: 4,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
-            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
+            gets_per_segment: TIER_ONE_MAX_GETS_PER_SEGMENT,
         },
     )
     .await;
@@ -717,6 +718,144 @@ async fn refunded_gets_admit_the_next_part() {
     assert_eq!(figures.parts_beyond_ceiling, 0);
     assert_eq!(figures.leaf_get_requests, 3);
     assert!(routes.iter().all(|r| *r == SegmentRoute::Pruned));
+}
+
+/// The logs fetcher's `block_range_threshold` in the tier-1 cost tests.
+const LOGS_UNPROBED_BOUND: u64 = 1_000;
+
+/// A logs fetcher whose tier-1 read is whole and unprobed at or under
+/// [`LOGS_UNPROBED_BOUND`], with a plan whole-object bound ten times higher.
+fn logs_fetcher(fx: &Fixture) -> LogSegmentFetcher {
+    let fetcher = LogSegmentFetcher::new(fx.store.clone())
+        .with_block_range_threshold(LOGS_UNPROBED_BOUND)
+        .with_projection_break_even_bytes(Some(10 * LOGS_UNPROBED_BOUND));
+    assert_eq!(fetcher.block_range_threshold(), LOGS_UNPROBED_BOUND);
+    assert_eq!(fetcher.plan_whole_object_bound(), 10 * LOGS_UNPROBED_BOUND);
+    fetcher
+}
+
+/// One part of `sizes.len()` entries, each holding keys `0..keys` in block 0
+/// of the first entry, every segment in the snapshot at the given size, and
+/// the route's figures under the logs tier-1 cost of [`logs_fetcher`].
+async fn route_sized(sizes: &[u64], keys: u16) -> (Run, Vec<SegmentRoute>, RouteFigures) {
+    let mut entries = vec![Rows::new(); sizes.len()];
+    for v in 0..keys {
+        entries[0].insert(v, BTreeSet::from([0u32]));
+    }
+    let mut fx = fixture(&[PartSpec::simple(entries)], &[], KeyType::Str).await;
+    for (segment, size) in fx.snapshot.segments.iter_mut().zip(sizes) {
+        segment.object_size = *size;
+    }
+    let query: BTreeSet<u16> = (0..keys).collect();
+    let keys = key_set(KeyType::Str, &query);
+    let accounting = PhaseAccounting::new();
+    let reader = CountingReader::new(fx.store.clone());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let totals = RouteTotals::new();
+    let tier_one = TierOneCost::for_logs(&logs_fetcher(&fx));
+    let result = route_under(
+        RouteInput {
+            tier_one,
+            ..input(&fx, &keys, &accounting, &reader, &budget)
+        },
+        ADR_CEILING,
+        &totals,
+    )
+    .await;
+    let run = Run {
+        result,
+        accounting,
+        reader,
+        totals,
+    };
+    let (routes, figures) = run.result.as_ref().expect("route").clone();
+    (run, routes, figures)
+}
+
+fn assert_over_tier_one(run: &Run, routes: &[SegmentRoute], figures: &RouteFigures) {
+    assert_eq!(figures.parts_over_tier_one, 1, "{figures:?}");
+    assert_eq!(figures.parts_covered, 0, "{figures:?}");
+    assert_eq!(figures.leaf_get_requests, 0, "{figures:?}");
+    assert_eq!(run.reader.calls.load(Ordering::Relaxed), 0);
+    assert!(routes.iter().all(|r| *r == SegmentRoute::Uncovered));
+    assert_accounting(run, figures);
+}
+
+fn assert_admitted(run: &Run, figures: &RouteFigures) {
+    assert_eq!(figures.parts_over_tier_one, 0, "{figures:?}");
+    assert_eq!(figures.parts_covered, 1, "{figures:?}");
+    assert!(figures.leaf_get_requests > 0, "{figures:?}");
+    assert_accounting(run, figures);
+}
+
+/// Two whole-read objects cost tier 1 2 GETs, so a worst case of 3 leaf GETs
+/// (two keys in one slice), between 1x and 2x the segment count, goes to
+/// tier 1 with no leaf read.
+#[tokio::test]
+async fn a_part_of_small_objects_dearer_than_their_whole_reads_goes_to_tier_one() {
+    let (run, routes, figures) = route_sized(&[1, LOGS_UNPROBED_BOUND], 2).await;
+    assert_over_tier_one(&run, &routes, &figures);
+}
+
+/// The same part with every object probed costs tier 1 2 x 2 = 4 GETs, so
+/// the 3-GET leaf route is admitted.
+#[tokio::test]
+async fn the_same_part_of_large_objects_is_admitted() {
+    let (run, routes, figures) = route_sized(&[LOGS_UNPROBED_BOUND + 1; 2], 2).await;
+    assert_admitted(&run, &figures);
+    assert_eq!(routes[0], SegmentRoute::Blocks(vec![0]));
+    assert_eq!(routes[1], SegmentRoute::Pruned);
+}
+
+/// k = 2 whole-read objects and m = 1 probed object cost tier 1 k + 2m = 4
+/// GETs: a worst case of 4 (three keys) is admitted, one of 5 (four keys) is
+/// over tier one.
+#[tokio::test]
+async fn a_mixed_part_is_admitted_at_its_tier_one_cost_and_not_one_get_past() {
+    let sizes = [1, LOGS_UNPROBED_BOUND, LOGS_UNPROBED_BOUND + 1];
+    let (run, _, figures) = route_sized(&sizes, 3).await;
+    assert_admitted(&run, &figures);
+    let (run, routes, figures) = route_sized(&sizes, 4).await;
+    assert_over_tier_one(&run, &routes, &figures);
+}
+
+/// The bound is the fetcher's `block_range_threshold`, inclusive, not its
+/// higher `plan_whole_object_bound`: two objects at the threshold are read
+/// whole (2 GETs, the 3-GET route is over tier one), two one byte above it
+/// are probed even though the plan would still read them whole (4 GETs, the
+/// route is admitted), and so are two at the plan bound.
+#[tokio::test]
+async fn the_whole_read_band_ends_at_the_block_range_threshold() {
+    let (run, routes, figures) = route_sized(&[LOGS_UNPROBED_BOUND; 2], 2).await;
+    assert_over_tier_one(&run, &routes, &figures);
+    let (run, _, figures) = route_sized(&[LOGS_UNPROBED_BOUND + 1; 2], 2).await;
+    assert_admitted(&run, &figures);
+    let (run, _, figures) = route_sized(&[10 * LOGS_UNPROBED_BOUND; 2], 2).await;
+    assert_admitted(&run, &figures);
+}
+
+#[test]
+fn tier_one_cost_charges_one_get_up_to_the_fetchers_whole_read_bound() {
+    use crate::span_fetcher::{DEFAULT_TRACE_PROBE_BYTES, SpanSegmentFetcher};
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let probed = TIER_ONE_MAX_GETS_PER_SEGMENT;
+    let spans = TierOneCost::for_spans(&SpanSegmentFetcher::new(store.clone()));
+    assert_eq!(spans.segment_gets(0, probed), 1);
+    assert_eq!(spans.segment_gets(DEFAULT_TRACE_PROBE_BYTES, probed), 1);
+    assert_eq!(spans.segment_gets(DEFAULT_TRACE_PROBE_BYTES + 1, probed), 2);
+    let spans =
+        TierOneCost::for_spans(&SpanSegmentFetcher::new(store.clone()).with_trace_probe_bytes(100));
+    assert_eq!(spans.segment_gets(100, probed), 1);
+    assert_eq!(spans.segment_gets(101, probed), 2);
+
+    let logs =
+        TierOneCost::for_logs(&LogSegmentFetcher::new(store).with_block_range_threshold(4_096));
+    assert_eq!(logs.segment_gets(4_096, probed), 1);
+    assert_eq!(logs.segment_gets(4_097, probed), 2);
+
+    assert_eq!(TierOneCost::PROBE_ONLY.segment_gets(0, probed), 2);
+    assert_eq!(TierOneCost::PROBE_ONLY.segment_gets(1, u64::MAX), u64::MAX);
 }
 
 /// Entries in an ADR-3939 logs day part.
@@ -1890,7 +2029,7 @@ async fn route_totals_add_every_part_outcome_and_leaf_get_under_the_signal() {
         Ceiling {
             leaf_gets: 4,
             parts: KEY_INDEX_MAX_PROBED_PARTS,
-            gets_per_entry: TIER_ONE_GETS_PER_ENTRY,
+            gets_per_segment: TIER_ONE_MAX_GETS_PER_SEGMENT,
         },
     )
     .await;
@@ -2015,6 +2154,7 @@ fn the_route_future_is_send() {
         reader: &reader,
         budget: &budget,
         limits: KeyIndexLeafLimits::default(),
+        tier_one: TierOneCost::PROBE_ONLY,
     });
     assert_send(&future);
     let (routes, figures) = block_on(future).expect("route");
