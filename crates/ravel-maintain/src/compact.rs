@@ -1575,6 +1575,82 @@ mod tests {
         assert_eq!(keys, sorted, "records ascending by (series_index, ts_ns)");
     }
 
+    /// Under the `catalog/compaction-swaps-record` mutant a compaction's
+    /// record names the max-UUID writer in place of its last input and is
+    /// otherwise whole: it decodes, sits at the key its own fields give,
+    /// declares the `input_set_hash` of the identities it names (what
+    /// seal_divergence recomputes), every part's footer carries that hash (what
+    /// the query path's L1 identity check compares), and the parts conserve
+    /// the inputs' samples. Only the identity multiset differs.
+    #[tokio::test]
+    async fn mutant_compaction_swaps_record_publishes_a_self_consistent_record() {
+        let Some(_mutant) = crate::publish::tests::scoped_mutant("catalog/compaction-swaps-record")
+        else {
+            return;
+        };
+        let store = MemoryStore::new();
+        seed(&store, 1, vec![series("alpha", &[(10, 1.0)])], vec![]).await;
+        seed(
+            &store,
+            2,
+            vec![series("beta", &[(20, 2.0), (21, 2.1)])],
+            vec![],
+        )
+        .await;
+        let clock = FixedClock::new(sealed_now_ns());
+        let outcome = compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        assert!(
+            matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "{outcome:?}"
+        );
+
+        let (record, parts) = read_output(&store).await;
+        let swapped = CompactionInputIdentity {
+            writer_id: Uuid::max().to_string(),
+            ..input_identity(2)
+        };
+        assert_eq!(record.inputs, vec![input_identity(1), swapped]);
+
+        let record_key = keys::compaction_record_key_for(&record).expect("record key");
+        let stored = store
+            .get(&record_key, GetRange::Full)
+            .await
+            .expect("the record sits at the key its fields give")
+            .data;
+        let decoded = record::decode_compaction(&stored).expect("the record decodes");
+        keys::verify_compaction_record_key(&decoded, &record_key).expect("key matches");
+        let declared: [u8; 32] = decoded
+            .input_set_hash
+            .as_slice()
+            .try_into()
+            .expect("32-byte hash");
+        assert_eq!(
+            declared,
+            erasure::compute_compaction_input_set_hash(&decoded.inputs),
+            "the declared hash is the hash of the identities the record names"
+        );
+        assert_eq!(parts.len(), decoded.parts.len());
+        for (bytes, part) in parts.iter().zip(&decoded.parts) {
+            let footer = ravel_segment::open_from_full(bytes, ReaderLimits::default())
+                .expect("open part")
+                .footer;
+            assert_eq!(
+                footer.input_set_hash.as_slice(),
+                declared.as_slice(),
+                "part {}",
+                part.part_index
+            );
+            assert_eq!(footer.part_index, part.part_index);
+        }
+        assert_eq!(
+            decoded.parts.iter().map(|p| p.sample_count).sum::<u64>(),
+            3,
+            "the parts carry the inputs' three samples"
+        );
+    }
+
     /// Two inputs each carrying an exemplar for the same `(series, ts)` with
     /// different trace ids: both reach the output. This is what a retried
     /// write produces (the ingest cap is flush-scoped), and the ADR-0047
