@@ -122,7 +122,10 @@
 #                                       name or past 44 characters, a malformed
 #                                       region and the falsification run exit 64,
 #                                       and the usage names the flags; s8: an
-#                                       engine arch with no s3s-fs asset passes
+#                                       engine arch with no s3s-fs asset passes;
+#                                       s9: a full run unsets a caller's
+#                                       METRICSBENCH_S3_BUCKET_SUFFIXES and
+#                                       keeps all four buckets
 #   t  real S3 with a local build    -> exit 65, nothing started
 #   u  stop, fold, start, folded     -> u (case a's output): fold.out,
 #      read-back                        readback-folded.json and both /metrics
@@ -410,17 +413,24 @@
 #                                       compact-tenant argv, 0 and no l1 arm
 #                                       64; ro2: --ravel-only on cardinality
 #                                       and churn, with --passes, --rss-band,
-#                                       a folded-catalog flag, real S3, the
+#                                       a folded-catalog flag, the
 #                                       control arm or the diagnostic
 #                                       refused 65, without
-#                                       the l1 arm 64; ro3: no l1 listing
+#                                       the l1 arm 64, with real S3 exit 0
+#                                       (issue #4481); ro3: no l1 listing
 #                                       time and ro3b: no GET byte counter
 #                                       are misses (70); ro4: a 422 stamped
 #                                       refused (budget), exit 0; ro5: a
 #                                       mismatch and ro5b: an error other
 #                                       than a 422 exit 70; ro6: an L0
 #                                       catalog that does not cover the
-#                                       ingest refused 70.
+#                                       ingest refused 70; ro7: --ravel-only
+#                                       on real S3: real-s3.yml, createbuckets
+#                                       told to check PREFIX-ravel alone, no
+#                                       Mimir, objects and read-backs naming
+#                                       PREFIX-ravel, ravel_only.store and
+#                                       object_store stamped; ro1's portable
+#                                       ravel_only.store.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -454,8 +464,13 @@
 #                                       MB_RAVEL_ONLY and MB_L1_MAX_PART_BYTES
 #                                       refusal exits 64 before any aws call;
 #                                       the history Ravel-only launch's user
-#                                       data; the env block's keys unchanged
-#                                       without them
+#                                       data, with and without a
+#                                       real-s3-prefix; the env block's keys
+#                                       unchanged without them.
+#                                       make-buckets.sh with the aws stub:
+#                                       four buckets per prefix, --ravel-only
+#                                       PREFIX-ravel alone, no prefix 64;
+#                                       box-run.sh's measured_bucket_suffixes
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
