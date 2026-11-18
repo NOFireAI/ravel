@@ -1739,7 +1739,8 @@ from `label_value`'s build:
   entries are read by range.
 - **Cap.** The three fields together are capped at
   `metrics_series_index_max_ratio_ppm` of the part's summed object sizes,
-  rounded down, default 10,000 (1 %), a cap apart from `label_value`'s.
+  rounded down, by default `DEFAULT_METRICS_SERIES_INDEX_MAX_RATIO_PPM`, a
+  ratio of 1 %, and a cap apart from `label_value`'s.
   A part whose series leaves would pass it, or one key of which exceeds
   the leaf body ceiling (`BodyOverCeiling`), gets none of the three refs,
   no series leaf is PUT, and the fold counts it in
