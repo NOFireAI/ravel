@@ -17,8 +17,13 @@
 # commit; required with MB_STAGE1=1 for any profile but ci, which defaults to
 # deploy/metricsbench/stage1-bands.ci.json), MB_STAGE1_ARMS, MB_CONTROL_IMAGE
 # (digest-pinned) and MB_CONTROL_SOURCE_COMMIT (run.sh's Stage 1 arms, on the
-# measured run only; each needs MB_STAGE1=1). AWS_PROFILE and AWS_REGION select
-# the account and region as for any aws CLI call.
+# measured run only; each needs MB_STAGE1=1), MB_L1_MAX_PART_BYTES (a positive
+# integer, with l1 in MB_STAGE1_ARMS; the measured run only), MB_RAVEL_ONLY (1
+# runs the measured profile as run.sh --ravel-only: history or ci, with
+# MB_STAGE1=1 MB_STAGE1_ARMS=l1 and MB_OBJECTS_BAND, without MB_RSS_BAND,
+# MB_CONTROL_IMAGE or a real-s3-prefix; the ci smoke stays a full run).
+# MB_STAGE1=1 on history needs MB_RAVEL_ONLY=1. AWS_PROFILE and AWS_REGION
+# select the account and region as for any aws CLI call.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=${MB_REPO:-$(cd "$here/../../.." && pwd)}
@@ -34,11 +39,35 @@ profile=${MB_PROFILE:-cardinality}
 instance_type=${MB_INSTANCE_TYPE:-m6a.4xlarge}
 cap_min=${MB_CAP_MIN:-2160}
 volume_gb=${MB_VOLUME_GB:-150}
+# run.sh refuses the same, but only after the box has built the harness and
+# run the ci smoke. The Ravel-only shape checks no memory band, so it takes no
+# MB_RSS_BAND, and only its objects band needs choosing.
+ravel_only=${MB_RAVEL_ONLY:-}
+case "$ravel_only" in
+  ''|0) ravel_only="" ;;
+  1) case "$profile" in
+       history|ci) ;;
+       *) echo "MB_RAVEL_ONLY=1 runs on the history and ci profiles only, not MB_PROFILE=$profile" >&2; exit 64;;
+     esac
+     if [ "${MB_STAGE1:-}" != 1 ] || [ "${MB_STAGE1_ARMS:-}" != l1 ]; then
+       echo "MB_RAVEL_ONLY=1 runs the Stage 1 l1 arm alone and needs MB_STAGE1=1 MB_STAGE1_ARMS=l1" >&2
+       exit 64
+     fi
+     if [ -n "${MB_CONTROL_IMAGE:-}" ] || [ -n "${MB_CONTROL_SOURCE_COMMIT:-}" ]; then
+       echo "MB_RAVEL_ONLY=1 with MB_CONTROL_IMAGE: the control arm compares two Ravel builds over passes the Ravel-only shape does not run" >&2
+       exit 64
+     fi
+     [ -z "$real_s3_prefix" ] || { echo "MB_RAVEL_ONLY=1 with a real-s3-prefix: run.sh --ravel-only refuses the real-S3 lane" >&2; exit 64; }
+     [ -z "${MB_RSS_BAND:-}" ] || { echo "MB_RAVEL_ONLY=1 with MB_RSS_BAND: run.sh --ravel-only refuses --rss-band" >&2; exit 64; }
+     [ -n "${MB_OBJECTS_BAND:-}" ] || { echo "MB_RAVEL_ONLY=1 with MB_PROFILE=$profile needs MB_OBJECTS_BAND set for it; the default is cardinality's" >&2; exit 64; }
+     ;;
+  *) echo "MB_RAVEL_ONLY must be 1, 0 or unset, not '$ravel_only'" >&2; exit 64;;
+esac
 # The default bands are the cardinality profile's pre-registered ones (#2821
 # comment 6590940753 for the Prometheus RSS band, comment 6611923577 for the
 # data-object band). Another profile needs both bands chosen and
 # pre-registered for it: they are refused here rather than defaulted.
-if [ "$profile" != cardinality ] && { [ -z "${MB_RSS_BAND:-}" ] || [ -z "${MB_OBJECTS_BAND:-}" ]; }; then
+if [ -z "$ravel_only" ] && [ "$profile" != cardinality ] && { [ -z "${MB_RSS_BAND:-}" ] || [ -z "${MB_OBJECTS_BAND:-}" ]; }; then
   echo "MB_PROFILE=$profile needs MB_RSS_BAND and MB_OBJECTS_BAND set for it; the defaults are cardinality's" >&2
   exit 64
 fi
@@ -49,6 +78,7 @@ case "$stage1" in
   ''|0) stage1="" ;;
   1) case "$profile" in
        cardinality|ci) ;;
+       history) [ -n "$ravel_only" ] || { echo "MB_STAGE1=1 with MB_PROFILE=history needs MB_RAVEL_ONLY=1 MB_STAGE1_ARMS=l1" >&2; exit 64; } ;;
        *) echo "MB_STAGE1=1 runs on the cardinality and ci profiles only, not MB_PROFILE=$profile" >&2; exit 64;;
      esac ;;
   *) echo "MB_STAGE1 must be 1, 0 or unset, not '$stage1'" >&2; exit 64;;
@@ -74,7 +104,17 @@ if [ -n "$control_image" ] || [ -n "$control_source_commit" ]; then
   case "$control_image" in *@sha256:*) ;; *) echo "MB_CONTROL_IMAGE must be digest-pinned (name@sha256:...)" >&2; exit 64;; esac
   [ -n "$control_source_commit" ] || { echo "MB_CONTROL_IMAGE needs MB_CONTROL_SOURCE_COMMIT" >&2; exit 64; }
 fi
+l1_max_part_bytes=${MB_L1_MAX_PART_BYTES:-}
+if [ -n "$l1_max_part_bytes" ]; then
+  case ",$stage1_arms," in
+    *,l1,*) ;;
+    *) echo "MB_L1_MAX_PART_BYTES sets the l1 arm's compaction and needs MB_STAGE1=1 with l1 in MB_STAGE1_ARMS" >&2; exit 64;;
+  esac
+  [[ "$l1_max_part_bytes" =~ ^[1-9][0-9]*$ ]] ||
+    { echo "MB_L1_MAX_PART_BYTES must be a positive integer, not '$l1_max_part_bytes'" >&2; exit 64; }
+fi
 rss_band=${MB_RSS_BAND:-prometheus:2147483648:6442450944}
+[ -z "$ravel_only" ] || rss_band=""
 objects_band=${MB_OBJECTS_BAND:-14000:16500}
 boxrun="$here/box-run.sh"
 region=${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}
@@ -117,15 +157,20 @@ boxrun_sha256=$(shasum -a 256 "$boxrun" | cut -d' ' -f1)
 aws s3 cp --only-show-errors "$work/src.tar.gz" "s3://${MB_RESULTS_BUCKET}/${prefix}/src.tar.gz"
 aws s3 cp --only-show-errors "$boxrun" "s3://${MB_RESULTS_BUCKET}/${prefix}/box-run.sh"
 
-# Each value is shell-quoted: /mb/env is sourced on the box.
+# Each value is shell-quoted: /mb/env is sourced on the box. RAVEL_ONLY and
+# L1_MAX_PART_BYTES are written only when set, so a launch without them renders
+# the same user data as before they existed.
+env_kvs=("BUCKET=${MB_RESULTS_BUCKET}" "PREFIX=${prefix}" "SRC_SHA256=${src_sha256}" \
+  "BOXRUN_SHA256=${boxrun_sha256}" "HARNESS_COMMIT=${harness_sha}" "RAVEL_IMAGE=${ravel_image}" \
+  "RAVEL_SOURCE_COMMIT=${ravel_source_commit}" "ANCHOR_MS=${anchor_ms}" "PROFILE=${profile}" \
+  "RSS_BAND=${rss_band}" "OBJECTS_BAND=${objects_band}" "REAL_S3_PREFIX=${real_s3_prefix}" \
+  "STAGE1=${stage1}" "STAGE1_BANDS=${stage1_bands}" "STAGE1_ARMS=${stage1_arms}" \
+  "CONTROL_IMAGE=${control_image}" "CONTROL_SOURCE_COMMIT=${control_source_commit}" \
+  "AWS_DEFAULT_REGION=${region}")
+[ -z "$ravel_only" ] || env_kvs+=("RAVEL_ONLY=${ravel_only}")
+[ -z "$l1_max_part_bytes" ] || env_kvs+=("L1_MAX_PART_BYTES=${l1_max_part_bytes}")
 env_block=$(
-  for kv in "BUCKET=${MB_RESULTS_BUCKET}" "PREFIX=${prefix}" "SRC_SHA256=${src_sha256}" \
-    "BOXRUN_SHA256=${boxrun_sha256}" "HARNESS_COMMIT=${harness_sha}" "RAVEL_IMAGE=${ravel_image}" \
-    "RAVEL_SOURCE_COMMIT=${ravel_source_commit}" "ANCHOR_MS=${anchor_ms}" "PROFILE=${profile}" \
-    "RSS_BAND=${rss_band}" "OBJECTS_BAND=${objects_band}" "REAL_S3_PREFIX=${real_s3_prefix}" \
-    "STAGE1=${stage1}" "STAGE1_BANDS=${stage1_bands}" "STAGE1_ARMS=${stage1_arms}" \
-    "CONTROL_IMAGE=${control_image}" "CONTROL_SOURCE_COMMIT=${control_source_commit}" \
-    "AWS_DEFAULT_REGION=${region}"; do
+  for kv in "${env_kvs[@]}"; do
     printf '%s=%q\n' "${kv%%=*}" "${kv#*=}"
   done
 )
