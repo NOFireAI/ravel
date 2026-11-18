@@ -386,7 +386,8 @@ cost, not correctness.
 ADR-3692's key-set ceiling amendment replaces `L_max` = 2,048 with
 `P_max x (1 + min(k, B_run))` and admits a part only when its worst case is
 at most 2 x its segments in the routed snapshot, which is narrowed to the
-statement's time window. Under it every multi-day lookup in the
+statement's time window (ADR-3692's per-segment tier-1 cost amendment
+charges a segment tier 1 reads whole at 1 instead of 2). Under it every multi-day lookup in the
 Consequences is covered when its window holds whole days: 30 day parts x
 126 = 3,780 leaf GETs against a ceiling of 1,024 x 65 = 66,560, and 126
 against a whole day part's tier-1 cost of 1,104. A window holding only a
@@ -521,8 +522,10 @@ after it. The lane writes one object per shard per hour: 192 entries a day
 at 8 shards, against box D's 552. The leaf GET figures depend on slices
 per day part, not on entries, and the run stamps both. Days covered do
 depend on entries: ADR-3692's key-set ceiling amendment admits a part only
-when its worst case is at most 2 x its segments in the routed snapshot, so
-a harness day part with no time range admits at 384 against box D's 1,104,
+when its worst case is at most 2 x its segments in the routed snapshot (1
+for a segment tier 1 reads whole, since ADR-3692's per-segment tier-1 cost
+amendment), so a harness day part with no time range admits at up to 384
+against box D's up to 1,104,
 and the headroom over the predicted 126 falls from about 9 x to about 3 x.
 An uncovered day on these states is read against 384 first.
 
