@@ -12,15 +12,65 @@
 #   WORKLOAD_INJECT_SWAPPED_RECORD=1  the self-check: the model expects one
 #             seeded record moved to another write, so the multiset assertion
 #             must fail, and nothing else may.
+#   RAVEL_ANTITHESIS_MUTANT=catalog/<stem>  a mutant control run (ADR-4326
+#             decision 3): the stack runs the config copy
+#             scripts/mutant-config.sh writes, over the
+#             catalog-maintenance-mutants images, with that mutant selected on
+#             every ravel-server container. The property the mutant must make
+#             false is the one formal/tla/catalog/antithesis-mutants.tsv names
+#             for it.
 #
 # Exit 0: every gate passed (or, in the self-check, exactly the injected
-# failure appeared). Exit 1: any gate failed or could not be checked; the
-# FAIL lines say which.
+# failure appeared; in a mutant run, the mutant's property was evaluated
+# false at least once). Exit 1: any gate failed or could not be checked; the
+# FAIL lines say which. In a mutant run every other gate, and every other
+# always-type assertion that went false, is reported and does not decide the
+# exit code.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WL="$(cd "$HERE/.." && pwd)"
 OUT="${1:?out dir}"
 SECS="${2:-240}"
+MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
+TSV="$(cd "$WL/../.." && pwd)/formal/tla/catalog/antithesis-mutants.tsv"
+COMPOSE_BASE="$WL/config/docker-compose.yaml"
+GATE=FAIL
+if [ -n "$MUTANT" ]; then
+    if [ "${WORKLOAD_INJECT_SWAPPED_RECORD:-}" = 1 ]; then
+        echo "refused: the self-check and a mutant run are separate runs; unset one of WORKLOAD_INJECT_SWAPPED_RECORD and RAVEL_ANTITHESIS_MUTANT"
+        exit 1
+    fi
+    mkdir -p "$OUT"
+    rm -rf "$OUT/mutant-config"
+    # Refuses a name that is not one of the catalog mutants.
+    "$HERE/mutant-config.sh" "$MUTANT" "$OUT/mutant-config" || exit 1
+    COMPOSE_BASE="$OUT/mutant-config/docker-compose.yaml"
+    expected=$(awk -F '\t' -v m="$MUTANT" '$2 == m { print $3 }' "$TSV")
+    case "$expected" in
+        '' | *$'\n'*) echo "refused: $TSV names not exactly one property for $MUTANT"; exit 1 ;;
+    esac
+    # The property each mutant must make false. The corrupt-HEAD mutant
+    # switches off both delete paths' HEAD guards, and each path asserts
+    # CorruptHeadFailsClosedOnDeletePaths under its own literal, so either
+    # one going false is the property going false.
+    ACCEPTED=("$expected")
+    if [ "$MUTANT" = catalog/corrupt-head-ignores-delete-gate ]; then
+        ACCEPTED+=("catalog: a catalog sweep never deletes under an unreadable HEAD")
+    fi
+    # A ravel-server built without antithesis-mutants ignores
+    # RAVEL_ANTITHESIS_MUTANT, and the run would test no mutant at all.
+    features=$(docker image inspect -f '{{ index .Config.Labels "org.ravel.antithesis.features" }}' \
+        ravel-antithesis-server:catalog-maintenance-mutants 2>/dev/null) || features=""
+    case ",$features," in
+        *,antithesis-mutants,*) ;;
+        *)
+            echo "refused: ravel-antithesis-server:catalog-maintenance-mutants was built with features '$features', not antithesis-mutants; build it with MUTANTS=1 scripts/build.sh"
+            exit 1
+            ;;
+    esac
+    GATE="REPORT (mutant run, not gated)"
+    echo "mutant $MUTANT: expecting \"$expected\" to be violated"
+fi
 # The driver's own setup budget is 600 s (SETUP_BUDGET in driver/src/main.rs);
 # this bound and launch.sh's --setup-timeout add room for the containers to
 # start around it.
@@ -47,12 +97,12 @@ REQUIRED=(
     "catalog: sweep deleted a superseded compaction input"
 )
 mkdir -p "$OUT"
-export COMPOSE_FILE="$WL/config/docker-compose.yaml:$WL/local/docker-compose.local.yaml"
+export COMPOSE_FILE="$COMPOSE_BASE:$WL/local/docker-compose.local.yaml"
 export COMPOSE_PROJECT_NAME=ravel-antithesis-catalog
 export WORKLOAD_EVENTUALLY_AFTER_SECS="$SECS"
 failures=()
 fail() {
-    echo "FAIL: $*"
+    echo "$GATE: $*"
     failures+=("$*")
 }
 
@@ -222,6 +272,29 @@ for m in "${REQUIRED[@]}"; do
     hits=$(awk -F '\t' -v m="$m" '$4 == m { print $3 }' "$OUT/assertions.tsv")
     [ -n "$hits" ] && [ "$hits" -gt 0 ] || fail "required assertion never held: $m"
 done
+
+if [ -n "$MUTANT" ]; then
+    # The mutant's property decides; every other violation is reported.
+    hit=""
+    while IFS= read -r m; do
+        mine=""
+        for p in "${ACCEPTED[@]}"; do
+            [ "$m" = "$p" ] && mine=1
+        done
+        if [ -n "$mine" ]; then
+            hit="${hit:-$m}"
+        else
+            echo "$GATE: always-type assertion violated besides the mutant's: $m"
+        fi
+    done < "$OUT/violated.tsv"
+    [ "${#failures[@]}" -gt 0 ] && echo "${#failures[@]} other gate(s) failed in this mutant run, reported above; see $OUT"
+    if [ -n "$hit" ]; then
+        echo "mutant OK: $MUTANT violated \"$hit\""
+        exit 0
+    fi
+    echo "FAIL: mutant $MUTANT ran, but none of these was violated: $(printf '"%s" ' "${ACCEPTED[@]}")"
+    exit 1
+fi
 
 if [ "${WORKLOAD_INJECT_SWAPPED_RECORD:-}" = 1 ]; then
     # The self-check: the swapped expectation must make the multiset fail,
