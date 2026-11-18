@@ -6404,7 +6404,11 @@ impl Catalog {
                     // failed to land. A Valid HEAD's bytes carry folder_id and
                     // created_unix_ns, so its version does not recur.
                     ravel_invariant::inv_always_if_known!(
-                        match self.store().get(&head_key, GetRange::Full).await {
+                        match {
+                            let reread = self.store().get(&head_key, GetRange::Full).await;
+                            counters.get_requests += 1;
+                            reread
+                        } {
                             Ok(got) if cas_acked => match &put_mode {
                                 PutMode::CasVersion(conditioned) => {
                                     if matches!(head_state, HeadState::Corrupt { .. }) {
@@ -12544,10 +12548,11 @@ pub(crate) mod tests {
     async fn fold_report_get_requests_equals_observed_store_gets() {
         // One rebuild fold over a fresh instrumented store holding a single
         // sealed segment. Returns (FoldReport.get_requests, the store's real GET
-        // calls issued during the fold only). Publishing happens on the inner
-        // store before it is wrapped, so only the fold's own requests are
-        // measured.
-        async fn measured(enforce: bool) -> (u64, u64) {
+        // calls issued during the fold only, the HEAD re-reads the folded-HEAD
+        // property issued among them, as counted from its captured
+        // evaluations). Publishing happens on the inner store before it is
+        // wrapped, so only the fold's own requests are measured.
+        async fn measured(enforce: bool) -> (u64, u64, u64) {
             let inner = MemoryStore::new();
             let now = now_at_seal(10);
             publish_real_segment(
@@ -12570,49 +12575,50 @@ pub(crate) mod tests {
                 }
             };
 
+            let folder_id = Uuid::new_v4();
             let before = store.metrics().snapshot();
             let report = catalog
-                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+                .fold(&tenant(), Signal::Metrics, folder_id, now, &[], None)
                 .await
                 .expect("fold");
             let after = store.metrics().snapshot();
 
             assert!(!report.no_op);
             assert!(report.rebuilt);
-            // Where assertions are evaluated, the folded-HEAD property re-reads
-            // HEAD once after the CAS; that GET is the instrumentation's, not
-            // the fold's, so the report leaves it out.
-            let instrumentation = u64::from(capturing());
+            let rereads = evaluations(FOLDED_HEAD_HELD, &folder_id.to_string()).len() as u64;
             (
                 report.get_requests,
-                after.get.calls - before.get.calls - instrumentation,
+                after.get.calls - before.get.calls,
+                rereads,
             )
         }
 
         // Enforcement off: the report must equal the store's real GET count.
         // The scan set is a single shard 0 either way (implicit generation 0 at
         // shard_count 1), so the GETs are HEAD (absent) + tenant-config +
-        // commit-record load + segment fetch = 4.
-        let (off_report, off_observed) = measured(false).await;
+        // commit-record load + segment fetch = 4, plus any re-read of HEAD
+        // where the folded-HEAD property is evaluated, which the report counts
+        // too.
+        let (off_report, off_observed, off_rereads) = measured(false).await;
         assert_eq!(
             off_report, off_observed,
             "with enforcement off the report must equal the store's observed GETs"
         );
-        assert_eq!(off_observed, 4);
+        assert_eq!(off_observed - off_rereads, 4);
 
         // Enforcement on: `read_scan_generations` funnels exactly one extra GET
         // (the provisioning-record read, NotFound here but still one request)
         // through `guarded_get`. That is the GET issue #770 dropped; the report
         // must now equal the store's real count on this path too.
-        let (on_report, on_observed) = measured(true).await;
+        let (on_report, on_observed, on_rereads) = measured(true).await;
         assert_eq!(
             on_report, on_observed,
             "with enforcement on the report must equal the store's observed GETs"
         );
-        assert_eq!(on_observed, 5);
+        assert_eq!(on_observed - on_rereads, 5);
         assert_eq!(
-            on_observed,
-            off_observed + 1,
+            on_observed - on_rereads,
+            off_observed - off_rereads + 1,
             "enforcement issues exactly one extra GET, the provisioning read"
         );
     }
