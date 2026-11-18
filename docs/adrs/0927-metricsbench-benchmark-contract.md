@@ -316,7 +316,9 @@ performance result. The 2026-10-26 amendment records the correction to this
 table's `ci` churn figure (the manifest declares 0, not 5%/h; the row above
 is left as written), makes the stream's time anchor an
 explicit on-grid run parameter, and gives each profile a declared
-range-evaluation grid.
+range-evaluation grid. The 2026-11-18 amendment records that the table's
+"total samples" column counts points, scalar samples and native histograms
+together.
 
 Every profile records exact active-series count, total series created,
 samples per series, scrape interval, duration, total samples, label
@@ -1374,3 +1376,29 @@ Consequences.
 - **Saving.** Replayed from the per-repetition records, the rule saves 42.0 min on R6 and 52.0 min on R5 (issue #3879).
 - **Leftover load.** If an engine keeps working on a query after the client gives up at the deadline, a skipped repetition also removes that leftover work, so the statements after it can run faster than they did before this amendment. Runs on either side of the amendment are compared only with this stated. The next run pre-registers Ravel's per-statement medians within 0.85 to 1.15 of R6's.
 - **`ravel_cost` count.** The record count drops below passes times repetitions times entries by the number of Ravel's skipped repetitions. R6's pre-registered count of 315 does not carry over.
+
+## Amendment (2026-11-18): a profile's total counts points, not scalar samples
+
+<!-- amendment-applies: sections="11. Three orthogonal profiles, pre-registered before the first run" pointer="2026-11-18 amendment" -->
+
+Decision 11's table heads its last column "total samples", and the same
+section lists "total samples" among the figures each profile records. Both
+count points: scalar samples and native histograms together. The manifest's
+`total_samples` (`benchmarks/metrics/workload.json`) is `active_series`
+times `samples_per_series` (`crates/ravel-bench/src/metrics_workload.rs`),
+and the generator emits a native-histogram series' points in it. The ingest
+report keeps the two classes apart, as `accepted_samples` and
+`accepted_histograms`, and a row whose receiver cannot store native
+histograms (VictoriaMetrics) reports them as unsupported instead.
+
+For `history` the native-histogram family is 100 per mille of the series. Of
+its 1,728,000,000 points, 1,555,200,000 are scalar samples and 172,800,000 are
+native histograms. A run that compares `accepted_samples` alone against the
+table's figure reads a 10 % shortfall that is not there (issue #3942). The
+table and its rows are left as written; this amendment is the correction.
+`benchmarks/metrics/README.md` already heads the same column "total points"
+and says how to compare ingest volume across runs.
+
+Consequences. A pre-registration bands `accepted_samples` against the scalar
+share of the total and `accepted_histograms` against the native-histogram
+share, per row.
