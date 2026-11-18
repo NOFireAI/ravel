@@ -11062,6 +11062,9 @@ mod tests {
                 .await,
             "the stalled LIST passes"
         );
+        // hygiene-allow: wall-clock -- token_rows_served bounds its reads with
+        // tokio's real-time timeout (the catalog's injected clock cannot sleep),
+        // so the real elapsed time is the subject: the check gave up only after it.
         assert!(started.elapsed() >= publish::EVIDENCE_HEAD_TIMEOUT);
     }
 
