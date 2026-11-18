@@ -829,8 +829,8 @@ async fn a_logs_set_absent_from_an_object_prunes_it() {
 /// exactly 1.
 ///
 /// Flip to watch it fail: in ravel-query's `route_parts`, drop the arm that
-/// counts a part whose `worst_gets` exceeds its snapshot segments x
-/// `gets_per_entry`. The part is then probed and covered: `partsOverTierOne`
+/// counts a part whose `worst_gets` exceeds its snapshot segments' tier-1
+/// cost. The part is then probed and covered: `partsOverTierOne`
 /// reads 0 and `leafGetRequests` is non-zero. Counting the arm in
 /// `parts_uncovered` instead fails on `partsUncovered` reading 1.
 #[tokio::test]

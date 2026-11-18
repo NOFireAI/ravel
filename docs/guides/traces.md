@@ -328,9 +328,10 @@ tail, a part folded without leaves, and the parts past the lookup's
 ceiling of 1,024 parts or `1,024 x (1 + min(k, 64))` leaf GETs for `k`
 distinct trace ids, 2,048 for one) fall back to the per-object KEY_IDX probe
 above. For a `trace_id IN (...)` list, a part whose worst-case leaf GETs
-exceed two GETs for each of its objects in the query's time window, what the
-per-object probe would cost there, is also left to that probe without a leaf
-GET.
+exceed what the per-object probe would cost over its objects in the query's
+time window is also left to that probe without a leaf GET. That cost is two
+GETs for each object, and one for an object small enough that the probe's
+first read (8 KiB by default) covers all of it.
 
 Objects a leaf ruled out are also counted in
 `stats.pruning.segmentsPrunedByKeyIndex`. The response's `stats.keyIndex`
