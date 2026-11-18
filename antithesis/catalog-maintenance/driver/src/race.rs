@@ -1,10 +1,11 @@
 //! The fold race (README.md, "The forced races"): a `ravel-cli` fold whose
 //! clock runs ahead of every other clock by less than the seal margin's
-//! `clock_skew_allowance`, and the two `--mode all` servers' on-demand folds,
-//! started together over a corrupt HEAD just before an hour seals. The
-//! skewed fold already counts that hour as sealed and the servers do not, so
-//! when the skewed fold's HEAD CAS lands first, each server fold loses its
-//! CAS to a HEAD that differs from the one it built.
+//! `clock_skew_allowance`, racing a server fold over a corrupt HEAD just
+//! before an hour seals. The skewed fold already counts that hour as sealed
+//! and the server does not, so they build different HEADs. The s3proxy holds
+//! the server's HEAD PUT while the skewed fold's CAS lands, so when the held
+//! PUT is released the store refuses it (`412`/`409`): its CAS was conditioned
+//! on the corrupt HEAD's version, which the skewed fold has replaced.
 
 /// How far ahead the skewed fold's clock runs: inside the 300-second
 /// `clock_skew_allowance` the seal margin is sized for, so a clock this far
@@ -12,8 +13,10 @@
 pub const FOLD_SKEW_S: u64 = 240;
 const _: () = assert!(FOLD_SKEW_S < crate::clock::CLOCK_SKEW_ALLOWANCE_S);
 
-/// The latest the server folds are posted after the skewed fold starts.
-pub const MAX_SERVER_DELAY_S: f64 = 40.0;
+/// A bound used by the clock window (`clock::fold_race_seal`): the latest a
+/// server fold may read its clock after the race starts and still, before the
+/// seal, build a pre-seal HEAD the skewed fold can overtake.
+pub const MAX_SERVER_DELAY_S: u64 = 40;
 
 /// The fold the skewed process runs, as `catalog fold --json` prints it.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -54,28 +57,20 @@ pub fn parse_server_fold(body: &str) -> Option<ServerFold> {
 /// Whether a server fold lost its HEAD CAS to the skewed fold's HEAD, one
 /// sealed hour ahead of its own.
 ///
-/// The skewed fold published `ahead_hour` from a rebuild, so its CAS was the
-/// one conditioned on the corrupt HEAD and it landed first: any CAS
-/// conditioned on that HEAD and made later lost to it. A server fold that
-/// reports `lost_cas` after a PUT read the corrupt HEAD, built a snapshot and
-/// made such a CAS. A server fold that read a valid HEAD instead ends as a
-/// no-op before any PUT, whatever it reports.
-pub fn overtaken(cli: &CliFold, server: &ServerFold, ahead_hour: u64) -> bool {
+/// The judgement reads the store, not the server's own answer. The skewed fold
+/// rebuilt `ahead_hour` and its CAS landed first, so when the s3proxy releases
+/// the held server HEAD PUT the store refuses it: `412 Precondition Failed` (or
+/// `409`), because the version it was conditioned on, the corrupt HEAD's, is
+/// gone. `head_cas_status` is that status, from the proxy's `held-result`. A
+/// `200` means the held PUT won, which is never an overtaken fold; any other
+/// status, or none held, is not either. The server's own answer may be
+/// `lost_cas` (clean code) or `published` (the `lost-cas-proceeds` mutant,
+/// which carries on after the refusal), and is kept only for the details.
+pub fn overtaken(cli: &CliFold, head_cas_status: Option<u16>, ahead_hour: u64) -> bool {
     !cli.no_op
         && cli.rebuilt
         && cli.watermark_hour == Some(ahead_hour)
-        && server.status == "lost_cas"
-        && server.put_requests.is_none_or(|n| n > 0)
-}
-
-/// Seconds after the skewed fold starts to post the server folds. The
-/// skewed fold's CAS lands about `cli_s` after its start, and a server fold
-/// reads HEAD when posted and makes its CAS about `server_s` later; it loses
-/// to the skewed fold when posted inside `(cli_s - server_s, cli_s)`. `frac`,
-/// in `[0, 1]`, picks the point in that window, from the last attempt's
-/// timings.
-pub fn server_delay_s(cli_s: f64, server_s: f64, frac: f64) -> f64 {
-    (cli_s - server_s * frac.clamp(0.0, 1.0)).clamp(0.0, MAX_SERVER_DELAY_S)
+        && matches!(head_cas_status, Some(412) | Some(409))
 }
 
 #[cfg(test)]
@@ -98,33 +93,26 @@ mod tests {
     }
 
     #[test]
-    fn only_a_cas_lost_to_the_skewed_rebuild_is_overtaken() {
+    fn only_a_refused_head_cas_after_the_skewed_rebuild_is_overtaken() {
         let won = cli(false, true, Some(11));
-        assert!(overtaken(&won, &server("lost_cas", Some(3)), 11));
-        // A server that spent its CAS retries lost them all.
-        assert!(overtaken(&won, &server("lost_cas", None), 11));
-        // No PUT: the server read a valid HEAD and stopped before any CAS.
-        assert!(!overtaken(&won, &server("lost_cas", Some(0)), 11));
-        // The server's own HEAD landed.
-        assert!(!overtaken(&won, &server("published", Some(3)), 11));
+        // A refused HEAD CAS (412 or 409) after the skewed rebuild: overtaken,
+        // whatever the server's own answer was. This rules out the old rule,
+        // which required the server to report "lost_cas": the mutant answers
+        // "published" after the same 412, and that still counts as won.
+        assert!(overtaken(&won, Some(412), 11));
+        assert!(overtaken(&won, Some(409), 11));
+        // A held PUT that succeeded (200) is a win, never overtaken. This rules
+        // out a rule that counts any held PUT as won.
+        assert!(!overtaken(&won, Some(200), 11));
+        // No PUT was held, or the store answered something else.
+        assert!(!overtaken(&won, None, 11));
+        assert!(!overtaken(&won, Some(500), 11));
         // The skewed fold rebased onto another HEAD, so a server's or a
-        // scheduled fold's CAS landed first.
-        assert!(!overtaken(
-            &cli(false, false, Some(11)),
-            &server("lost_cas", Some(3)),
-            11
-        ));
-        // The skewed fold published no hour ahead of the servers.
-        assert!(!overtaken(
-            &cli(false, true, Some(10)),
-            &server("lost_cas", Some(3)),
-            11
-        ));
-        assert!(!overtaken(
-            &cli(true, false, Some(11)),
-            &server("lost_cas", Some(3)),
-            11
-        ));
+        // scheduled fold's CAS landed first: no fresh rebuild to overtake with.
+        assert!(!overtaken(&cli(false, false, Some(11)), Some(412), 11));
+        // The skewed fold published no hour ahead of the server.
+        assert!(!overtaken(&cli(false, true, Some(10)), Some(412), 11));
+        assert!(!overtaken(&cli(true, false, Some(11)), Some(412), 11));
     }
 
     #[test]
@@ -146,21 +134,5 @@ mod tests {
             Some(server("lost_cas", None))
         );
         assert_eq!(parse_server_fold(r#"{"published": true}"#), None);
-    }
-
-    #[test]
-    fn the_server_folds_are_posted_inside_the_losing_window() {
-        // The skewed fold takes 6 s, a server fold 4 s: a post in (2, 6)
-        // reads HEAD before the skewed CAS and makes its own after it.
-        for frac in [0.1, 0.5, 0.9] {
-            let d = server_delay_s(6.0, 4.0, frac);
-            assert!(d > 2.0 && d < 6.0, "frac {frac}: {d}");
-        }
-        assert_eq!(server_delay_s(6.0, 4.0, 0.5), 4.0);
-        // A server fold slower than the skewed one is posted at once.
-        assert_eq!(server_delay_s(2.0, 9.0, 0.5), 0.0);
-        // Never past the bound that keeps the servers before the seal.
-        assert_eq!(server_delay_s(500.0, 1.0, 0.5), MAX_SERVER_DELAY_S);
-        assert_eq!(server_delay_s(6.0, 4.0, 7.0), 2.0);
     }
 }
