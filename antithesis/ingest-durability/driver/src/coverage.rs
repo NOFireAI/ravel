@@ -274,7 +274,7 @@ impl Coverage {
                     check(&METRICS_429, true, details.clone());
                 }
                 let text = String::from_utf8_lossy(body);
-                if HEAD_SHED_BODIES.contains(&text.trim()) {
+                if HEAD_SHED_BODIES.iter().any(|b| *b == text.trim()) {
                     *lock(&self.head_shed).entry(w.id).or_insert(0) += 1;
                 }
             }
@@ -326,7 +326,7 @@ impl Coverage {
             .iter()
             .filter(|(id, shed)| {
                 m.writes
-                    .get(id)
+                    .get(*id)
                     .is_some_and(|w| w.signal == signal && w.attempts.len() == **shed)
             })
             .map(|(id, _)| *id)
