@@ -298,7 +298,11 @@ impl Coverage {
             }
         }
         if poison > 0 && matches!(attempt, Attempt::Acked { .. }) {
-            check(&POISON_ACKED, true, json!({ "write": w.id, "poison": poison }));
+            check(
+                &POISON_ACKED,
+                true,
+                json!({ "write": w.id, "poison": poison }),
+            );
         }
     }
 
@@ -307,7 +311,11 @@ impl Coverage {
     pub fn note_token_read(&self, w: &Write) {
         let poison = self.poison(w.id);
         if poison > 0 {
-            check(&POISON_READ, true, json!({ "write": w.id, "poison": poison }));
+            check(
+                &POISON_READ,
+                true,
+                json!({ "write": w.id, "poison": poison }),
+            );
         }
     }
 
@@ -382,11 +390,7 @@ impl Coverage {
     pub fn drain_step(&self, tc: &TestCase, nodes: &[String]) {
         let mut d = lock(&self.drains);
         self.collect_drain(&mut d);
-        if d.pending.is_some()
-            || d
-                .last_request
-                .is_some_and(|t| t.elapsed() < DRAIN_INTERVAL)
-        {
+        if d.pending.is_some() || d.last_request.is_some_and(|t| t.elapsed() < DRAIN_INTERVAL) {
             return;
         }
         let node = draw_node(tc, nodes.len());
@@ -398,8 +402,8 @@ impl Coverage {
         let seq = d.next_seq;
         let request = self.control.join(format!("drain-{host}"));
         let tmp = self.control.join(format!(".drain-{host}.tmp"));
-        let written = std::fs::write(&tmp, format!("{seq}\n"))
-            .and_then(|()| std::fs::rename(&tmp, &request));
+        let written =
+            std::fs::write(&tmp, format!("{seq}\n")).and_then(|()| std::fs::rename(&tmp, &request));
         if let Err(e) = written {
             println!("coverage: writing drain request {}: {e}", request.display());
             return;
@@ -439,7 +443,11 @@ impl Coverage {
         let _ = std::fs::remove_file(&result);
         let answer = parse_drain_result(&text);
         if answer.seq != Some(p.seq) {
-            println!("coverage: ignoring a stale drain answer from {}: {}", p.host, text.trim());
+            println!(
+                "coverage: ignoring a stale drain answer from {}: {}",
+                p.host,
+                text.trim()
+            );
             return;
         }
         let details = json!({ "host": p.host, "seq": p.seq, "answer": text.trim() });

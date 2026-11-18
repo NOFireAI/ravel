@@ -644,10 +644,7 @@ impl Shared {
         );
         let mode = draw_mode(tc);
         let gzip = tc.draw(gs::weighted_booleans(0.3));
-        let poison = s
-            .cov
-            .as_ref()
-            .map_or(0, |c| c.draw_metric_poison(tc, mode));
+        let poison = s.cov.as_ref().map_or(0, |c| c.draw_metric_poison(tc, mode));
         let Some(w) = s.register(Signal::Metrics, mode, 0, samples, offset, false) else {
             return;
         };
