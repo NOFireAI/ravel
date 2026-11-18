@@ -3799,11 +3799,14 @@ pub async fn sweep_unreferenced_catalog_objects(
     // orphan" behavior, because a recovery fold rebuilding from no HEAD adopts
     // surviving old keys via `AlreadyExists` and is about to name them.
     // Every HEAD read the deletes below rest on, kept for the fail-closed
-    // assertion to decode on its own.
-    let mut gate_heads: Vec<Bytes> = Vec::with_capacity(2);
+    // assertion to decode on its own. Where assertions compile out it stays
+    // empty and never allocates.
+    let mut gate_heads: Vec<Bytes> = Vec::new();
     let referenced = match read_head_reference(store, tenant, signal).await? {
         HeadReference::Present { referenced, head } => {
-            gate_heads.push(head);
+            if ravel_invariant::EVALUATES {
+                gate_heads.push(head);
+            }
             referenced
         }
         HeadReference::Absent => {
@@ -3845,7 +3848,9 @@ pub async fn sweep_unreferenced_catalog_objects(
     if !candidates.is_empty() {
         let fresh = match read_head_reference(store, tenant, signal).await? {
             HeadReference::Present { referenced, head } => {
-                gate_heads.push(head);
+                if ravel_invariant::EVALUATES {
+                    gate_heads.push(head);
+                }
                 referenced
             }
             HeadReference::Absent => {

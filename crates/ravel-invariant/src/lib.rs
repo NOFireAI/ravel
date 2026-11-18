@@ -38,6 +38,9 @@ pub use antithesis_sdk as __sdk;
 /// The environment variable that selects the one mutant a mutant image runs.
 pub const MUTANT_ENV: &str = "RAVEL_ANTITHESIS_MUTANT";
 
+/// True exactly when the `inv_*` assertion macros evaluate their arguments.
+pub const EVALUATES: bool = cfg!(any(feature = "antithesis", feature = "capture"));
+
 /// Why [`init`] refused to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InitError {
@@ -571,6 +574,38 @@ mod tests {
 
         let selected = inv_mutant!("commit/commit-before-data");
         assert!(!selected, "inv_mutant! is false without the feature");
+    }
+
+    #[cfg(not(any(feature = "antithesis", feature = "capture")))]
+    #[test]
+    fn evaluates_is_false_without_the_feature() {
+        let evaluated = std::cell::Cell::new(false);
+        inv_always!(
+            {
+                evaluated.set(true);
+                true
+            },
+            "ravel-invariant test: evaluates is false without the feature",
+            serde_json::json!({})
+        );
+        assert!(!evaluated.get());
+        assert_eq!(evaluated.get(), crate::EVALUATES);
+    }
+
+    #[cfg(feature = "capture")]
+    #[test]
+    fn evaluates_is_true_under_capture() {
+        let evaluated = std::cell::Cell::new(false);
+        inv_always!(
+            {
+                evaluated.set(true);
+                true
+            },
+            "ravel-invariant test: evaluates is true under capture",
+            serde_json::json!({})
+        );
+        assert!(evaluated.get());
+        assert_eq!(evaluated.get(), crate::EVALUATES);
     }
 
     // Invokes each assertion macro once under `antithesis` so a build with that
