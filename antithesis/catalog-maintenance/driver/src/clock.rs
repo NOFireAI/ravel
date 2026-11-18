@@ -171,6 +171,37 @@ pub fn fold_race_nudge_s(now_s: u64) -> u64 {
     next_seal_s(now_s + MIN_NUDGE_S + FOLD_RACE_AIM_S) - FOLD_RACE_AIM_S - now_s
 }
 
+/// `max_flush_lifetime + clock_skew_allowance`: a bucket is sealed for
+/// compaction this long after its hour ends (`is_sealed` in
+/// crates/ravel-maintain), 900 s before the fold seals the hour.
+pub fn compaction_seal_margin_s() -> u64 {
+    MAX_FLUSH_LIFETIME_S + CLOCK_SKEW_ALLOWANCE_S
+}
+
+/// How far past a seal a nudge puts the clocks, so the settle and a process
+/// that reads its clock just before the reread still see the hour sealed.
+const SEAL_SLACK_S: u64 = 30;
+
+/// How far to move every clock forward so `hour` is sealed `margin_s` after
+/// its end, with [`SEAL_SLACK_S`] to spare; 0 when it already is.
+pub fn seal_nudge_s(now_s: u64, hour: u64, margin_s: u64) -> u64 {
+    ((hour + 1) * 3600 + margin_s + SEAL_SLACK_S).saturating_sub(now_s)
+}
+
+/// `DEFAULT_INTERIOR_REVERIFY_NS` in crates/ravel-maintain/src/config.rs: the
+/// maintain driver runs a full-keyspace sweep pass instead of the zoned one
+/// only when this long passed since its last (`MaintainMemo::full_sweep_due`),
+/// and an hour the clocks left far behind is reached by the full pass only.
+pub const INTERIOR_REVERIFY_S: u64 = 21_600;
+
+/// The second jump of the unfolded-record sweep (README.md, "The forced
+/// races"): past the pinned-query window of a marker written right after the
+/// first jump, and past the interior re-verify interval, so the server sweep
+/// after it is a full pass that would delete an input it marked.
+pub fn unfolded_window_jump_s() -> u64 {
+    INTERIOR_REVERIFY_S.max(pinned_window_s()) + 600
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +368,45 @@ mod tests {
         );
         assert!(check_sweep_jumps(protection_horizon_s() - 1, DEFAULT_WINDOW_JUMP_S).is_err());
         assert!(check_sweep_jumps(DEFAULT_HORIZON_JUMP_S, pinned_window_s() - 1).is_err());
+    }
+
+    #[test]
+    fn a_seal_nudge_seals_the_hour_and_no_later_one() {
+        // DEFAULT_MAX_FLUSH_LIFETIME_NS plus DEFAULT_CLOCK_SKEW_ALLOWANCE_NS.
+        assert_eq!(compaction_seal_margin_s(), 3900);
+        let hour = 500_000;
+        let end = (hour + 1) * 3600;
+        for now in [hour * 3600, hour * 3600 + 1799, end - 1, end + 3000] {
+            for margin in [compaction_seal_margin_s(), seal_margin_s()] {
+                let after = now + seal_nudge_s(now, hour, margin);
+                assert!(after >= end + margin, "{now} {margin}");
+                // Within the slack, so the next hour stays unsealed.
+                assert!(after < end + 3600 + margin, "{now} {margin}");
+            }
+        }
+        // The fold's seal of the hour comes after a compaction nudge.
+        let now = hour * 3600 + 10;
+        let after = now + seal_nudge_s(now, hour, compaction_seal_margin_s());
+        assert!(sealed_watermark_hour(after * NS_PER_SECOND) < Some(hour));
+        let after = now + seal_nudge_s(now, hour, seal_margin_s());
+        assert_eq!(sealed_watermark_hour(after * NS_PER_SECOND), Some(hour));
+        // Already sealed: no move.
+        assert_eq!(seal_nudge_s(end + 7200, hour, compaction_seal_margin_s()), 0);
+    }
+
+    #[test]
+    fn the_unfolded_window_jump_makes_the_next_pass_full_and_past_the_window() {
+        // DEFAULT_INTERIOR_REVERIFY_NS is 6 h.
+        assert_eq!(INTERIOR_REVERIFY_S, 6 * 3600);
+        let jump = unfolded_window_jump_s();
+        assert_eq!(jump, 22_200);
+        assert!(jump >= INTERIOR_REVERIFY_S && jump >= pinned_window_s());
+        // A marker written up to the slack after the first jump is still
+        // past its window after the second.
+        assert!(jump - 600 >= pinned_window_s());
+        // And the first jump is past the horizon of a record written just
+        // before it.
+        assert!(check_sweep_jumps(DEFAULT_HORIZON_JUMP_S, jump).is_ok());
     }
 
     #[test]
