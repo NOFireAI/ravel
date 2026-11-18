@@ -1543,7 +1543,8 @@ A ceiling meant to bound cost was inverting it.
   (1 + min(k_s, 2^bits, B_run))`, is at most 2 x the part's segments in
   the routed snapshot, the tier-1 probe's cost for those segments (ADR-2707
   decision 5: two ranged GETs per object; three as measured on spans, two
-  being the conservative value). The routed snapshot is already narrowed
+  being the conservative value). The per-segment tier-1 cost amendment
+  below charges a segment that tier 1 reads whole in one GET at 1, not 2. The routed snapshot is already narrowed
   to the statement's time window, so this is the part's segments in that
   window, not its `entry_count`: a one-hour window over a logs day part
   holds about 23 of its 552 segments, a tier-1 cost of about 46. A part
@@ -1593,7 +1594,7 @@ decoded frame (`decoded_bound`) is unchanged; with 16 parts in flight and
 |---|---|---|---|
 | 19 key-set ceiling: a 100-key logs request_id list over 30 day parts | 30 of 30 parts covered, `parts_beyond_ceiling` 0, leaf GETs at most 3,780, 0 tier-1 probes on covered parts | any part beyond the ceiling | predicted; services/ravel-server/tests/sql_key_in.rs |
 | 21 the cap at the largest set: a 1,024-key logs request_id list over 64 day parts | at least 63 parts covered at tier 2, covered plus `parts_beyond_ceiling` equal to 64, rows exact | fewer than 63 covered, or any wrong row | predicted; the admission loop in key_index_route.rs `route_parts` |
-| 20 per-part tier-1 test: a part whose worst case exceeds 2 x its segments in the routed snapshot | left to tier 1 after 0 leaf GETs, counted in `parts_over_tier_one` and not in `parts_uncovered`, rows exact | the part probed at tier 2 | predicted; the admission loop in key_index_route.rs `route_parts` |
+| 20 per-part tier-1 test: a part whose worst case exceeds 2 x its segments in the routed snapshot (its tier-1 cost since the per-segment tier-1 cost amendment) | left to tier 1 after 0 leaf GETs, counted in `parts_over_tier_one` and not in `parts_uncovered`, rows exact | the part probed at tier 2 | predicted; the admission loop in key_index_route.rs `route_parts` |
 | 11 (restated) single-key ceiling | a 1-key lookup over 1,025 parts admits 1,024 and leaves 1 beyond the ceiling, as before | any change | predicted; key_index_route.rs `ADR_CEILING` |
 
 Tests the implementing task names, each with the mutant it fails on:
@@ -1762,3 +1763,49 @@ section, instead of 27,400 GETs and 28.8 GB; ADR-3939's section hold
 amendment carries the same figures and the predicted peak RSS.
 
 Refs: #4376, #4347
+
+## Amendment (issue #4027): a part's tier-1 cost is charged per segment
+
+<!-- amendment-applies: sections="Amendment (issue #3939, key-set ceiling): the leaf GET ceiling scales with the key set, and a part is admitted against its own tier-1 cost" pointer="per-segment tier-1 cost amendment" -->
+
+Date: 2026-11-18.
+
+**Why.** The key-set ceiling amendment admits a part at tier 2 only when its
+worst case is at most 2 x its segments in the routed snapshot. Tier 1 does
+not spend 2 GETs on every segment. A logs segment at or under the logs
+fetcher's `block_range_threshold` (524,288 bytes by default) is read whole
+in one GET with no KEY_IDX probe, and a spans segment at or under the spans
+fetcher's `trace_probe_bytes` (8 KiB by default) is covered by the tail
+probe's first read. For a part made mostly of such segments the old rule
+overstated tier 1's cost by up to 2x and kept leaf routes dearer than the
+probe.
+
+**The rule.** A part is admitted only when its worst case is at most the
+sum of its segments' tier-1 costs in the routed snapshot. A segment costs 1
+GET at or under the caller's whole-read bound and 2 otherwise, the ADR-2707
+decision 5 value. The router reads the bound from the fetcher it routes
+for: `block_range_threshold` for logs, not `plan_whole_object_bound`,
+because a keyed segment between the two is still probed; and
+`trace_probe_bytes` for spans. `TierOneCost` in
+`crates/ravel-query/src/key_index_route.rs` holds the per-band table, with
+the code and the test behind each row. The metrics series route keeps the
+flat 2 per segment; its fetcher has the same whole-read rule, and charging
+it per segment is a separate change.
+
+**What stays.** A probed segment is still charged 2.
+`keyed_objects_the_scan_skips_are_probed_not_planned` pins a probe chain
+of four reads ahead of the whole-object GET (tail read, footer chase,
+KEY_IDX prefix, one bucket; its `dependencyDepth` assertion), so a probed
+segment can cost more than 2 and the comparison still leans toward tier 1
+there. Raising
+that charge would change ADR-2707 decision 5 and is not done here. Outcomes,
+statistics fields and `parts_over_tier_one` are unchanged.
+
+**Figures.** A logs day part of 552 segments now has a tier-1 cost of 1,104
+less one for each segment at or under the threshold. The key-set ceiling
+amendment's 1,050 at k = 1,024 is admitted while at most 54 of the 552 are.
+On run C's investigations corpus 28 of 1,908 logs L0 segments and none of
+2,152 spans L0 segments sit at or under the default bounds (#4027 comment
+6961331747), so that amendment's predicted figures stand for that corpus.
+
+Refs: #4027, #3939

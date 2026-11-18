@@ -4384,9 +4384,10 @@ the logs entry holding the same eleven fields as `stats.keyIndex`
 - `partsCovered`: parts the router answered from their leaves.
 - `partsUncovered`: parts with no leaf for `trace_id`, whose segments go
   to the tier-1 probe.
-- `partsOverTierOne`: parts whose worst-case leaf GET count exceeds two GETs
-  for each of the part's segments in the routed snapshot, their tier-1
-  probe's cost, left to the tier-1 probe without a leaf GET.
+- `partsOverTierOne`: parts whose worst-case leaf GET count exceeds the
+  tier-1 cost of the part's segments in the routed snapshot (1 GET for a
+  segment tier 1 reads whole, 2 for any other), left to the tier-1 probe
+  without a leaf GET.
 - `partsBeyondCeiling`: parts past the statement's leaf GET ceiling or the
   probed-parts ceiling, whose segments go to the tier-1 probe.
 - `leavesRejected`: parts whose leaf did not answer, read as uncovered: a
@@ -5856,9 +5857,18 @@ at k >= 64; ADR-3692's key-set ceiling amendment), computed from the set
 where `route` builds its bounds. It is an absolute cap: each admitted part
 is charged its worst case and refunded down to the GETs it issued, so the
 cap's worst-case division is the fewest parts it admits. A part whose worst
-case exceeds two GETs for each of its segments in the routed snapshot, its
+case exceeds the tier-1 cost of its segments in the routed snapshot, its
 own tier-1 probe's cost over the statement's window, is not probed and
-counts in `partsOverTierOne`, not `partsUncovered`
+counts in `partsOverTierOne`, not `partsUncovered`. Each segment is charged
+by `TierOneCost` from its `object_size`: 1 GET when tier 1 reads it whole in
+one GET without a KEY_IDX probe (at or under the logs fetcher's
+`block_range_threshold`, 512 KiB by default, or the spans fetcher's
+`trace_probe_bytes`, 8 KiB by default), 2 otherwise, ADR-2707 decision 5's
+conservative per-object probe cost (ADR-3692's per-segment tier-1 cost
+amendment;
+`a_part_of_small_objects_dearer_than_their_whole_reads_goes_to_tier_one`,
+`a_mixed_part_is_admitted_at_its_tier_one_cost_and_not_one_get_past`,
+`the_whole_read_band_ends_at_the_block_range_threshold`)
 (`a_part_costing_more_than_its_tier_one_probe_is_left_to_tier_one`,
 `a_part_with_few_segments_in_the_routed_snapshot_is_left_to_tier_one`,
 `the_same_part_with_every_segment_in_the_routed_snapshot_is_admitted`). The
