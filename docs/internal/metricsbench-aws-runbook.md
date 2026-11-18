@@ -16,7 +16,7 @@ The scripts are under
 
 | Script | Runs on | What it does |
 |---|---|---|
-| `make-buckets.sh` | your machine | creates the four empty real-S3 buckets for a prefix, each with a policy granting only the instance role |
+| `make-buckets.sh` | your machine | creates the four empty real-S3 buckets for a prefix (with `--ravel-only`, the Ravel bucket alone), each with a policy granting only the instance role |
 | `launch.sh` | your machine | uploads the source tarball and `box-run.sh`, then starts a self-terminating instance |
 | `user-data.tpl` | the box, at boot | schedules the shutdown, installs the AWS CLI, fetches `box-run.sh` and checks its checksum |
 | `box-run.sh` | the box | builds the harness at the pinned commit, runs `ci`, runs the profile, and uploads the outputs |
@@ -111,6 +111,20 @@ deploy/metricsbench/aws/launch.sh "$H" "<image@digest>" "$H" 1793595495000 r1 mb
 deploy/metricsbench/aws/launch.sh "$H" "<image@digest>" "$H" 1793595495000 f1
 ```
 
+**The #3941 series-listing run.** A Ravel-only run (`MB_RAVEL_ONLY=1`)
+on the real-S3 lane, so the L0 and L1 listing times include real S3 GET
+latency. Pre-register its band file and the objects band for `history`
+first (section 4). The measured run needs `<prefix>-ravel` alone; the ci
+smoke is a full four-engine run and needs its four buckets:
+
+```sh
+deploy/metricsbench/aws/make-buckets.sh --ravel-only mbr-<tag>
+deploy/metricsbench/aws/make-buckets.sh mbr-<tag>-ci
+MB_PROFILE=history MB_STAGE1=1 MB_STAGE1_ARMS=l1 MB_RAVEL_ONLY=1 \
+  MB_STAGE1_BANDS=<band file> MB_OBJECTS_BAND=<MIN:MAX> \
+  deploy/metricsbench/aws/launch.sh "$H" "<image@digest>" "$H" 1793595495000 l1 mbr-<tag>
+```
+
 The arguments, in order:
 1. the harness commit;
 2. the Ravel image;
@@ -172,11 +186,14 @@ function of the anchor and the seed.
   compaction and the read-back again on L1. The ci smoke stays a full
   four-engine run. `launch.sh` refuses it with exit 64 on a profile other
   than `history` or `ci`, without `MB_STAGE1=1` and `MB_STAGE1_ARMS=l1`, with
-  a control image, with `MB_RSS_BAND` (the shape takes no memory band), with
-  a real-S3 prefix (`run.sh --ravel-only` refuses the real-S3 lane), and
+  a control image, with `MB_RSS_BAND` (the shape takes no memory band), and
   without `MB_OBJECTS_BAND` or `MB_STAGE1_BANDS`. The shipped ci Stage 1 band
   file is pre-registered for a four-engine run, so a Ravel-only launch names
-  its own band file even on `ci`;
+  its own band file even on `ci`. It runs on either lane. With a real-S3
+  prefix the measured run uses `<prefix>-ravel` alone and starts no Mimir,
+  so `make-buckets.sh --ravel-only <prefix>` is enough for it; the ci smoke
+  still needs all four `<prefix>-ci` buckets (see "The #3941 series-listing
+  run" below);
 - `MB_L1_MAX_PART_BYTES`, a positive integer that `box-run.sh` passes to the
   measured run's l1 compaction as `--max-l1-part-bytes`. It needs
   `MB_STAGE1=1` with `l1` in `MB_STAGE1_ARMS`; `launch.sh` refuses it
