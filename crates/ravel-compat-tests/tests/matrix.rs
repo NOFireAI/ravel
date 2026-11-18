@@ -135,27 +135,31 @@
 //! - retired-reader startup with no, stale, contradicted or current
 //!   certificate [pinned]
 //!   - services/ravel-server/src/compat_gate.rs::retired_reader_refuses_without_current_certificate
-//! - crash after each publish step [partial: no test injects a crash after each
-//!   step of one publish and checks FaultStore counters]
+//! - crash after each publish step [pinned]
+//!   - crates/ravel-compat-tests/tests/crash_after_each_write.rs::a_crash_at_every_write_of_every_step_resumes_to_the_uninterrupted_end_state
 //!   - crates/ravel-maintain/src/compat_activate.rs::crash_mid_walk_resumes_from_the_cursor_and_only_then_sets_fence_complete
 //!   - crates/ravel-maintain/src/compat_activate.rs::lost_cursor_resume_rewalks_everything_idempotently
 //!   - crates/ravel-maintain/src/compat_certify.rs::a_cursor_left_by_a_failed_delete_is_not_resumed
 //!   - crates/ravel-maintain/tests/compat_write_policy.rs::a_failed_fence_cas_leaves_nothing_written
 //! - concurrent migrate, ingest, compaction and a late write inside H
-//!   [partial: no concurrent run]
+//!   [pinned]
+//!   - crates/ravel-compat-tests/tests/concurrent_interleaving.rs::seeded_interleavings_of_migrate_ingest_compaction_and_a_late_write
 //!   - crates/ravel-maintain/src/migrate.rs::a_straggler_landing_after_the_walk_refuses_the_floor_raise
 //!   - crates/ravel-maintain/src/migrate.rs::floor_raise_refuses_when_a_fresh_straggler_survives_the_walk
 //!   - crates/ravel-maintain/src/compat_certify.rs::a_lower_version_stamp_yields_contradicted
-//! - stale floor [partial: the audit reports it; no certify-path test]
+//! - stale floor [pinned]
+//!   - crates/ravel-compat-tests/tests/stale_floor.rs::a_stale_floor_does_not_certify_while_superseded_n_inputs_remain
 //!   - services/ravel-cli/src/maintain.rs::audit_versions_reports_a_stale_floor_for_a_record_at_the_floor
 //!   - crates/ravel-maintain/src/compat_certify.rs::a_lower_version_stamp_yields_contradicted
 //! - a publish straddling activation; a permit granted after activated + H
-//!   encodes N+1 [partial: the ingest permit test fixes the version at grant;
-//!   no test spans the horizon]
+//!   encodes N+1 [pinned]
+//!   - crates/ravel-compat-tests/tests/publish_straddling_activation.rs::a_straddling_publish_lands_at_n_and_a_grant_past_h_encodes_n_plus_one
 //!   - crates/ravel-ingest/src/shard.rs::version_chosen_at_permit_grant_and_first_activated_publish_fences_the_bucket
 //!   - crates/ravel-maintain/tests/compat_write_policy.rs::the_version_is_chosen_once_per_run_not_per_put
 //!   - crates/ravel-maintain/src/compat_certify.rs::certify_refuses_before_the_time_gate
-//! - certify cursor lost mid-run [partial: foreign cursors only]
+//! - certify cursor lost mid-run [pinned]
+//!   - crates/ravel-compat-tests/tests/certify_cursor_lost.rs::a_lost_cursor_restarts_the_census_and_rescans_the_censused_unit
+//!   - crates/ravel-compat-tests/tests/certify_cursor_lost.rs::a_lost_cursor_never_certifies_a_partial_census
 //!   - crates/ravel-maintain/src/compat_certify.rs::a_cursor_for_another_target_starts_a_fresh_census
 //!   - crates/ravel-maintain/src/compat_certify.rs::a_cursor_from_another_epoch_starts_a_fresh_census
 //! - Flight SQL scan of an out-of-window object answers a typed error
@@ -166,11 +170,18 @@
 //!   `docs/compatibility.md` does not exist]
 //!   - crates/ravel-catalog/tests/sys_proto_format_version_classification.rs::classification_is_complete
 //! - retention, erasure, legal hold and a pinned query during migrate
-//!   [partial: each alone, none during a migrate run]
+//!   [partial: erasure and a pinned query run during migrate; retention and
+//!   legal hold are tested alone, none during a migrate run; the erasure case
+//!   runs with claims on and the store clock aligned to the claim clock --
+//!   with claims off, or against the unclaimed background migrate, the
+//!   erased sample is served instead (issue #4449, with the unclaimed
+//!   background migrate itself as issue #4448)]
+//!   - crates/ravel-compat-tests/tests/erasure_during_migrate.rs::an_erasure_and_a_pinned_query_during_migrate_complete_at_n_plus_1
 //!   - crates/ravel-maintain/tests/retention_version_window.rs::an_out_of_window_object_holds_the_bucket
 //!   - crates/ravel-maintain/tests/erasure_compaction_fence.rs::an_erasure_rewrite_that_publishes_mid_migration_cancels_the_migration
 //!   - crates/ravel-maintain/tests/compat_write_policy.rs::erasure_refuses_an_unwritable_active_version_and_leaves_the_request_pending
-//! - rollback "F certified, B+2 installed, roll back to B+1" [deferred]
+//! - rollback "F certified, B+2 installed, roll back to B+1" [pinned]
+//!   - crates/ravel-compat-tests/tests/rollback_after_certificate.rs::b_plus_1_after_a_rollback_from_b_plus_2_reads_and_writes_n_plus_1
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -1218,7 +1229,7 @@ fn timings() -> CertifyTimings {
 
 /// Citation lines in this file's header map. A changed count fails until the
 /// constant is updated, so a parse that silently finds fewer lines fails too.
-const CITED_TESTS: usize = 108;
+const CITED_TESTS: usize = 116;
 
 /// The `path::name` citations in this file's header map.
 fn header_citations(source: &str) -> Vec<(String, String)> {
