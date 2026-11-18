@@ -18,10 +18,11 @@
 //! ([`encode_key_index_posting_leaf`], [`split_key_index_postings`]) and
 //! decoders ([`KeyIndexLeafPrefix::probe_posting_bucket`],
 //! [`KeyIndexSetPlan::posting_decoder`],
-//! [`verify_key_index_posting_leaf_frames`]) have no production caller yet:
-//! no fold writes a posting leaf and no router reads one. What production
-//! reaches is the version gate and the `entry_kind` check every prefix
-//! parse runs, and `verify_key_index_leaf` behind `ravel-cli inspect kidx`.
+//! [`verify_key_index_posting_leaf_frames`]) serve the metrics series index:
+//! the fold's build calls the encoder behind
+//! `CatalogConfig::metrics_series_index`, its carry decodes a previous
+//! posting leaf with [`verify_key_index_leaf`], and the query's series route
+//! probes one.
 
 use std::future::Future;
 use std::ops::Range;
@@ -962,8 +963,7 @@ fn prepare_postings<'a>(
 /// [`key_index_field_entry_kind`] gives as [`KeyIndexEntryKind::Posting`];
 /// any other is [`KeyIndexLeafEncodeError::InvalidInput`]. A body over
 /// `limits.max_body_bytes` is [`KeyIndexLeafEncodeError::BodyOverCeiling`]:
-/// split the postings with [`split_key_index_postings`]. No fold calls this
-/// yet.
+/// split the postings with [`split_key_index_postings`].
 pub fn encode_key_index_posting_leaf(
     input: &KeyIndexPostingLeafInput<'_>,
     limits: &KeyIndexLeafLimits,
@@ -2934,8 +2934,9 @@ fn verify_leaf_frames(
 
 /// Rewrites a verified leaf's header `format_version` to `format_version`,
 /// recomputing the header crc, the length fields and the ref; the directory
-/// and frames are kept byte for byte. It is for tests that need a leaf as an
-/// earlier writer left it: nothing in the fold or the rebuild calls it.
+/// and frames are kept byte for byte. Tests use it for a leaf as an earlier
+/// writer left it; the fold's series index uses it to write its kind-0
+/// `class_objects` leaf at version 3 (ADR-4146 decision 5).
 #[doc(hidden)]
 pub fn restamp_key_index_leaf_version(
     bytes: &[u8],

@@ -54,6 +54,14 @@ use crate::snapshot_format::{
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
+mod series_index;
+pub(crate) use series_index::{
+    BuiltSeriesIndex, SeriesIndexLimits, SeriesIndexOutcome, build_part_series_index,
+    is_series_index_field,
+};
+#[cfg(test)]
+pub(crate) use series_index::{SeriesBuildRecord, take_series_build_log_for_test};
+
 /// RSEG section kinds needed to decode a segment's catalog
 /// (docs/segment-format.md `SectionKind`). Kinds 1/2 are v1
 /// (LABEL_DICT/SERIES_TABLE); 5/6 are v2 (SERIES_IDS/SERIES_META).
@@ -418,7 +426,9 @@ pub struct FoldReport {
     /// entry, that hold no key-index leaf ref for at least one field the
     /// tenant's key-index set names at fold time: the declared logs fields,
     /// spans `trace_id`, metrics `label_value` under
-    /// [`CatalogConfig::metrics_label_index`](crate::CatalogConfig::metrics_label_index),
+    /// [`CatalogConfig::metrics_label_index`](crate::CatalogConfig::metrics_label_index)
+    /// and the three series-index fields under
+    /// [`CatalogConfig::metrics_series_index`](crate::CatalogConfig::metrics_series_index),
     /// whether or not a metrics erasure request is pending. The fold never
     /// builds leaves for a part it carries (ADR-3939 decision 2), so such a
     /// part keeps its refs until `ravel-cli catalog fold --rebuild-key-index`
@@ -444,6 +454,15 @@ pub struct FoldReport {
     /// [`CatalogConfig::metrics_label_index_max_ratio_ppm`](crate::CatalogConfig::metrics_label_index_max_ratio_ppm)
     /// of the part's entries' object bytes.
     pub metrics_label_index_parts_over_cap: u64,
+    /// Re-encoded metrics parts the publishing attempt left with no series
+    /// index (ADR-4146 decision 2) because its three fields' leaves would
+    /// have totalled more than
+    /// [`CatalogConfig::metrics_series_index_max_ratio_ppm`](crate::CatalogConfig::metrics_series_index_max_ratio_ppm)
+    /// of the part's entries' object bytes, or one key's posting or entries
+    /// exceeded the leaf body ceiling. Zero unless
+    /// [`CatalogConfig::metrics_series_index`](crate::CatalogConfig::metrics_series_index)
+    /// is on.
+    pub metrics_series_index_parts_over_cap: u64,
     /// Re-encoded metrics parts the publishing attempt built no
     /// `label_value` leaf for because a metrics erasure request was pending
     /// (or the pending-erasure LIST failed) when the fold started.
@@ -1831,8 +1850,10 @@ fn declared_logs_key_index_fields(
 /// `config`: the declared logs fields (see [`declared_logs_key_index_fields`],
 /// none without a config), `trace_id` for spans, and for metrics
 /// [`METRICS_LABEL_VALUE_FIELD`] when `catalog_config` turns on
-/// [`CatalogConfig::metrics_label_index`]. `None` for a signal the leaf build
-/// does not index.
+/// [`CatalogConfig::metrics_label_index`], followed by the three series-index
+/// fields (`series_label`, `series_class`, `class_objects`) when it also
+/// turns on [`CatalogConfig::metrics_series_index`]. `None` for a signal the
+/// leaf build does not index.
 pub(crate) fn declared_key_index_fields(
     signal: Signal,
     config: Option<&crate::tenant_config::TenantConfig>,
@@ -1850,7 +1871,15 @@ pub(crate) fn declared_key_index_fields(
             KeyType::Id16,
         )]),
         Signal::Metrics if catalog_config.metrics_label_index => {
-            Some(vec![(METRICS_LABEL_VALUE_FIELD.to_string(), KeyType::Str)])
+            let mut fields = vec![(METRICS_LABEL_VALUE_FIELD.to_string(), KeyType::Str)];
+            if catalog_config.metrics_series_index {
+                fields.extend(
+                    series_index::METRICS_SERIES_INDEX_FIELDS
+                        .iter()
+                        .map(|(name, key_type)| (name.to_string(), *key_type)),
+                );
+            }
+            Some(fields)
         }
         _ => None,
     }
@@ -1925,6 +1954,12 @@ pub(crate) struct HeldLabelDicts {
     budget: u64,
     pairs: u64,
     by_ordinal: BTreeMap<usize, (EntryKeyIndex, u64)>,
+    /// Whether the fold builds the series index, which holds each wanted
+    /// entry's series under an allowance of its own, `budget` (series, pair)
+    /// values.
+    series: bool,
+    series_pairs: u64,
+    series_by_ordinal: BTreeMap<usize, (series_index::EntrySeries, u64)>,
 }
 
 impl HeldLabelDicts {
@@ -1934,7 +1969,39 @@ impl HeldLabelDicts {
             budget,
             pairs: 0,
             by_ordinal: BTreeMap::new(),
+            series: false,
+            series_pairs: 0,
+            series_by_ordinal: BTreeMap::new(),
         }
+    }
+
+    /// Also holds each wanted entry's series for the series index.
+    pub(crate) fn with_series(mut self, series: bool) -> Self {
+        self.series = series;
+        self
+    }
+
+    /// Holds entry `ordinal`'s series when the series index is built, the
+    /// entry is wanted and its (series, pair) values fit the allowance;
+    /// `read` runs only for such an entry.
+    fn offer_series(&mut self, ordinal: usize, read: impl FnOnce() -> series_index::EntrySeries) {
+        if !self.series || !self.wants(ordinal) {
+            return;
+        }
+        let series = read();
+        let values = series
+            .as_ref()
+            .map(|list| list.iter().map(|(_, pairs)| pairs.len() as u64 + 1).sum())
+            .unwrap_or(0);
+        let Some(total) = self
+            .series_pairs
+            .checked_add(values)
+            .filter(|&total| total <= self.budget)
+        else {
+            return;
+        };
+        self.series_pairs = total;
+        self.series_by_ordinal.insert(ordinal, (series, values));
     }
 
     /// Whether entry `ordinal` belongs to a part the attempt builds a leaf
@@ -1976,10 +2043,24 @@ impl HeldLabelDicts {
 
     /// Drops every held entry in `ordinals`.
     fn release(&mut self, ordinals: std::ops::Range<usize>) {
-        let held: Vec<usize> = self.by_ordinal.range(ordinals).map(|(&o, _)| o).collect();
+        let held: Vec<usize> = self
+            .by_ordinal
+            .range(ordinals.clone())
+            .map(|(&o, _)| o)
+            .collect();
         for ordinal in held {
             if let Some((_, pairs)) = self.by_ordinal.remove(&ordinal) {
                 self.pairs -= pairs;
+            }
+        }
+        let held: Vec<usize> = self
+            .series_by_ordinal
+            .range(ordinals)
+            .map(|(&o, _)| o)
+            .collect();
+        for ordinal in held {
+            if let Some((_, values)) = self.series_by_ordinal.remove(&ordinal) {
+                self.series_pairs -= values;
             }
         }
         #[cfg(test)]
@@ -2005,6 +2086,16 @@ impl HeldPart<'_> {
             .ok()?
             .checked_add(self.start)?;
         self.held.by_ordinal.get(&ordinal).map(|(fields, _)| fields)
+    }
+
+    fn get_series(&self, part_ordinal: u64) -> Option<&series_index::EntrySeries> {
+        let ordinal = usize::try_from(part_ordinal)
+            .ok()?
+            .checked_add(self.start)?;
+        self.held
+            .series_by_ordinal
+            .get(&ordinal)
+            .map(|(series, _)| series)
     }
 }
 
@@ -2161,6 +2252,38 @@ async fn read_metrics_label_value_counted(
     object_size: u64,
     cost: &mut KeyIdxReadCost,
 ) -> Result<Vec<KeyIdxFieldEntries>, KeyIdxReadError> {
+    let location = open_rseg_footer_counted(store, tenant, key, object_size, cost).await?;
+    let Some(section) = location
+        .footer
+        .sections
+        .iter()
+        .find(|s| s.kind == RSEG_LABEL_DICT_KIND)
+    else {
+        return Err("object has no LABEL_DICT section".to_string().into());
+    };
+    let end = section
+        .offset
+        .checked_add(section.len)
+        .ok_or_else(|| "LABEL_DICT range overflows".to_string())?;
+    cost.section_gets += 1;
+    let stored = store
+        .get(key, GetRange::Range(section.offset, end))
+        .await
+        .map_err(|e| KeyIdxReadError::Get(format!("LABEL_DICT section GET: {e}")))?;
+    cost.section_bytes += stored.data.len() as u64;
+    Ok(metrics_label_value_entries(&location.footer, &stored.data)?)
+}
+
+/// Opens a metrics object's RSEG footer by range: a suffix GET (a second
+/// footer GET only when the footer is longer than
+/// [`KEY_INDEX_FOOTER_SUFFIX_LEN`]). The footer must name `tenant`.
+async fn open_rseg_footer_counted(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    key: &str,
+    object_size: u64,
+    cost: &mut KeyIdxReadCost,
+) -> Result<ravel_segment::FooterLocation, KeyIdxReadError> {
     use ravel_segment::FooterOutcome;
     if object_size == 0 {
         return Err("entry names a zero-byte object".to_string().into());
@@ -2203,25 +2326,7 @@ async fn read_metrics_label_value_counted(
     if location.footer.tenant_hash.as_slice() != tenant.0.as_slice() {
         return Err("footer names another tenant".to_string().into());
     }
-    let Some(section) = location
-        .footer
-        .sections
-        .iter()
-        .find(|s| s.kind == RSEG_LABEL_DICT_KIND)
-    else {
-        return Err("object has no LABEL_DICT section".to_string().into());
-    };
-    let end = section
-        .offset
-        .checked_add(section.len)
-        .ok_or_else(|| "LABEL_DICT range overflows".to_string())?;
-    cost.section_gets += 1;
-    let stored = store
-        .get(key, GetRange::Range(section.offset, end))
-        .await
-        .map_err(|e| KeyIdxReadError::Get(format!("LABEL_DICT section GET: {e}")))?;
-    cost.section_bytes += stored.data.len() as u64;
-    Ok(metrics_label_value_entries(&location.footer, &stored.data)?)
+    Ok(location)
 }
 
 /// PUTs one encoded leaf at its content-addressed key under the covered
@@ -3111,6 +3216,32 @@ async fn fetch_carried_leaf(
     limits: &KeyIndexLeafLimits,
     counters: &mut RequestCounters,
 ) -> Result<(KeyIndexLeafSummary, Bytes), CarryFailure> {
+    fetch_verified_leaf(
+        store,
+        tenant,
+        signal,
+        part_blake3,
+        part_entry_count,
+        leaf,
+        counters,
+        |bytes| verify_key_index_leaf_frames(bytes, limits, drop),
+    )
+    .await
+}
+
+/// [`fetch_carried_leaf`] with the frame check `verify` makes: the series
+/// carry decodes every entry kind, the generic carry only kind 0.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_verified_leaf(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    part_blake3: &[u8],
+    part_entry_count: u64,
+    leaf: &SnapshotKeyIndexLeafRef,
+    counters: &mut RequestCounters,
+    verify: impl FnOnce(&[u8]) -> Result<KeyIndexLeafSummary, snapshot_format::KeyIndexLeafRejection>,
+) -> Result<(KeyIndexLeafSummary, Bytes), CarryFailure> {
     counters.get_requests += 1;
     counters.key_index_leaf_gets += 1;
     let got = store
@@ -3131,11 +3262,9 @@ async fn fetch_carried_leaf(
     {
         return Err(CarryFailure::Newer(newer_leaf_refusal(&leaf.key, version)));
     }
-    let summary = verify_key_index_leaf_frames(&got.data, limits, drop).map_err(|e| {
-        match e.newer_version(signal) {
-            Some(version) => CarryFailure::Newer(newer_leaf_refusal(&leaf.key, version)),
-            None => CarryFailure::Unusable(format!("leaf {}: {e}", leaf.key)),
-        }
+    let summary = verify(&got.data).map_err(|e| match e.newer_version(signal) {
+        Some(version) => CarryFailure::Newer(newer_leaf_refusal(&leaf.key, version)),
+        None => CarryFailure::Unusable(format!("leaf {}: {e}", leaf.key)),
     })?;
     let expected = SnapshotKeyIndexLeafRef {
         key: String::new(),
@@ -3198,10 +3327,12 @@ async fn load_carry_source(
     counters: &mut RequestCounters,
 ) -> Result<CarriedSource, CarryFailure> {
     let refs = &source.part.key_index;
+    // The series fields are carried by `build_part_series_index` alone.
     if let Some(leaf) = refs.iter().find(|leaf| {
-        fields
-            .get(leaf.field.as_str())
-            .is_none_or(|key_type| u32::from(key_type.as_u8()) != leaf.key_type)
+        !series_index::is_series_index_field(signal, &leaf.field)
+            && fields
+                .get(leaf.field.as_str())
+                .is_none_or(|key_type| u32::from(key_type.as_u8()) != leaf.key_type)
     }) {
         return Err(format!(
             "previous leaf field {:?} is not declared under key type {}",
@@ -3730,6 +3861,22 @@ pub(crate) struct BuiltPartKeyIndex {
     /// build stopped before that pass's PUTs. `refs` is empty; leaves an
     /// earlier pass PUT are referenced by nothing.
     pub(crate) stopped_on_failed_get: bool,
+    /// The series index's outcome when the fold built it for the part
+    /// ([`merge_series_index`]); `None` when it was not built.
+    pub(crate) series_outcome: Option<SeriesIndexOutcome>,
+}
+
+/// Adds a part's series-index build to its generic leaves: its refs, kept
+/// sorted by (field, key8_lo), its uncovered (entry, field) count, its
+/// field pairs and its outcome.
+pub(crate) fn merge_series_index(built: &mut BuiltPartKeyIndex, series: BuiltSeriesIndex) {
+    built.refs.extend(series.refs);
+    built
+        .refs
+        .sort_by(|a, b| (&a.field, a.key8_lo).cmp(&(&b.field, b.key8_lo)));
+    built.uncovered_entries += series.uncovered_entries;
+    built.field_pairs.extend(series.field_pairs);
+    built.series_outcome = Some(series.outcome);
 }
 
 /// What [`build_part_key_index`] does where the fold and the
@@ -4222,6 +4369,7 @@ pub(crate) async fn build_part_key_index(
                     field_pairs: BTreeMap::new(),
                     field_passes,
                     stopped_on_failed_get: true,
+                    series_outcome: None,
                 });
             }
             first_pass = false;
@@ -4309,6 +4457,7 @@ pub(crate) async fn build_part_key_index(
             field_pairs: BTreeMap::new(),
             field_passes,
             stopped_on_failed_get: false,
+            series_outcome: None,
         };
         for (name, field) in fields {
             built.field_pairs.insert(name, field.pairs);
@@ -4837,6 +4986,12 @@ impl Catalog {
         } else {
             key_index_fields
         };
+        // ADR-4146 decision 2: the series index rides on the metrics fields
+        // `declared_key_index_fields` lists, under the same erasure gate.
+        let series_index_on = key_index_fields
+            .iter()
+            .flatten()
+            .any(|(name, _)| is_series_index_field(signal, name));
 
         // One tally cache for the WHOLE fold, CAS retries included: a lost
         // HEAD CAS restarts the loop, and a cache constructed inside it would
@@ -5715,7 +5870,8 @@ impl Catalog {
                 })
                 .collect();
             let mut held_label_dicts =
-                HeldLabelDicts::new(wanted_spans, self.config().key_index_build_max_pairs.max(1));
+                HeldLabelDicts::new(wanted_spans, self.config().key_index_build_max_pairs.max(1))
+                    .with_series(series_index_on);
             let mut previous_postings = self
                 .previous_postings_baseline(
                     tenant,
@@ -5747,6 +5903,7 @@ impl Catalog {
             let mut part_hashes: Vec<[u8; 32]> = Vec::with_capacity(spans.len());
             let mut total_part_bytes: u64 = 0;
             let mut metrics_label_index_parts_over_cap: u64 = 0;
+            let mut metrics_series_index_parts_over_cap: u64 = 0;
             let mut metrics_label_index_parts_erasure_gated: u64 = 0;
             let mut parts_reused: u64 = 0;
             let mut key_index_parts_missing_declared_leaves: u64 = 0;
@@ -6083,14 +6240,19 @@ impl Catalog {
                                 && previously_sealed_days.contains(&utc_day_of_hour(part_min_hour));
                             let puts_before = counters.put_requests;
                             let leaf_gets_before = counters.key_index_leaf_gets;
-                            let built = build_part_key_index(
+                            let generic: Vec<(String, KeyType)> = declared
+                                .iter()
+                                .filter(|(name, _)| !is_series_index_field(signal, name))
+                                .cloned()
+                                .collect();
+                            let mut built = build_part_key_index(
                                 self.store(),
                                 tenant,
                                 signal,
                                 *part_hash.as_bytes(),
                                 part_watermark,
                                 part_entries,
-                                declared,
+                                &generic,
                                 &sources,
                                 held_label_dicts.part(span.start),
                                 None,
@@ -6104,6 +6266,32 @@ impl Catalog {
                                 &mut counters,
                             )
                             .await?;
+                            if series_index_on {
+                                // ADR-4146 decision 2: its own cap, so the
+                                // series fields never uncover `label_value`.
+                                let series = build_part_series_index(
+                                    self.store(),
+                                    tenant,
+                                    *part_hash.as_bytes(),
+                                    part_watermark,
+                                    part_entries,
+                                    &sources,
+                                    held_label_dicts.part(span.start),
+                                    &SeriesIndexLimits {
+                                        leaf: key_index_leaf_limits(),
+                                        concurrency: self.config().fold_bucket_concurrency,
+                                        leaf_bytes_cap: metrics_label_index_leaf_bytes_cap(
+                                            part_entries.iter().map(|e| e.object_size).sum(),
+                                            self.config().metrics_series_index_max_ratio_ppm,
+                                        ),
+                                        budget: self.memory_budget(),
+                                    },
+                                    KeyIndexBuildCaller::Fold,
+                                    &mut counters,
+                                )
+                                .await?;
+                                merge_series_index(&mut built, series);
+                            }
                             if sealed_day {
                                 counters.sealed_day_leaf_puts +=
                                     counters.put_requests - puts_before;
@@ -6117,6 +6305,9 @@ impl Catalog {
                     };
                     if built.over_cap {
                         metrics_label_index_parts_over_cap += 1;
+                    }
+                    if built.series_outcome == Some(SeriesIndexOutcome::OverCap) {
+                        metrics_series_index_parts_over_cap += 1;
                     }
                     key_index_uncovered_entries += built.uncovered_entries;
                     key_index_leaves_written += built.refs.len() as u64;
@@ -6510,6 +6701,7 @@ impl Catalog {
                         key_index_leaf_gets: counters.key_index_leaf_gets,
                         key_index_carry_peak_held_bytes: counters.key_index_carry_peak_held_bytes,
                         metrics_label_index_parts_over_cap,
+                        metrics_series_index_parts_over_cap,
                         metrics_label_index_parts_erasure_gated,
                         metrics_label_index_erasure_list_requests: counters
                             .metrics_label_index_erasure_list_requests,
@@ -7246,11 +7438,13 @@ impl Catalog {
             let fetched = fetch_segment_object(self.store(), tenant, signal, entry).await;
             let mut charge = crate::BudgetCatalogCharge::new(self.memory_budget());
             let names = match fetched.and_then(|(_, data, location)| {
-                let names = segment_names_from_object(&location, &data, &mut charge)?;
+                let series = segment_series_from_object(&location, &data, &mut charge)?;
+                let names = segment_names_of_series(&series)?;
                 if let Some(held) = held_label_dicts.as_deref_mut() {
                     held.offer(ordinal, || {
                         metrics_label_value_from_object(tenant, &data, &location)
                     });
+                    held.offer_series(ordinal, || series_index::entry_series_of_catalog(&series));
                 }
                 Ok(names)
             }) {
@@ -7977,6 +8171,16 @@ fn segment_names_from_object(
     data: &[u8],
     charge: &mut dyn ravel_segment::CatalogCharge,
 ) -> Result<HashSet<String>, PostingsBuildError> {
+    segment_names_of_series(&segment_series_from_object(location, data, charge)?)
+}
+
+/// The series of a segment held whole, its catalog decoded once for the
+/// postings build and the series index.
+fn segment_series_from_object(
+    location: &ravel_segment::FooterLocation,
+    data: &[u8],
+    charge: &mut dyn ravel_segment::CatalogCharge,
+) -> Result<Vec<ravel_segment::SeriesEntry>, PostingsBuildError> {
     let limits = ReaderLimits::default();
     // ADR-0027: v7 is the only supported version (`open_from_full` has
     // already rejected anything else, including the retired v6). The chunked
@@ -7998,9 +8202,15 @@ fn segment_names_from_object(
         }
         other => return Err(PostingsBuildError::UnsupportedSegmentVersion(other)),
     };
+    Ok(series)
+}
 
+/// The distinct `__name__` values of a segment's decoded series.
+fn segment_names_of_series(
+    series: &[ravel_segment::SeriesEntry],
+) -> Result<HashSet<String>, PostingsBuildError> {
     let mut names = HashSet::new();
-    for s in &series {
+    for s in series {
         let name = s
             .labels
             .get(METRIC_NAME_LABEL)
@@ -8077,6 +8287,7 @@ fn no_op_report(
         key_index_leaf_gets: counters.key_index_leaf_gets,
         key_index_carry_peak_held_bytes: counters.key_index_carry_peak_held_bytes,
         metrics_label_index_parts_over_cap: 0,
+        metrics_series_index_parts_over_cap: 0,
         metrics_label_index_parts_erasure_gated: 0,
         metrics_label_index_erasure_list_requests: counters
             .metrics_label_index_erasure_list_requests,
@@ -19619,7 +19830,9 @@ pub(crate) mod tests {
     /// writes at the same budget. The restart stores the leaves the
     /// one-call build writes with writer 35's read failed, the same leaves
     /// as a fold whose first-pass read of writer 35 failed and needed no
-    /// restart.
+    /// restart. The metrics series fields (ADR-4146) are built in one pass
+    /// with no restart, and store the same bytes carried, from scratch and in
+    /// one fold ([`series_index::assert_series_leaves_carried_equal_from_scratch`]).
     #[tokio::test]
     async fn the_leaves_are_the_same_carried_from_scratch_and_after_a_restart() {
         let writer_35 = {
@@ -19740,6 +19953,7 @@ pub(crate) mod tests {
                 "budget {max_pairs}: after a restart"
             );
         }
+        series_index::assert_series_leaves_carried_equal_from_scratch().await;
     }
 
     /// The share is fixed for the build (ADR-3692 decision 5): with two
@@ -24362,4 +24576,6 @@ pub(crate) mod tests {
             matches(&[(ordinal[&1], &[0]), (ordinal[&3], &[0])], &[ordinal[&2]])
         );
     }
+
+    mod series_index;
 }

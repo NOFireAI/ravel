@@ -425,6 +425,10 @@ pub fn derived_key_index_repair_hold_bytes(max_pairs: u64) -> u64 {
 /// a part's data bytes. The ADR-3694 Stage 1 acceptance amendment (row 7)
 /// measured leaf bytes at 0.77% of the re-encoded parts' data bytes.
 pub const DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM: u32 = 10_000;
+/// Default `metrics_series_index_max_ratio_ppm`: 10,000 parts per million, a
+/// ratio of 0.01, ADR-4146 decision 2's predicted cap on the three series
+/// fields of a part together (owner decision 2).
+pub const DEFAULT_METRICS_SERIES_INDEX_MAX_RATIO_PPM: u32 = 10_000;
 /// Default `fold_reconcile_window_hours`: how far back of the previous fold's
 /// watermark the post-fold reconcile pass re-lists commit buckets to catch a
 /// compaction record or retention tombstone that landed in an hour already
@@ -799,6 +803,25 @@ pub struct CatalogConfig {
     /// [`DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM`] (a ratio of 0.01).
     /// Stored as an integer so the config stays `Eq`.
     pub metrics_label_index_max_ratio_ppm: u32,
+    /// ADR-4146 decision 2's switch: whether the fold also builds the three
+    /// metrics series-index fields (`series_label`, `series_class` and
+    /// `class_objects`) of every metrics part it re-encodes, from each
+    /// object's SERIES_IDS and stored label sets, read from the object bytes
+    /// its postings build holds, from one ranged read of the catalog
+    /// sections, or carried from the previous part's series leaves. Takes
+    /// effect only where [`Self::metrics_label_index`] and
+    /// [`Self::build_key_index_leaves`] are both on. While the tenant has a
+    /// pending metrics erasure request the fold writes no series leaf.
+    /// Default `false`: turning it on is an owner decision taken on the
+    /// ADR's acceptance run.
+    pub metrics_series_index: bool,
+    /// The byte cap on one part's three series-index fields together, as
+    /// parts per million of the summed object sizes of the part's entries: a
+    /// part whose series leaves would exceed it gets none of the three.
+    /// Default [`DEFAULT_METRICS_SERIES_INDEX_MAX_RATIO_PPM`] (a ratio of
+    /// 0.01). Separate from [`Self::metrics_label_index_max_ratio_ppm`], so
+    /// the series fields never uncover `label_value`.
+    pub metrics_series_index_max_ratio_ppm: u32,
     /// How far back of the previous fold's watermark the post-fold reconcile
     /// pass re-lists commit buckets, in hours (ADR-0063 section 4). Each fold
     /// re-lists the window `[watermark_hour_old - fold_reconcile_window_hours,
@@ -961,6 +984,8 @@ impl Default for CatalogConfig {
             key_index_repair_hold_bytes: None,
             metrics_label_index: true,
             metrics_label_index_max_ratio_ppm: DEFAULT_METRICS_LABEL_INDEX_MAX_RATIO_PPM,
+            metrics_series_index: false,
+            metrics_series_index_max_ratio_ppm: DEFAULT_METRICS_SERIES_INDEX_MAX_RATIO_PPM,
             fold_reconcile_window_hours: DEFAULT_FOLD_RECONCILE_WINDOW_HOURS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
             frontier_reconcile_max_hours: DEFAULT_FRONTIER_RECONCILE_MAX_HOURS,

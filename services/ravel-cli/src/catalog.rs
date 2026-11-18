@@ -286,6 +286,49 @@ pub async fn fold_with_retention_default(
     now_ns: i64,
     json: bool,
 ) -> anyhow::Result<(FoldReport, String)> {
+    fold_with_metrics_series_index(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        max_flush_lifetime_ns,
+        writers_stopped,
+        build_key_index_leaves,
+        key_index_build_max_pairs,
+        metrics_label_index,
+        CatalogConfig::default().metrics_series_index,
+        snapshot_part_max_entries,
+        default_retention_ns,
+        now_ns,
+        json,
+    )
+    .await
+}
+
+/// [`fold_with_retention_default`], plus `--metrics-series-index`: sets
+/// [`CatalogConfig::metrics_series_index`] for this fold, so with
+/// `build_key_index_leaves` and `metrics_label_index` a metrics fold also
+/// builds the three series-index fields (ADR-4146 decision 2). Without both
+/// it changes nothing.
+#[allow(clippy::too_many_arguments)]
+pub async fn fold_with_metrics_series_index(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    max_flush_lifetime_ns: Option<i64>,
+    writers_stopped: bool,
+    build_key_index_leaves: bool,
+    key_index_build_max_pairs: u64,
+    metrics_label_index: bool,
+    metrics_series_index: bool,
+    snapshot_part_max_entries: Option<usize>,
+    default_retention_ns: Option<i64>,
+    now_ns: i64,
+    json: bool,
+) -> anyhow::Result<(FoldReport, String)> {
     if default_retention_ns.is_some_and(|ns| ns <= 0) {
         anyhow::bail!("--retention-default must be greater than zero");
     }
@@ -311,6 +354,7 @@ pub async fn fold_with_retention_default(
         build_key_index_leaves,
         key_index_build_max_pairs,
         metrics_label_index,
+        metrics_series_index,
         snapshot_part_max_entries,
         default_retention_ns,
         now_ns,
@@ -372,6 +416,7 @@ pub async fn fold_inner(
         false,
         ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
         false,
+        false,
         None,
         None,
         now_ns,
@@ -393,6 +438,7 @@ async fn fold_core(
     build_key_index_leaves: bool,
     key_index_build_max_pairs: u64,
     metrics_label_index: bool,
+    metrics_series_index: bool,
     snapshot_part_max_entries: Option<usize>,
     default_retention_ns: Option<i64>,
     now_ns: i64,
@@ -404,6 +450,7 @@ async fn fold_core(
         build_key_index_leaves,
         key_index_build_max_pairs,
         metrics_label_index,
+        metrics_series_index,
         ..CatalogConfig::default()
     };
     if let Some(ns) = max_flush_lifetime_ns {
@@ -654,6 +701,10 @@ fn render_fold_report(
         report.metrics_label_index_parts_over_cap
     ));
     out.push_str(&format!(
+        "metrics_series_index_parts_over_cap: {}\n",
+        report.metrics_series_index_parts_over_cap
+    ));
+    out.push_str(&format!(
         "metrics_label_index_parts_erasure_gated: {}\n",
         report.metrics_label_index_parts_erasure_gated
     ));
@@ -744,7 +795,7 @@ pub async fn rebuild_key_index_at_budget(
     metrics_label_index: bool,
     json: bool,
 ) -> anyhow::Result<(KeyIndexRebuildReport, String)> {
-    let (result, out) = rebuild_key_index_outcome_at_budget(
+    rebuild_key_index_with_series_index(
         store,
         selection,
         tenant,
@@ -755,6 +806,42 @@ pub async fn rebuild_key_index_at_budget(
         key_index_build_max_pairs,
         key_index_repair_hold_bytes,
         metrics_label_index,
+        CatalogConfig::default().metrics_series_index,
+        json,
+    )
+    .await
+}
+
+/// [`rebuild_key_index_at_budget`], plus `--metrics-series-index`, which sets
+/// [`CatalogConfig::metrics_series_index`]
+/// ([`rebuild_key_index_outcome_with_series_index`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn rebuild_key_index_with_series_index(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    field: Option<String>,
+    batch_entries: u64,
+    key_index_build_max_pairs: u64,
+    key_index_repair_hold_bytes: Option<u64>,
+    metrics_label_index: bool,
+    metrics_series_index: bool,
+    json: bool,
+) -> anyhow::Result<(KeyIndexRebuildReport, String)> {
+    let (result, out) = rebuild_key_index_outcome_with_series_index(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        field,
+        batch_entries,
+        key_index_build_max_pairs,
+        key_index_repair_hold_bytes,
+        metrics_label_index,
+        metrics_series_index,
         json,
     )
     .await?;
@@ -816,6 +903,42 @@ pub async fn rebuild_key_index_outcome_at_budget(
     metrics_label_index: bool,
     json: bool,
 ) -> anyhow::Result<(Result<KeyIndexRebuildReport, KeyIndexRebuildError>, String)> {
+    rebuild_key_index_outcome_with_series_index(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        field,
+        batch_entries,
+        key_index_build_max_pairs,
+        key_index_repair_hold_bytes,
+        metrics_label_index,
+        CatalogConfig::default().metrics_series_index,
+        json,
+    )
+    .await
+}
+
+/// [`rebuild_key_index_outcome_at_budget`], plus `--metrics-series-index`,
+/// which sets [`CatalogConfig::metrics_series_index`]: with it and
+/// `metrics_label_index` a metrics rebuild also attaches the three
+/// series-index fields (ADR-4146 decision 2) to every part that lacks them.
+#[allow(clippy::too_many_arguments)]
+pub async fn rebuild_key_index_outcome_with_series_index(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    field: Option<String>,
+    batch_entries: u64,
+    key_index_build_max_pairs: u64,
+    key_index_repair_hold_bytes: Option<u64>,
+    metrics_label_index: bool,
+    metrics_series_index: bool,
+    json: bool,
+) -> anyhow::Result<(Result<KeyIndexRebuildReport, KeyIndexRebuildError>, String)> {
     let tenant_hash = TenantId::new(tenant).hash();
     require_tenant_data_present(
         selection,
@@ -832,6 +955,7 @@ pub async fn rebuild_key_index_outcome_at_budget(
             key_index_build_max_pairs,
             key_index_repair_hold_bytes,
             metrics_label_index,
+            metrics_series_index,
             ..CatalogConfig::default()
         },
     )
@@ -966,6 +1090,10 @@ pub fn render_rebuild_report(
         report.uncovered_entries
     ));
     out.push_str(&format!("parts_over_cap: {}\n", report.parts_over_cap));
+    out.push_str(&format!(
+        "series_index_parts_over_cap: {}\n",
+        report.series_index_parts_over_cap
+    ));
     out.push_str(&format!(
         "parts_erasure_gated: {}\n",
         report.parts_erasure_gated

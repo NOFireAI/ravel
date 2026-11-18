@@ -37,9 +37,11 @@ use crate::catalog::Catalog;
 use crate::config::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES;
 use crate::error::CatalogError;
 use crate::fold::{
-    HeadState, HeldLabelDicts, KeyIndexBuildCaller, KeyIndexBuildLimits, KeyIndexSectionHold,
-    MAX_HEAD_CAS_ATTEMPTS, RequestCounters, build_part_key_index, declared_key_index_fields,
-    head_object_key, key_index_leaf_limits, metrics_label_index_leaf_bytes_cap, newer_leaf_refusal,
+    BuiltPartKeyIndex, HeadState, HeldLabelDicts, KeyIndexBuildCaller, KeyIndexBuildLimits,
+    KeyIndexSectionHold, MAX_HEAD_CAS_ATTEMPTS, RequestCounters, SeriesIndexLimits,
+    SeriesIndexOutcome, build_part_key_index, build_part_series_index, declared_key_index_fields,
+    head_object_key, is_series_index_field, key_index_leaf_limits, merge_series_index,
+    metrics_label_index_leaf_bytes_cap, newer_leaf_refusal,
 };
 use crate::snapshot_format::{
     self, key_index_leaf_format_version, key_index_leaf_prefix_range,
@@ -212,6 +214,12 @@ pub struct KeyIndexRebuildReport {
     /// sets; no leaf of that field is PUT for them after the pass that
     /// passed the cap.
     pub parts_over_cap: u64,
+    /// Metrics parts given none of the three series-index fields (ADR-4146)
+    /// because their leaves would pass
+    /// [`CatalogConfig::metrics_series_index_max_ratio_ppm`](crate::CatalogConfig::metrics_series_index_max_ratio_ppm),
+    /// or one key's posting or entries pass the leaf body ceiling; no series
+    /// leaf is PUT for them.
+    pub series_index_parts_over_cap: u64,
     /// Metrics parts left unindexed because a metrics erasure request was
     /// pending (or the pending listing failed): every part in
     /// `parts_unindexed`, with no part read.
@@ -795,27 +803,91 @@ impl Catalog {
             let entries_held_before = section_hold
                 .as_ref()
                 .map_or(0, KeyIndexSectionHold::entries_held);
-            let built_part = build_part_key_index(
-                self.store(),
-                tenant,
-                signal,
-                part_blake3,
-                part.watermark_hour,
-                &entries,
-                &missing,
-                &[],
-                no_held.part(0),
-                section_hold.as_mut(),
-                &KeyIndexBuildLimits {
-                    leaf: key_index_leaf_limits(),
-                    max_pairs: self.config().key_index_build_max_pairs,
-                    concurrency: self.config().fold_bucket_concurrency,
-                    leaf_bytes_cap,
-                },
-                KeyIndexBuildCaller::Repair,
-                &mut counters,
-            )
-            .await;
+            let generic: Vec<(String, KeyType)> = missing
+                .iter()
+                .filter(|(name, _)| !is_series_index_field(signal, name))
+                .cloned()
+                .collect();
+            let series_missing: Vec<&str> = missing
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .filter(|name| is_series_index_field(signal, name))
+                .collect();
+            let built_part = if generic.is_empty() {
+                Ok(BuiltPartKeyIndex {
+                    refs: Vec::new(),
+                    uncovered_entries: 0,
+                    over_cap: false,
+                    field_pairs: BTreeMap::new(),
+                    field_passes: BTreeMap::new(),
+                    stopped_on_failed_get: false,
+                    series_outcome: None,
+                })
+            } else {
+                build_part_key_index(
+                    self.store(),
+                    tenant,
+                    signal,
+                    part_blake3,
+                    part.watermark_hour,
+                    &entries,
+                    &generic,
+                    &[],
+                    no_held.part(0),
+                    section_hold.as_mut(),
+                    &KeyIndexBuildLimits {
+                        leaf: key_index_leaf_limits(),
+                        max_pairs: self.config().key_index_build_max_pairs,
+                        concurrency: self.config().fold_bucket_concurrency,
+                        leaf_bytes_cap,
+                    },
+                    KeyIndexBuildCaller::Repair,
+                    &mut counters,
+                )
+                .await
+            };
+            // ADR-4146 decision 2: the three series fields are built
+            // together, by range, and only the missing ones are attached.
+            let built_part = match built_part {
+                Ok(mut leaves) if !series_missing.is_empty() && !leaves.stopped_on_failed_get => {
+                    match build_part_series_index(
+                        self.store(),
+                        tenant,
+                        part_blake3,
+                        part.watermark_hour,
+                        &entries,
+                        &[],
+                        no_held.part(0),
+                        &SeriesIndexLimits {
+                            leaf: key_index_leaf_limits(),
+                            concurrency: self.config().fold_bucket_concurrency,
+                            leaf_bytes_cap: metrics_label_index_leaf_bytes_cap(
+                                entries.iter().map(|e| e.object_size).sum(),
+                                self.config().metrics_series_index_max_ratio_ppm,
+                            ),
+                            budget: self.memory_budget(),
+                        },
+                        KeyIndexBuildCaller::Repair,
+                        &mut counters,
+                    )
+                    .await
+                    {
+                        Ok(mut series) => {
+                            series
+                                .refs
+                                .retain(|leaf| series_missing.contains(&leaf.field.as_str()));
+                            if series.outcome == SeriesIndexOutcome::Deferred {
+                                leaves.stopped_on_failed_get = true;
+                                leaves.refs.clear();
+                            }
+                            merge_series_index(&mut leaves, series);
+                            Ok(leaves)
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+                other => other,
+            };
             // A build that fails has still issued its reads and PUTs, so the
             // report counts them before the error interrupts the run.
             let ranged_gets = counters.key_index_ranged_gets - before.key_index_ranged_gets;
@@ -864,6 +936,9 @@ impl Catalog {
             }
             if leaves.over_cap {
                 report.parts_over_cap += 1;
+            }
+            if leaves.series_outcome == Some(SeriesIndexOutcome::OverCap) {
+                report.series_index_parts_over_cap += 1;
             }
             for (field, pairs) in &leaves.field_pairs {
                 *report.field_pairs.entry(field.clone()).or_insert(0) += pairs;
@@ -1207,6 +1282,7 @@ mod tests {
                 field_pairs: BTreeMap::from([(USER_ID.to_string(), 9)]),
                 uncovered_entries: 0,
                 parts_over_cap: 0,
+                series_index_parts_over_cap: 0,
                 parts_erasure_gated: 0,
                 erasure_list_requests: 0,
                 erasure_get_requests: 0,
@@ -1612,6 +1688,7 @@ mod tests {
                 field_pairs: BTreeMap::from([(USER_ID.to_string(), 8)]),
                 uncovered_entries: 0,
                 parts_over_cap: 0,
+                series_index_parts_over_cap: 0,
                 parts_erasure_gated: 0,
                 erasure_list_requests: 0,
                 erasure_get_requests: 0,
@@ -1795,6 +1872,7 @@ mod tests {
                     field_pairs: BTreeMap::from([(USER_ID.to_string(), 0)]),
                     uncovered_entries: 2,
                     parts_over_cap: 0,
+                    series_index_parts_over_cap: 0,
                     parts_erasure_gated: 0,
                     erasure_list_requests: 0,
                     erasure_get_requests: 0,
@@ -2889,6 +2967,7 @@ mod tests {
                 field_pairs: BTreeMap::from([(USER_ID.to_string(), 4)]),
                 uncovered_entries: 0,
                 parts_over_cap: 0,
+                series_index_parts_over_cap: 0,
                 parts_erasure_gated: 0,
                 erasure_list_requests: 0,
                 erasure_get_requests: 0,

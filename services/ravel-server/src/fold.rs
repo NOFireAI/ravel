@@ -87,6 +87,12 @@ pub struct FoldTaskConfig {
     /// `build_key_index_leaves`. Default `true` (the ADR-3694 Stage 1
     /// acceptance amendment).
     pub metrics_label_index: bool,
+    /// Whether those folds also build the metrics series index (ADR-4146
+    /// decision 2; `--fold-metrics-series-index` turns it on), mapped onto
+    /// `CatalogConfig::metrics_series_index` by
+    /// [`crate::query::build_catalog_for_server`]. It takes effect only with
+    /// `build_key_index_leaves` and `metrics_label_index`. Default `false`.
+    pub metrics_series_index: bool,
 }
 
 /// Why [`spawn`] refused to start the fold loops. Nothing is spawned.
@@ -119,6 +125,7 @@ impl Default for FoldTaskConfig {
             build_key_index_leaves: false,
             key_index_build_max_pairs: ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
             metrics_label_index: true,
+            metrics_series_index: false,
         }
     }
 }

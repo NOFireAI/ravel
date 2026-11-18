@@ -1669,12 +1669,101 @@ ceiling as `split_key_index_entries` does for entries. `inspect kidx`
 prints the `entry_kind` and, with `--entries`, every posting's bucket,
 `key8` and values.
 
-No production caller reads or writes a version 3 leaf yet: no fold builds
-the three fields (ADR-4146's fold step writes them behind its own switch)
-and no router reads them (its series route step). What production reaches
-today is the version gate and the `entry_kind` checks every prefix parse
-runs, and `inspect kidx`. The readers-before-writers order of decision 5
-governs the rollout.
+The PromQL resolve's series route reads the three fields
+(docs/query-engine.md); the fold writes them only behind the switch below.
+The readers-before-writers order of decision 5 governs the rollout: turn
+the switch on only once every query, maintain and fold process reads
+version 3.
+
+**The series index build (ADR-4146 decision 2).** The switch is
+`CatalogConfig::metrics_series_index`, default off (`ravel-server
+--fold-metrics-series-index`, `ravel-cli catalog fold
+--metrics-series-index`). It takes effect only where
+`metrics_label_index` and `build_key_index_leaves` are both on, and then
+`declared_key_index_fields` lists `series_label`, `series_class` and
+`class_objects` after `label_value`. With it off the fold writes the
+leaves and refs it wrote before the switch existed, byte for byte
+(`with_the_switch_off_the_fold_writes_the_leaves_and_refs_it_wrote_before`).
+The three fields are built per re-encoded metrics part, beside and apart
+from `label_value`'s build:
+
+- **Series key.** A series' key is `skey = u64::from_be_bytes(key8)`,
+  where `key8` is the first 8 bytes of its `SeriesId` in stored order
+  (`key8_id16`). A `series_class` key is `skey.to_be_bytes()` and every
+  `series_label` posting value is `skey`, so the router's
+  `u64::from_be_bytes(key8)` of a `series_class` key, and its
+  `to_be_bytes()` of a posting value, give back the same series
+  (`the_series_fields_hold_exactly_the_fixture_series`, and
+  `promql_query_range_routes_on_a_fold_built_series_index` in
+  ravel-server, which runs the series route over a part the fold built).
+- **Inputs.** Each covered entry contributes the series of its SERIES_IDS
+  and each series' stored label set, `__name__` included. An entry the
+  postings build fetched whole is read from those bytes with no GET,
+  within an allowance of `key_index_build_max_pairs` (series, pair) values
+  of its own; an entry a previous part's series leaves cover is carried
+  (below); any other entry is read by range: a footer suffix GET (a second
+  footer GET when the footer is longer than the suffix), then one GET
+  spanning its catalog sections (LABEL_DICT, SERIES_IDS and SERIES_META, or
+  SERIES_IDX and SERIES_META_CHUNKS for a sparse object), counted in
+  `key_index_ranged_gets` and its footer and section phases. An entry
+  whose read or decode fails, or whose data key cannot be derived, is in
+  the `uncovered_entry_ordinals` of all three fields
+  (`a_failed_catalog_read_leaves_the_entry_uncovered_in_all_three_fields`).
+- **Build.** A series' entry set is the covered entries holding it and its
+  pairs the union over every stored label set the part holds for its key.
+  A class is a distinct entry set; classes are numbered from 0 in
+  ascending order of their smallest member key. `series_label` holds, per
+  pair `key8`, the ascending keys of the series carrying the pair;
+  `series_class` holds, per series key, a one-element posting of its class;
+  `class_objects` holds one `(key8_i64(class), entry_ordinal, {0})` entry
+  per class and entry of its set. The two posting fields are sliced by
+  `split_key_index_postings` and written by
+  `encode_key_index_posting_leaf`; `class_objects` is sliced by
+  `split_key_index_entries`, written by the kind-0 encoder and restamped
+  to version 3 (`restamp_key_index_leaf_version`). All three fields are at
+  version 3; `label_value` and every logs and spans field stay at 2.
+- **Carry.** A previous part that holds all three fields and shares a data
+  object with the part is carried from: its `series_class` and
+  `class_objects` leaves give each series' previous entries, remapped by
+  data object key, and its `series_label` leaves each series' pairs. A
+  series whose remapped entry set is empty, its entries retired or
+  dropped, is in none of the three fields
+  (`a_retired_hour_drops_its_only_series_from_all_three_fields`). An entry
+  the previous leaves list as uncovered is read again. The carried build
+  writes the bytes a build from the objects writes
+  (`the_leaves_are_the_same_carried_from_scratch_and_after_a_restart`),
+  unless two distinct series share a key and one of them is held only by
+  an entry the part no longer holds: the carry then keeps that series'
+  pairs, a superset. A previous part without the three fields, as on the
+  first fold after the switch is turned on, is not carried from, and its
+  entries are read by range.
+- **Cap.** The three fields together are capped at
+  `metrics_series_index_max_ratio_ppm` of the part's summed object sizes,
+  rounded down, by default `DEFAULT_METRICS_SERIES_INDEX_MAX_RATIO_PPM`, a
+  ratio of 1 %, and a cap apart from `label_value`'s.
+  A part whose series leaves would pass it, or one key of which exceeds
+  the leaf body ceiling (`BodyOverCeiling`), gets none of the three refs,
+  no series leaf is PUT, and the fold counts it in
+  `metrics_series_index_parts_over_cap`; its `label_value` leaf is
+  written as with the switch off
+  (`a_part_over_the_series_cap_gets_no_series_refs_and_one_at_it_does`,
+  `a_posting_over_the_body_ceiling_leaves_the_part_without_series_refs`).
+- **Erasure.** While a metrics erasure request is pending no series leaf is
+  built, as for `label_value`
+  (`a_pending_erasure_request_builds_no_series_leaf`).
+- **Repair.** `--rebuild-key-index` with the switch on builds the three
+  fields of a part that lacks any of them, by range, and attaches the
+  missing ones; a failed ranged GET defers the part, and a part over the
+  cap is counted in the report's `series_index_parts_over_cap`
+  (`rebuild_key_index_attaches_the_three_series_fields`). A part carried by
+  reference keeps the refs it has, so a part without series refs counts in
+  `key_index_parts_missing_declared_leaves` until the repair attaches
+  them.
+
+`key_index_uncovered_entries` counts each uncovered entry once per series
+field, and every entry three times for a part given no series ref;
+`key_index_field_pairs` counts the posting values of `series_label` and
+`series_class` and the entries of `class_objects`.
 
 **Incremental tail build (ADR-3692 decision 5, ADR-3939 decision 5).** The
 tail part is re-encoded on every fold that advances the watermark, and a
