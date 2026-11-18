@@ -171,7 +171,11 @@
 //!   - crates/ravel-catalog/tests/sys_proto_format_version_classification.rs::classification_is_complete
 //! - retention, erasure, legal hold and a pinned query during migrate
 //!   [partial: erasure and a pinned query run during migrate; retention and
-//!   legal hold are tested alone, none during a migrate run]
+//!   legal hold are tested alone, none during a migrate run; the erasure case
+//!   runs with claims on and the store clock aligned to the claim clock --
+//!   with claims off, or against the unclaimed background migrate, the
+//!   erased sample is served instead (issue #4449, with the unclaimed
+//!   background migrate itself as issue #4448)]
 //!   - crates/ravel-compat-tests/tests/erasure_during_migrate.rs::an_erasure_and_a_pinned_query_during_migrate_complete_at_n_plus_1
 //!   - crates/ravel-maintain/tests/retention_version_window.rs::an_out_of_window_object_holds_the_bucket
 //!   - crates/ravel-maintain/tests/erasure_compaction_fence.rs::an_erasure_rewrite_that_publishes_mid_migration_cancels_the_migration

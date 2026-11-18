@@ -12,6 +12,14 @@
 //! reads every sample but the erased one, exactly once; the pinned snapshot's
 //! N objects still read as resolved, and certify refuses on them, naming the
 //! first in key order, until the sweeps delete them; then certify certifies.
+//!
+//! This outcome holds only with claims on (`claiming` below puts both tasks
+//! under `Coordination::On`) and with the store clock aligned to the claim
+//! clock (the `store.set_clock_ms` call in `one_seed`). With claims off
+//! (`--maintain-claims off`) or against the unclaimed background migrate, the
+//! erased sample is served instead; that race is tracked separately as
+//! issue #4449, with the unclaimed background migrate itself as issue #4448.
+//! This test does not exercise either mode.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
