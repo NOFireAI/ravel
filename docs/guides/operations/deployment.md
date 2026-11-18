@@ -111,16 +111,16 @@ refuses at once.
 The retry covers the reads that
 [Startup store reads](../../architecture.md#startup-store-reads) lists:
 `sys/qualification`, the retired-reader gate's reads of `sys/compat` and
-`sys/tenancy` (see
+`sys/tenancy` and its LIST of the first page of `t/` (see
 [Retired-reader startup gate](maintenance.md#retired-reader-startup-gate); a
 build that retires no reader, which is every build today, sends none),
 `sys/tenancy`, the `--tenant-kms-config`
 key-epoch records, the `shard_count` provisioning records, `sys/gc` and the
 `sys/ipcrypt/policy` marker. A retired-reader gate refusal, such as a family
 with no current certificate, a contradicted certificate, a late-write
-watermark not past the census, or `sys/tenancy` present without
-`sys/compat`, refuses on the first attempt; only a transient store error
-inside the gate retries. It does not cover the Azure store construction
+watermark not past the census, `sys/tenancy` present without `sys/compat`,
+or data under `t/` with neither marker, refuses on the first attempt; only
+a transient store error inside the gate retries. It does not cover the Azure store construction
 request, the `--require-bucket-protection` read or the
 `--format-window-check` reads, and none of those retries. The Azure request
 refuses on its first error. The bucket-protection read never refuses on a

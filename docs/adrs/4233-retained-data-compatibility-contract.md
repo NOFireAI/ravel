@@ -572,12 +572,14 @@ For a class A family:
     re-certify.
 - **Fresh stores, for the retired-reader release only.** A release whose
   reader for F no longer admits N treats a store with no `sys/compat` and
-  no `sys/tenancy` as fresh and bootstraps it, and refuses to start on one
-  with `sys/tenancy` and no `sys/compat`. This is how an unsupported upgrade
-  path, including skipping the release that carried both readers, is
-  refused before it modifies anything. The baseline and every release that
-  retires no reader run on a store without `sys/compat` as decision 1
-  says.
+  no `sys/tenancy` as fresh and bootstraps it (see the unmarked-bucket
+  amendment below: such a store that holds data under `t/` is refused, and
+  nothing writes `sys/compat` on a fresh store yet, issue #4483), and
+  refuses to start on one with `sys/tenancy` and no `sys/compat`. This is
+  how an unsupported upgrade path, including skipping the release that
+  carried both readers, is refused before it modifies anything. The
+  baseline and every release that retires no reader run on a store without
+  `sys/compat` as decision 1 says.
 - **What keeps it true.** Baseline-or-later writers stop starting to encode
   objects below the active version within `H` and stop publishing them within
   `H + P + T_req`, and once F is certified `--write-below-format-floor` is
@@ -1153,3 +1155,23 @@ watch 'ravel_compat_late_write_watermark_age_seconds{family}': now minus
 the watermark, computed at scrape time, rendered in maintain mode only,
 absent without a certificate. The startup gate in other modes only logs the
 7-day warning.
+
+## Amendment (2026-11-18): the unmarked-bucket refusal (issue #4399)
+
+<!-- amendment-applies: sections="7. Retiring a reader requires a certificate that stays checkable" pointer="unmarked-bucket amendment" -->
+
+Decision 7's "Fresh stores" paragraph took a store with no `sys/compat` and
+no `sys/tenancy` as fresh. A bucket written before ADR-0050 carries tenant
+data under `t/` and neither marker, so that test admitted it, and a release
+that retired a reader would have started on data it may not read. The
+retired-reader gate now also lists `t/` when both markers are absent (one
+LIST, first page only) and refuses with `TenantDataWithoutMarkers`, naming
+`ravel-cli compat init`, when that page holds an object or a continuation
+token. A failed LIST refuses too. The refusal comes before any write, like
+the `sys/tenancy` without `sys/compat` refusal. A store with neither marker
+and nothing under `t/` is still fresh and starts.
+
+This amendment narrows which stores are fresh; it does not change what
+happens to one. Nothing writes `sys/compat` on a fresh outcome today, so a
+fresh store is not yet bootstrapped into the contract as the paragraph says;
+issue #4483 tracks that bootstrap.

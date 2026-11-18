@@ -1310,7 +1310,8 @@ pub struct IngestPipelineSnapshot {
     /// Buffers dropped because their provisioning view stayed untrusted for
     /// `max_flush_lifetime` with no provisioning read succeeding, and then a
     /// read issued after the hold was spent failed, or `max_flush_lifetime`
-    /// more passed with no read confirming the view (issue #4363).
+    /// more passed with no read confirming the view, or a teardown drain did
+    /// not confirm it (issue #4363).
     pub abandoned_stale_provisioning: u64,
     pub abandoned_input_rejected: u64,
     /// Flushes whose ADR-1702 write gate encode returned no result (the job
@@ -1912,8 +1913,9 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
         "Buffers dropped unwritten because their flush stayed closed on a shard-generation \
          view the router cannot trust for the flush lifetime with no provisioning read \
          succeeding, and then a read issued after the hold was spent failed, or \
-         max_flush_lifetime more passed with no read confirming the view, by signal. Strict writers were answered 503 and their bytes refunded; buffered-mode rows \
-         in them are lost.",
+         max_flush_lifetime more passed with no read confirming the view, or a teardown \
+         drain did not confirm it, by signal. Strict writers were answered 503 and their \
+         bytes refunded; buffered-mode rows in them are lost.",
         "counter",
     );
     for pipeline in pipelines {
@@ -13175,8 +13177,8 @@ mod tests {
     /// snapshots, so a conversion that dropped the field or swapped two
     /// signals fails here. The HELP text is pinned whole: one that still says
     /// the drop follows the flush lifetime alone, without the read issued
-    /// after the hold was spent, or that drops the no-successful-read
-    /// condition, fails too.
+    /// after the hold was spent, that drops the no-successful-read
+    /// condition, or that leaves out the teardown drain, fails too.
     #[test]
     fn abandoned_stale_provisioning_counter_renders_for_every_signal() {
         let ingest = vec![
@@ -13233,8 +13235,9 @@ mod tests {
                     shard-generation view the router cannot trust for the flush lifetime with \
                     no provisioning read succeeding, and then a read issued after the hold \
                     was spent failed, or max_flush_lifetime more passed with no read \
-                    confirming the view, by signal. Strict writers were answered \
-                    503 and their bytes refunded; buffered-mode rows in them are lost.";
+                    confirming the view, or a teardown drain did not confirm it, by signal. \
+                    Strict writers were answered 503 and their bytes refunded; \
+                    buffered-mode rows in them are lost.";
         assert_eq!(
             body.matches(&format!("# HELP {family} {help}\n")).count(),
             1,

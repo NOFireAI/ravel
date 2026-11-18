@@ -51,8 +51,8 @@ pub enum GateOutcome {
     /// This build retires no reader; nothing was read.
     NoRetiredReader,
     /// Neither `sys/compat` nor `sys/tenancy` exists and the store holds no
-    /// `t/` data: a fresh store, which this build bootstraps at its own
-    /// versions.
+    /// `t/` data: a fresh store. Nothing writes `sys/compat` on this outcome
+    /// yet (issue #4483).
     Fresh,
     /// Every retired family carries a current certificate.
     Certified { families: Vec<CertifiedFamily> },

@@ -742,7 +742,26 @@ and the CAS read/write helpers.
   and format family: the last `(shard, hour)` bucket the walk finished. It
   sits on a path disjoint from the maint cursor (a shard segment is always
   numeric, `migrate` never is) and has the same CAS exemption; losing or
-  corrupting it costs a rescan from the start.
+  corrupting it costs a rescan from the start. Its payload is tag 1, then
+  the shard and the hour as little-endian u32s (9 bytes). The same key can
+  instead hold a drained stamp, tag 2, then the certificate version
+  (u32), the certified time (i64) and the late-write watermark (i64), all
+  little-endian (21 bytes). The server's background migrate writes it
+  `CreateIfAbsent` after the cursor is deleted, when a walk of a family
+  whose `sys/compat` certificate is `contradicted` drains with no bucket
+  held and no straggler left, and skips that family while the stamp matches
+  the certificate and watermark in `sys/compat`. This build's
+  `maintain migrate` reads a stamp as no position: it walks from the start,
+  then replaces the stamp by CAS with its cursor when its budget stops the
+  walk, or deletes it when the walk drains. An older build never
+  misreads it as a position. A build from ADR-4233's H9 change onwards that
+  does not know tag 2 treats it as another build's cursor: it walks from
+  the start and leaves the stamp in place, writing and deleting no cursor,
+  so while the stamp is present that build's `ravel-cli maintain migrate`
+  cannot resume a walk its budget stopped. A build before H9 (v0.31.1, for
+  one) reads a position only from a 9-byte tag-1 payload, so it walks from
+  the start and treats the stamp as a malformed cursor of its own, replaced
+  by CAS or deleted the same way.
 - The unnamed-since markers (`<signal>/maint/unn/...`, ADR-1133) record when
   a sweep first found a delete candidate past its protection horizon that the
   live HEAD does not name. The retention marker `retire.unn` is one per

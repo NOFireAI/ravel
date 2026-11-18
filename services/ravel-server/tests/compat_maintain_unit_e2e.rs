@@ -3,6 +3,7 @@
 //! late-write pass on a certified family, records its watermark in
 //! `sys/compat`, and renders the certificate gauges on `/metrics`:
 //! `ravel_compat_late_write_watermark_seconds{family}`,
+//! `ravel_compat_late_write_watermark_age_seconds{family}`,
 //! `ravel_compat_certificate_contradicted{family}` and
 //! `ravel_compat_certify_finalization_pending{family}`.
 //!
@@ -285,6 +286,7 @@ async fn a_maintain_server_runs_the_late_write_pass_and_renders_the_gauges() {
     let certified_seconds = (certified / NS_PER_SEC) as f64;
 
     let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+    let started_seconds = (now_ns() / NS_PER_SEC) as f64;
     let running = start(backend).await;
     let body = scrape_until(running.http_addr, |body| {
         rseg_sample(body, "ravel_compat_late_write_watermark_seconds")
@@ -292,12 +294,23 @@ async fn a_maintain_server_runs_the_late_write_pass_and_renders_the_gauges() {
     })
     .await;
     running.shutdown().await.expect("graceful shutdown");
+    let scraped_by_seconds = (now_ns() / NS_PER_SEC) as f64 + 1.0;
 
     let watermark = rseg_sample(&body, "ravel_compat_late_write_watermark_seconds")
         .expect("the watermark gauge renders");
     assert!(
         watermark > certified_seconds,
         "the pass advanced the watermark past the certificate:\n{body}"
+    );
+    // The age is the scrape time minus the watermark, so the two sum to a
+    // time inside the scrape window.
+    let age = rseg_sample(&body, "ravel_compat_late_write_watermark_age_seconds")
+        .expect("the age gauge renders");
+    assert!(age >= 0.0, "{body}");
+    assert!(
+        (started_seconds..=scraped_by_seconds).contains(&(watermark + age)),
+        "watermark {watermark} + age {age} is not a scrape time in \
+         [{started_seconds}, {scraped_by_seconds}]:\n{body}"
     );
     assert_eq!(
         rseg_sample(&body, "ravel_compat_certificate_contradicted"),

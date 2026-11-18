@@ -1341,7 +1341,8 @@ mod tests {
     async fn verify_refuses_a_family_outside_class_a() {
         for family in ["csnap", "rseg-typo"] {
             let store = certified_store(CERTIFIED + 1, false).await;
-            let out = verify(store, Some(keys()), T0, Some(family.to_string()), 0)
+            let before = every_object(store.as_ref()).await;
+            let out = verify(store.clone(), Some(keys()), T0, Some(family.to_string()), 0)
                 .await
                 .expect("verify returns a refusal");
             assert_eq!(out.exit_code, EXIT_REFUSED, "{family}");
@@ -1351,6 +1352,27 @@ mod tests {
                 "{family}: {}",
                 out.text
             );
+            assert_eq!(every_object(store.as_ref()).await, before, "{family}");
+        }
+    }
+
+    /// Every object's key, etag and version, for a before/after comparison.
+    async fn every_object(store: &dyn ObjectStoreBackend) -> Vec<(String, String, String)> {
+        let mut objects = Vec::new();
+        let mut page = None;
+        loop {
+            let listed = store.list("", page).await.expect("list");
+            objects.extend(listed.objects.into_iter().map(|meta| {
+                (
+                    meta.key,
+                    format!("{:?}", meta.etag),
+                    format!("{:?}", meta.version),
+                )
+            }));
+            match listed.next {
+                Some(next) => page = Some(next),
+                None => return objects,
+            }
         }
     }
 

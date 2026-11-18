@@ -1032,13 +1032,15 @@ mod tests {
     ///
     /// DISTINGUISHING: a unit that finalizes after a replaced pass calls
     /// certify with the stale version, and its step reports the certify
-    /// outcome instead of `CertificateReplaced`.
+    /// outcome instead of `CertificateReplaced`; the record's watermark and
+    /// `contradicted` flag stay as they were before the tick.
     #[tokio::test]
     async fn a_certificate_replaced_during_the_pass_skips_finalization() {
         let store = Arc::new(MemoryStore::with_page_size(2));
         seed_rseg(&store).await;
         certify_unfinalized(&store).await;
         let held_key = seed_commit(&store, V_SEG, NOW1 + HOUR).await;
+        let before = rseg_entry(store.as_ref()).await;
         let clock = FixedClock::new(NOW1 + 2 * HOUR);
         let faulted = Arc::new(FaultStore::new(store.clone(), FaultPlan::empty()));
         let gate = faulted.hold(Op::Get, Some(held_key), Occurrence::Nth(1));
@@ -1081,7 +1083,11 @@ mod tests {
             entry.certificate.map(|c| c.certified_unix_ns),
             Some(NOW1 + 1)
         );
-        assert!(entry.late_writes_verified_through_unix_ns <= NOW1);
+        assert_eq!(
+            entry.late_writes_verified_through_unix_ns,
+            before.late_writes_verified_through_unix_ns
+        );
+        assert_eq!(entry.contradicted, before.contradicted);
         assert_eq!(floor(store.as_ref()).await, None);
         assert!(cursor_present(store.as_ref()).await);
     }
