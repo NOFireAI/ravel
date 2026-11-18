@@ -1,15 +1,17 @@
-//! Smoke test for the `l1_listing_charge` bench (issue #4393): the library
-//! entry at two small caps on a reduced series count, its bands, and the
-//! binary search's answer re-checked against fresh listings.
+//! Smoke test for the `l1_listing_charge` bench (issues #4393 and #4433): the
+//! library entry at two small caps on a reduced series count, its bands for the
+//! listing and the sample read, and each binary search's answer re-checked
+//! against fresh reads.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::cell::Cell;
 
 use ravel_bench::l1_listing_charge::{
-    CAP_FIGURES, ListingChargeError, RunConfig, build_bucket, check_report, compact_at,
-    engine_listing_succeeds, held_fetch_bound, listing_bound, listing_succeeds, minimal_budget,
-    part_shape, report_json, run, upper_bound,
+    CAP_FIGURES, CAP_FLAGS, Compacted, ListingChargeError, PartShape, RunConfig, build_bucket,
+    check_report, compact_at, engine_listing_succeeds, fetcher_sample_read, held_fetch_bound,
+    isolate_part, listing_charge, listing_succeeds, minimal_budget, part_shape, report_json, run,
+    sample_read_bound, sample_read_succeeds, upper_bound,
 };
 use ravel_query::{DEFAULT_SUFFIX_LEN, DEFAULT_WHOLE_OBJECT_THRESHOLD};
 
@@ -36,7 +38,7 @@ async fn small_caps_report_every_figure_once_inside_its_band() {
     let report = run(config.clone()).await.expect("run");
     let text = serde_json::to_string_pretty(&report_json(&report)).expect("render");
 
-    for figure in CAP_FIGURES {
+    for figure in CAP_FIGURES.iter().chain(CAP_FLAGS.iter()) {
         assert_eq!(
             text.matches(&format!("\"{figure}\":")).count(),
             CAPS.len(),
@@ -51,70 +53,91 @@ async fn small_caps_report_every_figure_once_inside_its_band() {
 
     let bucket = build_bucket(&config).expect("bucket");
     for figures in &report.caps {
-        assert!(figures.full_parts >= 2, "cap {}", figures.cap_bytes);
-        let peak = figures.search.succeeds_at;
+        let cap = figures.cap_bytes;
+        assert!(figures.full_parts >= 2, "cap {cap}");
+        let sample_peak = figures.sample_search.succeeds_at;
+        let listing_peak = figures.listing_search.succeeds_at;
         // 64 B of decoded provenance columns and a 32 B `SampleProvenance`
         // for every sample: the part carries per-sample provenance.
         assert!(
-            figures.search.refused_at >= 96 * figures.shape.samples,
-            "cap {}: the largest refused budget, {} B, is below 96 B for each of {} samples",
-            figures.cap_bytes,
-            figures.search.refused_at,
+            figures.sample_search.refused_at >= 96 * figures.shape.samples,
+            "cap {cap}: the largest refused sample-read budget, {} B, is below 96 B for each \
+             of {} samples",
+            figures.sample_search.refused_at,
             figures.shape.samples
         );
-        assert!(
-            figures.search.refused_at >= one_percent_below(peak),
-            "cap {}: the search stopped {} B below {peak} B, coarser than 1 %",
-            figures.cap_bytes,
-            peak - figures.search.refused_at
-        );
+        for (path, search) in [
+            ("sample read", figures.sample_search),
+            ("listing", figures.listing_search),
+        ] {
+            assert!(
+                search.refused_at >= one_percent_below(search.succeeds_at),
+                "cap {cap}: the {path} search stopped {} B below {} B, coarser than 1 %",
+                search.succeeds_at - search.refused_at,
+                search.succeeds_at
+            );
+        }
+        // The listing's peak is its charge: the search starts there and every
+        // lower limit it tries is refused.
+        assert_eq!(listing_peak, figures.listing_charge_bytes, "cap {cap}");
 
-        // A fresh compaction of the same inputs gives the same part; list it
-        // again at the reported limit and 1 % below it.
-        let compacted = compact_at(&bucket, &config, figures.cap_bytes)
-            .await
-            .expect("compact");
+        // A fresh compaction of the same inputs gives the same part; read it
+        // again on each path at the reported limit and 1 % below it.
+        let compacted = compact_at(&bucket, &config, cap).await.expect("compact");
         let part = &compacted.parts[figures.part_index];
         let shape = part_shape(&compacted.store, part).await.expect("shape");
         assert_eq!(shape.samples, figures.shape.samples);
         assert_eq!(shape.series, figures.shape.series);
         let store = &compacted.store;
+        let series = shape.series;
         assert!(
-            listing_succeeds(store, part, shape.series, peak)
+            sample_read_succeeds(store, part, series, sample_peak)
                 .await
-                .expect("list"),
-            "cap {}: the listing must succeed at the reported peak {peak} B",
-            figures.cap_bytes
+                .expect("read"),
+            "cap {cap}: the sample read must succeed at the reported peak {sample_peak} B"
         );
         assert!(
-            !listing_succeeds(store, part, shape.series, one_percent_below(peak))
+            !sample_read_succeeds(store, part, series, one_percent_below(sample_peak))
                 .await
-                .expect("list"),
-            "cap {}: the listing must be refused 1 % below the reported peak {peak} B",
-            figures.cap_bytes
+                .expect("read"),
+            "cap {cap}: the sample read must be refused 1 % below the reported peak \
+             {sample_peak} B"
         );
         // The issue's formula leaves out the bytes the GETs hold, so a budget
-        // of exactly that figure is refused, while the listing bound is not.
+        // of exactly that figure is refused, while the sample-read bound is not.
         assert!(
-            !listing_succeeds(store, part, shape.series, upper_bound(&shape))
+            !sample_read_succeeds(store, part, series, upper_bound(&shape))
                 .await
-                .expect("list"),
-            "cap {}: a budget of the (64 + 32) * samples + catalog formula must be refused",
-            figures.cap_bytes
+                .expect("read"),
+            "cap {cap}: a budget of the (64 + 32) * samples + catalog formula must be refused"
         );
         assert!(
-            listing_succeeds(store, part, shape.series, listing_bound(&shape))
+            sample_read_succeeds(store, part, series, sample_read_bound(&shape))
                 .await
-                .expect("list")
+                .expect("read")
+        );
+
+        let isolated = isolate_part(&config, cap, &compacted, figures.part_index)
+            .await
+            .expect("isolate");
+        let only = &isolated.store;
+        assert!(
+            listing_succeeds(only, &config, series, listing_peak)
+                .await
+                .expect("list"),
+            "cap {cap}: the listing must succeed at the reported peak {listing_peak} B"
+        );
+        assert!(
+            !listing_succeeds(only, &config, series, one_percent_below(listing_peak))
+                .await
+                .expect("list"),
+            "cap {cap}: the listing must be refused 1 % below the reported peak {listing_peak} B"
         );
     }
 }
 
-/// The figure the bench measures through `SegmentFetcher::fetch_series` is the
-/// one the engine's listing (`resolve_series`, which reads each object with
-/// `list_series_phase_accounted`) needs, on a bucket compacted into one part.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fetcher_figure_matches_the_engine_listing_on_one_part() {
+/// A bucket compacted into one part, and that part's shape.
+async fn one_part() -> (RunConfig, Compacted, PartShape) {
     let one_part = u64::MAX >> 1;
     let config = small_config(vec![one_part]);
     let bucket = build_bucket(&config).expect("bucket");
@@ -122,23 +145,133 @@ async fn fetcher_figure_matches_the_engine_listing_on_one_part() {
         .await
         .expect("compact");
     assert_eq!(compacted.parts.len(), 1);
-    let part = &compacted.parts[0];
-    let shape = part_shape(&compacted.store, part).await.expect("shape");
+    let shape = part_shape(&compacted.store, &compacted.parts[0])
+        .await
+        .expect("shape");
+    // Above the whole-object threshold: the open GET holds the 64 KiB tail and
+    // the catalog run, not the part's pages.
+    assert_eq!(
+        (shape.wire_bytes, shape.held_fetch_bytes, shape.catalog_decode_bytes),
+        (1_202_303, 69_014, 242_523)
+    );
+    assert_eq!((shape.samples, shape.series), (230_400, 120));
+    (config, compacted, shape)
+}
+
+/// The listing path's peak, to the byte, on a one-part bucket: the bench's
+/// listing read (`listing_succeeds` over the store `isolate_part` returns)
+/// first succeeds at exactly [`listing_charge`], the held fetch bytes plus the
+/// inflated catalog sections, and `QueryEngine::resolve_series` called
+/// directly succeeds there and is refused one byte below.
+///
+/// FLIPS: a `listing_succeeds` that reads through
+/// `SegmentFetcher::fetch_series` moves the threshold to the sample-read bound,
+/// 22,429,937 B; `CatalogUse::Samples` in `list_series_phase_accounted` does
+/// the same through the engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listing_peak_is_the_held_fetch_and_catalog_bytes_through_resolve_series() {
+    let (config, compacted, shape) = one_part().await;
+    let isolated = isolate_part(&config, u64::MAX >> 1, &compacted, 0)
+        .await
+        .expect("isolate");
+    let store = &isolated.store;
+    let series = shape.series;
+    let config = &config;
+    // The upper end is the sample read's bound, so a listing that charged the
+    // provenance would still be bracketed and fail the pin below.
+    let peak = exact_threshold(1, sample_read_bound(&shape), |limit| async move {
+        listing_succeeds(store, config, series, limit)
+            .await
+            .expect("list")
+    })
+    .await;
+    assert_eq!(peak, listing_charge(&shape));
+    assert_eq!(peak, 69_014 + 242_523);
+    assert_eq!(peak, 311_537);
+    for (limit, expected) in [(peak, Some(series as usize)), (peak - 1, None)] {
+        assert_eq!(
+            engine_listing_succeeds(store, config, limit)
+                .await
+                .expect("engine listing"),
+            expected,
+            "resolve_series under {limit} B"
+        );
+    }
+}
+
+/// The sample-read path's peak, to the byte, on the same one-part bucket: the
+/// bench's sample read (`sample_read_succeeds`) first succeeds at exactly
+/// [`sample_read_bound`], the listing's charge plus 96 B of provenance for
+/// every sample, and `SegmentFetcher::fetch_series` called directly succeeds
+/// there and is refused one byte below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sample_read_peak_adds_the_provenance_through_fetch_series() {
+    let (_config, compacted, shape) = one_part().await;
     let store = &compacted.store;
-    let search = minimal_budget(upper_bound(&shape), |limit| {
-        listing_succeeds(store, part, shape.series, limit)
+    let part = &compacted.parts[0];
+    let series = shape.series;
+    let peak = exact_threshold(
+        upper_bound(&shape),
+        sample_read_bound(&shape),
+        |limit| async move {
+            sample_read_succeeds(store, part, series, limit)
+                .await
+                .expect("read")
+        },
+    )
+    .await;
+    assert_eq!(peak, sample_read_bound(&shape));
+    assert_eq!(peak, listing_charge(&shape) + 96 * 230_400);
+    assert_eq!(peak, 22_429_937);
+    for (limit, expected) in [(peak, Some(series as usize)), (peak - 1, None)] {
+        assert_eq!(
+            fetcher_sample_read(store, part, limit)
+                .await
+                .expect("fetch_series"),
+            expected,
+            "fetch_series under {limit} B"
+        );
+    }
+}
+
+/// On one part, the listing's peak is at most a twentieth of the sample
+/// read's, each found by the bench's own search. Measured: 311,537 B against
+/// 22,429,937 B, a 72x gap.
+///
+/// FLIPS: reverting #4433 (`CatalogUse::Samples` in
+/// `list_series_phase_accounted`, or the cherry-picked commit as a whole)
+/// makes the listing charge the provenance too, and the two peaks equal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listing_peak_is_at_most_a_twentieth_of_the_sample_read_peak_on_one_part() {
+    let (config, compacted, shape) = one_part().await;
+    let part = &compacted.parts[0];
+    let store = &compacted.store;
+    let series = shape.series;
+    let sample = minimal_budget(sample_read_bound(&shape), |limit| {
+        sample_read_succeeds(store, part, series, limit)
     })
     .await
-    .expect("search");
-
-    let listed = engine_listing_succeeds(store, &config, search.succeeds_at)
+    .expect("sample-read search");
+    let isolated = isolate_part(&config, u64::MAX >> 1, &compacted, 0)
         .await
-        .expect("engine listing");
-    assert_eq!(listed, Some(shape.series as usize));
-    let refused = engine_listing_succeeds(store, &config, one_percent_below(search.succeeds_at))
-        .await
-        .expect("engine listing");
-    assert_eq!(refused, None);
+        .expect("isolate");
+    let only = &isolated.store;
+    let config = &config;
+    let listing = minimal_budget(listing_charge(&shape), |limit| {
+        listing_succeeds(only, config, series, limit)
+    })
+    .await
+    .expect("listing search");
+    eprintln!(
+        "one part: listing peak {} B, sample-read peak {} B",
+        listing.succeeds_at, sample.succeeds_at
+    );
+    assert!(
+        listing.succeeds_at.saturating_mul(20) <= sample.succeeds_at,
+        "the listing peak {} B is more than 1/20 of the sample-read peak {} B",
+        listing.succeeds_at,
+        sample.succeeds_at
+    );
 }
 
 /// The search against a known threshold: it returns a succeeding limit within
@@ -181,28 +314,72 @@ async fn check_report_rejects_missing_duplicate_and_out_of_band_figures() {
         f(entry);
         serde_json::to_string_pretty(&doc).expect("render")
     };
-    let missing = edit(&|e| {
-        e.remove("peak_charge_bytes");
-    });
-    assert!(check_report(&missing, &caps).is_err());
-    let out_of_band = edit(&|e| {
-        e.insert("peak_per_sample_bytes".into(), 250.0.into());
-    });
-    assert!(check_report(&out_of_band, &caps).is_err());
-    let refused_above_bound = edit(&|e| {
-        let bound = e["listing_bound_bytes"].as_u64().expect("bound");
-        e.insert("refused_at_bytes".into(), bound.into());
-    });
-    assert!(check_report(&refused_above_bound, &caps).is_err());
-    let bound_refused = edit(&|e| {
-        e.insert("listing_bound_succeeds".into(), false.into());
-    });
-    assert!(check_report(&bound_refused, &caps).is_err());
-    let coarse = edit(&|e| {
-        let peak = e["peak_charge_bytes"].as_u64().expect("peak");
-        e.insert("refused_at_bytes".into(), (peak - peak / 50).into());
-    });
-    assert!(check_report(&coarse, &caps).is_err());
+    let fails_alone = |doc: &str, prefix: &str| {
+        let failures = check_report(doc, &caps).expect_err(prefix);
+        assert!(
+            matches!(failures.as_slice(), [only] if only.starts_with(prefix)),
+            "expected one failure starting {prefix:?}: {failures:?}"
+        );
+    };
+    let cap = caps[0];
+    // (peak, refused, per sample, bound, bound succeeds) for each path.
+    for (path, peak, refused, per_sample, bound, succeeds) in [
+        (
+            "listing",
+            "listing_peak_bytes",
+            "listing_refused_at_bytes",
+            "listing_peak_per_sample_bytes",
+            "listing_charge_bytes",
+            "listing_charge_succeeds",
+        ),
+        (
+            "sample-read",
+            "sample_peak_bytes",
+            "sample_refused_at_bytes",
+            "sample_peak_per_sample_bytes",
+            "sample_read_bound_bytes",
+            "sample_read_bound_succeeds",
+        ),
+    ] {
+        let missing = edit(&|e| {
+            e.remove(peak);
+        });
+        let failures = check_report(&missing, &caps).expect_err("missing");
+        assert!(
+            failures.contains(&format!("cap {cap}: {peak} missing"))
+                && failures.contains(&format!("{peak}: emitted 0 times for 1 caps")),
+            "{failures:?}"
+        );
+        let out_of_band = edit(&|e| {
+            e.insert(per_sample.into(), 250.0.into());
+        });
+        fails_alone(&out_of_band, &format!("cap {cap}: {path} peak per sample 250"));
+        let refused_above_bound = edit(&|e| {
+            let at = e[bound].as_u64().expect("bound");
+            let top = e[peak].as_u64().expect("peak").max(at + 1);
+            e.insert(peak.into(), top.into());
+            e.insert(refused.into(), at.into());
+        });
+        let failures = check_report(&refused_above_bound, &caps).expect_err("refused");
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.starts_with(&format!("cap {cap}: the {path} was refused a "))),
+            "{failures:?}"
+        );
+        let bound_refused = edit(&|e| {
+            e.insert(succeeds.into(), false.into());
+        });
+        fails_alone(
+            &bound_refused,
+            &format!("cap {cap}: the {path} does not succeed under its bound, {bound}"),
+        );
+        let coarse = edit(&|e| {
+            let top = e[peak].as_u64().expect("peak");
+            e.insert(refused.into(), (top - top / 50).into());
+        });
+        fails_alone(&coarse, &format!("cap {cap}: the {path} refused at "));
+    }
 
     // A key written twice in one entry parses as its last value, so only the
     // raw-text count sees it.
@@ -210,48 +387,42 @@ async fn check_report_rejects_missing_duplicate_and_out_of_band_figures() {
     assert!(serde_json::from_str::<serde_json::Value>(&duplicated).is_ok());
     assert!(check_report(&duplicated, &caps).is_err());
 
-    // Two caps whose peak falls as samples grow.
-    let mut doc = json.clone();
-    let mut second = doc["caps"][0].clone();
-    let samples = second["samples"].as_u64().expect("samples");
-    let peak = second["peak_charge_bytes"].as_u64().expect("peak");
-    second["cap_bytes"] = (CAPS[1]).into();
-    second["samples"] = (samples * 2).into();
-    second["peak_charge_bytes"] = (peak / 2).into();
-    doc["caps"].as_array_mut().expect("caps").push(second);
-    let falling = serde_json::to_string_pretty(&doc).expect("render");
-    let failures = check_report(&falling, &CAPS).expect_err("peak fell");
-    assert!(
-        failures.iter().any(|f| f.contains("peak fell")),
-        "{failures:?}"
-    );
+    // Two caps whose peak falls on one path as samples grow.
+    for (path, peak) in [
+        ("listing", "listing_peak_bytes"),
+        ("sample-read", "sample_peak_bytes"),
+    ] {
+        let mut doc = json.clone();
+        let mut second = doc["caps"][0].clone();
+        let samples = second["samples"].as_u64().expect("samples");
+        let top = second[peak].as_u64().expect("peak");
+        second["cap_bytes"] = (CAPS[1]).into();
+        second["samples"] = (samples * 2).into();
+        second[peak] = (top - 1).into();
+        doc["caps"].as_array_mut().expect("caps").push(second);
+        let falling = serde_json::to_string_pretty(&doc).expect("render");
+        let failures = check_report(&falling, &CAPS).expect_err("peak fell");
+        assert!(
+            failures
+                .iter()
+                .any(|f| f.starts_with(&format!("{path} peak fell"))),
+            "{failures:?}"
+        );
+    }
 }
 
-/// The budget limit at which listing `part` starts to succeed, to the byte:
-/// refused at `refused`, succeeding at `succeeds`.
-async fn exact_threshold(
-    store: &std::sync::Arc<ravel_object_store::memory::MemoryStore>,
-    part: &ravel_catalog::SegmentRef,
-    series: u64,
-    mut refused: u64,
-    mut succeeds: u64,
-) -> u64 {
-    assert!(
-        !listing_succeeds(store, part, series, refused)
-            .await
-            .expect("list")
-    );
-    assert!(
-        listing_succeeds(store, part, series, succeeds)
-            .await
-            .expect("list")
-    );
+/// The budget limit at which `read` starts to succeed, to the byte: refused at
+/// `refused`, succeeding at `succeeds`.
+async fn exact_threshold<F, Fut>(mut refused: u64, mut succeeds: u64, mut read: F) -> u64
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    assert!(!read(refused).await, "refused at {refused} B");
+    assert!(read(succeeds).await, "succeeds at {succeeds} B");
     while succeeds - refused > 1 {
         let mid = refused + (succeeds - refused) / 2;
-        if listing_succeeds(store, part, series, mid)
-            .await
-            .expect("list")
-        {
+        if read(mid).await {
             succeeds = mid;
         } else {
             refused = mid;
@@ -261,7 +432,7 @@ async fn exact_threshold(
 }
 
 /// `held_fetch_bound` equals, to the byte, what the fetcher holds on a real
-/// part on each side of the whole-object threshold: the listing's exact
+/// part on each side of the whole-object threshold: the sample read's exact
 /// threshold minus the `(64 + 32) * samples + catalog` formula. At 72 h of
 /// history the compactor's one-series overshoot closes the first part of a
 /// 256 KiB cap above 512 KiB (853,172 B, measured 2026-11-17), where the open
@@ -297,12 +468,15 @@ async fn held_fetch_bound_matches_the_bytes_a_real_part_holds() {
             small += 1;
             assert_eq!(shape.held_fetch_bytes, shape.wire_bytes);
         }
+        let series = shape.series;
         let threshold = exact_threshold(
-            store,
-            part,
-            shape.series,
             upper_bound(&shape),
-            listing_bound(&shape),
+            sample_read_bound(&shape),
+            |limit| async move {
+                sample_read_succeeds(store, part, series, limit)
+                    .await
+                    .expect("read")
+            },
         )
         .await;
         assert_eq!(
@@ -371,58 +545,107 @@ fn held_fetch_bound_charges_the_tail_the_footer_chase_and_the_uncovered_catalog(
     );
 }
 
-/// The peak-per-sample band fails when the full 96 B of per-sample provenance
-/// is not charged, or is charged twice. The old [1, 200] B band admitted both.
-/// The wrong figures are the real run's own figure, and the default caps'
-/// measured 97.03 and 98.30 B, with the 64 B of columns dropped (the 32 B
-/// record only) or with another 96 B on top.
+/// Sets `key` of the one cap entry of `json` to `value` and checks the result.
+fn check_with(
+    json: &serde_json::Value,
+    caps: &[u64],
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), Vec<String>> {
+    let mut doc = json.clone();
+    doc["caps"][0]
+        .as_object_mut()
+        .expect("cap entry")
+        .insert(key.into(), value);
+    check_report(&serde_json::to_string_pretty(&doc).expect("render"), caps)
+}
+
+/// Asserts `failures` is one per-sample band failure of `path` for `wrong`.
+fn only_band_failure(failures: &[String], cap: u64, path: &str, wrong: f64, band: &str) {
+    assert!(
+        matches!(failures, [only] if only.starts_with(&format!(
+            "cap {cap}: {path} peak per sample {}",
+            wrong.trunc()
+        )) && only.ends_with(&format!("B outside {band}"))),
+        "{wrong} B a sample must fail the {path} band alone: {failures:?}"
+    );
+}
+
+/// The sample-read peak-per-sample band fails when the full 96 B of per-sample
+/// provenance is not charged, or is charged twice. The old [1, 200] B band
+/// admitted both. The wrong figures are the real run's own figure, and the
+/// default caps' measured 97.03 and 98.30 B, with the 64 B of columns dropped
+/// (the 32 B record only) or with another 96 B on top.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn peak_per_sample_band_rejects_missing_and_doubled_provenance() {
+async fn sample_peak_per_sample_band_rejects_missing_and_doubled_provenance() {
     let caps = [CAPS[0]];
     let report = run(small_config(caps.to_vec())).await.expect("run");
     let json = report_json(&report);
     let text = serde_json::to_string_pretty(&json).expect("render");
     check_report(&text, &caps).expect("the real per-sample charge is inside the band");
-    let real = report.caps[0].peak_per_sample();
+    let real = report.caps[0].sample_peak_per_sample();
 
-    let check_per_sample = |value: f64| {
-        let mut doc = json.clone();
-        doc["caps"][0]
-            .as_object_mut()
-            .expect("cap entry")
-            .insert("peak_per_sample_bytes".into(), value.into());
-        check_report(&serde_json::to_string_pretty(&doc).expect("render"), &caps)
-    };
+    let key = "sample_peak_per_sample_bytes";
     for measured in [real, 97.03, 98.30] {
-        check_per_sample(measured).expect("a measured figure is inside the band");
+        check_with(&json, &caps, key, measured.into())
+            .expect("a measured figure is inside the band");
         for wrong in [measured - 64.0, measured + 96.0] {
-            let failures = check_per_sample(wrong).expect_err("outside the band");
-            assert!(
-                matches!(failures.as_slice(), [only] if only.starts_with(&format!(
-                    "cap {}: peak per sample {}",
-                    caps[0],
-                    wrong.trunc()
-                )) && only.ends_with("B outside [96, 130]")),
-                "{wrong} B a sample (from {measured} B) must fail the band alone: {failures:?}"
-            );
+            let failures = check_with(&json, &caps, key, wrong.into()).expect_err("outside");
+            only_band_failure(&failures, caps[0], "sample-read", wrong, "[96, 130]");
         }
     }
 }
 
-/// The reported peak sits at or below the listing bound on a real run, and
+/// The listing peak-per-sample band fails when the listing charges provenance
+/// again, the 32 B records alone or the full 96 B, and when it charges only
+/// the held fetch bytes without the catalog decode. The wrong figures are the
+/// real run's own figure and the default caps' measured 1.03 and 2.30 B with
+/// 32 or 96 B on top, and the 64 MiB cap's held fetch bytes alone, 78,022 B
+/// over 7,447,680 samples.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listing_peak_per_sample_band_rejects_a_provenance_charge() {
+    let caps = [CAPS[0]];
+    let report = run(small_config(caps.to_vec())).await.expect("run");
+    let json = report_json(&report);
+    let text = serde_json::to_string_pretty(&json).expect("render");
+    check_report(&text, &caps).expect("the real per-sample charge is inside the band");
+    let real = report.caps[0].listing_peak_per_sample();
+
+    let key = "listing_peak_per_sample_bytes";
+    for measured in [real, 1.03, 2.30] {
+        check_with(&json, &caps, key, measured.into())
+            .expect("a measured figure is inside the band");
+        for wrong in [measured + 32.0, measured + 96.0] {
+            let failures = check_with(&json, &caps, key, wrong.into()).expect_err("outside");
+            only_band_failure(&failures, caps[0], "listing", wrong, "[1, 16]");
+        }
+    }
+    let fetch_only = 78_022.0 / 7_447_680.0;
+    let failures = check_with(&json, &caps, key, fetch_only.into()).expect_err("below");
+    only_band_failure(&failures, caps[0], "listing", fetch_only, "[1, 16]");
+}
+
+/// Each path's reported peak sits at or below its bound on a real run, and
 /// `check_report` compares the two directly: a peak one byte above the bound
 /// fails even when the refused limit stays below the bound, the 1 % bracket
-/// holds and the listing under the bound succeeded.
+/// holds and the read under the bound succeeded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn peak_above_the_listing_bound_fails_the_direct_check() {
+async fn a_peak_above_its_bound_fails_the_direct_check() {
     let report = run(small_config(CAPS.to_vec())).await.expect("run");
     for entry in &report.caps {
         assert!(
-            entry.search.succeeds_at <= entry.listing_bound_bytes,
-            "cap {}: the reported peak {} B is above the listing bound {} B",
+            entry.sample_search.succeeds_at <= entry.sample_read_bound_bytes,
+            "cap {}: the reported sample-read peak {} B is above its bound {} B",
             entry.cap_bytes,
-            entry.search.succeeds_at,
-            entry.listing_bound_bytes
+            entry.sample_search.succeeds_at,
+            entry.sample_read_bound_bytes
+        );
+        assert!(
+            entry.listing_search.succeeds_at <= entry.listing_charge_bytes,
+            "cap {}: the reported listing peak {} B is above its bound {} B",
+            entry.cap_bytes,
+            entry.listing_search.succeeds_at,
+            entry.listing_charge_bytes
         );
     }
 
@@ -432,23 +655,38 @@ async fn peak_above_the_listing_bound_fails_the_direct_check() {
     let text = serde_json::to_string_pretty(&json).expect("render");
     check_report(&text, &caps).expect("the real report holds every band");
 
-    let bound = json["caps"][0]["listing_bound_bytes"]
-        .as_u64()
-        .expect("bound");
-    let mut doc = json.clone();
-    let entry = doc["caps"][0].as_object_mut().expect("cap entry");
-    entry.insert("peak_charge_bytes".into(), (bound + 1).into());
-    entry.insert("refused_at_bytes".into(), (bound - 1).into());
-    entry.insert("listing_bound_succeeds".into(), true.into());
-    let violated = serde_json::to_string_pretty(&doc).expect("render");
-    assert_eq!(
-        check_report(&violated, &caps),
-        Err(vec![format!(
-            "cap {}: the peak {} B is above the listing bound {bound} B",
-            caps[0],
-            bound + 1
-        )])
-    );
+    for (path, peak, refused, bound, succeeds) in [
+        (
+            "listing",
+            "listing_peak_bytes",
+            "listing_refused_at_bytes",
+            "listing_charge_bytes",
+            "listing_charge_succeeds",
+        ),
+        (
+            "sample-read",
+            "sample_peak_bytes",
+            "sample_refused_at_bytes",
+            "sample_read_bound_bytes",
+            "sample_read_bound_succeeds",
+        ),
+    ] {
+        let at = json["caps"][0][bound].as_u64().expect("bound");
+        let mut doc = json.clone();
+        let entry = doc["caps"][0].as_object_mut().expect("cap entry");
+        entry.insert(peak.into(), (at + 1).into());
+        entry.insert(refused.into(), (at - 1).into());
+        entry.insert(succeeds.into(), true.into());
+        let violated = serde_json::to_string_pretty(&doc).expect("render");
+        assert_eq!(
+            check_report(&violated, &caps),
+            Err(vec![format!(
+                "cap {}: the {path} peak {} B is above its bound {at} B",
+                caps[0],
+                at + 1
+            )])
+        );
+    }
 }
 
 /// `minimal_budget` terminates when the threshold is below 100 bytes, where the
