@@ -1,19 +1,19 @@
 #!/bin/sh
-# Every ravel-server container's entrypoint: wait until the store answers and
-# the driver has written the seed marker, then exec ravel-server as the
-# container's main process.
+# Every ravel-server container's entrypoint: wait until the driver has written
+# the seed marker, then exec ravel-server as the container's main process.
 #
-# The store wait is ingest-durability's: ravel-server exits within seconds when
-# the store does not answer its startup read, and nothing would start it again.
 # The marker wait is this workload's: `ravel-cli load --ingest-hour-stride`
 # refuses a tenant that already has a HEAD or a commit, and stops if a fold
 # runs while it loads, so no server, and so no fold, ingest or maintenance
 # pass, may start before the seeded load has finished. A restarted container
-# finds the marker at once.
+# finds the marker as soon as the store answers. There is no separate store
+# wait: a store outage after the marker check reaches ravel-server's own
+# startup retry (--startup-store-deadline, #4325), which this workload
+# exercises; one that starts before it holds the container here instead.
 #
-# Both waits together give up after RAVEL_ENTRYPOINT_WAIT_SECS (900 s, the
-# local loop's setup bound; the driver's own setup budget is 600 s), measured
-# on /proc/uptime because the wall clock jumps under libfaketime.
+# The wait gives up after RAVEL_ENTRYPOINT_WAIT_SECS (900 s, the local loop's
+# setup bound; the driver's own setup budget is 600 s), measured on
+# /proc/uptime because the wall clock jumps under libfaketime.
 trap 'exit 143' TERM INT
 sig="aws:amz:${RAVEL_S3_REGION:?}:s3"
 creds="${RAVEL_S3_ACCESS_KEY:?}:${RAVEL_S3_SECRET_KEY:?}"
@@ -48,6 +48,5 @@ wait_for() {
     done
 }
 
-wait_for "the object store" "$base?max-keys=1"
 wait_for "the seed marker $marker" "$base/$marker"
 exec /usr/local/bin/ravel-server "$@"
