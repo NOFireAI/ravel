@@ -2609,10 +2609,12 @@ exits before serving, with an error naming the family and the remedy. A
 bucket with neither `sys/compat` nor `sys/tenancy` and nothing under `t/`
 is a fresh store and starts. A bucket with `sys/tenancy` and no
 `sys/compat`, or with data under `t/` and neither marker (a bucket written
-before ADR-0050), is refused with an error naming `ravel-cli compat init`,
-which adopts the store from the release that reads both versions. The gate
-checks for `t/` data with one LIST of its first page, and a failed LIST
-refuses. `sys/compat` without a configured
+before the tenancy marker existed), is refused with an error naming
+`ravel-cli compat init`, which adopts the store from the release that reads
+both versions. The gate checks for `t/` data with one LIST of its first
+page; a failed LIST refuses, after the startup retries when the error is
+transient.
+`sys/compat` without a configured
 `--tenant-hash-key-file` is refused too, because the certificates cannot be
 authenticated. A watermark more than 7 days old logs a `WARN` line and
 still starts.
