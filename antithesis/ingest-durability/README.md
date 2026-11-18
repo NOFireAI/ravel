@@ -178,6 +178,46 @@ They add `libloading`, `linkme`, `rand` 0.8, `rand_chacha` 0.3 and
 `rustc_version_runtime` to Cargo.lock. The driver is its own Cargo workspace,
 with its own lock file, and the repository's workspace never builds it.
 
+## Mutants
+
+The commit area's negative configs (formal/tla/commit/negative/) that break a
+safety property are switches in the shipped code, each an
+`inv_mutant!("commit/<stem>")` call (ADR-4326 decision 3). They compile in only
+with ravel-server's `antithesis-mutants` feature, which only the
+`ingest-durability-mutants` image tag carries: `MUTANTS=1 scripts/build.sh`
+builds ravel-server with `sql,antithesis,antithesis-mutants`, stamps the list
+into the `org.ravel.antithesis.server-features` label, and checks that
+`/symbols/ravel-server` holds every mutant name (a plain build checks that it
+holds none). The plain build is unchanged.
+
+`RAVEL_ANTITHESIS_MUTANT=commit/<stem>` in ravel1's and ravel2's environment
+turns one switch on. A server built without the feature ignores the variable,
+so `scripts/launch.sh` and `scripts/local-run.sh` refuse a mutant run unless
+the `-mutants` server image carries the feature label, and refuse any name
+that is not a mutant line of formal/tla/commit/antithesis-mutants.tsv. That
+file names the property each mutant must make false; the configs it marks
+`none:` are reachability obligations or out of scope, not switches.
+
+| Mutant | Switch | Property it makes false |
+|---|---|---|
+| `commit/ack-before-commit` | a metrics shard's `commit_flush` (crates/ravel-ingest/src/shard.rs) acks its strict waiters before the data object and the commit record are written | `commit: a strict metrics ack names a durable commit record` (crates/ravel-ingest/src/router.rs) |
+| `commit/commit-before-data` | `put_data_object` (crates/ravel-commit/src/publish.rs) returns success without the PUT | `commit: a commit record never exists without its data object` (crates/ravel-commit/src/publish.rs) |
+| `commit/mismatched-identity-idempotent` | every shard actor draws one fixed writer identity (`draw_writer_identity`, crates/ravel-ingest/src/router.rs), so two writers reuse a commit key, and a commit record that already exists with other content is taken as an idempotent match (crates/ravel-commit/src/publish.rs) | `commit: one commit identity holds one content hash` (crates/ravel-commit/src/publish.rs) |
+| `commit/marker-before-all-shards` | a keyed log write's receipt waits for its first shard's ack only (`await_strict_acks`, crates/ravel-ingest/src/log_router.rs), so the idempotency marker is written ahead of the other shards' commits | `commit: an idempotency marker implies every shard's commit is durable` (crates/ravel-ingest/src/idempotency.rs) |
+
+`ack-before-commit` changes the metrics path only; the log path's acks are
+untouched, so the driver's log read-back cannot fail under it. The driver's
+metrics read-back (`a read with an acked metrics write's commit tokens returns
+every sample of that write`) may fail as a knock-on effect; the gated property
+is the server's own.
+
+A mutant run passes when its property was evaluated false at least once. The
+local loop gates on exactly that and lists any other always-property that went
+false, without gating on it. An Antithesis mutant run is named
+`ravel-ingest-durability-mutant` with the `attrs.mutant` parameter set to the
+mutant (`none` on a plain run); its report should show the expected property
+failing.
+
 ## Build, run locally, launch
 
 Build on a Linux amd64 host, never on a laptop:
@@ -213,7 +253,32 @@ image keeps LTO. Unstripped binaries are in `/symbols` of each image.
 Once #4308 lands, the workload also runs weekly from
 `.github/workflows/antithesis-weekly.yml` (Tuesday 03:07 UTC, at most 240
 compute hours), which calls `scripts/build.sh all` and `scripts/launch.sh` as
-they are.
+they are. The `weekly` marker file in this directory opts the workload in
+(ADR-4326 decision 4); until #4308 lands, nothing reads it.
+
+A smoke run is a plain run with a small budget; a mutant run builds, moves and
+launches the `-mutants` images. On the build host:
+
+```sh
+MUTANTS=1 antithesis/ingest-durability/scripts/build.sh
+RAVEL_ANTITHESIS_MUTANT=commit/commit-before-data \
+    antithesis/ingest-durability/scripts/local-run.sh out/mutant1 300
+MUTANTS=1 antithesis/ingest-durability/scripts/export-images.sh s3://<bucket>/<prefix>
+```
+
+Then, on the machine that launches runs:
+
+```sh
+antithesis/ingest-durability/scripts/launch.sh 1 "ingest-durability smoke"
+MUTANTS=1 antithesis/ingest-durability/scripts/import-images.sh s3://<bucket>/<prefix>
+RAVEL_ANTITHESIS_MUTANT=commit/commit-before-data \
+    antithesis/ingest-durability/scripts/launch.sh <max-compute-hours> "ingest-durability mutant"
+```
+
+The `-mutants` archives are saved as `<name>-mutants.tar.zst` beside the plain
+ones, so one prefix holds both. `MUTANTS=1` needs a tag ending in `-mutants`
+and a `-mutants` tag needs `MUTANTS=1` (`scripts/image-tag.sh`), so a mutant
+build never lands under the plain tag.
 
 The harness expects these fault flags (`scripts/launch.sh`):
 

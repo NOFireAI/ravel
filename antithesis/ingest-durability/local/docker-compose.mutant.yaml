@@ -1,0 +1,17 @@
+# Mutant-run overrides (scripts/local-run.sh with RAVEL_ANTITHESIS_MUTANT set),
+# layered over ../config/docker-compose.yaml and docker-compose.local.yaml:
+# every workload image becomes its ingest-durability-mutants build, and ravel1
+# and ravel2 get the selector. A plain run never loads this file.
+services:
+  init:
+    image: ravel-antithesis-server:ingest-durability-mutants
+  ravel1:
+    image: ravel-antithesis-server:ingest-durability-mutants
+    environment:
+      RAVEL_ANTITHESIS_MUTANT: ${RAVEL_ANTITHESIS_MUTANT:?a mutant run needs RAVEL_ANTITHESIS_MUTANT}
+  ravel2:
+    image: ravel-antithesis-server:ingest-durability-mutants
+    environment:
+      RAVEL_ANTITHESIS_MUTANT: ${RAVEL_ANTITHESIS_MUTANT:?a mutant run needs RAVEL_ANTITHESIS_MUTANT}
+  driver:
+    image: ravel-antithesis-driver:ingest-durability-mutants
