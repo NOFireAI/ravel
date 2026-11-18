@@ -928,7 +928,10 @@ impl Shared {
             println!("fold race: no HEAD key known yet");
             return false;
         };
-        if !self.nudge(clock::fold_race_nudge_s(now_ns() / NS_PER_SECOND), "fold race") {
+        if !self.nudge(
+            clock::fold_race_nudge_s(now_ns() / NS_PER_SECOND),
+            "fold race",
+        ) {
             return false;
         }
         let now_s = now_ns() / NS_PER_SECOND;

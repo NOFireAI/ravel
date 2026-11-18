@@ -433,10 +433,13 @@ fn requests(
         match rules.admit(&head.method, &key, HOLD_CAP) {
             Admit::Refuse => {
                 // No pipelining: the previous answer has been read already.
-                let _ = up.shutdown(Shutdown::Both);
+                // Write the refusal before shutting `up` down: that shutdown
+                // ends the answers thread's copy, which then shuts the client
+                // down, so a shutdown first races this write to nothing.
                 let mut w = client.try_clone()?;
                 w.write_all(&refusal())?;
                 w.flush()?;
+                let _ = up.shutdown(Shutdown::Both);
                 return Ok(());
             }
             Admit::Forward => {
@@ -720,7 +723,10 @@ mod tests {
         assert_eq!(rules.apply(&format!("hold-key {HEAD_KEY}")), "ok");
         // Holds only that key: a record PUT and another key go straight through.
         assert_eq!(rules.admit("PUT", RECORD, HOLD_CAP), Admit::Forward);
-        assert_eq!(rules.admit("PUT", "t/0a0b/catalog/logs/x", HOLD_CAP), Admit::Forward);
+        assert_eq!(
+            rules.admit("PUT", "t/0a0b/catalog/logs/x", HOLD_CAP),
+            Admit::Forward
+        );
         let r = Arc::clone(&rules);
         let held = std::thread::spawn(move || r.admit("PUT", HEAD_KEY, HOLD_CAP));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -776,7 +782,10 @@ mod tests {
             parse_held_result(&format!("{HEAD_KEY} 412")),
             Some((HEAD_KEY.to_string(), 412))
         );
-        assert_eq!(parse_held_result(&format!("{HEAD_KEY} 200")), Some((HEAD_KEY.to_string(), 200)));
+        assert_eq!(
+            parse_held_result(&format!("{HEAD_KEY} 200")),
+            Some((HEAD_KEY.to_string(), 200))
+        );
         assert_eq!(parse_held_result("none"), None);
         assert_eq!(parse_held_result(&format!("{HEAD_KEY} x")), None);
     }
@@ -833,8 +842,10 @@ mod tests {
                             l.extend_from_slice(&h.raw);
                             l.extend_from_slice(&body);
                         }
-                        w.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").as_bytes())
-                            .expect("answers");
+                        w.write_all(
+                            format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                        )
+                        .expect("answers");
                     }
                 });
             }
@@ -946,7 +957,10 @@ mod tests {
         assert_eq!(rules.admit("PUT", RECORD, HOLD_CAP), Admit::Refuse);
         assert_eq!(control(&addr, "held"), Ok("none".to_string()));
         assert_eq!(control(&addr, "held-result"), Ok("none".to_string()));
-        assert_eq!(control(&addr, &format!("hold-key {HEAD_KEY}")), Ok("ok".to_string()));
+        assert_eq!(
+            control(&addr, &format!("hold-key {HEAD_KEY}")),
+            Ok("ok".to_string())
+        );
         assert!(control(&addr, "hold-key").is_err());
         assert!(control(&addr, "bogus").is_err());
         assert_eq!(control(&addr, "pass"), Ok("ok".to_string()));
