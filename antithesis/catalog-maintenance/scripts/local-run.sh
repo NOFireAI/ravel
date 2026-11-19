@@ -76,12 +76,12 @@ fi
 # start around it.
 SETUP_LIMIT=900
 # The eventually waits up to 300 s for recovery, then jumps the clocks, runs
-# up to six fold races, three record races and one unfolded-record sweep
-# (README.md, "The forced races"; about 1600 s between them at their waits'
-# bounds), folds, compacts and audits, takes the two sweep jumps (each with
-# its reread and serving waits), sweeps, folds, audits again and reads;
-# 4200 s bounds all of it.
-END_LIMIT=$((SECS + 4200))
+# up to six fold races, five record races, one unfolded-record sweep and one
+# unreadable-HEAD sweep (README.md, "The forced races"; about 2200 s between
+# them at their waits' bounds), folds, compacts and audits, takes the two
+# sweep jumps (each with its reread and serving waits), sweeps, folds, audits
+# again and reads; 4800 s bounds all of it.
+END_LIMIT=$((SECS + 4800))
 SERVERS="ravel1 ravel2 maint1 maint2"
 MULTISET="catalog: compaction preserves the acked multiset"
 UPPER="catalog: no scan shows a phantom or an excess copy"
@@ -90,9 +90,10 @@ UPPER="catalog: no scan shows a phantom or an excess copy"
 # jumps, sweep and deletion of a superseded input the compaction enables.
 # Then each forced race (README.md, "The forced races") reaching the
 # situation it forces: a server fold losing its HEAD CAS, a server's
-# compaction record PUT losing to a concurrent compaction, and the clocks
+# compaction record PUT losing to a concurrent compaction, the clocks
 # passing a record's protection horizon and pinned-query window while HEAD
-# had not folded it. Each is the situation one silent mutant needs; a run
+# had not folded it, and the servers' sweeps passing the protection horizon
+# while HEAD was unreadable. Each is the situation one silent mutant needs; a run
 # that never reaches it cannot tell that mutant from clean code.
 REQUIRED=(
     "catalog: the workload starts"
@@ -107,6 +108,7 @@ REQUIRED=(
     "catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead"
     "catalog: a server's compaction record PUT lost to a concurrent compaction"
     "catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it"
+    "catalog: the servers' sweeps ran past the protection horizon while HEAD was unreadable"
 )
 mkdir -p "$OUT"
 export COMPOSE_FILE="$COMPOSE_BASE:$WL/local/docker-compose.local.yaml"
