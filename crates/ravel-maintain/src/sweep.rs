@@ -4777,6 +4777,9 @@ mod tests {
         // Four candidates, comfortably below orphan_breaker_min_count, so the
         // breaker never interferes with either half of this test.
         let config = CompactorConfig::default();
+        // This shard's commit prefix only: an invariants build also LISTs the
+        // audit hold shard's commit prefix before the deletes.
+        let shard_commits = keys::commit_shard_prefix(&tenant, signal, shard).unwrap();
 
         // The second commit-prefix LIST is the batched re-verify (ADR-0048
         // decision 5): faulting it aborts the pass before any delete, which
@@ -4789,7 +4792,7 @@ mod tests {
             let clock = aged_clock(&config);
             let plan = FaultPlan::empty().with_rule(
                 Rule::new(Op::List, ScriptedFault::Timeout)
-                    .with_key_contains("/c/")
+                    .with_key_contains(shard_commits.clone())
                     .with_occurrence(Occurrence::Nth(2)),
             );
             let store = FaultStore::new(mem, plan);
@@ -4825,7 +4828,7 @@ mod tests {
             let clock = aged_clock(&config);
             let plan = FaultPlan::empty().with_rule(
                 Rule::new(Op::List, ScriptedFault::Timeout)
-                    .with_key_contains("/c/")
+                    .with_key_contains(shard_commits.clone())
                     .with_occurrence(Occurrence::Nth(3)),
             );
             let store = FaultStore::new(mem, plan);
