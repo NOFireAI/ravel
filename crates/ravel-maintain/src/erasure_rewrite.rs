@@ -2751,8 +2751,12 @@ async fn build_and_publish_rewrite(
     let parts = build.parts.len();
     // The written output's part keys, captured before `build` is consumed, so
     // the output-content invariant below re-reads exactly the objects this
-    // publish wrote.
-    let output_part_keys: Vec<String> = build.parts.iter().map(|p| p.key.clone()).collect();
+    // publish wrote. Empty where assertions compile out.
+    let output_part_keys: Vec<String> = if ravel_invariant::EVALUATES {
+        build.parts.iter().map(|p| p.key.clone()).collect()
+    } else {
+        Vec::new()
+    };
     let publish =
         publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns).await?;
     // `publish_rewrite_record` abandons at its deadline check and nowhere else.
@@ -2763,48 +2767,57 @@ async fn build_and_publish_rewrite(
     // the written output and confirm no surviving sample matches an applied
     // erasure request. Judged from the published part bytes, not the build-time
     // keep/drop decision, so the `rewrite-keeps-erased-records` mutant that
-    // carried an erased sample into the output is caught here. Instrumentation
-    // only (EVALUATES), so a shipped build re-reads nothing.
+    // carried an erased sample into the output is caught here. A re-read or
+    // decode that fails records nothing and leaves the publish's result as it
+    // is.
     if ravel_invariant::EVALUATES
         && bucket.signal == Signal::Metrics
         && matches!(publish, PublishOutcome::Published)
     {
-        assert_rewrite_output_minus_erased(store, config, bucket, &output_part_keys, overlapping)
-            .await?;
+        let _clean =
+            rewrite_output_minus_erased(store, config, &output_part_keys, overlapping).await;
+        ravel_invariant::inv_always_if_known!(
+            _clean,
+            "erasure: a rewrite's output is its inputs minus the erased records",
+            std::collections::BTreeMap::from([
+                ("bucket", bucket_prefix_for_error(bucket)),
+                // Content-addressed, so a test isolates its own evaluation by
+                // part key even though every metrics rewrite shares the message
+                // and bucket prefix.
+                ("parts", output_part_keys.join(",")),
+            ])
+        );
     }
 
     Ok((parts, publish, abandoned))
 }
 
-/// Re-read the metrics rewrite output parts named by `part_keys` and assert
-/// (`RewriteOutputsAreInputsMinusErased`) that no surviving sample matches any
-/// `overlapping` request's erasure predicate: the output is its inputs minus the
-/// erased records. The evidence is the decoded output bytes, independent of the
-/// build's own keep/drop decision.
-async fn assert_rewrite_output_minus_erased(
+/// Whether the metrics rewrite output parts named by `part_keys` hold no
+/// surviving sample that any `overlapping` request's erasure predicate matches
+/// (`RewriteOutputsAreInputsMinusErased`): `Some(true)` when the output is
+/// clean, `Some(false)` when it carries an erased sample, `None` when a part
+/// could not be re-read or decoded. The evidence is the decoded output bytes,
+/// independent of the build's own keep/drop decision.
+async fn rewrite_output_minus_erased(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
-    // Used only in the assertion's detail, which is empty without the feature.
-    _bucket: &Bucket,
     part_keys: &[String],
     overlapping: &[&PendingErasureRequest],
-) -> Result<()> {
-    // Bound only in the macro arg below (empty without the feature), so the
-    // underscore keeps a shipped build's unused-variable lint quiet.
-    let _leak = output_erased_leak(store, config, part_keys, overlapping).await?;
-    ravel_invariant::inv_always!(
-        _leak.is_none(),
-        "erasure: a rewrite's output is its inputs minus the erased records",
-        std::collections::BTreeMap::from([
-            ("bucket", bucket_prefix_for_error(_bucket)),
-            // Content-addressed, so a test isolates its own evaluation by part
-            // key even though every metrics rewrite shares the message and
-            // bucket prefix.
-            ("parts", part_keys.join(",")),
-            ("leak", format!("{_leak:?}")),
-        ])
-    );
-    Ok(())
+) -> Option<bool> {
+    match output_erased_leak(store, config, part_keys, overlapping).await {
+        Ok(leak) => {
+            if let Some((series, ts_ns)) = &leak {
+                tracing::error!(
+                    parts = %part_keys.join(","),
+                    series = %series,
+                    ts_ns,
+                    "erasure rewrite output still carries a sample an applied request erases"
+                );
+            }
+            Some(leak.is_none())
+        }
+        Err(_) => None,
+    }
 }
 
 /// The first `(series_id_hex, ts_ns)` in the written metrics output parts that

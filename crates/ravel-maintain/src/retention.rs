@@ -897,11 +897,24 @@ async fn physical_sweep(
 
     // Deletion order (docs/consistency-model.md "Deletion and GC", ADR-0019
     // decision 4): records, then data objects, then L1 parts, tombstone last.
-    delete_all(store, lease, &listing.commit_keys, dry_run).await?;
-    delete_all(store, lease, &listing.compaction_record_keys, dry_run).await?;
-    delete_all(store, lease, &listing.rewrite_record_keys, dry_run).await?;
-    delete_all(store, lease, &l0_data_keys, dry_run).await?;
-    delete_all(store, lease, &l1_part_keys, dry_run).await?;
+    //
+    // The tenant's holds re-read from the store, the evidence the
+    // HeldObjectNeverDeleted assertion in `delete_all` judges from. A failed
+    // re-read leaves `None`, the assertion records nothing, and the sweep goes
+    // on.
+    let holds_now = if ravel_invariant::EVALUATES && !dry_run {
+        crate::legal_hold::LegalHoldCheck::refresh(store, &bucket.tenant_hash)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let holds_now = holds_now.as_ref();
+    delete_all(store, lease, holds_now, &listing.commit_keys, dry_run).await?;
+    delete_all(store, lease, holds_now, &listing.compaction_record_keys, dry_run).await?;
+    delete_all(store, lease, holds_now, &listing.rewrite_record_keys, dry_run).await?;
+    delete_all(store, lease, holds_now, &l0_data_keys, dry_run).await?;
+    delete_all(store, lease, holds_now, &l1_part_keys, dry_run).await?;
 
     // Verify the bucket is empty before deleting the tombstone: the commit
     // prefix must contain only the tombstone, and the l1/ prefix must be empty.
@@ -1118,9 +1131,13 @@ fn protected_sweep_keys<'a>(
 /// any of these keys is protected. It stays as the last line of defence, so a
 /// future caller that reaches the deletes by another route still cannot delete
 /// a held key.
+///
+/// `holds_now` is the tenant's hold set re-read from the store, read only by
+/// the HeldObjectNeverDeleted assertion; `None` records nothing.
 async fn delete_all(
     store: &dyn ObjectStoreBackend,
     lease: &dyn LeaseCheck,
+    holds_now: Option<&crate::legal_hold::LegalHoldCheck>,
     keys: &[String],
     dry_run: bool,
 ) -> Result<()> {
@@ -1129,6 +1146,13 @@ async fn delete_all(
             continue;
         }
         if !dry_run {
+            let _verdict =
+                crate::legal_hold::held_object_verdict(holds_now, lease, &[key.as_str()]);
+            ravel_invariant::inv_always_if_known!(
+                _verdict,
+                "gc: a held object is never deleted",
+                std::collections::BTreeMap::from([("key", key.clone())])
+            );
             store.delete(key).await?;
         }
     }

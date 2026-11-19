@@ -2530,13 +2530,15 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
     // faults could hold the alarm off indefinitely.
     note_owned_units(ownership, worker, live_set, tenant, shard_count);
 
-    let hold = match LegalHoldCheck::refresh(store, tenant).await {
+    let refresh = LegalHoldCheck::refresh(store, tenant).await;
+    // The store call's own result, carried to the RefreshFailureNeverSweeps
+    // assertion at the end of the tick.
+    let refresh_ok = refresh.is_ok();
+    let hold = match refresh {
         Ok(hold) => hold,
         // Mutant lifecycle/refresh-failure-is-no-hold (ADR-4326): treat a failed
         // refresh as an empty hold set and proceed into the tick's sweeps
-        // instead of skipping. The RefreshFailureNeverSweeps site in
-        // ravel-maintain's sweep then catches the delete under the failed
-        // refresh.
+        // instead of skipping.
         Err(_) if ravel_invariant::inv_mutant!("lifecycle/refresh-failure-is-no-hold") => {
             LegalHoldCheck::empty()
         }
@@ -2551,10 +2553,15 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 "gc: a failed hold refresh skips the maintain tick",
                 std::collections::BTreeMap::from([("tenant", tenant.to_hex())])
             );
+            // No sweep ran, so the tick deleted nothing.
+            assert_refresh_failure_never_sweeps(tenant, refresh_ok, 0);
             return MaintainReport::default();
         }
     };
 
+    // Objects the tick's sweeps report deleting, summed from their own
+    // reports for the RefreshFailureNeverSweeps assertion at the end.
+    let mut deleted = 0usize;
     let mut total = MaintainReport::default();
     for signal in MAINTAINED_SIGNALS {
         // Durable shard_count validation before maintaining this (tenant,
@@ -2964,6 +2971,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                     if report.orphan_breaker_tripped {
                         log_orphan_breaker_trip(tenant, signal, shard, &report);
                     }
+                    deleted += sweep_report_deletes(&report);
                     safety.record_sweep(signal, &report);
                     blocked_named_hours.extend(&report.blocked_named_hours);
                 }
@@ -2997,6 +3005,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
         {
             match sweep_idempotency_markers(store, clock, compactor, &hold, tenant, signal).await {
                 Ok(outcome) => {
+                    deleted += outcome.deleted;
                     tracing::info!(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
@@ -3041,6 +3050,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 .await
             {
                 Ok(outcome) => {
+                    deleted += outcome.deleted;
                     safety.record_catalog_sweep(&outcome);
                     tracing::info!(
                         tenant = %tenant.to_hex(),
@@ -3083,7 +3093,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
         // amendment); `CreateIfAbsent` alone does not fence them, since the
         // two records have different keys.
         if worker.owns_unit(live_set, tenant, signal, 0) {
-            run_erasure_pass(
+            deleted += run_erasure_pass(
                 store,
                 clock,
                 compactor,
@@ -3121,14 +3131,17 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
     // are counted apart from them, under `signal="audit"`.
     if worker.owns_unit(live_set, tenant, Signal::Audit, QUERY_AUDIT_SHARD) {
         match sweep_audit_retention(store, clock, compactor, &hold, tenant).await {
-            Ok(outcome) => tracing::info!(
-                tenant = %tenant.to_hex(),
-                records = outcome.records_deleted,
-                data = outcome.data_deleted,
-                parts = outcome.parts_deleted,
-                kept = outcome.kept,
-                "maintenance: query-audit retention sweep complete"
-            ),
+            Ok(outcome) => {
+                deleted += outcome.records_deleted + outcome.data_deleted + outcome.parts_deleted;
+                tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    records = outcome.records_deleted,
+                    data = outcome.data_deleted,
+                    parts = outcome.parts_deleted,
+                    kept = outcome.kept,
+                    "maintenance: query-audit retention sweep complete"
+                )
+            }
             Err(err) => tracing::warn!(
                 tenant = %tenant.to_hex(),
                 error = %err,
@@ -3182,6 +3195,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                     superseded_deletes_refused = report.superseded_deletes_refused,
                     "maintenance: query-audit input-cleanup sweep complete"
                 );
+                deleted += sweep_report_deletes(&report);
                 report_unmaintained_breaker_trip(
                     safety,
                     tenant,
@@ -3207,10 +3221,39 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
     // `MaintainReport` or the per-signal safety arrays, for the same reasons as
     // the query-audit block above.
     if worker.owns_unit(live_set, tenant, Signal::Alerts, ALERT_SHARD) {
-        run_alert_retention(store, clock, compactor, &hold, tenant, safety).await;
+        deleted += run_alert_retention(store, clock, compactor, &hold, tenant, safety).await;
     }
 
+    // Retention's physical sweep inside `scan_and_maintain_with_memo` reports
+    // retired buckets, not deleted objects, so its deletes are not in `deleted`.
+    assert_refresh_failure_never_sweeps(tenant, refresh_ok, deleted);
     total
+}
+
+/// The objects one [`ravel_maintain::SweepReport`] says its pass deleted: orphans
+/// moved out of the live keyspace, quarantine copies reaped, superseded records
+/// and data, and unreferenced parts.
+fn sweep_report_deletes(report: &ravel_maintain::SweepReport) -> usize {
+    report.orphans_deleted
+        + report.quarantine_reaped
+        + report.superseded_records_deleted
+        + report.superseded_data_deleted
+        + report.unreferenced_parts_deleted
+}
+
+/// RefreshFailureNeverSweeps (ADR-4326 lifecycle): a tick whose hold refresh
+/// failed deletes nothing. `refresh_ok` is the refresh store call's own result
+/// and `deleted` the objects the tick's sweeps reported deleting.
+fn assert_refresh_failure_never_sweeps(_tenant: &TenantHash, _refresh_ok: bool, _deleted: usize) {
+    ravel_invariant::inv_always!(
+        _refresh_ok || _deleted == 0,
+        "gc: a failed hold refresh sweeps nothing",
+        std::collections::BTreeMap::from([
+            ("tenant", _tenant.to_hex()),
+            ("refresh_ok", _refresh_ok.to_string()),
+            ("deleted", _deleted.to_string()),
+        ])
+    );
 }
 
 /// The alert retention driver for one tenant (ADR-1688 decisions 3 and 6, and
@@ -3237,6 +3280,8 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
 /// window is. It is skipped only for a tenant whose alert keyspace and its
 /// quarantine copies hold nothing at all ([`alert_keyspace_is_empty`]), where
 /// every one of its listings would come back empty.
+///
+/// Returns the objects both sweeps reported deleting.
 async fn run_alert_retention(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -3244,9 +3289,11 @@ async fn run_alert_retention(
     hold: &LegalHoldCheck,
     tenant: &TenantHash,
     safety: &MaintenanceSafetyMetrics,
-) {
+) -> usize {
+    let mut deleted = 0usize;
     let memo_or_records_seen = compactor.alert_retention_window_ns > 0
-        && run_alert_retention_sweep(store, clock, compactor, hold, tenant, safety).await;
+        && run_alert_retention_sweep(store, clock, compactor, hold, tenant, safety, &mut deleted)
+            .await;
 
     if !memo_or_records_seen {
         match alert_keyspace_is_empty(store, tenant).await {
@@ -3256,7 +3303,7 @@ async fn run_alert_retention(
                     "maintenance: alerts shard orphan sweep skipped: the tenant's alert keyspace \
                      and its quarantine copies hold nothing"
                 );
-                return;
+                return deleted;
             }
             Ok(false) => {}
             // Not knowing is not the same as empty: sweep, and let the sweep's
@@ -3294,6 +3341,7 @@ async fn run_alert_retention(
             // Zero today: nothing compacts or rewrites the alerts shard, so it
             // has no supersession chain for rule 2 to refuse or hold.
             safety.record_unmaintained_superseded(Signal::Alerts, &report);
+            deleted += sweep_report_deletes(&report);
         }
         Err(err) => tracing::warn!(
             tenant = %tenant.to_hex(),
@@ -3301,6 +3349,7 @@ async fn run_alert_retention(
             "maintenance: alerts shard orphan sweep failed; retried next tick"
         ),
     }
+    deleted
 }
 
 /// Log and count a mass-orphan breaker trip reported by a `sweep_shard` pass
@@ -3347,7 +3396,7 @@ fn log_orphan_breaker_trip(
 /// Returns whether it found the memo object or an alert commit record, either
 /// of which puts an object under the tenant's alert keyspace, so the caller
 /// needs no listing of its own to know the orphan sweep has something to look
-/// at.
+/// at. Adds the objects the retention sweep reported deleting to `deleted`.
 async fn run_alert_retention_sweep(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -3355,20 +3404,24 @@ async fn run_alert_retention_sweep(
     hold: &LegalHoldCheck,
     tenant: &TenantHash,
     safety: &MaintenanceSafetyMetrics,
+    deleted: &mut usize,
 ) -> bool {
     match alert_keep_set(store, clock, compactor, tenant).await {
         Ok(AlertKeepSetOutcome::Ready(keep)) => {
             match sweep_alert_retention(store, clock, compactor, hold, tenant, ALERT_SHARD, &keep)
                 .await
             {
-                Ok(outcome) => tracing::info!(
-                    tenant = %tenant.to_hex(),
-                    records = outcome.records_deleted,
-                    data = outcome.data_deleted,
-                    kept = outcome.kept,
-                    kept_current_state = outcome.kept_current_state,
-                    "maintenance: alert retention sweep complete"
-                ),
+                Ok(outcome) => {
+                    *deleted += outcome.records_deleted + outcome.data_deleted;
+                    tracing::info!(
+                        tenant = %tenant.to_hex(),
+                        records = outcome.records_deleted,
+                        data = outcome.data_deleted,
+                        kept = outcome.kept,
+                        kept_current_state = outcome.kept_current_state,
+                        "maintenance: alert retention sweep complete"
+                    )
+                }
                 Err(err) => tracing::warn!(
                     tenant = %tenant.to_hex(),
                     error = %err,
@@ -3652,14 +3705,6 @@ struct ErasureRewritePass {
     /// `.done` is withheld even when `deferred` is false: completion follows the
     /// resolver the query path trusts, not the pass's own live-record hop.
     catalog_blocked: std::collections::HashSet<String>,
-    /// Every bucket this pass ran the completion resolver over. Kept only so the
-    /// completion-write invariant (ADR-4326
-    /// `CompletionImpliesNoPreRewriteExposure`) can re-derive the served set
-    /// from a fresh read at the write rather than trust `catalog_blocked`, the
-    /// flag the pass itself set. Populated only under the invariants build
-    /// (`ravel_invariant::EVALUATES`); empty in a shipped build, which runs no
-    /// such re-read.
-    checked_buckets: Vec<Bucket>,
 }
 
 /// Rewrite every bucket of one `(tenant, signal)` against `pending`
@@ -3825,11 +3870,6 @@ async fn erasure_rewrite_pass(
             // bucket the pass called `AlreadyApplied` or `NoApplicableRequests`
             // off its one-hop view, or a derived ack-open hour still unsealed,
             // is exactly where completion must be withheld.
-            // Record the bucket for the completion-write invariant's fresh
-            // re-read (invariants build only).
-            if ravel_invariant::EVALUATES {
-                pass.checked_buckets.push(bucket);
-            }
             match ravel_maintain::bucket_erasure_completion(
                 store, clock, compactor, hold, &bucket, pending,
             )
@@ -4010,8 +4050,10 @@ async fn write_erasure_completion(
 /// request's scope, so ingest that never stops does not stall completion, and
 /// the wait is bounded to
 /// [`ravel_maintain::erasure_rewrite::erasure_seal_wait_bound_ns`].
+///
+/// Returns the `.dreq` objects the request sweep reported deleting.
 #[allow(clippy::too_many_arguments)]
-async fn run_erasure_pass(
+pub(crate) async fn run_erasure_pass(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     compactor: &CompactorConfig,
@@ -4021,7 +4063,7 @@ async fn run_erasure_pass(
     scan_shards: u32,
     memo: &mut MaintainMemo,
     safety: &MaintenanceSafetyMetrics,
-) {
+) -> usize {
     match pending_erasure_requests(store, tenant, signal).await {
         Ok(pending) if !pending.is_empty() => {
             // Discovery unions the per-shard commit-prefix listing (inside
@@ -4079,33 +4121,7 @@ async fn run_erasure_pass(
                      request stays pending"
                 );
             } else {
-                // CompletionImpliesNoPreRewriteExposure (ADR-4326): the
-                // independent re-read of the served set the invariant below
-                // judges from, run once per tick over the buckets this pass
-                // checked. `None` on a re-read failure (the invariant then
-                // cannot tell). Fresh store reads, not `pass.catalog_blocked`,
-                // which the pass itself set. Invariants build only.
-                let _served_reread: Option<std::collections::HashSet<String>> =
-                    if ravel_invariant::EVALUATES {
-                        let mut fresh = std::collections::HashSet::new();
-                        let mut ok = true;
-                        for b in &pass.checked_buckets {
-                            match ravel_maintain::bucket_erasure_completion(
-                                store, clock, compactor, hold, b, &pending,
-                            )
-                            .await
-                            {
-                                Ok(completion) => fresh.extend(completion.blocked),
-                                Err(_) => {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        ok.then_some(fresh)
-                    } else {
-                        None
-                    };
+                let mut completing: Vec<&PendingErasureRequest> = Vec::new();
                 for entry in &pending {
                     // Completion follows the CATALOG resolver, not the rewrite
                     // pass's one-hop live-record classification (ADR-0064 §4
@@ -4119,8 +4135,7 @@ async fn run_erasure_pass(
                     //
                     // Mutant lifecycle/complete-ignores-served-set (ADR-4326):
                     // drop the served-set guard, so a `.done` lands while the
-                    // subject is still served. The re-read invariant at the
-                    // write catches it.
+                    // subject is still served.
                     if pass.catalog_blocked.contains(&entry.request.request_id)
                         && !ravel_invariant::inv_mutant!("lifecycle/complete-ignores-served-set")
                     {
@@ -4134,14 +4149,32 @@ async fn run_erasure_pass(
                         );
                         continue;
                     }
-                    // CompletionImpliesNoPreRewriteExposure: at the write, the
-                    // served set re-read from the store must no longer serve
-                    // this request's subject. `None` where the re-read could not
-                    // tell.
+                    completing.push(entry);
+                }
+                // The evidence CompletionImpliesNoPreRewriteExposure judges
+                // each `.done` write below from, read afresh from the store.
+                let served_now = if ravel_invariant::EVALUATES && !completing.is_empty() {
+                    served_after_completion(
+                        store,
+                        clock,
+                        compactor,
+                        hold,
+                        tenant,
+                        signal,
+                        scan_shards,
+                        &pending,
+                    )
+                    .await
+                } else {
+                    std::collections::HashMap::new()
+                };
+                for entry in completing {
+                    let _verdict = served_now
+                        .get(&entry.request.request_id)
+                        .copied()
+                        .flatten();
                     ravel_invariant::inv_always_if_known!(
-                        _served_reread
-                            .as_ref()
-                            .map(|blocked| !blocked.contains(&entry.request.request_id)),
+                        _verdict,
                         "erasure: a completion is written only when no pre-rewrite object is still served",
                         std::collections::BTreeMap::from([
                             ("request_id", entry.request.request_id.clone()),
@@ -4216,14 +4249,79 @@ async fn run_erasure_pass(
                 "maintenance: erasure request sweep pass complete"
             );
             safety.record_erasure_sweep(signal, &outcome);
+            outcome.deleted
         }
-        Err(err) => tracing::warn!(
-            tenant = %tenant.to_hex(),
-            signal = ?signal,
-            error = %err,
-            "maintenance: erasure request sweep pass failed; retried next tick"
-        ),
+        Err(err) => {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                error = %err,
+                "maintenance: erasure request sweep pass failed; retried next tick"
+            );
+            0
+        }
     }
+}
+
+/// The evidence for CompletionImpliesNoPreRewriteExposure (ADR-4326
+/// lifecycle), built apart from the pass that decided the completions: the
+/// tenant's hours listed again from the store, and for each sealed one the
+/// catalog resolver asked again whether it still serves each pending request's
+/// subject. Per request: `Some(true)` when no sealed bucket serves it,
+/// `Some(false)` when one does, and `None` when a listing, a resolve or a held
+/// bucket leaves that unknown. An unsealed bucket is left out:
+/// CompletionCoversEveryBucketOpenAtRequest owns that case.
+#[allow(clippy::too_many_arguments)]
+async fn served_after_completion(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    hold: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+    pending: &[PendingErasureRequest],
+) -> std::collections::HashMap<String, Option<bool>> {
+    let mut known = true;
+    let mut served: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let now_ns = clock.now_ns();
+    for shard in 0..scan_shards {
+        let Ok(hours) = list_erasure_scan_hours(store, tenant, signal, shard).await else {
+            known = false;
+            continue;
+        };
+        for hour in hours {
+            let bucket = Bucket::new(*tenant, signal, shard, hour);
+            if !bucket.is_sealed(now_ns, compactor) {
+                continue;
+            }
+            match ravel_maintain::bucket_erasure_completion(
+                store, clock, compactor, hold, &bucket, pending,
+            )
+            .await
+            {
+                Ok(completion) => {
+                    if completion.unresolved {
+                        known = false;
+                    }
+                    served.extend(completion.blocked);
+                }
+                Err(_) => known = false,
+            }
+        }
+    }
+    pending
+        .iter()
+        .map(|entry| {
+            let id = entry.request.request_id.clone();
+            let verdict = if served.contains(&id) {
+                Some(false)
+            } else {
+                known.then_some(true)
+            };
+            (id, verdict)
+        })
+        .collect()
 }
 
 /// Whether a recomputed live set differs from the one last held, which is the

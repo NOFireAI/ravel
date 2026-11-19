@@ -795,18 +795,13 @@ pub async fn sweep_orphans(
         });
     }
 
-    // ADR-4326 lifecycle: under the invariants build, re-read the tenant's
-    // holds at the delete as the independent evidence HeldObjectNeverDeleted and
-    // RefreshFailureNeverSweeps read, distinct from the `lease` this pass was
-    // handed. A failed re-read leaves the hold state unknown, so the pass
-    // deletes nothing this tick; the `refresh-failure-is-no-hold` mutant
-    // proceeds instead. A shipped build never evaluates this (EVALUATES is
-    // false), so the sweep's behaviour is unchanged there.
-    let gate_holds = if ravel_invariant::EVALUATES && !candidates.is_empty() {
-        match crate::legal_hold::sweep_delete_gate(store, tenant).await {
-            Some(holds) => Some(holds),
-            None => return Ok(OrphanSweepOutcome::default()),
-        }
+    // The tenant's holds re-read from the store, the evidence the
+    // HeldObjectNeverDeleted assertion below judges from. A failed re-read
+    // leaves `None`, the assertion records nothing, and the pass goes on.
+    let holds_now = if ravel_invariant::EVALUATES && !candidates.is_empty() {
+        crate::legal_hold::LegalHoldCheck::refresh(store, tenant)
+            .await
+            .ok()
     } else {
         None
     };
@@ -828,20 +823,19 @@ pub async fn sweep_orphans(
         let dest = quarantine_key(&meta.key, quarantined_at_ns);
         match quarantine_object(store, &meta.key, &dest).await {
             Ok(QuarantineMove::Copied) => {
-                // HeldObjectNeverDeleted: judged from the holds re-read at the
-                // delete (the store's current hold set), not the `lease` handed
-                // in, so an empty lease substituted for a failed refresh does
-                // not hide a live hold on this key.
-                if let Some(_holds) = &gate_holds {
-                    ravel_invariant::inv_always!(
-                        !_holds.is_protected(&meta.key),
-                        "gc: a held object is never deleted",
-                        std::collections::BTreeMap::from([
-                            ("key", meta.key.clone()),
-                            ("tenant", tenant.to_hex()),
-                        ])
-                    );
-                }
+                let _verdict = crate::legal_hold::held_object_verdict(
+                    holds_now.as_ref(),
+                    lease,
+                    &[meta.key.as_str()],
+                );
+                ravel_invariant::inv_always_if_known!(
+                    _verdict,
+                    "gc: a held object is never deleted",
+                    std::collections::BTreeMap::from([
+                        ("key", meta.key.clone()),
+                        ("tenant", tenant.to_hex()),
+                    ])
+                );
                 store.delete(&meta.key).await?;
                 ravel_invariant::inv_reachable!(
                     "gc: orphan sweep delete",
@@ -1066,6 +1060,10 @@ pub async fn sweep_quarantine(
     let mut reaped = 0usize;
     let mut reaped_bytes = 0u64;
     let mut retained = 0usize;
+    // The tenant's holds re-read from the store once, before the pass's first
+    // delete: the evidence the HeldObjectNeverDeleted assertion below judges
+    // from. The inner `None` is a failed re-read, which records nothing.
+    let mut holds_now: Option<Option<crate::legal_hold::LegalHoldCheck>> = None;
     for meta in objects {
         let Some(quarantined_at_ns) = parse_quarantine_timestamp(&meta.key) else {
             retained += 1;
@@ -1075,13 +1073,39 @@ pub async fn sweep_quarantine(
             retained += 1;
             continue;
         }
-        let held = lease.is_protected(&meta.key)
-            || original_key_from_quarantine(&meta.key).is_some_and(|k| lease.is_protected(k));
+        let original = original_key_from_quarantine(&meta.key);
+        let held = lease.is_protected(&meta.key) || original.is_some_and(|k| lease.is_protected(k));
         if held {
             retained += 1;
             continue;
         }
         if !config.dry_run {
+            let _verdict = if ravel_invariant::EVALUATES {
+                if holds_now.is_none() {
+                    holds_now = Some(
+                        crate::legal_hold::LegalHoldCheck::refresh(store, tenant)
+                            .await
+                            .ok(),
+                    );
+                }
+                let mut removed = vec![meta.key.as_str()];
+                removed.extend(original);
+                crate::legal_hold::held_object_verdict(
+                    holds_now.as_ref().and_then(Option::as_ref),
+                    lease,
+                    &removed,
+                )
+            } else {
+                None
+            };
+            ravel_invariant::inv_always_if_known!(
+                _verdict,
+                "gc: a held object is never deleted",
+                std::collections::BTreeMap::from([
+                    ("key", meta.key.clone()),
+                    ("tenant", tenant.to_hex()),
+                ])
+            );
             store.delete(&meta.key).await?;
         }
         reaped += 1;
