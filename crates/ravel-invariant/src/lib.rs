@@ -909,10 +909,12 @@ mod tests {
     #[cfg(not(any(feature = "antithesis", feature = "capture")))]
     #[test]
     fn inv_fault_is_false_without_the_feature() {
-        for _ in 0..1_000 {
-            assert!(!inv_fault!("ingest/encode-cancelled"));
-            assert!(!inv_fault!("ingest/data-put-refused"));
-        }
+        let fired = (0..1_000)
+            .filter(|_| {
+                inv_fault!("ingest/encode-cancelled") || inv_fault!("ingest/data-put-refused")
+            })
+            .count();
+        assert_eq!(fired, 0, "inv_fault! is false without the feature");
     }
 
     #[cfg(any(feature = "antithesis", feature = "capture"))]

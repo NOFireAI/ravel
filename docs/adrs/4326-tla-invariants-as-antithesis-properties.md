@@ -401,3 +401,65 @@ Decision 7 prices 19 mutant runs. With this correction there are 20, and the
 twentieth run (a 12-hour cap and about one hour of overshoot) is not in the
 plan of about 452 hours. It comes out of the rerun reserve or needs the
 owner's go, as a rerun beyond the reserve does.
+
+## Amendment (2026-11-19): fault switches for ingest answers a store fault cannot reach (#4496)
+
+<!-- amendment-applies: none reason="adds a fault-switch macro and two ingest switches beside the mutant controls of decision 3, which stand as written; it retires and narrows no earlier wording" -->
+
+Approved by the owner 2026-11-19, as Phase B1 of the ingest-durability
+coverage variant (#4326).
+
+A store fault does not reach three ingest answers: the `ShardUnavailable`
+answer of a flush whose write-gate encode returned no result, the
+partial-shard commit that answer leaves when a sibling shard committed, and
+the metrics and logs `Abandoned` answer of a data PUT that ended without
+landing. A store outage retries inside `object_store` for up to 180 s, so the
+10 s strict-ack timeout answers the write first. This amendment adds a switch
+that takes each of those paths on demand.
+
+- `inv_fault!("<area>/<name>")`, in `ravel-invariant`, is a `bool`. It is
+  compiled in under the `antithesis` feature (the workload images) and under
+  `capture` (the invariants lane, so its tests run in CI); with neither it is
+  the constant `false`, as `inv_mutant!` is without `antithesis-mutants`. A
+  name outside `fault::FAULTS` does not compile where the switch is compiled
+  in.
+- `RAVEL_ANTITHESIS_FAULTS` sets the rates, as `name=rate,name=rate` with each
+  rate a decimal in `[0, 1]`. `init` reads it once; unset or empty enables
+  nothing. An unknown name, a rate that does not parse or lies outside
+  `[0, 1]`, an entry that is not `name=rate`, a name given twice, or a value
+  that is not UTF-8 is a typed `InitError`, and the process refuses to start.
+  Rate 0 does not fire and rate 1 fires at every evaluation, neither with a
+  draw; a rate between draws from `antithesis_sdk::random` under
+  `antithesis` and from a std-only generator under `capture` alone. Each
+  firing records the reachable `fault: <name> fired`. A test sets a rate on
+  its own thread with `fault::scoped`.
+- `ingest/encode-cancelled`, in `WriteGateSlot::encode_on`, returns the gate's
+  `Cancelled` error without running the encode, before the slot's gate-less
+  inline return, so it reaches a flush with or without a write gate. The
+  metrics, logs and spans flush encodes all pass through `encode_on`. The
+  flush answers it as case five of the buffered-drop list in
+  `docs/consistency-model.md` answers a gate fault: no store call, the strict
+  waiter gets the retryable `ShardUnavailable`, and `flush_gate_faults`
+  counts it.
+- `ingest/data-put-refused`, in the metrics and logs
+  `put_data_object_with_retry`, returns `PutAbort::Exhausted` before the
+  first PUT, with no store call. The flush answers it as case one of that
+  list: the strict waiter gets the retryable `Abandoned`, and
+  `abandoned_retry_exhausted` counts it. The spans twin carries no switch.
+
+A switch is not a mutant. A mutant run expects its named property to go
+false; a fault run expects every property to hold, since the switch only
+takes a failure path the SUT already answers. The two keep separate macros,
+environment variables, registries and `InitError` variants, and a fault
+needs no mutant image.
+
+The switches weaken no durability. Each answer they produce is one
+`docs/consistency-model.md` already defines; on both paths the flush ends
+before its data object is written, so the strict waiter is acknowledged with
+an error and no token and no commit record exists. A buffered write was
+acknowledged at enqueue, before either switch, as it is for the store
+faults these switches stand in for. `check-release-profile.sh` refuses
+`antithesis` and `ravel-invariant/capture` in the published image build (the
+Dockerfile and `publish-images.yml`) and in every workspace manifest, except
+`antithesis` forwarded by a feature of the same name, so a published binary
+compiles neither switch in.
