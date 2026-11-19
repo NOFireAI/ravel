@@ -263,6 +263,10 @@ label set so that Ravel's own telemetry cannot explode
 
 ### Shutdown
 
+The server installs its SIGTERM and SIGINT handlers before `/readyz` reports
+200, so a signal delivered the instant the pod becomes ready drains rather than
+taking the signal's default disposition and killing the process.
+
 On SIGTERM, `/readyz` is the drain signal. The process does these steps in
 order:
 
