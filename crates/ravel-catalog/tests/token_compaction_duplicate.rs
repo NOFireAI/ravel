@@ -1367,10 +1367,12 @@ async fn token_in_a_tombstoned_bucket_without_the_check_is_added() {
 /// `token_beside_an_input_its_live_rewrite_replaced_adds_its_own_input`
 /// (issue #4428). HEAD folded before rewrite R landed, so HEAD still names
 /// `held` (M's raw object, or a compaction part of M), an input R replaced.
-/// P's commit record and data object have since been swept: R superseded P
-/// and HEAD never named it. The token's rows now live only in R's part,
-/// which also carries M's surviving rows, so a snapshot that adds R's part
-/// beside `held` serves M's rows twice.
+/// The test then deletes P's commit record and data object directly. The
+/// fold also named P, and the superseded-input sweep holds an object HEAD
+/// names, so whether a real sweep can reach this state is open (#4428); the
+/// test pins what the resolver does if it is reached. The token's rows now
+/// live only in R's part, which also carries M's surviving rows, so a
+/// snapshot that adds R's part beside `held` serves M's rows twice.
 ///
 /// A correct answer serves every surviving row exactly once: R's part
 /// without `held`, or a refusal. It never holds both.
@@ -1405,11 +1407,11 @@ async fn swept_token_beside_an_input_its_live_rewrite_replaced(compacted_m: bool
     store
         .delete(&keys::commit_key_for_record(&p).expect("commit key"))
         .await
-        .expect("sweep P's commit record");
+        .expect("delete P's commit record");
     store
         .delete(&l0_key(&p))
         .await
-        .expect("sweep P's data object");
+        .expect("delete P's data object");
 
     let window = (late_window().0, sealed_window().1);
     let (plain, _) = resolve_counted(&store, Signal::Logs, window, &[]).await;
@@ -1425,10 +1427,18 @@ async fn swept_token_beside_an_input_its_live_rewrite_replaced(compacted_m: bool
             &QueryAccounting::new(),
         )
         .await;
-    let Ok(snapshot) = answer else {
-        // A refusal is a correct answer to a state the resolver cannot serve
-        // exactly once; it must never be a successful double count.
-        return;
+    let snapshot = match answer {
+        Ok(snapshot) => snapshot,
+        // Refusing P's token is a correct answer to a state the resolver
+        // cannot serve exactly once. Any other error is a broken fixture.
+        Err(CatalogError::UnsatisfiableToken { writer_id, seq, .. }) => {
+            assert_eq!(
+                (writer_id, seq),
+                (Uuid::from_u128(0x4418_0001).to_string(), 1)
+            );
+            return;
+        }
+        Err(other) => panic!("resolve failed for another reason: {other}"),
     };
     let keys = sorted_keys(&snapshot);
     assert!(
