@@ -10839,6 +10839,207 @@ mod tests {
         assert_eq!(safety.bytes_reclaimed(Signal::Logs), 0);
     }
 
+    const REFRESH_FAILURE_SWEEPS_NOTHING: &str = "gc: a failed hold refresh sweeps nothing";
+
+    /// Selects mutant `name` on this thread until the returned guard drops;
+    /// `None` outside the invariants build, where no mutant is compiled in.
+    fn scoped_lifecycle_mutant(name: &'static str) -> Option<Box<dyn std::any::Any>> {
+        let guard: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = Default::default();
+        let _ = name;
+        ravel_invariant::inv_sometimes!(
+            {
+                let scoped = ravel_invariant::mutant::scoped(name).expect("a registered mutant");
+                *guard.borrow_mut() = Some(Box::new(scoped) as Box<dyn std::any::Any>);
+                true
+            },
+            "ravel-server maintain test: a mutant is scoped",
+            ""
+        );
+        guard.into_inner()
+    }
+
+    /// `(condition, details)` of every captured evaluation of `message` whose
+    /// details mention `needle`; empty outside the invariants build.
+    fn captured(message: &'static str, needle: &str) -> Vec<(bool, String)> {
+        let found = std::cell::RefCell::new(Vec::new());
+        let _ = (message, needle);
+        ravel_invariant::inv_sometimes!(
+            {
+                found.borrow_mut().extend(
+                    ravel_invariant::capture::evaluations_of(message)
+                        .into_iter()
+                        .filter(|e| e.details.contains(needle))
+                        .map(|e| (e.condition, e.details)),
+                );
+                true
+            },
+            "ravel-server maintain test: evaluations are read",
+            ""
+        );
+        found.into_inner()
+    }
+
+    /// What [`tick_with_deletable_work_under_a_failed_refresh`] observed.
+    struct FailedRefreshTick {
+        /// Superseded data objects deleted, summed over the three ticks.
+        superseded_data_deleted: u64,
+        /// Hold-shard LISTs the fault refused in tick 3.
+        refresh_faults: u64,
+        /// Tick 3's recorded refresh failures.
+        refresh_failures: u64,
+        /// Captured `RefreshFailureNeverSweeps` evaluations for the tenant.
+        evaluations: Vec<(bool, String)>,
+    }
+
+    /// Ticks 1 and 2 compact two inputs and hold them on the pinned-query
+    /// window, as in
+    /// `a_superseded_sweep_counts_the_recorded_size_of_each_deleted_input`;
+    /// tick 3, once the window has passed and both inputs are deletable, runs
+    /// over a `FaultStore` that fails every LIST of the audit hold shard's
+    /// commit prefix, so the tick's hold refresh fails.
+    async fn tick_with_deletable_work_under_a_failed_refresh(
+        tenant_name: &str,
+    ) -> FailedRefreshTick {
+        let tenant_id = TenantId::new(tenant_name);
+        let tenant = tenant_id.hash();
+        let written_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let mem = std::sync::Arc::new(MemoryStore::new());
+        mem.set_clock_ms((written_ns / 1_000_000) as u64);
+        for seq in [1, 1_000] {
+            publish_compactable_input(mem.as_ref(), &tenant_id, 0, seq).await;
+        }
+        let compactor = CompactorConfig {
+            interior_reverify_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let retention = RetentionConfig::default();
+        let worker = solo_worker();
+        let live = worker.solo_live_set();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+        let clock = FixedClock::new(written_ns);
+
+        let compacted = run_tick_with_clock(
+            &clock,
+            mem.as_ref(),
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &live,
+        )
+        .await;
+        assert_eq!(compacted.compacted, 1, "tick 1 compacts the two inputs");
+        let past_horizon = written_ns + compactor.protection_horizon_ns + 1_000_000_000;
+        clock.set(past_horizon);
+        mem.set_clock_ms((past_horizon / 1_000_000) as u64);
+        run_tick_with_clock(
+            &clock,
+            mem.as_ref(),
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &live,
+        )
+        .await;
+        assert_eq!(
+            safety.objects_deleted_superseded_data_deleted(),
+            0,
+            "tick 2 deletes nothing: the inputs wait out the pinned-query window"
+        );
+
+        let window_ns = compactor.max_query_duration_ns
+            + compactor.head_cache_ttl_ns
+            + 4 * compactor.clock_skew_allowance_ns;
+        clock.set(past_horizon + window_ns);
+        mem.set_clock_ms(((past_horizon + window_ns) / 1_000_000) as u64);
+        let hold_prefix = keys::commit_shard_prefix(&tenant, Signal::Audit, AUDIT_HOLD_SHARD)
+            .expect("valid audit hold shard prefix");
+        let store = FaultStore::new(
+            std::sync::Arc::clone(&mem),
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("hold shard unavailable".into()),
+                )
+                .with_key_contains(hold_prefix),
+            ),
+        );
+        run_tick_with_clock(
+            &clock, &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+
+        FailedRefreshTick {
+            superseded_data_deleted: safety.objects_deleted_superseded_data_deleted(),
+            refresh_faults: store.fault_count(
+                Op::List,
+                ravel_object_store::fault::FaultKind::Transient,
+            ),
+            refresh_failures: safety.legal_hold_refresh_failures(),
+            evaluations: captured(REFRESH_FAILURE_SWEEPS_NOTHING, &tenant.to_hex()),
+        }
+    }
+
+    /// RefreshFailureNeverSweeps (ADR-4326 lifecycle), shipped arm: a tick
+    /// whose hold refresh fails, with deletable superseded inputs present,
+    /// deletes nothing, and under the invariants build the property is
+    /// evaluated and never false.
+    #[tokio::test]
+    async fn a_failed_hold_refresh_with_deletable_work_deletes_nothing() {
+        let observed = tick_with_deletable_work_under_a_failed_refresh("refresh-default").await;
+        assert_eq!(observed.refresh_faults, 1, "the hold refresh LIST really faulted");
+        assert_eq!(observed.refresh_failures, 1, "tick 3 skipped on the failed refresh");
+        assert_eq!(
+            observed.superseded_data_deleted, 0,
+            "a failed hold refresh deletes nothing, though both inputs are deletable"
+        );
+        if ravel_invariant::EVALUATES {
+            assert!(
+                !observed.evaluations.is_empty(),
+                "the property is evaluated on the skipped tick"
+            );
+            assert!(
+                observed.evaluations.iter().all(|(held, _)| *held),
+                "RefreshFailureNeverSweeps never evaluates false on the shipped skip: {:?}",
+                observed.evaluations
+            );
+        }
+    }
+
+    /// RefreshFailureNeverSweeps (ADR-4326 lifecycle), mutant arm: with
+    /// `lifecycle/refresh-failure-is-no-hold` selected the tick proceeds under
+    /// an empty hold set after the failed refresh, its superseded sweep
+    /// deletes the two inputs, and the property evaluates false.
+    #[tokio::test]
+    async fn refresh_failure_is_no_hold_mutant_makes_refresh_failure_never_sweeps_false() {
+        let Some(_mutant) = scoped_lifecycle_mutant("lifecycle/refresh-failure-is-no-hold") else {
+            return;
+        };
+        let observed = tick_with_deletable_work_under_a_failed_refresh("refresh-mutant").await;
+        assert!(observed.refresh_faults >= 1, "the hold refresh LIST really faulted");
+        assert_eq!(
+            observed.superseded_data_deleted, 2,
+            "the mutant sweeps both inputs under the failed refresh"
+        );
+        assert!(
+            observed.evaluations.iter().any(|(held, _)| !held),
+            "RefreshFailureNeverSweeps must evaluate false under the mutant: {:?}",
+            observed.evaluations
+        );
+    }
+
     /// An `OrphanPass::Skip` pass never ran rule 1, so its zero orphan figures
     /// are structural, not a measurement: they must not reach the
     /// `ravel_maintain_orphans_present` gauge. Since the orphan-cadence split
