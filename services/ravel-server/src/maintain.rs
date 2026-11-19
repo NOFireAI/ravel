@@ -2547,6 +2547,10 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 "maintenance: legal hold refresh failed; skipping this tenant's tick entirely, retried next tick"
             );
             safety.record_legal_hold_refresh_failure();
+            ravel_invariant::inv_reachable!(
+                "gc: a failed hold refresh skips the maintain tick",
+                std::collections::BTreeMap::from([("tenant", tenant.to_hex())])
+            );
             return MaintainReport::default();
         }
     };
