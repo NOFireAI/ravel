@@ -260,9 +260,9 @@ fi
 # Mirrors CI's `lint`, `sql`, `flight-sql`, `features`, `features-agents`,
 # `features-mcp`, `invariants` and `invariants-services` jobs. In scoped mode
 # each lane runs when a crate it covers is in the closure computed above, so
-# `-p ravel-query` runs the sql, agents, mcp, flight-sql, esql and
-# invariants-services lanes (ravel-sql, ravel-server and ravel-cli depend on
-# it) and `-p ravel-affinity` runs none.
+# `-p ravel-query` runs the sql, agents, mcp, flight-sql, esql, invariants and
+# invariants-services lanes (ravel-sql, ravel-server, ravel-cli, ravel-ingest
+# and ravel-maintain depend on it) and `-p ravel-affinity` runs none.
 #
 # Under --dry-run every cargo command below is printed by `run` and not
 # executed, so the printed list is the list a real run executes.

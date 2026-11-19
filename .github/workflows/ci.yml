@@ -3155,9 +3155,17 @@ jobs:
   # nextest runs those binaries in parallel where `cargo test` runs them one
   # at a time; it runs no doctests, and neither crate's doctests depend on
   # these features.
+  #
+  # Gated like the gates.sh lane, on a change whose closure reaches
+  # ravel-server or ravel-cli, so it is not one of the always-on jobs ADR-0053
+  # D4 lists. mcp_area is set exactly when the closure reaches ravel-server
+  # (scripts/ci-lane-areas.tsv), server_or_operator covers ravel-server's own
+  # paths, and agents_area covers crates/ravel-agents-client/, the one
+  # ravel-cli dependency outside the mcp area. A ravel-cli path is in no area
+  # list, so the changes job's catch-all turns every area on for it.
   invariants-services:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.mcp_area == 'true' || needs.changes.outputs.server_or_operator == 'true' || needs.changes.outputs.agents_area == 'true')
     runs-on: ubuntu-latest
     # 60m (provisional): not a measurement. The cache is saved only on main,
     # so every run before the first main run builds cold. Tighten it once

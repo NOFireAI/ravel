@@ -152,8 +152,9 @@ ravel-catalog's sys_proto_format_version_classification test;
 agents_real_store prints a skip line and passes unless
 RAVEL_REAL_STORE_URL is set) and `mcp` (clippy, the
 feature-gated binaries the lane lists, and the lib tests), so `-p ravel-query`
-runs five lanes, and each of them builds into the same `target/` as the
-other four (the disk figures below predate these two lanes). The agents
+runs five ravel-server lanes, plus the bench, stage-timing, sql-explain and
+both invariants lanes named below, all building into the same `target/` (the
+disk figures below predate the agents, mcp and invariants lanes). The agents
 lane has one more run with its own trigger, ravel-agents-runtime or
 ravel-agents-sim in the closure (so any agents crate, not ravel-server
 alone): those two crates' tests again with `RAVEL_AGENTS_PAGE_ENTRIES=2`,
