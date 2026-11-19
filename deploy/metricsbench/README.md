@@ -1786,8 +1786,13 @@ stamps it:
 > selector, its metric name and every value of its label="value" matchers,
 > and expected_routed_prunes is the resolved set's size minus value_holders
 > (named_in_window - value_holders for one selector), both null unless
-> route_bound; route_bound is false when a selector has no qualifying
-> matcher, since the router then probes only that selector's metric name
+> route_bound; series_holders, the series route's bound (ADR-4146), counts
+> the resolved set's objects holding a series whose stored labels carry, for
+> at least one selector, its metric name and every label="value" pair, and
+> expected_series_prunes is the resolved set's size minus series_holders,
+> both null unless route_bound; route_bound is false when a selector has no
+> qualifying matcher, since the router then probes only that selector's
+> metric name
 
 The file holds `method`, `profile`, `objects_l0`, `objects_l1`,
 `series_total`, `min_commit_tokens` (how many tokens the ingest report's
@@ -1797,8 +1802,9 @@ qualifying entry: `id`, `promql`, `eval`, `selectors`,
 `positive_equalities`, `metrics`, `name_pruned`, `fetch_window` with
 `start_ns` and `end_ns`, `segments_in_window`, `named_in_window`,
 `token_only_fetched`, `unrouted_fetched_expected`, `holders`,
-`value_holders`, `expected_routed_prunes`, `route_bound` and
-`route_bound_reason`) and `skipped` (`id` and `reason` for each entry that
+`value_holders`, `expected_routed_prunes`, `series_holders`,
+`expected_series_prunes`, `route_bound` and `route_bound_reason`) and
+`skipped` (`id` and `reason` for each entry that
 does not qualify).
 
 **Checking a run.** `stage1-check.sh BANDS OUT-DIR` checks a run's figures
@@ -1910,6 +1916,71 @@ reads as the server counts them in `s3GetWireBytes`. Each row has a
 
 The prune count itself (`segmentsPrunedByLabelIndex` = the resolved set
 minus value holders) is `holders_routed_prune_mismatches`, [0, 0].
+
+**Series route (`MB_SERIES_INDEX=1`).** ADR-4146 step M1 measures the
+metrics series index on the same lane. `MB_SERIES_INDEX=1` puts it on
+wherever Stage 1 puts the label index on; `0` or unset leaves the run as
+above, with every stamp and `stage1-compare.json` unchanged (case si8). Any
+other value exits 64 (case si6), as does `MB_SERIES_INDEX=1` without
+`MB_STAGE1=1` (case si5). Step `stage1-flags` reads the help texts it saves:
+`ravel-server --help` must list `--fold-metrics-series-index` and `ravel-cli
+catalog fold --help` must list `--metrics-series-index` as options, and the
+routed server flags and the leaf-on fold flags must put the label index on.
+The series index is built and read only alongside the label index, and
+ravel-server accepts its switch without it and does nothing with it, so the
+run refuses that case rather than measure a no-op. Each refusal ends the run
+with exit 70 at `stage1-flags` before anything is up, with
+`stage1.series_index` stamped `refused:` and the help file named (the
+`si-help` cases). Then the routed server flags carry
+`--fold-metrics-series-index` (and so do the Ravel-only shape's up flags,
+taken from them: case si7), and every `catalog fold` run with the label
+index on carries `--metrics-series-index`: `stage1-leaves` and the
+extra-hour, l1 and erasure arms' leaf-on folds. The unrouted and control
+passes and the leaf-off folds carry neither (cases si1 and si2).
+`stage1.series_index` stamps the switch, both flags and their help files.
+
+After `stage1-leaves`, step `stage1-leaves-series` stamps the rebuild
+report's `series_index_parts_over_cap` (metrics parts given none of the
+series fields) and the `field_pairs` of `series_label`, `series_class` and
+`class_objects` (null for a field no part built) as
+`stage1.leaves.series_index`; a report lacking them fails the step with
+exit 70. The series fields' leaf bytes are not reported apart from
+`leaf_bytes_written`, so ADR-4146 row A6's byte figure is read by hand.
+
+`stage1-holders` then sorts each answered routed record of a route-bound
+statement by its `seriesIndex`: `answered` when the series route answered
+every (plan, part) pair (`planPartsAnswered` above 0, no decline),
+`declined` when it answered none and declined some, `none` when it routed no
+plan, `mixed` when both, `absent` when the record has no `seriesIndex`. An
+answered record carries its prunes under `segmentsPrunedBySeriesIndex`
+alone, and the run checks that figure against the statement's
+`expected_series_prunes` (the resolved set less `series_holders`) exactly.
+The routed prune check above reads the statement's other records and skips
+the statement when it has none. `stage1.holders` gains `series_index`,
+`series_prune_check` (the rule as a sentence),
+`series_prune_mismatches` (each naming the statement, its
+`expected_series_prunes`, `series_holders` and the routed figures: case
+si3), `series_prune_unchecked` (a mixed or malformed record, or no whole
+figure to compare: case si4), the two counts, `series_prune_records_checked`
+and `series_route_records` (answered routed records per route). Each
+statement's row gains `series_holders`, `expected_series_prunes`,
+`routed_pruned_by_series_index`, `series_opened_minus_expected` (over its
+series-answered records, `segmentsFetched` minus `series_holders` plus
+`token_only_fetched` of largest magnitude) and `series_index_records`, per
+routed record its pass, rep, route, `segmentsFetched`, both prune counters,
+`seriesIndex` and `seriesIndexPasses`.
+
+`stage1-bands.series.cardinality.json`, predicted, carries ADR-4146 rows A1
+and A6 as figures the run stamps: no series prune mismatch and none
+unchecked, at least one record checked, `series_holders` for
+`mb_single_counter_rate` in [139, 143] (141 measured), its
+`series_opened_minus_expected` 0 (145 opened = 141 + 4), no part over the
+series cap and each series field built. Check it as a second
+`stage1-check.sh` run beside `stage1-bands.cardinality.json`; on a series run
+that file's `holders_single_counter_rate_opened_minus_expected`, which reads
+the label-value route's bound, is expected to miss, since the series route
+opens fewer objects (the `stage1-check` series cases). `aws/launch.sh` does
+not pass `MB_SERIES_INDEX` to the box yet.
 
 The nightly workflow's manual dispatch takes a `stage1` input (default
 false) that sets `MB_STAGE1=1` and then runs `stage1-check.sh` with the `ci`
