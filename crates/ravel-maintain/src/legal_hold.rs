@@ -698,4 +698,35 @@ mod tests {
             refused + 1
         );
     }
+
+    /// `HeldObjectNeverDeleted`'s verdict is false only for a key both the
+    /// store re-read and the pass's snapshot hold, and unknown without a
+    /// re-read.
+    #[test]
+    fn held_object_verdict_needs_the_store_and_the_snapshot_to_hold_the_key() {
+        let held = LegalHoldCheck {
+            held_prefixes: vec!["t/acme/m/l0/0007/".to_string()],
+        };
+        let key = "t/acme/m/l0/0007/obj";
+        let other = "t/acme/m/l0/0008/obj";
+        let empty = LegalHoldCheck::empty();
+
+        assert_eq!(held_object_verdict(Some(&held), &held, &[key]), Some(false));
+        assert_eq!(
+            held_object_verdict(Some(&held), &held, &[other, key]),
+            Some(false),
+            "any removed key held by both"
+        );
+        assert_eq!(
+            held_object_verdict(Some(&held), &empty, &[key]),
+            Some(true),
+            "a hold the snapshot does not have was placed after it"
+        );
+        assert_eq!(
+            held_object_verdict(Some(&empty), &held, &[key]),
+            Some(true),
+            "a hold the store has since cleared"
+        );
+        assert_eq!(held_object_verdict(None, &held, &[key]), None);
+    }
 }

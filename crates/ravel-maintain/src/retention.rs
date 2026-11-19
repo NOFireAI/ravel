@@ -2115,4 +2115,136 @@ mod tests {
             "the protection-window invariant never evaluates false past the horizon: {found:?}"
         );
     }
+
+    const HELD_NEVER_DELETED: &str = "gc: a held object is never deleted";
+
+    /// Seed a tombstone for `hour` and one L1 part under that bucket's `l1/`
+    /// prefix, the object `delete_all` removes; returns the bucket and the
+    /// part's key.
+    async fn put_tombstoned_part(store: &dyn ObjectStoreBackend, hour: u32) -> (Bucket, String) {
+        let bucket = put_tombstone(store, hour).await;
+        let part_key = format!("{}p.0", l1_bucket_prefix(&bucket));
+        store
+            .put(
+                &part_key,
+                bytes::Bytes::from_static(b"part"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed part");
+        (bucket, part_key)
+    }
+
+    /// One retention evaluation of `bucket` past its protection horizon, under
+    /// `lease`.
+    async fn sweep_past_horizon(
+        store: &dyn ObjectStoreBackend,
+        bucket: &Bucket,
+        lease: &dyn LeaseCheck,
+    ) -> RetentionOutcome {
+        let config = CompactorConfig {
+            max_query_duration_ns: 0,
+            head_cache_ttl_ns: 0,
+            clock_skew_allowance_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let past = RETIRED_AT_NS
+            .saturating_add(config.protection_horizon_ns)
+            .saturating_add(1);
+        let (outcome, _expiry) = retention_sweep_bucket_observed(
+            &mut SnapshotReachability::new(),
+            store,
+            &crate::clock::FixedClock::new(past),
+            &config,
+            Some(WINDOW_NS),
+            lease,
+            bucket,
+            RewriteBound::Unread,
+        )
+        .await
+        .expect("retention pass");
+        outcome
+    }
+
+    /// Retention's physical delete under a real hold snapshot that holds
+    /// another shard: `HeldObjectNeverDeleted` is evaluated at the part's
+    /// delete and holds.
+    #[tokio::test]
+    async fn held_object_never_deleted_holds_at_the_retention_delete() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let (bucket, part_key) = put_tombstoned_part(&store, 43).await;
+        let other_shard = crate::legal_hold::shard_hold_scopes(&tenant(), Signal::Metrics, 1)
+            .expect("scopes")[2]
+            .clone();
+        crate::legal_hold::write_hold_set(
+            &store,
+            &tenant(),
+            uuid::Uuid::from_u128(0x4301),
+            1,
+            &other_shard,
+            "litigation",
+        )
+        .await
+        .expect("place hold");
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant())
+            .await
+            .expect("refresh");
+
+        let outcome = sweep_past_horizon(&store, &bucket, &snapshot).await;
+        assert_eq!(outcome, RetentionOutcome::Swept);
+        assert!(
+            store.get(&part_key, GetRange::Full).await.is_err(),
+            "the part is deleted"
+        );
+
+        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &part_key);
+        assert_eq!(found.len(), 1, "one evaluation at the part's delete: {found:?}");
+        assert!(found[0].0, "an unheld part's delete holds: {found:?}");
+    }
+
+    /// A hold placed after the pass's snapshot is not one the pass could
+    /// honour: the delete the snapshot allows goes ahead, and although the
+    /// store re-read at the delete now holds the part, `HeldObjectNeverDeleted`
+    /// is evaluated and holds.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_does_not_fail_the_retention_delete() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let (bucket, part_key) = put_tombstoned_part(&store, 44).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant())
+            .await
+            .expect("refresh");
+        crate::legal_hold::write_hold_set(
+            &store,
+            &tenant(),
+            uuid::Uuid::from_u128(0x4401),
+            1,
+            &l1_bucket_prefix(&bucket),
+            "litigation",
+        )
+        .await
+        .expect("place hold after the snapshot");
+        let fresh = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant())
+            .await
+            .expect("refresh");
+        assert!(
+            fresh.is_protected(&part_key) && !snapshot.is_protected(&part_key),
+            "the store now holds the part; the pass's snapshot does not"
+        );
+
+        let outcome = sweep_past_horizon(&store, &bucket, &snapshot).await;
+        assert_eq!(outcome, RetentionOutcome::Swept, "the snapshot allows it");
+
+        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &part_key);
+        assert_eq!(found.len(), 1, "one evaluation at the part's delete: {found:?}");
+        assert!(
+            found[0].0,
+            "a hold placed after the snapshot never makes the property false: {found:?}"
+        );
+    }
 }

@@ -4723,13 +4723,30 @@ mod tests {
         );
     }
 
-    /// The site is not vacuous: an orphan sweep handed an empty `lease` (what a
-    /// refresh-failure substitution leaves) still re-reads the store's real hold
-    /// set at the delete, so a live hold on the swept key makes
-    /// `HeldObjectNeverDeleted` evaluate false. The passed-in `NoLeases` does not
-    /// hide it.
+    /// A lease whose answer changes after its first `skip` calls: it lets a
+    /// candidate through selection and then reports it protected, which is
+    /// the delete-under-a-held-snapshot shape a correct pass never takes.
+    struct ProtectsAfter {
+        skip: std::sync::atomic::AtomicUsize,
+    }
+
+    impl LeaseCheck for ProtectsAfter {
+        fn is_protected(&self, _key: &str) -> bool {
+            self.skip
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_err()
+        }
+    }
+
+    /// The site is not vacuous: an orphan delete of a key that both the store
+    /// re-read and the pass's lease hold makes `HeldObjectNeverDeleted`
+    /// evaluate false.
     #[tokio::test]
-    async fn held_object_never_deleted_breaks_when_an_empty_lease_deletes_a_held_key() {
+    async fn held_object_never_deleted_breaks_when_a_held_orphan_is_deleted() {
         if !crate::publish::tests::capturing() {
             return;
         }
@@ -4738,7 +4755,6 @@ mod tests {
         let shard = 4;
         let store = MemoryStore::new();
         put_orphan(&store, &tenant, signal, shard, 0).await;
-        // A hold whose scope is the shard's L0 data prefix covers the orphan key.
         let scope = l0_data_prefix(&tenant, signal, shard).unwrap();
         crate::legal_hold::write_hold_set(&store, &tenant, Uuid::from_u128(1), 0, &scope, "legal")
             .await
@@ -4746,20 +4762,151 @@ mod tests {
 
         let config = CompactorConfig::default();
         let clock = aged_clock(&config);
-        // `NoLeases`: the lease the sweep is handed protects nothing, mirroring an
-        // empty snapshot substituted for a failed refresh.
-        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+        // One unprotected answer, at candidate selection.
+        let lease = ProtectsAfter {
+            skip: std::sync::atomic::AtomicUsize::new(1),
+        };
+        let outcome = sweep_orphans(&store, &clock, &config, &lease, &tenant, signal, shard)
             .await
             .expect("sweep");
-        assert_eq!(
-            outcome.deleted, 1,
-            "the empty lease let the held key be swept"
-        );
+        assert_eq!(outcome.deleted, 1, "the lease let the held key be swept");
 
         let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &tenant.to_hex());
         assert!(
             found.iter().any(|(held, _)| !held),
-            "the re-read of the store's real holds makes the property false: {found:?}"
+            "a held key the pass's lease protects makes the property false: {found:?}"
+        );
+    }
+
+    /// A hold placed after the pass's snapshot does not make the orphan delete
+    /// the snapshot allows read as a violation, although the store re-read at
+    /// the delete holds the key.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_does_not_fail_the_orphan_delete() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let tenant = TenantHash([0x5c; 16]);
+        let signal = Signal::Metrics;
+        let shard = 4;
+        let store = MemoryStore::new();
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+        let scope = l0_data_prefix(&tenant, signal, shard).unwrap();
+        crate::legal_hold::write_hold_set(&store, &tenant, Uuid::from_u128(1), 0, &scope, "legal")
+            .await
+            .expect("place hold after the snapshot");
+
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+        let outcome = sweep_orphans(&store, &clock, &config, &snapshot, &tenant, signal, shard)
+            .await
+            .expect("sweep");
+        assert_eq!(outcome.deleted, 1, "the snapshot allows the delete");
+
+        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &tenant.to_hex());
+        assert_eq!(found.len(), 1, "one evaluation at the delete: {found:?}");
+        assert!(
+            found[0].0,
+            "a hold placed after the snapshot never makes the property false: {found:?}"
+        );
+    }
+
+    /// Seed one quarantine copy of a data object of `shard`, quarantined at
+    /// `1`, and return the copy's key.
+    async fn put_quarantined(store: &dyn ObjectStoreBackend, tenant: &TenantHash, shard: u32) -> String {
+        let original = orphan_data_key(tenant, Signal::Metrics, shard, 0);
+        let key = quarantine_key(&original, 1);
+        store
+            .put(&key, Bytes::new(), PutOptions::default())
+            .await
+            .expect("seed quarantine copy");
+        key
+    }
+
+    /// A clock just past the quarantine horizon of a copy quarantined at `1`.
+    fn past_quarantine_horizon(config: &CompactorConfig) -> FixedClock {
+        FixedClock::new(config.quarantine_horizon_ns + 2)
+    }
+
+    /// The quarantine purge under a real hold snapshot that holds another
+    /// shard: `HeldObjectNeverDeleted` is evaluated at the purge and holds.
+    #[tokio::test]
+    async fn held_object_never_deleted_holds_at_the_quarantine_purge() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let tenant = TenantHash([0x5d; 16]);
+        let store = MemoryStore::new();
+        let copy = put_quarantined(&store, &tenant, 6).await;
+        let other = l0_data_prefix(&tenant, Signal::Metrics, 7).unwrap();
+        crate::legal_hold::write_hold_set(&store, &tenant, Uuid::from_u128(1), 0, &other, "legal")
+            .await
+            .expect("place hold");
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+
+        let config = CompactorConfig::default();
+        let clock = past_quarantine_horizon(&config);
+        let outcome = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            6,
+        )
+        .await
+        .expect("purge");
+        assert_eq!(outcome.reaped, 1, "the copy is purged");
+
+        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &copy);
+        assert_eq!(found.len(), 1, "one evaluation at the purge: {found:?}");
+        assert!(found[0].0, "an unheld copy's purge holds: {found:?}");
+    }
+
+    /// A hold placed after the pass's snapshot on the copy's original key does
+    /// not make the purge the snapshot allows read as a violation.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_does_not_fail_the_quarantine_purge() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let tenant = TenantHash([0x5e; 16]);
+        let store = MemoryStore::new();
+        let copy = put_quarantined(&store, &tenant, 6).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+        let scope = l0_data_prefix(&tenant, Signal::Metrics, 6).unwrap();
+        crate::legal_hold::write_hold_set(&store, &tenant, Uuid::from_u128(1), 0, &scope, "legal")
+            .await
+            .expect("place hold after the snapshot");
+
+        let config = CompactorConfig::default();
+        let clock = past_quarantine_horizon(&config);
+        let outcome = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            6,
+        )
+        .await
+        .expect("purge");
+        assert_eq!(outcome.reaped, 1, "the snapshot allows the purge");
+
+        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &copy);
+        assert_eq!(found.len(), 1, "one evaluation at the purge: {found:?}");
+        assert!(
+            found[0].0,
+            "a hold placed after the snapshot never makes the property false: {found:?}"
         );
     }
 
