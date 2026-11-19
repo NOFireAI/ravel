@@ -40,9 +40,10 @@ fn now_unix_ns() -> i64 {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Registers the assertion catalog with Antithesis, so an assertion that is
-    // never reached still reports, and refuses an unknown
-    // RAVEL_ANTITHESIS_MUTANT (the off-by-default `antithesis` and
-    // `antithesis-mutants` features; without them this does nothing).
+    // never reached still reports, refuses an unknown RAVEL_ANTITHESIS_MUTANT,
+    // and reads RAVEL_ANTITHESIS_FAULTS to set the fault rates, refusing a bad
+    // value. Reads nothing and does nothing without the off-by-default
+    // `antithesis`, `antithesis-mutants` and `capture` features.
     ravel_invariant::init()?;
 
     // Not `Cli::parse()`: this also refuses the fold flags in the modes that
@@ -757,6 +758,15 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // The SIGTERM and SIGINT handlers are installed after the startup store
+    // checks and before `start`. A signal during the startup store checks
+    // still takes its default action (or is discarded when the server is
+    // PID 1, issue #4438). A signal during `start`, including its retried
+    // ipcrypt startup marker read, or between readiness and the await below,
+    // is held by the installed handler and drained once `start` returns Ok
+    // (an `Err` from `start` ends `main` with that error instead).
+    let mut shutdown_listener = ShutdownListener::install();
+
     let running = ravel_server::start_with_heartbeat_and_ipcrypt(
         config,
         store,
@@ -775,7 +785,24 @@ async fn main() -> anyhow::Result<()> {
         listener.attach_readiness(running.readiness());
     }
 
-    wait_for_shutdown_signal().await;
+    // Test seam (issue #4493): hold the process in the window between
+    // readiness reporting 200 and the shutdown await, so a test can deliver a
+    // signal inside that window and prove the handler installed before `start`
+    // buffers it. The block is compiled only with debug assertions, which the
+    // release profile leaves off.
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("RAVEL_SHUTDOWN_WINDOW_TEST_SLEEP_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        tracing::info!(
+            sleep_ms = ms,
+            "test seam: holding the shutdown window open after readiness"
+        );
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    shutdown_listener.recv().await;
     ravel_invariant::inv_reachable!(
         "server: a shutdown signal started a graceful drain",
         serde_json::json!({})
@@ -839,27 +866,71 @@ fn rules_ignored_by_mode(mode: Mode, has_rules: bool) -> bool {
     has_rules && !matches!(mode, Mode::All | Mode::Query)
 }
 
-async fn wait_for_shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-
+/// A shutdown-signal listener. On unix its OS handlers are installed when it is
+/// built, not when it is first awaited, so a SIGTERM or SIGINT arriving
+/// between the build and the drain await is delivered on that await (tokio
+/// buffers one pending signal per stream) rather than taking the signal's
+/// default action (issue #4493). On other targets [`recv`](Self::recv)
+/// awaits `tokio::signal::ctrl_c` on its first poll.
+struct ShutdownListener {
+    /// `None` when the SIGTERM handler failed to install; that branch then never
+    /// resolves [`recv`](Self::recv).
     #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
+    sigterm: Option<tokio::signal::unix::Signal>,
+    /// `None` when the SIGINT handler failed to install; that branch then
+    /// resolves [`recv`](Self::recv) at once and the drain starts.
+    #[cfg(unix)]
+    sigint: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownListener {
+    /// Install the handlers. On unix these are SIGTERM and SIGINT (SIGINT is
+    /// the signal `tokio::signal::ctrl_c` listens for). A handler that fails
+    /// to install is kept as `None`.
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            ShutdownListener {
+                sigterm: signal(SignalKind::terminate()).ok(),
+                sigint: signal(SignalKind::interrupt()).ok(),
             }
-            Err(_) => std::future::pending::<()>().await,
         }
-    };
+        #[cfg(not(unix))]
+        {
+            ShutdownListener {}
+        }
+    }
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+    /// Resolve when either signal fires. A failed SIGTERM install never
+    /// resolves; a failed SIGINT install resolves at once.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            let sigterm = &mut self.sigterm;
+            let sigint = &mut self.sigint;
+            let terminate = async {
+                match sigterm {
+                    Some(sig) => {
+                        sig.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let interrupt = async {
+                if let Some(sig) = sigint {
+                    sig.recv().await;
+                }
+            };
+            tokio::select! {
+                _ = terminate => {},
+                _ = interrupt => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 
@@ -1083,6 +1154,39 @@ mod tests {
             call_at < start_at,
             "the allocator step must run before start"
         );
+    }
+
+    /// Issue #4493: `main` installs the shutdown-signal handler after the
+    /// startup store checks return and before it starts the server, so a
+    /// SIGTERM delivered the instant `/readyz` turns 200 is buffered and
+    /// drained rather than killing the process; and it awaits the listener
+    /// where the drain begins, after `start`. Asserted over the source, like
+    /// the tests above: `main` cannot be called from a test. Needles built with
+    /// `concat!` so this test's own source cannot match itself.
+    #[test]
+    fn main_installs_the_shutdown_listener_after_startup_checks_and_before_start() {
+        const SRC: &str = include_str!("main.rs");
+        let main_src = &SRC[..SRC.find("\n#[cfg(test)]").expect("test module present")];
+        let install = concat!("ShutdownListener::", "install()");
+        assert_eq!(main_src.matches(install).count(), 1);
+        let install_at = main_src.find(install).expect("install present");
+        let checks_at = main_src
+            .find(concat!("startup_retry::run_startup_", "store_checks("))
+            .expect("main runs the startup store checks");
+        let start_at = main_src
+            .find(concat!(
+                "ravel_server::",
+                "start_with_heartbeat_and_ipcrypt("
+            ))
+            .expect("main starts the server");
+        assert!(
+            checks_at < install_at && install_at < start_at,
+            "the shutdown listener is installed after the startup store checks and before start"
+        );
+        let recv_at = main_src
+            .find(concat!("shutdown_listener.", "recv().await"))
+            .expect("main awaits the shutdown listener");
+        assert!(start_at < recv_at, "the drain await runs after start");
     }
 
     /// Issue #4325: `main` makes its startup store checks through the one

@@ -3139,9 +3139,11 @@ fn init_tracing() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Registers the Antithesis assertion catalog and refuses an unknown
-    // RAVEL_ANTITHESIS_MUTANT; does nothing without the off-by-default
-    // `antithesis` and `antithesis-mutants` features.
+    // Registers the Antithesis assertion catalog, refuses an unknown
+    // RAVEL_ANTITHESIS_MUTANT, and reads RAVEL_ANTITHESIS_FAULTS to set the
+    // fault rates, refusing a bad value; reads nothing and does nothing without
+    // the off-by-default `antithesis`, `antithesis-mutants` and `capture`
+    // features.
     ravel_invariant::init()?;
     init_tracing();
     run(parse_cli(std::env::args_os()).unwrap_or_else(|err| err.exit())).await
