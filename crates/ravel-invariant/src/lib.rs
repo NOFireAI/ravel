@@ -11,6 +11,11 @@
 //!   traceability column, so it is a literal.
 //! - [`inv_mutant!`]`("<area>/<negative cfg stem>")` is the test-only switch a
 //!   mutant control flips: `if inv_mutant!("commit/commit-before-data") { .. }`.
+//! - [`inv_fault!`]`("<area>/<name>")` is the switch a fault run flips: it
+//!   fires at the rate `RAVEL_ANTITHESIS_FAULTS` gives that name, and its
+//!   site then takes a failure path the SUT already answers. A mutant run
+//!   expects a property to go false; a fault run expects every property to
+//!   hold.
 //!
 //! Every feature is off by default and none is in a published build
 //! (`scripts/guards/check-release-profile.sh` refuses `antithesis`,
@@ -24,8 +29,13 @@
 //!   [`init`] selected from `RAVEL_ANTITHESIS_MUTANT` (or a test scoped with
 //!   `mutant::scoped`), and its name must be in `mutant::MUTANTS`.
 //!
+//! With `antithesis` or `capture`, [`inv_fault!`] is compiled in: [`init`]
+//! reads `RAVEL_ANTITHESIS_FAULTS`, a test sets a rate with `fault::scoped`,
+//! and the name must be in `fault::FAULTS`.
+//!
 //! With neither `antithesis` nor `capture`, each assertion macro expands to
-//! nothing; without `antithesis-mutants`, [`inv_mutant!`] expands to `false`.
+//! nothing and [`inv_fault!`] to `false`; without `antithesis-mutants`,
+//! [`inv_mutant!`] expands to `false`.
 //! Neither evaluates its arguments then, so an argument must not carry a side
 //! effect the code relies on.
 
@@ -38,6 +48,10 @@ pub use antithesis_sdk as __sdk;
 /// The environment variable that selects the one mutant a mutant image runs.
 pub const MUTANT_ENV: &str = "RAVEL_ANTITHESIS_MUTANT";
 
+/// The environment variable that sets the fault switches' rates, as
+/// `name=rate,name=rate` with each rate a decimal in `[0, 1]`.
+pub const FAULT_ENV: &str = "RAVEL_ANTITHESIS_FAULTS";
+
 /// True exactly when the `inv_*` assertion macros evaluate their arguments.
 pub const EVALUATES: bool = cfg!(any(feature = "antithesis", feature = "capture"));
 
@@ -49,6 +63,17 @@ pub enum InitError {
     UnknownMutant { name: String },
     /// `RAVEL_ANTITHESIS_MUTANT` is not valid UTF-8.
     MutantNotUnicode,
+    /// `RAVEL_ANTITHESIS_FAULTS` (or a test's scoped rate) names no
+    /// registered fault.
+    UnknownFault { name: String },
+    /// An entry of `RAVEL_ANTITHESIS_FAULTS` is not `name=rate`.
+    MalformedFaultEntry { entry: String },
+    /// A fault's rate is not a decimal in `[0, 1]`.
+    InvalidFaultRate { name: String, rate: String },
+    /// `RAVEL_ANTITHESIS_FAULTS` names one fault twice.
+    DuplicateFault { name: String },
+    /// `RAVEL_ANTITHESIS_FAULTS` is not valid UTF-8.
+    FaultsNotUnicode,
 }
 
 impl fmt::Display for InitError {
@@ -61,6 +86,27 @@ impl fmt::Display for InitError {
             ),
             InitError::MutantNotUnicode => {
                 write!(f, "{MUTANT_ENV} is not valid UTF-8; refusing to start")
+            }
+            InitError::UnknownFault { name } => write!(
+                f,
+                "{FAULT_ENV} names {name:?}, no registered fault; refusing to start \
+                 (the registered names are in ravel_invariant::fault::FAULTS)"
+            ),
+            InitError::MalformedFaultEntry { entry } => write!(
+                f,
+                "{FAULT_ENV} entry {entry:?} is not name=rate; refusing to start"
+            ),
+            InitError::InvalidFaultRate { name, rate } => write!(
+                f,
+                "{FAULT_ENV} gives fault {name:?} the rate {rate:?}, not a decimal in \
+                 [0, 1]; refusing to start"
+            ),
+            InitError::DuplicateFault { name } => write!(
+                f,
+                "{FAULT_ENV} names fault {name:?} more than once; refusing to start"
+            ),
+            InitError::FaultsNotUnicode => {
+                write!(f, "{FAULT_ENV} is not valid UTF-8; refusing to start")
             }
         }
     }
@@ -76,13 +122,38 @@ impl std::error::Error for InitError {}
 /// `antithesis-mutants` it reads `RAVEL_ANTITHESIS_MUTANT` once and selects
 /// that mutant for the life of the process; unset or empty selects none, and
 /// a name `mutant::MUTANTS` does not hold is [`InitError::UnknownMutant`].
-/// With neither feature it does nothing and reads nothing.
+/// With `antithesis` or `capture` it reads `RAVEL_ANTITHESIS_FAULTS` once and
+/// sets the fault rates for the life of the process; unset or empty enables
+/// none, and a value `fault::parse_rates` refuses is the error returned.
+/// With none of the three features it does nothing and reads nothing.
 pub fn init() -> Result<(), InitError> {
     #[cfg(feature = "antithesis")]
     antithesis_sdk::antithesis_init();
     #[cfg(feature = "antithesis-mutants")]
     mutant::init_from_env()?;
+    #[cfg(any(feature = "antithesis", feature = "capture"))]
+    fault::init_from_env()?;
     Ok(())
+}
+
+#[cfg(any(
+    feature = "antithesis",
+    feature = "capture",
+    feature = "antithesis-mutants"
+))]
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// The SDK call of one assertion, or nothing without `antithesis`.
@@ -290,6 +361,41 @@ macro_rules! inv_mutant {
     };
 }
 
+/// True when the named fault fires at this evaluation, drawn at the rate in
+/// force for it: the rate a test set with `fault::scoped` on this thread,
+/// else the one [`init`] read from `RAVEL_ANTITHESIS_FAULTS`. The name must
+/// be in `fault::FAULTS`, which a build with `antithesis` or `capture`
+/// checks at compile time. Without either feature this is the constant
+/// `false`.
+#[cfg(any(feature = "antithesis", feature = "capture"))]
+#[macro_export]
+macro_rules! inv_fault {
+    ($name:literal) => {{
+        const _: () = ::std::assert!(
+            $crate::fault::is_registered($name),
+            ::std::concat!(
+                "inv_fault!: ",
+                $name,
+                " is not in ravel_invariant::fault::FAULTS"
+            ),
+        );
+        $crate::fault::fires($name)
+    }};
+}
+/// True when the named fault fires at this evaluation, drawn at the rate in
+/// force for it: the rate a test set with `fault::scoped` on this thread,
+/// else the one [`init`] read from `RAVEL_ANTITHESIS_FAULTS`. The name must
+/// be in `fault::FAULTS`, which a build with `antithesis` or `capture`
+/// checks at compile time. Without either feature this is the constant
+/// `false`.
+#[cfg(not(any(feature = "antithesis", feature = "capture")))]
+#[macro_export]
+macro_rules! inv_fault {
+    ($name:literal) => {
+        false
+    };
+}
+
 /// In-process record of every assertion evaluation, for crate tests.
 #[cfg(feature = "capture")]
 pub mod capture {
@@ -394,27 +500,12 @@ pub mod mutant {
         "resharding/token-validated-against-count",
     ];
 
-    const fn str_eq(a: &str, b: &str) -> bool {
-        let (a, b) = (a.as_bytes(), b.as_bytes());
-        if a.len() != b.len() {
-            return false;
-        }
-        let mut i = 0;
-        while i < a.len() {
-            if a[i] != b[i] {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
-
     /// Whether `name` is in [`MUTANTS`]; `inv_mutant!` asserts it at compile
     /// time.
     pub const fn is_registered(name: &str) -> bool {
         let mut i = 0;
         while i < MUTANTS.len() {
-            if str_eq(MUTANTS[i], name) {
+            if crate::str_eq(MUTANTS[i], name) {
                 return true;
             }
             i += 1;
@@ -515,6 +606,245 @@ pub mod mutant {
     const _: fn() = || <ScopedMutant as AmbiguousIfSend<_>>::check();
 }
 
+/// The fault switches: the registered names, the process rates, the per-test
+/// scope and the draw.
+#[cfg(any(feature = "antithesis", feature = "capture"))]
+pub mod fault {
+    use std::cell::RefCell;
+    use std::ffi::OsStr;
+    use std::marker::PhantomData;
+    use std::sync::OnceLock;
+
+    use crate::{FAULT_ENV, InitError};
+
+    /// Every fault `inv_fault!` may name, `<area>/<name>`.
+    pub const FAULTS: &[&str] = &["ingest/encode-cancelled", "ingest/data-put-refused"];
+
+    /// Whether `name` is in [`FAULTS`]; `inv_fault!` asserts it at compile
+    /// time.
+    pub const fn is_registered(name: &str) -> bool {
+        let mut i = 0;
+        while i < FAULTS.len() {
+            if crate::str_eq(FAULTS[i], name) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn registered(name: &str) -> Result<&'static str, InitError> {
+        FAULTS
+            .iter()
+            .copied()
+            .find(|f| *f == name)
+            .ok_or_else(|| InitError::UnknownFault {
+                name: name.to_owned(),
+            })
+    }
+
+    fn parse_rate(name: &str, text: &str) -> Result<f64, InitError> {
+        let invalid = || InitError::InvalidFaultRate {
+            name: name.to_owned(),
+            rate: text.to_owned(),
+        };
+        let bytes = text.as_bytes();
+        let decimal = bytes.iter().all(|b| b.is_ascii_digit() || *b == b'.')
+            && bytes.iter().filter(|b| **b == b'.').count() <= 1
+            && bytes.iter().any(u8::is_ascii_digit);
+        if !decimal {
+            return Err(invalid());
+        }
+        let rate: f64 = text.parse().map_err(|_| invalid())?;
+        if (0.0..=1.0).contains(&rate) {
+            Ok(rate)
+        } else {
+            Err(invalid())
+        }
+    }
+
+    /// The rates a value of `RAVEL_ANTITHESIS_FAULTS` sets: none when unset
+    /// or empty; otherwise `name=rate` entries separated by `,`, each name in
+    /// [`FAULTS`] at most once and each rate a decimal in `[0, 1]`. Any
+    /// other value is an error.
+    pub fn parse_rates(value: Option<&OsStr>) -> Result<Vec<(&'static str, f64)>, InitError> {
+        let Some(value) = value else {
+            return Ok(Vec::new());
+        };
+        let value = value.to_str().ok_or(InitError::FaultsNotUnicode)?;
+        if value.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rates: Vec<(&'static str, f64)> = Vec::new();
+        for entry in value.split(',') {
+            let malformed = || InitError::MalformedFaultEntry {
+                entry: entry.to_owned(),
+            };
+            let (name, rate) = entry.split_once('=').ok_or_else(malformed)?;
+            if name.is_empty() {
+                return Err(malformed());
+            }
+            let name = registered(name)?;
+            let rate = parse_rate(name, rate)?;
+            if rates.iter().any(|(seen, _)| *seen == name) {
+                return Err(InitError::DuplicateFault {
+                    name: name.to_owned(),
+                });
+            }
+            rates.push((name, rate));
+        }
+        Ok(rates)
+    }
+
+    static PROCESS: OnceLock<Vec<(&'static str, f64)>> = OnceLock::new();
+
+    pub(crate) fn init_from_env() -> Result<(), InitError> {
+        let rates = parse_rates(std::env::var_os(FAULT_ENV).as_deref())?;
+        // Read once: a second call keeps the first rates.
+        let _ = PROCESS.set(rates);
+        Ok(())
+    }
+
+    thread_local! {
+        static SCOPED: RefCell<Option<Vec<(&'static str, f64)>>> = const { RefCell::new(None) };
+    }
+
+    fn rate_of(rates: &[(&'static str, f64)], name: &str) -> f64 {
+        rates
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map_or(0.0, |(_, rate)| *rate)
+    }
+
+    /// The rate in force for `name` on this thread: the test scope's when one
+    /// is open here, the process rates otherwise. A fault with no rate, and
+    /// any fault before [`crate::init`], has rate 0.
+    pub fn rate(name: &str) -> f64 {
+        SCOPED
+            .with(|scoped| scoped.borrow().as_deref().map(|r| rate_of(r, name)))
+            .unwrap_or_else(|| PROCESS.get().map_or(0.0, |r| rate_of(r, name)))
+    }
+
+    /// One evaluation of `inv_fault!(name)`. Rate 0 returns false and rate 1
+    /// returns true, neither with a draw; a rate between draws once. A firing
+    /// records the reachable "fault: <name> fired".
+    pub fn fires(name: &str) -> bool {
+        let rate = rate(name);
+        let fired = if rate <= 0.0 {
+            false
+        } else if rate >= 1.0 {
+            true
+        } else {
+            unit_draw() < rate
+        };
+        if fired {
+            record_fired(name);
+        }
+        fired
+    }
+
+    // One literal per fault: the SDK registers each reachable's message at
+    // its site. `every_fault_records_its_firing` keeps this match and
+    // `FAULTS` in step.
+    fn record_fired(name: &str) {
+        let details = std::collections::BTreeMap::from([("fault", name)]);
+        match name {
+            "ingest/encode-cancelled" => {
+                crate::inv_reachable!("fault: ingest/encode-cancelled fired", details)
+            }
+            "ingest/data-put-refused" => {
+                crate::inv_reachable!("fault: ingest/data-put-refused fired", details)
+            }
+            _ => {}
+        }
+    }
+
+    /// A draw in `[0, 1)`.
+    fn unit_draw() -> f64 {
+        (random_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    #[cfg(feature = "antithesis")]
+    fn random_u64() -> u64 {
+        antithesis_sdk::random::get_random()
+    }
+
+    // splitmix64 over a per-thread seed from std's randomly keyed hasher.
+    #[cfg(not(feature = "antithesis"))]
+    fn random_u64() -> u64 {
+        use std::cell::Cell;
+        use std::hash::{BuildHasher, RandomState};
+
+        thread_local! {
+            static STATE: Cell<u64> =
+                Cell::new(RandomState::new().hash_one(std::thread::current().id()));
+        }
+        STATE.with(|state| {
+            let next = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+            state.set(next);
+            let mut z = next;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        })
+    }
+
+    /// Sets `name`'s rate on the calling thread until the guard drops, for a
+    /// test. A thread with a scope open sees only the rates its open scopes
+    /// set, not the process rates, so tests in one binary do not see each
+    /// other's faults. Code the test hands to another thread (a multi-thread
+    /// runtime's workers, the blocking pool) does not see it either: drive
+    /// the fault site on the test's own thread.
+    pub fn scoped(name: &str, rate: f64) -> Result<ScopedFault, InitError> {
+        let name = registered(name)?;
+        if !(0.0..=1.0).contains(&rate) {
+            return Err(InitError::InvalidFaultRate {
+                name: name.to_owned(),
+                rate: rate.to_string(),
+            });
+        }
+        let previous = SCOPED.with(|scoped| {
+            let mut scoped = scoped.borrow_mut();
+            let previous = scoped.clone();
+            let rates = scoped.get_or_insert_with(Vec::new);
+            rates.retain(|(n, _)| *n != name);
+            rates.push((name, rate));
+            previous
+        });
+        Ok(ScopedFault {
+            previous,
+            _not_send: PhantomData,
+        })
+    }
+
+    /// Restores the calling thread's previous scope on drop.
+    ///
+    /// It is not `Send`: dropped on another thread it would restore that
+    /// thread's slot and leave the scope open on this one.
+    #[must_use = "the fault's scoped rate ends when this guard drops"]
+    pub struct ScopedFault {
+        previous: Option<Vec<(&'static str, f64)>>,
+        _not_send: PhantomData<*const ()>,
+    }
+
+    impl Drop for ScopedFault {
+        fn drop(&mut self) {
+            let previous = self.previous.take();
+            SCOPED.with(|scoped| *scoped.borrow_mut() = previous);
+        }
+    }
+
+    // Fails to compile if ScopedFault becomes Send: the call below is then
+    // ambiguous between the two impls.
+    trait AmbiguousIfSend<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    struct IsSend;
+    impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
+    const _: fn() = || <ScopedFault as AmbiguousIfSend<_>>::check();
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -574,6 +904,242 @@ mod tests {
 
         let selected = inv_mutant!("commit/commit-before-data");
         assert!(!selected, "inv_mutant! is false without the feature");
+    }
+
+    #[cfg(not(any(feature = "antithesis", feature = "capture")))]
+    #[test]
+    fn inv_fault_is_false_without_the_feature() {
+        for _ in 0..1_000 {
+            assert!(!inv_fault!("ingest/encode-cancelled"));
+            assert!(!inv_fault!("ingest/data-put-refused"));
+        }
+    }
+
+    #[cfg(any(feature = "antithesis", feature = "capture"))]
+    #[test]
+    fn fault_values_init_refuses_have_typed_errors() {
+        use std::ffi::OsStr;
+
+        use crate::fault::{parse_rates, scoped};
+        use crate::{FAULT_ENV, InitError};
+
+        let parse = |value: &str| parse_rates(Some(OsStr::new(value)));
+        let unknown = InitError::UnknownFault {
+            name: "ingest/no-such-fault".to_owned(),
+        };
+        assert_eq!(parse("ingest/no-such-fault=1"), Err(unknown.clone()));
+        assert_eq!(
+            scoped("ingest/no-such-fault", 1.0).err(),
+            Some(unknown.clone()),
+            "a test scope refuses the same names"
+        );
+        assert_eq!(
+            parse("ingest/encode-cancelled=1.5"),
+            Err(InitError::InvalidFaultRate {
+                name: "ingest/encode-cancelled".to_owned(),
+                rate: "1.5".to_owned(),
+            })
+        );
+        assert_eq!(
+            scoped("ingest/encode-cancelled", 1.5).err(),
+            Some(InitError::InvalidFaultRate {
+                name: "ingest/encode-cancelled".to_owned(),
+                rate: "1.5".to_owned(),
+            })
+        );
+        for rate in ["", "-0.5", "nan", "inf", "1e-1", "0.5.0", ".", "half"] {
+            assert_eq!(
+                parse(&format!("ingest/encode-cancelled={rate}")),
+                Err(InitError::InvalidFaultRate {
+                    name: "ingest/encode-cancelled".to_owned(),
+                    rate: rate.to_owned(),
+                }),
+                "rate {rate:?}"
+            );
+        }
+        for entry in ["ingest/encode-cancelled", "=1"] {
+            assert_eq!(
+                parse(entry),
+                Err(InitError::MalformedFaultEntry {
+                    entry: entry.to_owned()
+                }),
+                "entry {entry:?}"
+            );
+        }
+        assert_eq!(
+            parse("ingest/data-put-refused=1,"),
+            Err(InitError::MalformedFaultEntry {
+                entry: String::new()
+            }),
+            "a trailing separator is an empty entry"
+        );
+        let duplicate = InitError::DuplicateFault {
+            name: "ingest/data-put-refused".to_owned(),
+        };
+        assert_eq!(
+            parse("ingest/data-put-refused=0.5,ingest/data-put-refused=0.5"),
+            Err(duplicate.clone())
+        );
+        for err in [
+            unknown,
+            duplicate,
+            InitError::MalformedFaultEntry { entry: "x".into() },
+            InitError::InvalidFaultRate {
+                name: "x".into(),
+                rate: "2".into(),
+            },
+            InitError::FaultsNotUnicode,
+        ] {
+            let text = err.to_string();
+            assert!(
+                text.contains(FAULT_ENV) && text.contains("refusing to start"),
+                "{text}"
+            );
+        }
+    }
+
+    #[cfg(all(any(feature = "antithesis", feature = "capture"), unix))]
+    #[test]
+    fn non_unicode_fault_value_is_refused() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        assert_eq!(
+            crate::fault::parse_rates(Some(OsStr::from_bytes(b"ingest/\xff=1"))),
+            Err(crate::InitError::FaultsNotUnicode)
+        );
+    }
+
+    #[cfg(any(feature = "antithesis", feature = "capture"))]
+    #[test]
+    fn a_valid_fault_value_enables_exactly_the_named_faults() {
+        use std::ffi::OsStr;
+
+        use crate::fault::parse_rates;
+
+        assert_eq!(parse_rates(None), Ok(Vec::new()));
+        assert_eq!(parse_rates(Some(OsStr::new(""))), Ok(Vec::new()));
+        assert_eq!(
+            parse_rates(Some(OsStr::new("ingest/data-put-refused=0.25"))),
+            Ok(vec![("ingest/data-put-refused", 0.25)])
+        );
+        assert_eq!(
+            parse_rates(Some(OsStr::new(
+                "ingest/encode-cancelled=1,ingest/data-put-refused=0"
+            ))),
+            Ok(vec![
+                ("ingest/encode-cancelled", 1.0),
+                ("ingest/data-put-refused", 0.0)
+            ])
+        );
+        assert_eq!(
+            parse_rates(Some(OsStr::new("ingest/encode-cancelled=.5"))),
+            Ok(vec![("ingest/encode-cancelled", 0.5)])
+        );
+    }
+
+    #[cfg(any(feature = "antithesis", feature = "capture"))]
+    #[test]
+    fn rate_zero_never_fires_and_rate_one_always_fires() {
+        use crate::fault::scoped;
+
+        const DRAWS: usize = 10_000;
+        let count = || {
+            (0..DRAWS)
+                .filter(|_| inv_fault!("ingest/encode-cancelled"))
+                .count()
+        };
+        assert_eq!(count(), 0, "no scope and no process rate: rate 0");
+        {
+            let _off = scoped("ingest/encode-cancelled", 0.0).expect("registered");
+            assert_eq!(count(), 0, "rate 0 never fires");
+        }
+        {
+            let _on = scoped("ingest/encode-cancelled", 1.0).expect("registered");
+            assert_eq!(count(), DRAWS, "rate 1 always fires");
+            assert!(
+                !inv_fault!("ingest/data-put-refused"),
+                "a scope sets only the fault it names"
+            );
+        }
+        {
+            let _half = scoped("ingest/encode-cancelled", 0.5).expect("registered");
+            let fired = count();
+            assert!(
+                (4_000..=6_000).contains(&fired),
+                "rate 0.5 fired {fired} of {DRAWS}"
+            );
+        }
+        assert_eq!(count(), 0, "the scope ended with its guard");
+    }
+
+    #[cfg(feature = "capture")]
+    #[test]
+    fn every_fault_records_its_firing() {
+        use crate::capture::{Kind, evaluations_of};
+
+        for name in crate::fault::FAULTS.iter().copied() {
+            let message = format!("fault: {name} fired");
+            let before = evaluations_of(&message).len();
+            let guard = crate::fault::scoped(name, 1.0).expect("registered");
+            assert!(crate::fault::fires(name));
+            drop(guard);
+            assert!(!crate::fault::fires(name));
+            let after = evaluations_of(&message);
+            assert_eq!(after.len(), before + 1, "{message}: {after:?}");
+            let last = after.last().expect("one evaluation");
+            assert_eq!(last.kind, Kind::Reachable);
+            assert!(last.details.contains(name), "{}", last.details);
+        }
+    }
+
+    // Two tests in one binary, run as two threads that each set a different
+    // fault. Both hold their scope before either reads and until both have
+    // read, so a process-wide rate would show one of them the other's fault.
+    #[cfg(any(feature = "antithesis", feature = "capture"))]
+    #[test]
+    fn scoped_faults_do_not_leak_between_tests() {
+        use std::sync::{Arc, Barrier};
+
+        use crate::fault::scoped;
+
+        let both_set = Arc::new(Barrier::new(2));
+        let both_read = Arc::new(Barrier::new(2));
+        let run = |name: &'static str| {
+            let both_set = Arc::clone(&both_set);
+            let both_read = Arc::clone(&both_read);
+            std::thread::spawn(move || {
+                let guard = scoped(name, 1.0).expect("a registered fault");
+                both_set.wait();
+                let seen = (
+                    inv_fault!("ingest/encode-cancelled"),
+                    inv_fault!("ingest/data-put-refused"),
+                );
+                both_read.wait();
+                drop(guard);
+                let after = (
+                    inv_fault!("ingest/encode-cancelled"),
+                    inv_fault!("ingest/data-put-refused"),
+                );
+                (seen, after)
+            })
+        };
+        let first = run("ingest/encode-cancelled");
+        let second = run("ingest/data-put-refused");
+        let (first, second) = (
+            first.join().expect("first test thread"),
+            second.join().expect("second test thread"),
+        );
+        assert_eq!(first, ((true, false), (false, false)), "first test's view");
+        assert_eq!(
+            second,
+            ((false, true), (false, false)),
+            "second test's view"
+        );
+        assert!(
+            !inv_fault!("ingest/encode-cancelled") && !inv_fault!("ingest/data-put-refused"),
+            "a thread that opened no scope sees no fault"
+        );
     }
 
     #[cfg(not(any(feature = "antithesis", feature = "capture")))]

@@ -181,6 +181,11 @@ impl WriteGateSlot {
     {
         #[cfg(feature = "flush-input-bytes")]
         self.record_input(input_bytes);
+        // Before the gate-less return, so the fault reaches a flush whether
+        // or not a gate is attached. The flush answers it as a gate fault.
+        if ravel_invariant::inv_fault!("ingest/encode-cancelled") {
+            return Err(CpuGateError::Cancelled);
+        }
         let Some(gate) = gate else {
             return Ok(job());
         };
