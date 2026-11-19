@@ -77,8 +77,35 @@ async fn l0_data_count(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize
 #[tokio::test]
 #[ignore = "contract decision pending #4501: a hold acknowledged after the pass's hold refresh does not stop that pass's deletes"]
 async fn a_hold_acknowledged_after_the_pass_refresh_stops_the_pass_deletes() {
-    let store = MemoryStore::new();
     let created = sealed_now_ns();
+    let past_horizon = created
+        .saturating_add(cfg().protection_horizon_ns)
+        .saturating_add(NS_PER_HOUR);
+
+    // Control: with no hold the same pass deletes the superseded inputs, so
+    // the held run below is checking a delete that would otherwise happen.
+    let control = MemoryStore::new();
+    let control_clock = FixedClock::new(created);
+    let control_bucket = seed_and_compact(&control, &control_clock).await;
+    let control_snapshot = LegalHoldCheck::refresh(&control, &control_bucket.tenant_hash)
+        .await
+        .expect("refresh");
+    control_clock.set(past_horizon);
+    let control_report = sweep_shard(
+        &control,
+        &control_clock,
+        &cfg(),
+        &control_snapshot,
+        &control_bucket.tenant_hash,
+        control_bucket.signal,
+        control_bucket.shard,
+    )
+    .await
+    .expect("control sweep");
+    assert!(control_report.superseded_data_deleted > 0);
+    assert_eq!(l0_data_count(&control, &control_bucket).await, 0);
+
+    let store = MemoryStore::new();
     let clock = FixedClock::new(created);
     let bucket = seed_and_compact(&store, &clock).await;
     let data_before = l0_data_count(&store, &bucket).await;
@@ -118,11 +145,7 @@ async fn a_hold_acknowledged_after_the_pass_refresh_stops_the_pass_deletes() {
     );
 
     // The same pass reaches its delete batch, past the protection horizon.
-    clock.set(
-        created
-            .saturating_add(cfg().protection_horizon_ns)
-            .saturating_add(NS_PER_HOUR),
-    );
+    clock.set(past_horizon);
     let report = sweep_shard(
         &store,
         &clock,
