@@ -1147,7 +1147,8 @@ fn protected_sweep_keys<'a>(
 /// a held key.
 ///
 /// `holds_now` is the tenant's hold set re-read from the store, read only by
-/// the HeldObjectNeverDeleted assertion; `None` records nothing.
+/// the HeldObjectNeverDeleted assertion, which is false for a deleted key it
+/// protects; `None` records nothing.
 async fn delete_all(
     store: &dyn ObjectStoreBackend,
     lease: &dyn LeaseCheck,
@@ -1160,8 +1161,7 @@ async fn delete_all(
             continue;
         }
         if !dry_run {
-            let _verdict =
-                crate::legal_hold::held_object_verdict(holds_now, lease, &[key.as_str()]);
+            let _verdict = holds_now.map(|fresh| !fresh.is_protected(key));
             ravel_invariant::inv_always_if_known!(
                 _verdict,
                 "gc: a held object is never deleted",
@@ -2180,9 +2180,9 @@ mod tests {
         outcome
     }
 
-    /// Retention's physical delete under a real hold snapshot that holds
-    /// another shard: `HeldObjectNeverDeleted` is evaluated at the part's
-    /// delete and holds.
+    /// Retention under a real hold snapshot: the held bucket's part is skipped
+    /// with no evaluation, and the unheld bucket's part delete is evaluated
+    /// once and holds.
     #[tokio::test]
     async fn held_object_never_deleted_holds_at_the_retention_delete() {
         if !crate::publish::tests::capturing() {
@@ -2190,15 +2190,13 @@ mod tests {
         }
         let store = MemoryStore::new();
         let (bucket, part_key) = put_tombstoned_part(&store, 43).await;
-        let other_shard = crate::legal_hold::shard_hold_scopes(&tenant(), Signal::Metrics, 1)
-            .expect("scopes")[2]
-            .clone();
+        let (held_bucket, held_part_key) = put_tombstoned_part(&store, 45).await;
         crate::legal_hold::write_hold_set(
             &store,
             &tenant(),
             uuid::Uuid::from_u128(0x4301),
             1,
-            &other_shard,
+            &l1_bucket_prefix(&held_bucket),
             "litigation",
         )
         .await
@@ -2206,6 +2204,18 @@ mod tests {
         let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant())
             .await
             .expect("refresh");
+
+        let held_outcome = sweep_past_horizon(&store, &held_bucket, &snapshot).await;
+        assert_eq!(held_outcome, RetentionOutcome::SweptPartial);
+        assert!(
+            store.get(&held_part_key, GetRange::Full).await.is_ok(),
+            "the held part survives"
+        );
+        let held = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &held_part_key);
+        assert!(
+            held.is_empty(),
+            "the held part is never evaluated: {held:?}"
+        );
 
         let outcome = sweep_past_horizon(&store, &bucket, &snapshot).await;
         assert_eq!(outcome, RetentionOutcome::Swept);
@@ -2223,20 +2233,16 @@ mod tests {
         assert!(found[0].0, "an unheld part's delete holds: {found:?}");
     }
 
-    /// A hold placed after the pass's snapshot is not one the pass could
-    /// honour: the delete the snapshot allows goes ahead, and although the
-    /// store re-read at the delete now holds the part, `HeldObjectNeverDeleted`
-    /// is evaluated and holds.
+    /// The site is not vacuous: retention under `NoLeases` deletes a part that
+    /// a hold record in the store covers, and `HeldObjectNeverDeleted`
+    /// evaluates false.
     #[tokio::test]
-    async fn a_hold_placed_after_the_snapshot_does_not_fail_the_retention_delete() {
+    async fn held_object_never_deleted_breaks_when_a_held_part_is_deleted() {
         if !crate::publish::tests::capturing() {
             return;
         }
         let store = MemoryStore::new();
         let (bucket, part_key) = put_tombstoned_part(&store, 44).await;
-        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant())
-            .await
-            .expect("refresh");
         crate::legal_hold::write_hold_set(
             &store,
             &tenant(),
@@ -2246,27 +2252,15 @@ mod tests {
             "litigation",
         )
         .await
-        .expect("place hold after the snapshot");
-        let fresh = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant())
-            .await
-            .expect("refresh");
-        assert!(
-            fresh.is_protected(&part_key) && !snapshot.is_protected(&part_key),
-            "the store now holds the part; the pass's snapshot does not"
-        );
+        .expect("place hold");
 
-        let outcome = sweep_past_horizon(&store, &bucket, &snapshot).await;
-        assert_eq!(outcome, RetentionOutcome::Swept, "the snapshot allows it");
+        let outcome = sweep_past_horizon(&store, &bucket, &crate::NoLeases).await;
+        assert_eq!(outcome, RetentionOutcome::Swept, "NoLeases lets it go");
 
         let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &part_key);
-        assert_eq!(
-            found.len(),
-            1,
-            "one evaluation at the part's delete: {found:?}"
-        );
         assert!(
-            found[0].0,
-            "a hold placed after the snapshot never makes the property false: {found:?}"
+            found.iter().any(|(held, _)| !held),
+            "deleting a part the store's holds cover makes the property false: {found:?}"
         );
     }
 }
