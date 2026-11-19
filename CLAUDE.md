@@ -186,7 +186,12 @@ builds them as dependencies and cargo never compiles a dependency's
 An `invariants` lane (clippy and tests of ravel-invariant, ravel-commit,
 ravel-ingest, ravel-catalog, ravel-maintain and ravel-fleet with
 `--features ravel-invariant/capture,ravel-invariant/antithesis-mutants`) runs
-whenever one of those six is in scope, matching CI's `invariants` job.
+whenever one of those six is in scope, matching CI's `invariants` job. An
+`invariants-services` lane runs the same clippy and tests for ravel-server
+and ravel-cli whenever either is in scope, matching CI's
+`invariants-services` job. Both depend on each of the six and on
+ravel-query, so a run scoped to any of those runs it too, into the same
+`target/`.
 gates.sh also runs a `-p ravel-cli --features sql-explain` clippy and test
 lane whenever ravel-cli is in scope, matching CI's `features` job. And
 it runs `cargo clippy -p ravel-ingest --all-targets` on its own whenever

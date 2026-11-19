@@ -257,11 +257,12 @@ fi
 # `flight-lane` feature left main uncompilable under
 # `--features sql-latency,profiling,flight-lane` because nothing gated it.
 #
-# Mirrors CI's `lint`, `sql`, `flight-sql`, `features`, `features-agents` and
-# `features-mcp` jobs. In scoped mode each lane runs when a crate it covers is
-# in the closure computed above, so `-p ravel-query` runs the sql, agents, mcp,
-# flight-sql and esql lanes (ravel-sql and ravel-server depend on it) and
-# `-p ravel-affinity` runs none.
+# Mirrors CI's `lint`, `sql`, `flight-sql`, `features`, `features-agents`,
+# `features-mcp`, `invariants` and `invariants-services` jobs. In scoped mode
+# each lane runs when a crate it covers is in the closure computed above, so
+# `-p ravel-query` runs the sql, agents, mcp, flight-sql, esql and
+# invariants-services lanes (ravel-sql, ravel-server and ravel-cli depend on
+# it) and `-p ravel-affinity` runs none.
 #
 # Under --dry-run every cargo command below is printed by `run` and not
 # executed, so the printed list is the list a real run executes.
@@ -346,6 +347,7 @@ want_stage_timing=0
 want_cli_sql_explain=0
 want_ingest_shipping=0
 want_invariants=0
+want_invariants_services=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_sql=1
   want_agents=1
@@ -358,6 +360,7 @@ if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_cli_sql_explain=1
   want_ingest_shipping=1
   want_invariants=1
+  want_invariants_services=1
 else
   for c in "${gate_crates[@]}"; do
     case "${c}" in
@@ -399,6 +402,11 @@ else
       ravel-invariant | ravel-commit | ravel-ingest | ravel-catalog | ravel-maintain | ravel-fleet)
         want_invariants=1
         ;;
+    esac
+    # The services that carry them too. Every crate above has both in its
+    # closure, so the lane also runs whenever the six-crate one does.
+    case "${c}" in
+      ravel-server | ravel-cli) want_invariants_services=1 ;;
     esac
   done
 fi
@@ -511,6 +519,13 @@ run_feature_lanes() {
       -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet
   fi
 
+  # The same features for ravel-server and ravel-cli, a lane of its own as CI's
+  # `invariants-services` job is a job of its own.
+  if [[ ${want_invariants_services} -eq 1 ]]; then
+    run_feature_lane ravel-invariant/capture,ravel-invariant/antithesis-mutants \
+      -p ravel-server -p ravel-cli
+  fi
+
   # ravel-cli's `sql explain` subcommand (issue #2881) and its tests compile
   # only under `sql-explain`, which no other lane selects. Mirrors CI's
   # `cli-sql-explain` features leg.
@@ -603,6 +618,7 @@ run_executor_gates() {
     want_sql=1 want_agents=1 want_agents_small_pages=1 want_mcp=1
     want_flight_sql=1 want_esql=1 want_bench=1 want_stage_timing=1
     want_cli_sql_explain=1 want_ingest_shipping=1 want_invariants=1
+    want_invariants_services=1
     run_feature_lanes
   )" || lanes_rc=$?
   if [[ ${lanes_rc} -ne 0 ]]; then
