@@ -1,0 +1,25 @@
+{
+  "schema": "metricsbench-stage1-bands/1",
+  "profile": "cardinality",
+  "status": "predicted: ADR-4146 acceptance rows A1 and A6, before any MB_SERIES_INDEX=1 run; checked beside stage1-bands.cardinality.json, whose label-route figures describe the label-value route alone",
+  "figures": [
+    {"name": "holders_series_prune_mismatches", "file": "stamps.json", "path": "stage1.holders.series_prune_mismatches_count", "min": 0, "max": 0,
+     "basis": "predicted (ADR-4146 A1, docs/adrs/4146-series-level-key-index-for-metrics.md, Acceptance): segmentsPrunedBySeriesIndex = resolved set minus series_holders, exactly, on every answered stage1-routed record the series route answered in full; A1 names mb_single_counter_rate, and its miss line is exactness because the route has no approximate step (a key8 collision is predicted 0 at these sizes), which holds for every route_bound statement the route answers"},
+    {"name": "holders_series_prune_unchecked", "file": "stamps.json", "path": "stage1.holders.series_prune_unchecked_count", "min": 0, "max": 0,
+     "basis": "predicted: the cardinality snapshot is one covering part (T8's state check, ADR-4146 worked example), so a corpus statement's routed plans are answered or declined together on it, no record is mixed, and every series-answered record carries a whole-number segmentsPrunedBySeriesIndex against a whole-number expected_series_prunes"},
+    {"name": "holders_series_prune_records_checked", "file": "stamps.json", "path": "stage1.holders.series_prune_records_checked", "min": 1, "max": null,
+     "basis": "predicted (ADR-4146 A1): at least mb_single_counter_rate's answered stage1-routed records are answered by the series route (one plan, k = 5 keys, M = 1), so the exact prune check above compared at least one record; 0 means the series route answered nothing and holders_series_prune_mismatches passed vacuously"},
+    {"name": "holders_series_single_counter_rate_series_holders", "file": "holders.json", "path": "statements[id=mb_single_counter_rate].series_holders", "min": 139, "max": 143,
+     "basis": "ADR-4146 A1: series_holders stamped at 141 plus or minus 2 (141 measured 2026-11-10, comment 6790288400; the 2 mirrors the one-object drift between 1,597 and 1,596 in comment 6822878261); a figure outside it is a miss unless the run's state explains it"},
+    {"name": "holders_series_single_counter_rate_opened_minus_expected", "file": "stamps.json", "path": "stage1.holders.statements[id=mb_single_counter_rate].series_opened_minus_expected", "min": 0, "max": 0,
+     "basis": "ADR-4146 A1: objects opened = series_holders plus token-only objects (141 + 4 = 145 if the state matches T8); the figure is, over the series-answered stage1-routed records of mb_single_counter_rate, segmentsFetched minus (series_holders + token_only_fetched) of largest magnitude, exactly 0, and null (a miss) when the route answered none of them"},
+    {"name": "leaves_series_index_parts_over_cap", "file": "stamps.json", "path": "stage1.leaves.series_index.series_index_parts_over_cap", "min": 0, "max": 0,
+     "basis": "predicted (ADR-4146 A6): uncovered parts 0, the series index at about 0.15 % of part data bytes (39.3 to 40.5 MB of 26.7 GB), far under the cap, so the stage1-leaves rebuild gives every metrics part the series fields. The A6 byte figure itself is not banded: the rebuild report counts the series fields' leaf bytes only inside leaf_bytes_written"},
+    {"name": "leaves_series_label_pairs", "file": "stamps.json", "path": "stage1.leaves.series_index.field_pairs.series_label", "min": 1, "max": null,
+     "basis": "predicted (ADR-4146 A6): the stage1-leaves rebuild with --metrics-series-index writes the series_label field for the cardinality part; null or 0 means it built none"},
+    {"name": "leaves_series_class_pairs", "file": "stamps.json", "path": "stage1.leaves.series_index.field_pairs.series_class", "min": 1, "max": null,
+     "basis": "predicted (ADR-4146 A6): the rebuild writes the series_class field beside series_label"},
+    {"name": "leaves_class_objects_pairs", "file": "stamps.json", "path": "stage1.leaves.series_index.field_pairs.class_objects", "min": 1, "max": null,
+     "basis": "predicted (ADR-4146 A6): the rebuild writes the class_objects field beside series_label"}
+  ]
+}

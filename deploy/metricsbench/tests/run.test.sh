@@ -398,6 +398,33 @@
 #                                       stage1-unrouted; kl8: a text report
 #                                       with no such line passes, stamped
 #                                       absent.
+#                                       Series route (MB_SERIES_INDEX,
+#                                       issue #4146): si1: an opt-out image,
+#                                       --fold-metrics-series-index on the
+#                                       routed recreate alone,
+#                                       --metrics-series-index on the leaf
+#                                       rebuild alone, stage1.series_index,
+#                                       stage1.leaves.series_index and every
+#                                       series-answered record checked
+#                                       against expected_series_prunes;
+#                                       si2: an opt-in image, every arm on,
+#                                       the flags beside the label index's;
+#                                       si3: a series prune mismatch names
+#                                       the statement; si4: a declined
+#                                       statement held to the label check, a
+#                                       mixed one series_prune_unchecked;
+#                                       si5: no MB_STAGE1 and si6: a value
+#                                       other than 1 or 0 exit 64;
+#                                       si-help-*: a help lacking either
+#                                       flag exit 70 at stage1-flags with
+#                                       nothing up; si7: the Ravel-only
+#                                       shape's up and folds; si8: the
+#                                       switch off, no series flag or stamp,
+#                                       the holders stamp and
+#                                       stage1-compare.json equal z's; si10:
+#                                       a rebuild report without the series
+#                                       figures exit 70 at
+#                                       stage1-leaves-series.
 #                                       History l1 and the Ravel-only shape
 #                                       (issue #4392): hl1: history with
 #                                       MB_STAGE1_ARMS=l1 runs; hl2: history
@@ -452,6 +479,11 @@
 #                                       tokens, value holders beyond the
 #                                       resolved set and no probe phase;
 #                                       missing without the figure.
+#                                       The series file (ADR-4146 A1, A6):
+#                                       every figure in band on si9 (A1's
+#                                       141 holders, 4 tokens, 145 opened),
+#                                       the prune mismatch out of band on
+#                                       si3, missing on si8.
 #                                       box-run.sh, sourced: the band file
 #                                       per profile (refused for cardinality
 #                                       without MB_STAGE1_BANDS) and
@@ -539,14 +571,36 @@ help_style() {
 leaf_style() {
   echo "${STUB_LEAF_HELP_STYLE:-opt-in}"
 }
+# series_help: which binaries list the metrics series index switch,
+# STUB_SERIES_HELP: none (the default, an image built before ADR-4146 step
+# M1), both, server (ravel-server only) or cli (ravel-cli only).
+series_help() {
+  echo "${STUB_SERIES_HELP:-none}"
+}
+# series_flag BINARY: the series switch of BINARY.
+series_flag() {
+  case "$1" in
+    */ravel-server) echo --fold-metrics-series-index ;;
+    *) echo --metrics-series-index ;;
+  esac
+}
 # reject_flags IMAGE WORDS...: exit 2 as clap does on a label index flag
-# IMAGE's binaries do not take, or on --no-key-index-leaves where leaf_style
-# is opt-in.
+# IMAGE's binaries do not take, on a series index switch series_help does not
+# list, or on --no-key-index-leaves where leaf_style is opt-in.
 reject_flags() {
   local style w
   style="$(help_style "$1")"
   shift
   for w in "$@"; do
+    case "$(series_help):${w}" in
+      both:*) ;;
+      server:--fold-metrics-series-index | cli:--metrics-series-index) ;;
+      *:--fold-metrics-series-index | *:--metrics-series-index)
+        printf 'docker-reject %s %s\n' "${RAVEL_IMAGE-}" "$w" >>"${STUB_LOG}"
+        echo "error: unexpected argument '${w}' found" >&2
+        exit 2
+        ;;
+    esac
     if [ "$(leaf_style):${w}" = "opt-in:--no-key-index-leaves" ]; then
       printf 'docker-reject %s %s\n' "${RAVEL_IMAGE-}" "$w" >>"${STUB_LOG}"
       echo "error: unexpected argument '${w}' found" >&2
@@ -974,7 +1028,13 @@ JSON
                 [ "${STUB_STAGE1_LEAVES_EXIT:-0}" -eq 0 ] || exit "${STUB_STAGE1_LEAVES_EXIT}"
                 : >"${STUB_STATE}.rebuilt"
                 echo head-rebuilt-leaves >"${STUB_STATE}.head"
-                foldreport rebuild "{\"leaves_written\": ${STUB_STAGE1_LEAVES:-12}, \"parts_rebuilt\": ${STUB_STAGE1_PARTS_REBUILT:-3}}"
+                series=""
+                case " $* " in
+                  *" --metrics-series-index "*)
+                    series=", \"series_index_parts_over_cap\": ${STUB_SERIES_PARTS_OVER_CAP:-0}, \"field_pairs\": {\"label_value\": 9, \"series_label\": 7, \"series_class\": 5, \"class_objects\": 4}"
+                    ;;
+                esac
+                foldreport rebuild "{\"leaves_written\": ${STUB_STAGE1_LEAVES:-12}, \"parts_rebuilt\": ${STUB_STAGE1_PARTS_REBUILT:-3}${series}}"
                 exit 0
                 ;;
               *" --json "*)
@@ -1068,6 +1128,12 @@ JSON
     case "$(help_style "$image")" in
       opt-out | both) printf '      %s\n          Skip the metrics label index;\n          %s was the opt-in of earlier images\n' "$out" "$in" ;;
     esac
+    case "${entry##*/}:$(series_help)" in
+      ravel-server:both | ravel-server:server | ravel-cli:both | ravel-cli:cli)
+        printf '      %s\n          Build the metrics series index with the label index\n' "$(series_flag "$entry")"
+        ;;
+      *) printf '          (no %s in this image)\n' "$(series_flag "$entry")" ;;
+    esac
     printf '  -h, --help\n          Print help\n'
     ;;
   stats)
@@ -1149,7 +1215,7 @@ if mode == "rebuild":
            "parts_rebuilt": 0, "parts_deferred": 0, "leaves_written": 0, "leaf_bytes_written": 4096,
            "section_bytes_read": 2048, "ranged_gets": 7, "uncovered_entries": 0, "parts_over_cap": 0,
            "parts_erasure_gated": 0, "erasure_list_requests": 1, "erasure_get_requests": 1,
-           "attempt_count": 2,
+           "attempt_count": 2, "series_index_parts_over_cap": 0, "field_pairs": {"label_value": 9},
            # key_index_rebuild.rs:65-80, every field.
            "attempts": [{"parts": 2, "part_gets": 2, "ranged_gets": 3, "leaf_puts": 8, "head_cas_tries": 2, "parts_published": 0},
                         {"parts": 3, "part_gets": 3, "ranged_gets": 4, "leaf_puts": leaves, "head_cas_tries": 1, "parts_published": 3}]}
@@ -1567,7 +1633,9 @@ esac
 # 100 wire bytes. A cold-ravel-diagnostic/ run of repetition R reports R
 # resolve-phase GETs and io.unfoldedSegmentsResolved 10*R.
 # Entry STUB_TWO_HASH_ENTRY gets a second record in every pass, rep 2, with
-# result_hash blake3:<entry>-rep2.
+# result_hash blake3:<entry>-rep2. A folded-routed record run while
+# RAVEL_SERVER_EXTRA_FLAGS holds --fold-metrics-series-index carries the
+# series members series_figures below gives it.
 python3 -I - "$corpus" "$diag" "$out" "$verdict" "$@" <<'PY'
 import json, os, re, sys
 corpus, diag, out, verdict = sys.argv[1:5]
@@ -1585,6 +1653,33 @@ ids = [e["id"] for e in json.load(open(corpus))["entries"]]
 phases = [{"name": n, "requests": 1, "phase": n, "s3GetRequests": 1, "s3GetWireBytes": 100}
           for n in ("resolve", "plan", "probe", "scan", "decode")]
 routed_prunes = int(os.environ.get("STUB_ROUTED_PRUNES") or 3)
+series = routed and "--fold-metrics-series-index" in os.environ.get("RAVEL_SERVER_EXTRA_FLAGS", "").split()
+series_reasons = ("no_series_refs", "rejected", "over_tier_one", "beyond_ceiling", "over_q_a",
+                  "over_s_max", "over_q_bc", "over_budget", "reservation_refused")
+def series_figures(i):
+    # The series members a routed record carries with the series route on:
+    # every (plan, part) pair answered, so the prunes count under
+    # segmentsPrunedBySeriesIndex (STUB_SERIES_PRUNES, default 3) and the
+    # label counter says 0; entry STUB_SERIES_DECLINED_ENTRY's pairs all
+    # declined over_budget, its prunes under the label counter, and entry
+    # STUB_SERIES_MIXED_ENTRY's split, one pair answered and two declined.
+    declines = dict.fromkeys(series_reasons, 0)
+    if i == os.environ.get("STUB_SERIES_DECLINED_ENTRY"):
+        declines["over_budget"] = 3
+        return {"segmentsPrunedBySeriesIndex": 0, "segmentsPrunedByLabelIndex": routed_prunes,
+                "seriesIndex": {"plansRouted": 1, "planPartsAnswered": 0, "declines": declines}}
+    answered, label_prunes, series_prunes = 3, 0, int(os.environ.get("STUB_SERIES_PRUNES") or 3)
+    if i == os.environ.get("STUB_SERIES_MIXED_ENTRY"):
+        declines["over_q_a"] = 2
+        answered, label_prunes, series_prunes = 1, routed_prunes, 0
+    # crates/ravel-query/src/http/json.rs SeriesIndexPassJson, every field.
+    passes = [{"pass": p, "partsProbed": 3, "plansOffered": 1, "plansAdmitted": 1, "keysOffered": 2,
+               "keysProbed": 2, "distinctBuckets": 2, "bridgedBytes": 0, "prefixBytes": 64,
+               "bytesPastPrefix": 0, "leafGetRequests": 0, "leafWireBytes": 0, "leafCacheHits": 2}
+              for p in "ABC"]
+    return {"segmentsPrunedBySeriesIndex": series_prunes, "segmentsPrunedByLabelIndex": label_prunes,
+            "seriesIndex": {"plansRouted": 1, "planPartsAnswered": answered, "declines": declines},
+            "seriesIndexPasses": passes}
 def key_index(i):
     hits = 0 if i == os.environ.get("STUB_ROUTED_LEAF_UNREAD_ENTRY") else int(os.environ.get("STUB_ROUTED_KEYINDEX_HITS") or 2)
     return [{"phase": "keyIndex", "s3GetRequests": 0, "cacheHits": hits}]
@@ -1603,6 +1698,8 @@ def record(i):
          "labelIndexValues": values(i) if routed else None,
          "estimate": None, "io": None, "pass_label": label, "fold_state": state,
          "result_hash": f"blake3:{i}-routed" if routed and i == differ else f"blake3:{i}"}
+    if series:
+        r.update(series_figures(i))
     if i == os.environ.get("STUB_INCORRECT_ENTRY") or (routed and i == os.environ.get("STUB_ROUTED_STATUS_ENTRY")):
         r["status"] = "incorrect"
     if i == os.environ.get("STUB_ABSENT_ENTRY"):
@@ -1654,13 +1751,16 @@ STUB
 # unrouted_fetched_expected 4, the stub query records' segmentsFetched; their
 # fetched + pruned is 10), no token-only object, two holders, route-bound,
 # one value holder, so expected_routed_prunes 3, the stub routed records'
-# segmentsPrunedByLabelIndex. It reports one commit token naming one object.
+# segmentsPrunedByLabelIndex, and one series holder, so expected_series_prunes
+# 3, the stub's series-answered records' segmentsPrunedBySeriesIndex. It
+# reports one commit token naming one object.
 # Entry STUB_HOLDERS_NAMED_SPLIT gets 7 in its window, 4 named, so fetched +
 # pruned is not segments_in_window; entry STUB_ABSENT_ENTRY 7 in its window, 0
 # named, 0 holders and 0 value holders; STUB_HOLDERS_WINDOW_OFF 5 named and
 # expected; STUB_HOLDERS_WINDOW_NULL null counts; STUB_HOLDERS_UNBOUND is not
 # route-bound and carries no value holders; STUB_HOLDERS_PRUNES_OFF expects 2
-# routed prunes. STUB_RUN_FIGURES names a JSON file whose "holders" object
+# routed prunes; STUB_HOLDERS_SERIES_OFF 2 series holders and 2 series
+# prunes. STUB_RUN_FIGURES names a JSON file whose "holders" object
 # holds "report", the top-level fields to replace, and "statements", entry ids
 # ("*" for every entry) to the fields to replace. Exit STUB_HOLDERS_EXIT
 # writes nothing.
@@ -1692,21 +1792,25 @@ def statement(i):
     s = {"id": i, "promql": "up", "selectors": [], "positive_equalities": [], "metrics": ["up"],
          "name_pruned": True, "segments_in_window": 10, "named_in_window": 4, "token_only_fetched": 0,
          "unrouted_fetched_expected": 4, "holders": 2, "value_holders": 1, "expected_routed_prunes": 3,
-         "route_bound": True, "route_bound_reason": None}
+         "series_holders": 1, "expected_series_prunes": 3, "route_bound": True, "route_bound_reason": None}
     if i == env("STUB_HOLDERS_NAMED_SPLIT"):
         s["segments_in_window"] = 7
     if i == env("STUB_ABSENT_ENTRY"):
         s.update({"segments_in_window": 7, "named_in_window": 0, "unrouted_fetched_expected": 0, "holders": 0,
-                  "value_holders": 0, "expected_routed_prunes": 0})
+                  "value_holders": 0, "expected_routed_prunes": 0, "series_holders": 0,
+                  "expected_series_prunes": 0})
     if i == env("STUB_HOLDERS_WINDOW_OFF"):
         s.update({"named_in_window": 5, "unrouted_fetched_expected": 5})
     if i == env("STUB_HOLDERS_WINDOW_NULL"):
         s.update({"segments_in_window": None, "named_in_window": None, "unrouted_fetched_expected": None})
     if i == env("STUB_HOLDERS_UNBOUND"):
         s.update({"route_bound": False, "route_bound_reason": "stub: no qualifying matcher",
-                  "value_holders": None, "expected_routed_prunes": None})
+                  "value_holders": None, "expected_routed_prunes": None, "series_holders": None,
+                  "expected_series_prunes": None})
     if i == env("STUB_HOLDERS_PRUNES_OFF"):
         s.update({"value_holders": 2, "expected_routed_prunes": 2})
+    if i == env("STUB_HOLDERS_SERIES_OFF"):
+        s.update({"series_holders": 2, "expected_series_prunes": 2})
     if figs:
         s.update(figs["statements"].get("*", {}))
         s.update(figs["statements"].get(i, {}))
@@ -4345,6 +4449,117 @@ STUB_FOLD_NO_LEAF_LINE=1 run_stage1 kl8 ci
 expect_rc kl8 0
 check "kl8: the fold stamp says the report has no leaf line" 'j("stamps.json")["ravel_catalog_fold_writers_stopped"]["key_index_leaves_written"].startswith("absent: fold.out carries no key_index_leaves_written line") and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "met"'
 
+# --- si: the series route (ADR-4146 step M1, issue #4146) ---------------------------
+# STUB_SERIES_HELP=both lists --fold-metrics-series-index in ravel-server's
+# help and --metrics-series-index in ravel-cli catalog fold's; the stubbed
+# routed records carry the series members once ravel-server runs with the
+# server flag, every pair answered and 3 segments pruned by the series index.
+SERIES_ROUTED_FLAGS="${ROUTED_FLAGS} --fold-metrics-series-index"
+# si1: the switch on, an opt-out image: the server flag on the routed passes
+# only, the fold flag on the leaf rebuild only, each stamped, and every
+# series-answered record checked against expected_series_prunes.
+MB_STAGE1=1 MB_SERIES_INDEX=1 STUB_SERIES_HELP=both run_stage1 si1 cardinality
+expect_rc si1 0
+if stage1_flags_check si1 "${LOG}" "${UP_FLAGS}" "${UNROUTED_FLAGS}" "${SERIES_ROUTED_FLAGS}" "" "--metrics-series-index" ""; then
+  pass "si1: --fold-metrics-series-index on the routed recreate alone, --metrics-series-index on the stage1-leaves rebuild alone"
+else
+  fail "si1: the series flags are not on exactly the routed recreate and the leaf rebuild"
+fi
+expect_no_log "si1: no flag refused" "docker-reject "
+check "si1: stage1.series_index names both flags and the help files they were found in" '{k: v for k, v in j("stamps.json")["stage1"]["series_index"].items() if k != "method"} == {"enabled": True, "switch": "MB_SERIES_INDEX=1", "server_flag": "--fold-metrics-series-index", "server_help": "stage1-flags.server.help.txt", "cli_flag": "--metrics-series-index", "cli_help": "stage1-flags.cli.help.txt"} and all(w in j("stamps.json")["stage1"]["series_index"]["method"] for w in ("option line", "label index on", "server_flags_routed", "stage1-leaves"))'
+check "si1: server_flags_routed and the restart stamp carry the server flag, up and unrouted do not" 'j("stamps.json")["stage1"]["server_flags_routed"] == "'"${SERIES_ROUTED_FLAGS}"'" and j("stamps.json")["stage1"]["restart"].startswith("recreated: docker compose up -d --no-deps --force-recreate ravel-server with RAVEL_SERVER_EXTRA_FLAGS='"'${SERIES_ROUTED_FLAGS}'"'") and j("stamps.json")["stage1"]["server_flags_up"] == "'"${UP_FLAGS}"'" and j("stamps.json")["stage1"]["server_flags_unrouted"] == "'"${UNROUTED_FLAGS}"'"'
+check "si1: stage1-leaves-series follows stage1-leaves and stamps the rebuild report's series figures" 'j("stamps.json")["steps_completed"][j("stamps.json")["steps_completed"].index("readback-folded"):] == ["readback-folded","stage1-fold","stage1-unrouted","stage1-leaves","stage1-leaves-series","stage1-restart","stage1-routed","stage1-holders"] and {k: v for k, v in j("stamps.json")["stage1"]["leaves"]["series_index"].items() if k != "method"} == {"file": "stage1-leaves.json", "series_index_parts_over_cap": 0, "field_pairs": {"series_label": 7, "series_class": 5, "class_objects": 4}}'
+check "si1: every route_bound statement's series-answered record checked, none mismatching, none unchecked" 'j("stamps.json")["stage1"]["holders"]["series_index"] is True and j("stamps.json")["stage1"]["holders"]["series_prune_mismatches_count"] == 0 and j("stamps.json")["stage1"]["holders"]["series_prune_mismatches"] == [] and j("stamps.json")["stage1"]["holders"]["series_prune_unchecked_count"] == 0 and j("stamps.json")["stage1"]["holders"]["series_prune_records_checked"] == len('"${CORPUS_IDS}"') and j("stamps.json")["stage1"]["holders"]["series_route_records"] == {"answered": len('"${CORPUS_IDS}"')}'
+check "si1: the label prune check skips statements whose records the series route answered" 'j("stamps.json")["stage1"]["holders"]["routed_prune_mismatches_count"] == 0 and j("stamps.json")["stage1"]["holders"]["routed_prune_unchecked_count"] == 0'
+check "si1: each statement carries its series figures and its records' series members, seriesIndexPasses included" 'all({k: s[k] for k in ("series_holders", "expected_series_prunes", "routed_pruned_by_series_index", "series_opened_minus_expected")} == {"series_holders": 1, "expected_series_prunes": 3, "routed_pruned_by_series_index": [3], "series_opened_minus_expected": 3} and [{k: v for k, v in r.items() if k not in ("seriesIndex", "seriesIndexPasses")} for r in s["series_index_records"]] == [{"pass": 1, "rep": 1, "series_route": "answered", "segmentsFetched": 4, "segmentsPrunedBySeriesIndex": 3, "segmentsPrunedByLabelIndex": 0}] and s["series_index_records"][0]["seriesIndex"]["planPartsAnswered"] == 3 and [p["pass"] for p in s["series_index_records"][0]["seriesIndexPasses"]] == ["A", "B", "C"] and all(len(p) == 13 for p in s["series_index_records"][0]["seriesIndexPasses"]) for s in j("stamps.json")["stage1"]["holders"]["statements"])'
+check "si1: the series check sentence names what it compares" 'all(w in j("stamps.json")["stage1"]["holders"]["series_prune_check"] for w in ("segmentsPrunedBySeriesIndex", "== expected_series_prunes", "the resolved set less series_holders", "planPartsAnswered", "mixed"))'
+
+# si2: an opt-in image (built before #4145) with every arm on: the server
+# flag beside --fold-metrics-label-index wherever the routed flags run, the
+# fold flag after --metrics-label-index on every leaf-on fold.
+MB_STAGE1=1 MB_SERIES_INDEX=1 MB_STAGE1_ARMS=extra-hour,l1,erasure STUB_HELP_STYLE=opt-in STUB_SERIES_HELP=both \
+  STUB_RUN_FIGURES="${TMP}/run-arms.json" run_stage1 si2 ci
+expect_rc si2 0
+if stage1_flags_check si2 "${LOG}" "--fold-key-index-leaves" "--disable-fold --fold-key-index-leaves" \
+  "--disable-fold --fold-key-index-leaves --fold-metrics-label-index --fold-metrics-series-index" "" \
+  "--metrics-label-index --metrics-series-index" arms; then
+  pass "si2: opt-in image, every arm: the series flags ride beside the label index's opt-in on the routed recreates and every leaf-on fold"
+else
+  fail "si2: the series flags on an opt-in image are not on exactly the routed recreates and the leaf-on folds"
+fi
+expect_no_log "si2: no flag refused" "docker-reject "
+
+# si3: a series-answered record whose segmentsPrunedBySeriesIndex is not
+# expected_series_prunes: the statement named with both figures.
+MB_STAGE1=1 MB_SERIES_INDEX=1 STUB_SERIES_HELP=both STUB_HOLDERS_SERIES_OFF=mb_selective_job_rate_sum run_stage1 si3 cardinality
+expect_rc si3 0
+check "si3: the statement named with its expected series prunes, series holders and the routed figures" 'j("stamps.json")["stage1"]["holders"]["series_prune_mismatches_count"] == 1 and j("stamps.json")["stage1"]["holders"]["series_prune_mismatches"] == [{"id": "mb_selective_job_rate_sum", "expected_series_prunes": 2, "series_holders": 2, "routed_pruned_by_series_index": [3]}] and j("stamps.json")["stage1"]["holders"]["series_prune_unchecked_count"] == 0'
+
+# si4: a statement whose pairs the route declined is held to the label prune
+# check (its expected_routed_prunes off by one here, so it mismatches there);
+# one it answered in part is series_prune_unchecked and in neither check.
+MB_STAGE1=1 MB_SERIES_INDEX=1 STUB_SERIES_HELP=both STUB_SERIES_DECLINED_ENTRY=mb_selective_job_rate_sum \
+  STUB_HOLDERS_PRUNES_OFF=mb_selective_job_rate_sum STUB_SERIES_MIXED_ENTRY=mb_single_counter_rate run_stage1 si4 cardinality
+expect_rc si4 0
+check "si4: the declined statement mismatches the label check, the mixed one is series_prune_unchecked, the rest are series-checked" 'j("stamps.json")["stage1"]["holders"]["routed_prune_mismatches"] == [{"id": "mb_selective_job_rate_sum", "expected_routed_prunes": 2, "value_holders": 2, "routed_pruned_by_label_index": [3]}] and j("stamps.json")["stage1"]["holders"]["routed_prune_unchecked_count"] == 0 and j("stamps.json")["stage1"]["holders"]["series_prune_unchecked"] == [{"id": "mb_single_counter_rate", "why": "series_route mixed"}] and j("stamps.json")["stage1"]["holders"]["series_prune_mismatches_count"] == 0 and j("stamps.json")["stage1"]["holders"]["series_prune_records_checked"] == len('"${CORPUS_IDS}"') - 2 and j("stamps.json")["stage1"]["holders"]["series_route_records"] == {"answered": len('"${CORPUS_IDS}"') - 2, "declined": 1, "mixed": 1}'
+
+# si5 to si9: refusals. Without MB_STAGE1, or with a value other than 1 or 0,
+# the usage is refused before anything runs.
+MB_SERIES_INDEX=1 STUB_SERIES_HELP=both run_stage1 si5 ci
+expect_rc si5 64
+expect_err "si5: the refusal names MB_STAGE1=1" "MB_SERIES_INDEX=1 routes the Stage 1 passes through the metrics series index and needs MB_STAGE1=1"
+expect_no_log "si5: nothing brought up" "docker-env up "
+MB_STAGE1=1 MB_SERIES_INDEX=yes STUB_SERIES_HELP=both run_stage1 si6 ci
+expect_rc si6 64
+expect_err "si6: the refusal names the value" "MB_SERIES_INDEX takes 1 (on) or 0 (off), got 'yes'"
+expect_no_log "si6: nothing brought up" "docker-env up "
+# A binary whose help lacks its series flag fails stage1-flags before up.
+for help in none:server cli:server server:cli; do
+  case_name="si-help-${help%%:*}"
+  missing="${help##*:}"
+  if [ "${missing}" = server ]; then
+    want="refused: MB_SERIES_INDEX=1 needs --fold-metrics-series-index, and ravel-server --help in ${IMAGE} does not list it; see ${TMP}/${case_name}/out/stage1-flags.server.help.txt"
+  else
+    want="refused: MB_SERIES_INDEX=1 needs --metrics-series-index, and ravel-cli catalog fold --help in ${IMAGE} does not list it; see ${TMP}/${case_name}/out/stage1-flags.cli.help.txt"
+  fi
+  MB_STAGE1=1 MB_SERIES_INDEX=1 STUB_SERIES_HELP="${help%%:*}" run_stage1 "${case_name}" ci
+  expect_rc "${case_name}" 70
+  check "${case_name}: stage1-flags named, stage1.series_index says which flag the ${missing} help lacks" 'j("stamps.json")["failed_step"] == "stage1-flags" and j("stamps.json")["stage1"]["series_index"] == "'"${want}"'" and "stage1-flags" not in j("stamps.json")["steps_completed"]'
+  expect_err "${case_name}: the refusal names the flag and the help file" "${want}"
+  expect_no_log "${case_name}: nothing brought up" "docker-env up "
+done
+
+# si7: the Ravel-only shape: up takes the routed flags, the series flag
+# included, and both of its folds pass --metrics-series-index.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 MB_SERIES_INDEX=1 STUB_SERIES_HELP=both run_stage1 si7 history --ravel-only
+expect_rc si7 0
+expect_log "si7: up runs ravel-server with the series flag" "docker-env up RAVEL_SERVER_EXTRA_FLAGS=--fold-key-index-leaves --fold-metrics-series-index"
+if [ "$(grep -c '^docker compose .* catalog fold .* --writers-stopped --key-index-leaves --metrics-series-index --json$' "${LOG}")" -eq 2 ] &&
+  [ "$(grep -c '^docker compose .* catalog fold ' "${LOG}")" -eq 2 ]; then
+  pass "si7: both Ravel-only folds pass --metrics-series-index"
+else
+  fail "si7: the Ravel-only folds are not the two with --metrics-series-index: $(grep '^docker compose .* catalog fold ' "${LOG}")"
+fi
+
+# si8: the switch off on an image that lists the series flags: no series flag
+# anywhere, no series stamp, and the holders stamp and stage1-compare.json
+# equal case z's (the same profile and stubs, the switch unset there too).
+MB_STAGE1=1 MB_SERIES_INDEX=0 STUB_SERIES_HELP=both run_stage1 si8 cardinality
+expect_rc si8 0
+expect_no_log "si8: no server series flag" "--fold-metrics-series-index"
+expect_no_log "si8: no fold series flag" "--metrics-series-index"
+check "si8: no series stamp, step or holders field" '"series_index" not in j("stamps.json")["stage1"] and "series_index" not in j("stamps.json")["stage1"]["leaves"] and "stage1-leaves-series" not in j("stamps.json")["steps_completed"] and not any(k.startswith("series") and k != "series_total" for k in j("stamps.json")["stage1"]["holders"]) and not any(k.startswith("series") for s in j("stamps.json")["stage1"]["holders"]["statements"] for k in s)'
+check "si8: the holders stamp and stage1-compare.json equal case z's" 'j("stamps.json")["stage1"]["holders"] == j("'"${TMP}/z/out/stamps.json"'")["stage1"]["holders"] and j("stage1-compare.json") == j("'"${TMP}/z/out/stage1-compare.json"'")'
+OUT="${TMP}/z/out"
+LOG="${TMP}/z/calls.log"
+expect_no_log "si8 (z's run): the switch unset passes no series flag" "series-index"
+
+# si10: a rebuild report without a whole series_index_parts_over_cap fails
+# stage1-leaves-series before the routed pass.
+MB_STAGE1=1 MB_SERIES_INDEX=1 STUB_SERIES_HELP=both STUB_SERIES_PARTS_OVER_CAP=null run_stage1 si10 ci
+expect_rc si10 70
+check "si10: stage1-leaves-series named, its stamp says what the report lacks, no routed pass" 'j("stamps.json")["failed_step"] == "stage1-leaves-series" and j("stamps.json")["stage1"]["leaves"]["series_index"] == "failed: stage1-leaves.json has no whole series_index_parts_over_cap" and "stage1-leaves" in j("stamps.json")["steps_completed"] and "stage1-routed" not in j("stamps.json")["steps_completed"]'
+
 # --- z: stage1-check.sh ------------------------------------------------------------------
 CHECK="${HERE}/../stage1-check.sh"
 CI_BANDS="${HERE}/../stage1-bands.ci.json"
@@ -4398,6 +4613,37 @@ for c in za zn; do
     fail "check cardinality ${c}: exit ${rc}, stderr $(cat "${CHECK_ERR}")"
   fi
 done
+
+# The series band file (ADR-4146 A1 and A6, predicted). si9 is si1 with
+# mb_single_counter_rate given A1's figures: 141 series holders, 4 token-only
+# objects and 145 objects opened, so every figure is in band.
+SERIES_BANDS="${HERE}/../stage1-bands.series.cardinality.json"
+SERIES_FIGURES="$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["figures"]))' "${SERIES_BANDS}")"
+cat >"${TMP}/run-series-a1.json" <<'JSON'
+{"holders": {"report": {},
+             "statements": {"mb_single_counter_rate": {"series_holders": 141, "token_only_fetched": 4}}},
+ "records": {"folded-routed": {"mb_single_counter_rate": {"segmentsFetched": 145}}}}
+JSON
+MB_STAGE1=1 MB_SERIES_INDEX=1 STUB_SERIES_HELP=both STUB_RUN_FIGURES="${TMP}/run-series-a1.json" run_stage1 si9 cardinality
+expect_rc si9 0
+run_check series-clean "${SERIES_BANDS}" "${TMP}/si9/out"
+if [ "${rc}" -eq 0 ] && [ "${SERIES_FIGURES}" -eq 9 ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq "${SERIES_FIGURES}" ] &&
+  grep -qxF 'ok holders_series_prune_mismatches = 0 in [0, 0] (stamps.json stage1.holders.series_prune_mismatches_count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok holders_series_single_counter_rate_series_holders = 141 in [139, 143] (holders.json statements[id=mb_single_counter_rate].series_holders)' "${CHECK_OUT}" &&
+  grep -qxF 'ok holders_series_single_counter_rate_opened_minus_expected = 0 in [0, 0] (stamps.json stage1.holders.statements[id=mb_single_counter_rate].series_opened_minus_expected)' "${CHECK_OUT}" &&
+  grep -qxF 'ok leaves_series_index_parts_over_cap = 0 in [0, 0] (stamps.json stage1.leaves.series_index.series_index_parts_over_cap)' "${CHECK_OUT}"; then
+  pass "check series: every one of the ${SERIES_FIGURES} figures in band on a run with A1's figures"
+else
+  fail "check series: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
+fi
+# si3's mismatching statement fails the exact prune band.
+run_check series-mismatch "${SERIES_BANDS}" "${TMP}/si3/out"
+expect_rc series-mismatch 1
+expect_check_err "check series si3: the series prune mismatch is out of band" 'out of band holders_series_prune_mismatches = 1 not in [0, 0] (stamps.json stage1.holders.series_prune_mismatches_count)'
+# A run with the switch off carries none of the figures.
+run_check series-off "${SERIES_BANDS}" "${TMP}/si8/out"
+expect_rc series-off 1
+expect_check_err "check series si8: the switch off leaves the series figures missing" 'missing holders_series_prune_mismatches: no series_prune_mismatches_count in stage1.holders (stamps.json stage1.holders.series_prune_mismatches_count)'
 
 # The arms' bands: every figure in band on case za's run, every arm on, but
 # the reference prune band, n/a since the extra-hour and l1 arms changed the

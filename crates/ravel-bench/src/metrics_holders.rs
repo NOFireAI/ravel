@@ -46,6 +46,19 @@
 //! fewer prunes than expected, never as more. Both are `None` for a statement
 //! that is not `route_bound`.
 //!
+//! `series_holders` is the series route's bound (ADR-4146). Of the same
+//! resolved set, it counts the objects holding a series whose stored labels
+//! carry, for at least one selector, the selector's metric name and every
+//! `label="value"` pair: the route intersects those pairs' series postings
+//! and keeps the objects whose series class names them. It reads no `!=`,
+//! `=~` or `!~` matcher, so it is not `holders`, and an object holding
+//! `job="api"` on one series and `code="500"` on another is not a series
+//! holder of `{job="api",code="500"}`, so it is not `value_holders` either.
+//! `expected_series_prunes` is the resolved set's size minus
+//! `series_holders`, the `segmentsPrunedBySeriesIndex` a routed pass reports
+//! when the series route answers it on every part. Both are `None` for a
+//! statement that is not `route_bound`.
+//!
 //! `segments_in_window` counts every object in the window, whatever metrics it
 //! holds. It is not what an unrouted query fetches: Ravel's resolve also
 //! prunes by name postings when every selector of the statement names the same
@@ -110,7 +123,11 @@ pub const HOLDERS_METHOD: &str = "the data objects the folded snapshot names (L0
      (read with label_dict_strings, compared as text) hold, for at least one selector, its \
      metric name and every value of its label=\"value\" matchers, and expected_routed_prunes is \
      the resolved set's size minus value_holders (named_in_window - value_holders for one \
-     selector), both null unless route_bound; route_bound is false when a selector has no \
+     selector), both null unless route_bound; series_holders, the series route's bound \
+     (ADR-4146), counts the resolved set's objects holding a series whose stored labels carry, \
+     for at least one selector, its metric name and every label=\"value\" pair, and \
+     expected_series_prunes is the resolved set's size minus series_holders, both null unless \
+     route_bound; route_bound is false when a selector has no \
      qualifying matcher, since the router then probes only that selector's metric name";
 
 /// The footer section kind of LABEL_DICT (docs/segment-format.md).
@@ -181,6 +198,15 @@ pub struct HolderCount {
     /// `segmentsPrunedByLabelIndex` a routed pass reports. `None` unless
     /// `route_bound`.
     pub expected_routed_prunes: Option<u64>,
+    /// Objects of the resolved set holding a series whose labels carry, for
+    /// at least one selector, its metric name and every positive equality
+    /// pair: the series route's bound (ADR-4146). `None` unless
+    /// `route_bound`.
+    pub series_holders: Option<u64>,
+    /// The resolved set's size minus `series_holders`: the
+    /// `segmentsPrunedBySeriesIndex` a pass the series route answers on every
+    /// part reports. `None` unless `route_bound`.
+    pub expected_series_prunes: Option<u64>,
     /// Every selector has a qualifying matcher, so the engine routes the
     /// statement and `value_holders` bounds what a routed pass opens.
     pub route_bound: bool,
@@ -313,6 +339,7 @@ struct Tally {
     holders: u64,
     token_only: u64,
     value_holders: u64,
+    series_holders: u64,
 }
 
 impl Tally {
@@ -424,6 +451,7 @@ where
                 holders: 0,
                 token_only: 0,
                 value_holders: 0,
+                series_holders: 0,
             }),
             Ok(None) => skipped.push(skip("no metric selector".to_string())),
             Err(reason) => skipped.push(skip(format!(
@@ -455,6 +483,7 @@ where
     let mut in_window = vec![false; tallies.len()];
     let mut named = vec![false; tallies.len()];
     let mut held = vec![false; tallies.len()];
+    let mut series_hit = vec![false; tallies.len()];
     let mut token_matched = vec![false; min_tokens.len()];
     let mut token_objects = Vec::new();
     for object in objects {
@@ -489,6 +518,7 @@ where
         }
         named.iter_mut().for_each(|n| *n = false);
         held.iter_mut().for_each(|h| *h = false);
+        series_hit.iter_mut().for_each(|h| *h = false);
         for series in &catalog {
             let name = series.entry.labels.get("__name__");
             for &t in name
@@ -508,8 +538,17 @@ where
                 .map(|l| (l.name.clone(), l.value.clone()))
                 .collect();
             for &(t, s) in candidates {
-                if in_window[t] && !held[t] && tallies[t].selectors[s].matches(&labels) {
+                let selector = &tallies[t].selectors[s];
+                if in_window[t] && !held[t] && selector.matches(&labels) {
                     held[t] = true;
+                }
+                if !series_hit[t]
+                    && selector
+                        .positive_equalities
+                        .iter()
+                        .all(|p| labels.contains(p))
+                {
+                    series_hit[t] = true;
                 }
             }
         }
@@ -544,6 +583,7 @@ where
                             .all(|(_, value)| strings.contains(value))
                 });
                 tally.value_holders += u64::from(value_held);
+                tally.series_holders += u64::from(series_hit[t]);
             }
         }
     }
@@ -597,6 +637,9 @@ where
                     value_holders: route_bound.then_some(tally.value_holders),
                     expected_routed_prunes: route_bound
                         .then(|| resolved.saturating_sub(tally.value_holders)),
+                    series_holders: route_bound.then_some(tally.series_holders),
+                    expected_series_prunes: route_bound
+                        .then(|| resolved.saturating_sub(tally.series_holders)),
                     route_bound,
                     route_bound_reason: tally.route_unbound,
                 }
@@ -779,6 +822,24 @@ mod tests {
         assert_eq!(
             counts,
             [("eq_and_ne", 3, 1), ("eq_only", 3, 2), ("eq_range", 3, 2)]
+        );
+        // The series route reads `job="api"` alone: `b`'s code 500 series
+        // makes it a series holder of eq_and_ne though not a holder. Every
+        // statement is name-pruned and all three objects in each window hold
+        // http_requests, so the resolved set is 3 and one object (`c`, job
+        // db) is pruned.
+        let series: Vec<(&str, Option<u64>, Option<u64>)> = report
+            .statements
+            .iter()
+            .map(|s| (s.id.as_str(), s.series_holders, s.expected_series_prunes))
+            .collect();
+        assert_eq!(
+            series,
+            [
+                ("eq_and_ne", Some(2), Some(1)),
+                ("eq_only", Some(2), Some(1)),
+                ("eq_range", Some(2), Some(1)),
+            ]
         );
         assert_eq!(
             report.statements[0].positive_equalities,
@@ -1399,6 +1460,135 @@ mod tests {
                 ("cross", 0, Some(1), Some(2), 2),
                 ("two_metrics", 3, Some(3), Some(1), 1),
                 ("ratio_unbound", 2, None, None, 0),
+            ]
+        );
+    }
+
+    /// `series_holders` and `expected_series_prunes` against a routed pass on
+    /// a snapshot folded with the metrics series index, over the objects of
+    /// the label-index test: `API_200`, `WEB_500`, `SPLIT` (`job="api"` and
+    /// `code="500"` on different series) and `other_metric`. For `cross` no
+    /// object holds a series carrying both pairs, so series_holders is 0 and
+    /// all 3 objects holding http_requests are pruned, where the label route
+    /// keeps `SPLIT` (value_holders 1, 2 prunes). Every prune is counted
+    /// under `segmentsPrunedBySeriesIndex` and none under the label index,
+    /// since the series route answers each routed plan on the one part. For
+    /// `ratio_unbound` it answers the routed selector's plan, yet the
+    /// unrouted `sum(http_requests)` plan keeps every object, so nothing is
+    /// pruned: an answered pair alone does not make a statement's prunes
+    /// comparable, `route_bound` does.
+    #[tokio::test]
+    async fn expected_series_prunes_is_what_the_series_route_prunes() {
+        use std::time::Duration;
+
+        const API_200: &[&[(&str, &str)]] = &[&[("job", "api"), ("code", "200")]];
+        const WEB_500: &[&[(&str, &str)]] = &[&[("job", "web"), ("code", "500")]];
+        const SPLIT: &[&[(&str, &str)]] = &[
+            &[("job", "api"), ("code", "200")],
+            &[("job", "web"), ("code", "500")],
+        ];
+        let ts_ns = fixture_newest_ns() - MIN;
+        let fixture = folded_fixture(
+            &[
+                FixtureObject {
+                    metric: "http_requests",
+                    series: API_200,
+                    ts_ns,
+                },
+                FixtureObject {
+                    metric: "http_requests",
+                    series: WEB_500,
+                    ts_ns,
+                },
+                FixtureObject {
+                    metric: "http_requests",
+                    series: SPLIT,
+                    ts_ns,
+                },
+                FixtureObject {
+                    metric: "other_metric",
+                    series: API,
+                    ts_ns,
+                },
+            ],
+            ravel_catalog::CatalogConfig {
+                build_key_index_leaves: true,
+                metrics_label_index: true,
+                metrics_label_index_max_ratio_ppm: 100_000_000,
+                metrics_series_index: true,
+                metrics_series_index_max_ratio_ppm: 100_000_000,
+                ..ravel_catalog::CatalogConfig::default()
+            },
+        )
+        .await;
+        let corpus = vec![
+            entry("eq_only", r#"http_requests{job="api"}"#),
+            entry("cross", r#"http_requests{job="api",code="500"}"#),
+            entry(
+                "two_metrics",
+                r#"http_requests{job="web"} / other_metric{job="api"}"#,
+            ),
+            entry(
+                "ratio_unbound",
+                r#"sum(http_requests{job="api"}) / sum(http_requests)"#,
+            ),
+        ];
+        let grid = QueryGrid {
+            newest_ms: fixture.newest_ns / 1_000_000,
+            ..grid()
+        };
+        let report = count_holders(
+            &corpus,
+            "ci",
+            &grid,
+            &[],
+            fixture.objects.into_iter().map(Ok),
+        )
+        .expect("counts");
+        type Figures<'a> = (
+            &'a str,
+            Option<u64>,
+            Option<u64>,
+            Option<u64>,
+            u64,
+            u64,
+            u64,
+        );
+        let mut figures: Vec<Figures> = Vec::new();
+        for statement in &report.statements {
+            let (_, stats) = fixture
+                .engine
+                .instant_with_stats(
+                    fixture.tenant,
+                    &statement.promql,
+                    grid.newest_ms,
+                    &[],
+                    fixture.now,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("query");
+            let answered = stats
+                .series_index
+                .as_ref()
+                .map_or(0, |s| s.plan_parts_answered);
+            figures.push((
+                statement.id.as_str(),
+                statement.value_holders,
+                statement.series_holders,
+                statement.expected_series_prunes,
+                stats.segments_pruned_by_series_index,
+                stats.segments_pruned_by_label_index,
+                answered,
+            ));
+        }
+        assert_eq!(
+            figures,
+            [
+                ("eq_only", Some(2), Some(2), Some(1), 1, 0, 1),
+                ("cross", Some(1), Some(0), Some(3), 3, 0, 1),
+                ("two_metrics", Some(3), Some(3), Some(1), 1, 0, 2),
+                ("ratio_unbound", None, None, None, 0, 0, 1),
             ]
         );
     }
