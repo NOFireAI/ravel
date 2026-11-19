@@ -1253,6 +1253,11 @@ impl FlushCtx {
         deadline_ns: i64,
         grant: &PublishGrant,
     ) -> Result<(), PutAbort> {
+        // The flush answers it as a data PUT that exhausted its retries,
+        // with no store call issued.
+        if ravel_invariant::inv_fault!("ingest/data-put-refused") {
+            return Err(PutAbort::Exhausted);
+        }
         let mut attempt: u32 = 0;
         loop {
             grant
