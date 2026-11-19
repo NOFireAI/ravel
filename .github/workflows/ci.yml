@@ -3144,6 +3144,58 @@ jobs:
         with:
           phase: report
 
+  # The same features for ravel-server and ravel-cli (scripts/gates.sh's
+  # `invariants-services` lane, issue #4487). Both carry assertion sites and
+  # tests whose expectations depend on them (a fold's GET budget counts the
+  # HEAD re-read an evaluated site issues, #4485), and no other job builds
+  # them with these features. A job of its own so the `invariants` job's
+  # runtime is unchanged: ravel-cli's dev-dependency turns on ravel-server's
+  # `sql` feature, so this builds the SQL engine and links every test binary
+  # of both crates, the size of `sql-shard`'s endpoint suite plus ravel-cli.
+  # nextest runs those binaries in parallel where `cargo test` runs them one
+  # at a time; it runs no doctests, and neither crate's doctests depend on
+  # these features.
+  invariants-services:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    # 60m (provisional): not a measurement. The cache is saved only on main,
+    # so every run before the first main run builds cold. Tighten it once
+    # warm runs supply a figure.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
+      - uses: ./.github/actions/free-disk-space
+        with:
+          background: "true"
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main, as in `features-otap`
+          # (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Names the cargo profile, as in `sql-shard` above.
+          key: ci-profile
+      - name: Clippy ravel-server and ravel-cli with capture and mutants
+        run: cargo clippy --locked --profile ci -p ravel-server -p ravel-cli --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --all-targets -- -D warnings
+      - name: Test ravel-server and ravel-cli with capture and mutants
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-server -p ravel-cli --features ravel-invariant/capture,ravel-invariant/antithesis-mutants
+      - name: Report the lowest free space the job reached
+        if: always()
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
+
   # Builds the root Dockerfile's two shipping images (`server` and `operator`)
   # to prove the images the project actually ships still build. No other job
   # runs this

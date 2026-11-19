@@ -31,7 +31,12 @@ connection, a pushed-but-broken main).
   `agents` and `mcp` when `ravel-server` is in the closure, `flight-sql`
   when `ravel-sql` or `ravel-server` is, and `esql` when `ravel-esql`,
   `ravel-sql` or `ravel-server` is; the agents lane's page-size-2 run
-  follows `ravel-agents-runtime` or `ravel-agents-sim`. In workspace mode it also runs
+  follows `ravel-agents-runtime` or `ravel-agents-sim`. The `invariants`
+  lane (`--features ravel-invariant/capture,ravel-invariant/antithesis-mutants`)
+  runs when `ravel-invariant`, `ravel-commit`, `ravel-ingest`,
+  `ravel-catalog`, `ravel-maintain` or `ravel-fleet` is in the closure, and
+  the `invariants-services` lane, the same features for `ravel-server` and
+  `ravel-cli`, when either of those is. In workspace mode it also runs
   `scripts/gates-sdk.sh` (node 22; `RAVEL_GATES_SKIP_SDK=1` skips it).
   That is `--tier merge`, the default and the merge gate.
   `--tier executor -p CRATE` is the executor's gate in fleet specs: fmt
