@@ -104,6 +104,18 @@ compaction record is seen the workload jumps the clock twice more.
 | `check_bounds` | The upper-bound check below, on one node. |
 | `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs up to six fold races until a server fold lost its CAS, up to five record races until a server's record PUT lost, the unfolded-record sweep unless one already reached its situation, and the unreadable-HEAD sweep, then folds, compacts, audits, takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, runs the full multiset check and ends the timeline. |
 
+The forced eventually runs inside the state machine, like a drawn one: once
+`WORKLOAD_EVENTUALLY_AFTER_SECS` passes, the timer only sets a flag, and the
+next rule to start runs the eventually from its Hegel worker. The timer runs
+it itself only if no rule has started it 600 s later, when the machine has
+ended. Once faults stop, every rule halts its thread for good instead of
+returning, and the process ends through the eventually's exit. A rule that
+returned would let Hegel's concurrent engine finish the round and schedule
+the next one, every rule a no-op, recording each step as fast as four
+workers ask for rules: the driver grew at about 240 MB/s until it was
+OOM-killed. A started flag makes the eventually exclusive, so a drawn and a
+forced one never both run.
+
 ### The multiset checks
 
 A no-token SQL scan's freshness is bounded by listing, and a commit landing

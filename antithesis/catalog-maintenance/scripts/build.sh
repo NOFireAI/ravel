@@ -17,7 +17,12 @@ case "${MUTANTS:-}" in
         FEATURES=sql,antithesis
         ;;
     1)
-        TAG="${TAG:-catalog-maintenance-mutants}"
+        # launch.sh, local-run.sh and mutant-config.sh all name this tag.
+        if [ -n "${TAG:-}" ]; then
+            echo "refused: TAG cannot be set with MUTANTS=1; the mutant images are always tagged catalog-maintenance-mutants" >&2
+            exit 1
+        fi
+        TAG=catalog-maintenance-mutants
         FEATURES=sql,antithesis,antithesis-mutants
         ;;
     *)
