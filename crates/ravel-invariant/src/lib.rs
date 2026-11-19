@@ -848,6 +848,19 @@ pub mod fault {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    // Every test here that makes a fault fire holds this lock: the capture
+    // record is one per process, and `every_fault_records_its_firing` counts
+    // the firings in it.
+    #[cfg(any(feature = "antithesis", feature = "capture"))]
+    static FAULT_FIRING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(any(feature = "antithesis", feature = "capture"))]
+    fn fault_firing_lock() -> std::sync::MutexGuard<'static, ()> {
+        FAULT_FIRING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[cfg(not(any(
         feature = "antithesis",
         feature = "capture",
@@ -1045,6 +1058,8 @@ mod tests {
     fn rate_zero_never_fires_and_rate_one_always_fires() {
         use crate::fault::scoped;
 
+        let _firing = fault_firing_lock();
+
         const DRAWS: usize = 10_000;
         let count = || {
             (0..DRAWS)
@@ -1080,6 +1095,7 @@ mod tests {
     fn every_fault_records_its_firing() {
         use crate::capture::{Kind, evaluations_of};
 
+        let _firing = fault_firing_lock();
         for name in crate::fault::FAULTS.iter().copied() {
             let message = format!("fault: {name} fired");
             let before = evaluations_of(&message).len();
@@ -1105,6 +1121,7 @@ mod tests {
 
         use crate::fault::scoped;
 
+        let _firing = fault_firing_lock();
         let both_set = Arc::new(Barrier::new(2));
         let both_read = Arc::new(Barrier::new(2));
         let run = |name: &'static str| {
