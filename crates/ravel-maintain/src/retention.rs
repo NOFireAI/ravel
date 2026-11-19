@@ -315,6 +315,7 @@ pub async fn retention_sweep_bucket_with_reach(
         lease,
         bucket,
         RewriteBound::Unread,
+        &mut 0,
     )
     .await?;
     Ok(outcome)
@@ -382,6 +383,10 @@ pub(crate) struct RewriteBoundRead {
 /// without the read; the scan passes it when it already holds the bucket's
 /// exact expiry. The read only feeds the retention lag, so a failed one falls
 /// back to that same bound and never fails the evaluation.
+///
+/// `deleted` is raised by one for every object the physical sweep deletes
+/// (records, data objects, L1 parts and the tombstone), including deletes made
+/// before the sweep returns an error.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn retention_sweep_bucket_observed(
     reach: &mut SnapshotReachability,
@@ -392,6 +397,7 @@ pub(crate) async fn retention_sweep_bucket_observed(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
     rewrite_bound: RewriteBound<'_>,
+    deleted: &mut usize,
 ) -> Result<(RetentionOutcome, Option<ObservedExpiry>)> {
     let Some(window_ns) = window_ns else {
         return Ok((RetentionOutcome::NoPolicy, None));
@@ -428,7 +434,7 @@ pub(crate) async fn retention_sweep_bucket_observed(
                 version: tombstone_version,
             };
             let outcome = physical_sweep(
-                reach, store, clock, config, lease, bucket, &listing, &anchor,
+                reach, store, clock, config, lease, bucket, &listing, &anchor, deleted,
             )
             .await?;
             return Ok((outcome, expiry));
@@ -528,6 +534,7 @@ pub async fn maintain_bucket_with_reach(
         lease,
         bucket,
         RewriteBound::Unread,
+        &mut 0,
     )
     .await?;
     if let Some(refused) = refused {
@@ -541,7 +548,9 @@ pub async fn maintain_bucket_with_reach(
 /// `rewrite_bound`). A compaction refused for its part-index windows
 /// ([`MaintainError::is_part_index_refusal`]) is returned in the last
 /// element, not as the call's error, so the caller's pass goes on to the
-/// shard's other buckets; the compaction element is `None` then.
+/// shard's other buckets; the compaction element is `None` then. `deleted`
+/// counts the retention physical sweep's deletes as
+/// [`retention_sweep_bucket_observed`] does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn maintain_bucket_observed(
     reach: &mut SnapshotReachability,
@@ -552,6 +561,7 @@ pub(crate) async fn maintain_bucket_observed(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
     rewrite_bound: RewriteBound<'_>,
+    deleted: &mut usize,
 ) -> Result<(
     RetentionOutcome,
     Option<ObservedExpiry>,
@@ -568,6 +578,7 @@ pub(crate) async fn maintain_bucket_observed(
         lease,
         bucket,
         rewrite_bound,
+        deleted,
     )
     .await?;
     let (compaction, acquisition, refused) = match outcome {
@@ -725,6 +736,7 @@ async fn physical_sweep(
     bucket: &Bucket,
     listing: &BucketListing,
     anchor: &MarkerAnchor,
+    deleted: &mut usize,
 ) -> Result<RetentionOutcome> {
     let tombstone_key = anchor.key.as_str();
     let dry_run = config.dry_run;
@@ -910,25 +922,15 @@ async fn physical_sweep(
         None
     };
     let holds_now = holds_now.as_ref();
-    delete_all(store, lease, holds_now, &listing.commit_keys, dry_run).await?;
-    delete_all(
-        store,
-        lease,
-        holds_now,
+    for keys in [
+        &listing.commit_keys,
         &listing.compaction_record_keys,
-        dry_run,
-    )
-    .await?;
-    delete_all(
-        store,
-        lease,
-        holds_now,
         &listing.rewrite_record_keys,
-        dry_run,
-    )
-    .await?;
-    delete_all(store, lease, holds_now, &l0_data_keys, dry_run).await?;
-    delete_all(store, lease, holds_now, &l1_part_keys, dry_run).await?;
+        &l0_data_keys,
+        &l1_part_keys,
+    ] {
+        delete_all(store, lease, holds_now, keys, dry_run, deleted).await?;
+    }
 
     // Verify the bucket is empty before deleting the tombstone: the commit
     // prefix must contain only the tombstone, and the l1/ prefix must be empty.
@@ -952,6 +954,7 @@ async fn physical_sweep(
     }
     if !dry_run {
         store.delete(tombstone_key).await?;
+        *deleted += 1;
         ravel_invariant::inv_reachable!(
             "gc: retention physical sweep delete",
             std::collections::BTreeMap::from([("tombstone_key", tombstone_key.to_string())])
@@ -1148,13 +1151,15 @@ fn protected_sweep_keys<'a>(
 ///
 /// `holds_now` is the tenant's hold set re-read from the store, read only by
 /// the HeldObjectNeverDeleted assertion, which is false for a deleted key it
-/// protects; `None` records nothing.
+/// protects; `None` records nothing. `deleted` is raised by one per delete
+/// the store accepted.
 async fn delete_all(
     store: &dyn ObjectStoreBackend,
     lease: &dyn LeaseCheck,
     holds_now: Option<&crate::legal_hold::LegalHoldCheck>,
     keys: &[String],
     dry_run: bool,
+    deleted: &mut usize,
 ) -> Result<()> {
     for key in keys {
         if lease.is_protected(key) {
@@ -1168,6 +1173,7 @@ async fn delete_all(
                 std::collections::BTreeMap::from([("key", key.clone())])
             );
             store.delete(key).await?;
+            *deleted += 1;
         }
     }
     Ok(())
@@ -1745,6 +1751,7 @@ mod tests {
             &crate::sweep::NoLeases,
             bucket,
             bound,
+            &mut 0,
         )
         .await
     }
@@ -2174,10 +2181,51 @@ mod tests {
             lease,
             bucket,
             RewriteBound::Unread,
+            &mut 0,
         )
         .await
         .expect("retention pass");
         outcome
+    }
+
+    /// The physical sweep counts each object it deletes: the bucket's L1 part
+    /// and its tombstone. Inside the protection horizon nothing is deleted and
+    /// the count stays zero.
+    #[tokio::test]
+    async fn the_physical_sweep_counts_every_object_it_deletes() {
+        let store = MemoryStore::new();
+        let (bucket, _part_key) = put_tombstoned_part(&store, 46).await;
+        let config = CompactorConfig {
+            max_query_duration_ns: 0,
+            head_cache_ttl_ns: 0,
+            clock_skew_allowance_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let past = RETIRED_AT_NS
+            .saturating_add(config.protection_horizon_ns)
+            .saturating_add(1);
+        let before = RETIRED_AT_NS.saturating_add(1);
+        for (now, expected, want) in [
+            (before, RetentionOutcome::Tombstoned, 0),
+            (past, RetentionOutcome::Swept, 2),
+        ] {
+            let mut deleted = 0;
+            let (outcome, _expiry) = retention_sweep_bucket_observed(
+                &mut SnapshotReachability::new(),
+                &store,
+                &crate::clock::FixedClock::new(now),
+                &config,
+                Some(WINDOW_NS),
+                &crate::NoLeases,
+                &bucket,
+                RewriteBound::Unread,
+                &mut deleted,
+            )
+            .await
+            .expect("retention pass");
+            assert_eq!(outcome, expected);
+            assert_eq!(deleted, want, "objects deleted at {now}");
+        }
     }
 
     /// Retention under a real hold snapshot: the held bucket's part is skipped

@@ -2202,6 +2202,7 @@ pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
         total.l0_records_pending += report.l0_records_pending;
         total.lag_bound_gets += report.lag_bound_gets;
         total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
+        total.retention_objects_deleted += report.retention_objects_deleted;
     }
 
     // Prune stall history to exactly this cycle's owned set (ADR-0065
@@ -2907,6 +2908,8 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                     total.l0_records_pending += report.l0_records_pending;
                     total.lag_bound_gets += report.lag_bound_gets;
                     total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
+                    total.retention_objects_deleted += report.retention_objects_deleted;
+                    deleted += report.retention_objects_deleted;
                 }
                 Some(Err(MaintainError::ConservationViolation {
                     input_sample_count,
@@ -3224,8 +3227,6 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
         deleted += run_alert_retention(store, clock, compactor, &hold, tenant, safety).await;
     }
 
-    // Retention's physical sweep inside `scan_and_maintain_with_memo` reports
-    // retired buckets, not deleted objects, so its deletes are not in `deleted`.
     assert_refresh_failure_never_sweeps(tenant, refresh_ok, deleted);
     total
 }
@@ -3243,7 +3244,12 @@ fn sweep_report_deletes(report: &ravel_maintain::SweepReport) -> usize {
 
 /// RefreshFailureNeverSweeps (ADR-4326 lifecycle): a tick whose hold refresh
 /// failed deletes nothing. `refresh_ok` is the refresh store call's own result
-/// and `deleted` the objects the tick's sweeps reported deleting.
+/// and `deleted` the objects the tick's sweeps reported deleting, retention's
+/// physical sweep included.
+///
+/// A sweep or scan pass that returns an error reports no counts, so objects it
+/// deleted before the error are not in `deleted`: a tick that deletes under a
+/// failed refresh and then fails in the same pass is not seen here.
 fn assert_refresh_failure_never_sweeps(_tenant: &TenantHash, _refresh_ok: bool, _deleted: usize) {
     ravel_invariant::inv_always!(
         _refresh_ok || _deleted == 0,
@@ -11037,6 +11043,163 @@ mod tests {
             observed.superseded_data_deleted, 2,
             "the mutant sweeps both inputs under the failed refresh"
         );
+        assert!(
+            observed.evaluations.iter().any(|(held, _)| !held),
+            "RefreshFailureNeverSweeps must evaluate false under the mutant: {:?}",
+            observed.evaluations
+        );
+    }
+
+    /// What [`retention_tick_under_a_failed_refresh`] observed.
+    struct FailedRefreshRetentionTick {
+        /// Tick 2's report.
+        report: MaintainReport,
+        /// Commit records, data objects and tombstones left in the bucket's
+        /// shard after tick 2.
+        surviving: usize,
+        /// Hold-shard LISTs the fault refused in tick 2.
+        refresh_faults: u64,
+        /// Captured `RefreshFailureNeverSweeps` evaluations for the tenant.
+        evaluations: Vec<(bool, String)>,
+    }
+
+    /// Tick 1 tombstones one expired hour-0 bucket under a zero protection
+    /// horizon and a zero pinned-query window; tick 2, whose only deletable
+    /// work is that bucket's physical sweep, runs over a `FaultStore` that
+    /// fails every LIST of the audit hold shard's commit prefix, so its hold
+    /// refresh fails.
+    async fn retention_tick_under_a_failed_refresh(
+        tenant_name: &str,
+    ) -> FailedRefreshRetentionTick {
+        let tenant_id = TenantId::new(tenant_name);
+        let tenant = tenant_id.hash();
+        let mem = std::sync::Arc::new(MemoryStore::new());
+        publish_terminal_bucket(mem.as_ref(), &tenant_id).await;
+        let compactor = CompactorConfig {
+            protection_horizon_ns: 0,
+            max_query_duration_ns: 0,
+            head_cache_ttl_ns: 0,
+            clock_skew_allowance_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let max_ingest_lag_ns = ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
+        let floor_ns = compactor.retention_floor_ns(max_ingest_lag_ns);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(floor_ns),
+                tenants: Vec::new(),
+            },
+            &compactor,
+            max_ingest_lag_ns,
+        )
+        .expect("valid retention policy");
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        let live = worker.solo_live_set();
+
+        let first = run_tick(
+            mem.as_ref(),
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &live,
+        )
+        .await;
+        assert_eq!(first.retired, 1, "tick 1 tombstones the expired bucket");
+        assert_eq!(first.retention_objects_deleted, 0, "tick 1 deletes nothing");
+
+        let hold_prefix = keys::commit_shard_prefix(&tenant, Signal::Audit, AUDIT_HOLD_SHARD)
+            .expect("valid audit hold shard prefix");
+        let store = FaultStore::new(
+            std::sync::Arc::clone(&mem),
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("hold shard unavailable".into()),
+                )
+                .with_key_contains(hold_prefix),
+            ),
+        );
+        let report = run_tick(
+            &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &ownership, &worker,
+            &live,
+        )
+        .await;
+
+        let commit_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid commit shard prefix");
+        let l0_prefix = &shard_hold_scopes(&tenant, Signal::Metrics, 0).expect("scopes")[0];
+        let surviving = list_all(mem.as_ref(), &commit_prefix)
+            .await
+            .expect("list commit prefix")
+            .len()
+            + list_all(mem.as_ref(), l0_prefix)
+                .await
+                .expect("list l0 prefix")
+                .len();
+        FailedRefreshRetentionTick {
+            report,
+            surviving,
+            refresh_faults: store
+                .fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient),
+            evaluations: captured(REFRESH_FAILURE_SWEEPS_NOTHING, &tenant.to_hex()),
+        }
+    }
+
+    /// RefreshFailureNeverSweeps, shipped arm, over retention's physical
+    /// sweep: a failed hold refresh skips the tick, the expired bucket
+    /// survives, and the property is evaluated and never false.
+    #[tokio::test]
+    async fn a_failed_hold_refresh_never_sweeps_an_expired_bucket() {
+        let observed = retention_tick_under_a_failed_refresh("retention-refresh-default").await;
+        assert_eq!(
+            observed.refresh_faults, 1,
+            "the hold refresh LIST really faulted"
+        );
+        assert_eq!(observed.report, MaintainReport::default(), "tick 2 skipped");
+        assert_eq!(
+            observed.surviving, 3,
+            "the commit record, data object and tombstone survive"
+        );
+        if ravel_invariant::EVALUATES {
+            assert!(
+                !observed.evaluations.is_empty(),
+                "the property is evaluated on the skipped tick"
+            );
+            assert!(
+                observed.evaluations.iter().all(|(held, _)| *held),
+                "RefreshFailureNeverSweeps never evaluates false on the shipped skip: {:?}",
+                observed.evaluations
+            );
+        }
+    }
+
+    /// RefreshFailureNeverSweeps, mutant arm, over retention's physical
+    /// sweep: with `lifecycle/refresh-failure-is-no-hold` selected the tick
+    /// sweeps the expired bucket under the failed refresh, the tick counts
+    /// the sweep's deletes, and the property evaluates false.
+    #[tokio::test]
+    async fn refresh_failure_is_no_hold_mutant_trips_on_a_retention_sweep() {
+        let Some(_mutant) = scoped_lifecycle_mutant("lifecycle/refresh-failure-is-no-hold") else {
+            return;
+        };
+        let observed = retention_tick_under_a_failed_refresh("retention-refresh-mutant").await;
+        assert!(
+            observed.refresh_faults >= 1,
+            "the hold refresh LIST really faulted"
+        );
+        assert_eq!(
+            observed.report.retention_objects_deleted, 3,
+            "the sweep deletes the commit record, the data object and the tombstone"
+        );
+        assert_eq!(observed.surviving, 0, "the bucket is gone");
         assert!(
             observed.evaluations.iter().any(|(held, _)| !held),
             "RefreshFailureNeverSweeps must evaluate false under the mutant: {:?}",
