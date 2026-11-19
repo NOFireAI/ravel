@@ -1362,3 +1362,99 @@ async fn token_in_a_tombstoned_bucket_without_the_check_is_added() {
         }
     );
 }
+
+/// The swept-record twin of
+/// `token_beside_an_input_its_live_rewrite_replaced_adds_its_own_input`
+/// (issue #4428). HEAD folded before rewrite R landed, so HEAD still names
+/// `held` (M's raw object, or a compaction part of M), an input R replaced.
+/// P's commit record and data object have since been swept: R superseded P
+/// and HEAD never named it. The token's rows now live only in R's part,
+/// which also carries M's surviving rows, so a snapshot that adds R's part
+/// beside `held` serves M's rows twice.
+///
+/// A correct answer serves every surviving row exactly once: R's part
+/// without `held`, or a refusal. It never holds both.
+async fn swept_token_beside_an_input_its_live_rewrite_replaced(compacted_m: bool) {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let p = l0(Signal::Logs, 1, HOUR, start, L_ROWS);
+    let m = l0(Signal::Logs, 2, HOUR, start + 2_000_000, M_ROWS);
+    put_l0(store.as_ref(), &p).await;
+    put_l0(store.as_ref(), &m).await;
+    let held = if compacted_m {
+        let mut c = compaction(Signal::Logs, &[&m], 0x11, 0xc1, M_ROWS);
+        c.parts[0].min_event_ts_ns = m.min_event_ts_ns;
+        c.parts[0].max_event_ts_ns = m.max_event_ts_ns;
+        put_compaction(store.as_ref(), &c).await;
+        part_key(&c)
+    } else {
+        l0_key(&m)
+    };
+    fold_hour(&store, Signal::Logs).await;
+    let request_id = Uuid::from_u128(0xd4428);
+    put_dreq(store.as_ref(), Signal::Logs, request_id).await;
+    let rw = put_rewrite(
+        store.as_ref(),
+        Signal::Logs,
+        &[&p, &m],
+        request_id,
+        start,
+        L_ROWS + M_ROWS - 1,
+    )
+    .await;
+    store
+        .delete(&keys::commit_key_for_record(&p).expect("commit key"))
+        .await
+        .expect("sweep P's commit record");
+    store
+        .delete(&l0_key(&p))
+        .await
+        .expect("sweep P's data object");
+
+    let window = (late_window().0, sealed_window().1);
+    let (plain, _) = resolve_counted(&store, Signal::Logs, window, &[]).await;
+    assert_eq!(sorted_keys(&plain), vec![held.clone()], "HEAD is stale");
+
+    let answer = catalog(&store)
+        .resolve_with_accounting(
+            &tenant(),
+            Signal::Logs,
+            window.0,
+            &[token(&p)],
+            window.1,
+            &QueryAccounting::new(),
+        )
+        .await;
+    let Ok(snapshot) = answer else {
+        // A refusal is a correct answer to a state the resolver cannot serve
+        // exactly once; it must never be a successful double count.
+        return;
+    };
+    let keys = sorted_keys(&snapshot);
+    assert!(
+        !(keys.contains(&held) && keys.contains(&rewrite_part_key(&rw))),
+        "R's part beside an input R replaced serves M's rows twice: {keys:?}, rows {}",
+        rows(&snapshot)
+    );
+    assert!(
+        keys.contains(&rewrite_part_key(&rw)),
+        "the token's surviving rows live only in R's part once P is swept: {keys:?}"
+    );
+    assert_eq!(
+        rows(&snapshot),
+        L_ROWS + M_ROWS - 1,
+        "every surviving row counted once"
+    );
+}
+
+#[tokio::test]
+#[ignore = "suspected defect #4428: the swept-token fallback adds a live rewrite's part beside an input it replaced"]
+async fn swept_token_beside_a_raw_input_its_live_rewrite_replaced() {
+    swept_token_beside_an_input_its_live_rewrite_replaced(false).await;
+}
+
+#[tokio::test]
+#[ignore = "suspected defect #4428: the swept-token fallback adds a live rewrite's part beside an input it replaced"]
+async fn swept_token_beside_a_compaction_its_live_rewrite_replaced() {
+    swept_token_beside_an_input_its_live_rewrite_replaced(true).await;
+}
