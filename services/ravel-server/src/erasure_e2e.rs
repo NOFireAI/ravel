@@ -742,6 +742,498 @@ async fn metrics_erasure_reaches_query_cache_rewrite_and_physical_absence() {
     }
 }
 
+/// Selects mutant `name` on this thread until the returned guard drops;
+/// `None` outside the invariants build, where no mutant is compiled in (the
+/// `inv_sometimes!` body, and so the reference to `ravel_invariant::mutant`,
+/// is dropped without the feature).
+fn scoped_mutant(name: &'static str) -> Option<Box<dyn std::any::Any>> {
+    let guard: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = Default::default();
+    let _ = name;
+    ravel_invariant::inv_sometimes!(
+        {
+            let scoped = ravel_invariant::mutant::scoped(name).expect("a registered mutant");
+            *guard.borrow_mut() = Some(Box::new(scoped) as Box<dyn std::any::Any>);
+            true
+        },
+        "ravel-server test: a mutant is scoped",
+        ""
+    );
+    guard.into_inner()
+}
+
+/// `(is_violation, details)` of every captured evaluation of `message`; empty
+/// outside the invariants build.
+fn captured_evaluations(message: &'static str) -> Vec<(bool, String)> {
+    let found = std::cell::RefCell::new(Vec::new());
+    let _ = message;
+    ravel_invariant::inv_sometimes!(
+        {
+            found.borrow_mut().extend(
+                ravel_invariant::capture::evaluations_of(message)
+                    .into_iter()
+                    .map(|e| (e.is_violation(), e.details)),
+            );
+            true
+        },
+        "ravel-server test: evaluations are read",
+        ""
+    );
+    found.into_inner()
+}
+
+/// Counts the PUTs and GETs a test cares about, by exact key, and forwards
+/// every call to the store it wraps.
+struct KeyCountingStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    puts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    gets: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+}
+
+impl KeyCountingStore {
+    fn new(inner: Arc<dyn ObjectStoreBackend>) -> Self {
+        Self {
+            inner,
+            puts: Default::default(),
+            gets: Default::default(),
+        }
+    }
+
+    fn puts_of(&self, key: &str) -> u64 {
+        self.puts
+            .lock()
+            .expect("lock")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn gets_of(&self, key: &str) -> u64 {
+        self.gets
+            .lock()
+            .expect("lock")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for KeyCountingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        *self
+            .puts
+            .lock()
+            .expect("lock")
+            .entry(key.to_string())
+            .or_default() += 1;
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        *self
+            .gets
+            .lock()
+            .expect("lock")
+            .entry(key.to_string())
+            .or_default() += 1;
+        self.inner.get(key, range).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list_after(prefix, start_after, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Publish one sealed L0 input at ingest hour 0 of metrics shard 0 holding
+/// the erasure subject's series, as writer sequence `seq`. Returns its
+/// identity and its commit record's key.
+async fn publish_subject_l0(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    seq: u64,
+) -> (ravel_proto::commit::v1::CompactionInputIdentity, String) {
+    let tenant_hash = tenant.hash();
+    let labels = metric_labels(ERASED_SUBJECT, "a");
+    let series = vec![SeriesInput {
+        series_id: SeriesId::compute(tenant, METRIC_NAME, &labels).expect("series id"),
+        labels,
+        samples: vec![Sample {
+            ts_ns: SAMPLE_TS_NS,
+            value: SUBJECT_VALUE,
+        }],
+    }];
+    let writer_id = Uuid::from_u128(0x9200 + u128::from(seq));
+    let written = SegmentWriter::write(
+        series,
+        SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: seq,
+        },
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write segment");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: seq,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: 10 + seq as i64,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+    let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+    (
+        ravel_proto::commit::v1::CompactionInputIdentity {
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: seq,
+        },
+        commit_key,
+    )
+}
+
+/// A `RewriteRecord` at `(Metrics, shard 0, hour 0)` that supersedes only
+/// `superseded` and names `request_id` in its drops: the bucket state of
+/// `crate::maintain`'s `done_follows_the_catalog_resolver_not_the_one_hop_live_record`.
+/// The rewrite pass's one-hop resolver reads the request as applied, while the
+/// catalog resolver still serves the subject out of any other live L0.
+async fn forge_partial_rewrite(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    superseded: &ravel_proto::commit::v1::CompactionInputIdentity,
+    request_id: Uuid,
+) {
+    let part = ravel_proto::commit::v1::CompactionPart {
+        part_index: 0,
+        first_series_id: vec![0u8; 16],
+        last_series_id: vec![0xffu8; 16],
+        content_hash: vec![0u8; 32],
+        object_size: 64,
+        sample_count: 1,
+        series_count: 1,
+        run_count: 1,
+        min_event_ts_ns: SAMPLE_TS_NS,
+        max_event_ts_ns: SAMPLE_TS_NS,
+        segment_format_version: 3,
+        declared_column_stats: Vec::new(),
+    };
+    let inputs = vec![superseded.clone()];
+    let applied = vec![request_id.to_string()];
+    let input_set_hash =
+        ravel_commit::erasure::compute_rewrite_input_set_hash(&inputs, None, &applied);
+    let record = ravel_proto::commit::v1::RewriteRecord {
+        format_version: 1,
+        tenant_hash: tenant.0.to_vec(),
+        signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+        shard: 0,
+        ingest_hour_bucket: 0,
+        inputs,
+        input_set_hash: input_set_hash.to_vec(),
+        parts: vec![part],
+        drops: vec![ravel_proto::commit::v1::RewriteDrop {
+            request_id: request_id.to_string(),
+            dropped_count: 1,
+        }],
+        created_unix_ns: 20,
+        superseded_record_key: String::new(),
+    };
+    ravel_commit::erasure::validate_rewrite(&record).expect("forged rewrite is valid");
+    let key = keys::rewrite_record_key_for(&record).expect("rewrite record key");
+    store
+        .put(
+            &key,
+            ravel_commit::erasure::encode_rewrite(&record),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put forged rewrite");
+}
+
+/// Delete the L0 input whose commit record is `commit_key`, record and data
+/// object both: what a sweep of a superseded input leaves behind. Returns the
+/// data object's key.
+async fn sweep_l0_input(store: &dyn ObjectStoreBackend, commit_key: &str) -> String {
+    let got = store
+        .get(commit_key, GetRange::Full)
+        .await
+        .expect("get commit record");
+    let rec = record::decode(&got.data).expect("decode commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .delete(commit_key)
+        .await
+        .expect("delete commit record");
+    store.delete(&data_key).await.expect("delete data object");
+    data_key
+}
+
+/// Every key under `(tenant, Metrics, shard 0, hour 0)`'s commit prefix.
+async fn hour_zero_commit_keys(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> Vec<String> {
+    let prefix =
+        keys::commit_shard_hour_prefix(tenant, Signal::Metrics, 0, 0).expect("bucket prefix");
+    list_all(store, &prefix)
+        .await
+        .expect("list bucket")
+        .into_iter()
+        .map(|meta| meta.key)
+        .collect()
+}
+
+/// The served-set state every completion attempt below runs over: two live
+/// L0 inputs in sealed hour 0, both holding the subject, and a rewrite that
+/// supersedes only the first and names the request, acknowledged at
+/// [`TEST_NOW_NS`]. Returns the second input's commit key, the `.dreq` key
+/// and the `.done` key.
+async fn served_set_fixture(
+    store: &dyn ObjectStoreBackend,
+    tenant_id: &TenantId,
+    request_id: Uuid,
+) -> (String, String, String) {
+    let tenant = tenant_id.hash();
+    let (l0_one, _) = publish_subject_l0(store, tenant_id, 1).await;
+    let (_, l0_two_commit) = publish_subject_l0(store, tenant_id, 2).await;
+    forge_partial_rewrite(store, &tenant, &l0_one, request_id).await;
+    let dreq_key = submit_erasure_request(
+        store,
+        &tenant,
+        Signal::Metrics,
+        request_id,
+        ERASED_SUBJECT,
+        TEST_NOW_NS,
+    )
+    .await;
+    let done_key =
+        keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+    (l0_two_commit, dreq_key, done_key)
+}
+
+/// One production erasure pass (`crate::maintain::run_erasure_pass`, the
+/// rewrite, completion and `.dreq` sweep a tick runs) at `now_ns`.
+async fn erasure_pass_at(
+    store: &dyn ObjectStoreBackend,
+    harness: &mut TickHarness,
+    tenant: &TenantHash,
+    now_ns: i64,
+) {
+    crate::maintain::run_erasure_pass(
+        store,
+        &ravel_maintain::FixedClock::new(now_ns),
+        &harness.compactor,
+        &ravel_maintain::NoLeases,
+        tenant,
+        Signal::Metrics,
+        1,
+        &mut harness.memo,
+        &harness.safety,
+    )
+    .await;
+}
+
+const COMPLETION_NOT_SERVED: &str =
+    "erasure: a completion is written only when no pre-rewrite object is still served";
+
+/// CompletionImpliesNoPreRewriteExposure (ADR-4326), through the served-set
+/// branch of the completion gate. Every completion attempt runs at a clock
+/// where every in-scope bucket is sealed (hour 0 and the ack-open hour), so
+/// the unsealed-bucket branch withholds nothing. The only thing that withholds
+/// `.done` is a store-visible L0 input the catalog resolver still serves for
+/// the subject: the second input, which the bucket's rewrite does not
+/// supersede. Once that input's commit record and data object are gone, as a
+/// sweep of a superseded input leaves them, hour 0 is still sealed, still
+/// untombstoned and still read record by record, but the resolver finds
+/// nothing serving the subject and `.done` is written. The
+/// `complete-ignores-served-set` mutant arm writes `.done` on the first
+/// attempt, and the property evaluates false.
+#[tokio::test]
+async fn completion_waits_for_the_served_set() {
+    let mut harness = TickHarness::new();
+    let sealed_ns = harness.ack_hour_sealed_ns(TEST_NOW_NS);
+    let tenant_id = TenantId::new("acme");
+    let tenant = tenant_id.hash();
+    for hour in [0, (TEST_NOW_NS / NS_PER_HOUR) as u32] {
+        assert!(
+            ravel_maintain::Bucket::new(tenant, Signal::Metrics, 0, hour)
+                .is_sealed(sealed_ns, &harness.compactor),
+            "in-scope hour {hour} is sealed at every completion attempt"
+        );
+    }
+
+    // --- Part A: the shipped served-set gate -----------------------------
+    {
+        let store = KeyCountingStore::new(Arc::new(MemoryStore::new()));
+        let request_id = Uuid::from_u128(0x5E12);
+        let (l0_two_commit, dreq_key, done_key) =
+            served_set_fixture(&store, &tenant_id, request_id).await;
+        let l0_two_gets = store.gets_of(&l0_two_commit);
+        let rewrite_key = hour_zero_commit_keys(&store, &tenant)
+            .await
+            .into_iter()
+            .find(|key| key.contains("/rw."))
+            .expect("the forged rewrite record");
+        let rewrite_gets = store.gets_of(&rewrite_key);
+
+        erasure_pass_at(&store, &mut harness, &tenant, sealed_ns).await;
+        let pass_one_rewrite_gets = store.gets_of(&rewrite_key) - rewrite_gets;
+        assert_eq!(
+            pass_one_rewrite_gets, 2,
+            "pass 1 reads the rewrite record in the rewrite pass and the completion gate"
+        );
+        assert!(
+            !object_exists(&store, &done_key).await,
+            "the second L0 input still serves the subject, so the completion is withheld"
+        );
+        assert_eq!(store.puts_of(&done_key), 0, "no .done PUT is attempted");
+        assert_eq!(
+            store.gets_of(&l0_two_commit) - l0_two_gets,
+            1,
+            "the completion gate reads the still-served input's commit record once"
+        );
+        assert!(
+            object_exists(&store, &dreq_key).await,
+            "the request stays pending while the served set blocks it"
+        );
+
+        let l0_two_data = sweep_l0_input(&store, &l0_two_commit).await;
+        assert!(!object_exists(&store, &l0_two_data).await);
+        let hour_zero = hour_zero_commit_keys(&store, &tenant).await;
+        assert!(
+            !hour_zero.iter().any(|key| matches!(
+                keys::partition_bucket_entry(key),
+                Ok(keys::BucketEntry::Tombstone(_))
+            )),
+            "hour 0 carries no tombstone at pass 2: {hour_zero:?}"
+        );
+        assert!(
+            !hour_zero.contains(&l0_two_commit),
+            "the second input's commit record is gone"
+        );
+        let rewrite_gets = store.gets_of(&rewrite_key);
+        erasure_pass_at(&store, &mut harness, &tenant, sealed_ns).await;
+        assert!(
+            object_exists(&store, &done_key).await,
+            "once no in-scope bucket serves the subject, the completion is written"
+        );
+        assert_eq!(store.puts_of(&done_key), 1, "exactly one .done PUT");
+        // The completion gate decodes the bucket's rewrite record as pass 1
+        // did, so pass 2 went past the tombstone check; the invariants build
+        // adds the served-set re-read's one GET.
+        assert_eq!(
+            store.gets_of(&rewrite_key) - rewrite_gets,
+            pass_one_rewrite_gets + u64::from(ravel_invariant::EVALUATES),
+            "pass 2 reads hour 0's rewrite record as pass 1 did"
+        );
+
+        if ravel_invariant::EVALUATES {
+            let found: Vec<(bool, String)> = captured_evaluations(COMPLETION_NOT_SERVED)
+                .into_iter()
+                .filter(|(_, details)| details.contains(&request_id.to_string()))
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "the one completion write is judged against the re-read served set: {found:?}"
+            );
+            assert!(
+                found.iter().all(|(violation, _)| !violation),
+                "CompletionImpliesNoPreRewriteExposure never evaluates false on the shipped \
+                 gate: {found:?}"
+            );
+        }
+    }
+
+    // --- Part B: the complete-ignores-served-set mutant arm --------------
+    // No-op in a default build, where `scoped_mutant` returns `None`.
+    let Some(_mutant) = scoped_mutant("lifecycle/complete-ignores-served-set") else {
+        return;
+    };
+    let store = MemoryStore::new();
+    let request_id = Uuid::from_u128(0x5E13);
+    let (_, _, done_key) = served_set_fixture(&store, &tenant_id, request_id).await;
+    erasure_pass_at(&store, &mut harness, &tenant, sealed_ns).await;
+    assert!(
+        object_exists(&store, &done_key).await,
+        "the complete-ignores-served-set mutant writes .done while the second input still serves \
+         the subject"
+    );
+    let found: Vec<(bool, String)> = captured_evaluations(COMPLETION_NOT_SERVED)
+        .into_iter()
+        .filter(|(_, details)| details.contains(&request_id.to_string()))
+        .collect();
+    assert!(
+        found.iter().any(|(violation, _)| *violation),
+        "CompletionImpliesNoPreRewriteExposure must evaluate false under the mutant: {found:?}"
+    );
+}
+
 // === Metrics with key-index leaves and the label index on =================
 
 /// The metrics chain again, with the fold building the ADR-3694 decision 2

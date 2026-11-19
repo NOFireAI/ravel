@@ -404,7 +404,12 @@ pub async fn write_hold_set_with_compat(
         attrs.push((ATTR_REASON.to_string(), AttrValue::Str(reason.into())));
     }
     let body = format!("legal hold set scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await?;
+    ravel_invariant::inv_reachable!(
+        "gc: a legal hold is placed",
+        std::collections::BTreeMap::from([("scope", scope.to_string())])
+    );
+    Ok(())
 }
 
 /// Write a new immutable `clear` record releasing the legal hold on `scope` at
@@ -446,7 +451,12 @@ pub async fn write_hold_clear_with_compat(
         (ATTR_SCOPE.to_string(), AttrValue::Str(scope.into())),
     ];
     let body = format!("legal hold clear scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await?;
+    ravel_invariant::inv_reachable!(
+        "gc: a legal hold is released",
+        std::collections::BTreeMap::from([("scope", scope.to_string())])
+    );
+    Ok(())
 }
 
 /// Encode one legal-hold RLOG record as an L0 [`Signal::Audit`] object and its
