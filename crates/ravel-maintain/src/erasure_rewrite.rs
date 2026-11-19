@@ -2822,7 +2822,7 @@ async fn rewrite_output_minus_erased(
 
 /// The first `(series_id_hex, ts_ns)` in the written metrics output parts that
 /// an applied erasure request still drops, or `None` when the output is clean.
-/// The evidence for `assert_rewrite_output_minus_erased`.
+/// The evidence for `rewrite_output_minus_erased`.
 async fn output_erased_leak(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,

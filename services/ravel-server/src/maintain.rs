@@ -4169,10 +4169,7 @@ pub(crate) async fn run_erasure_pass(
                     std::collections::HashMap::new()
                 };
                 for entry in completing {
-                    let _verdict = served_now
-                        .get(&entry.request.request_id)
-                        .copied()
-                        .flatten();
+                    let _verdict = served_now.get(&entry.request.request_id).copied().flatten();
                     ravel_invariant::inv_always_if_known!(
                         _verdict,
                         "erasure: a completion is written only when no pre-rewrite object is still served",
@@ -10983,10 +10980,8 @@ mod tests {
 
         FailedRefreshTick {
             superseded_data_deleted: safety.objects_deleted_superseded_data_deleted(),
-            refresh_faults: store.fault_count(
-                Op::List,
-                ravel_object_store::fault::FaultKind::Transient,
-            ),
+            refresh_faults: store
+                .fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient),
             refresh_failures: safety.legal_hold_refresh_failures(),
             evaluations: captured(REFRESH_FAILURE_SWEEPS_NOTHING, &tenant.to_hex()),
         }
@@ -10999,8 +10994,14 @@ mod tests {
     #[tokio::test]
     async fn a_failed_hold_refresh_with_deletable_work_deletes_nothing() {
         let observed = tick_with_deletable_work_under_a_failed_refresh("refresh-default").await;
-        assert_eq!(observed.refresh_faults, 1, "the hold refresh LIST really faulted");
-        assert_eq!(observed.refresh_failures, 1, "tick 3 skipped on the failed refresh");
+        assert_eq!(
+            observed.refresh_faults, 1,
+            "the hold refresh LIST really faulted"
+        );
+        assert_eq!(
+            observed.refresh_failures, 1,
+            "tick 3 skipped on the failed refresh"
+        );
         assert_eq!(
             observed.superseded_data_deleted, 0,
             "a failed hold refresh deletes nothing, though both inputs are deletable"
@@ -11028,7 +11029,10 @@ mod tests {
             return;
         };
         let observed = tick_with_deletable_work_under_a_failed_refresh("refresh-mutant").await;
-        assert!(observed.refresh_faults >= 1, "the hold refresh LIST really faulted");
+        assert!(
+            observed.refresh_faults >= 1,
+            "the hold refresh LIST really faulted"
+        );
         assert_eq!(
             observed.superseded_data_deleted, 2,
             "the mutant sweeps both inputs under the failed refresh"

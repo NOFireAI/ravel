@@ -799,11 +799,21 @@ impl KeyCountingStore {
     }
 
     fn puts_of(&self, key: &str) -> u64 {
-        self.puts.lock().expect("lock").get(key).copied().unwrap_or(0)
+        self.puts
+            .lock()
+            .expect("lock")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn gets_of(&self, key: &str) -> u64 {
-        self.gets.lock().expect("lock").get(key).copied().unwrap_or(0)
+        self.gets
+            .lock()
+            .expect("lock")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -815,7 +825,12 @@ impl ObjectStoreBackend for KeyCountingStore {
         data: bytes::Bytes,
         opts: PutOptions,
     ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
-        *self.puts.lock().expect("lock").entry(key.to_string()).or_default() += 1;
+        *self
+            .puts
+            .lock()
+            .expect("lock")
+            .entry(key.to_string())
+            .or_default() += 1;
         self.inner.put(key, data, opts).await
     }
 
@@ -824,7 +839,12 @@ impl ObjectStoreBackend for KeyCountingStore {
         key: &str,
         range: GetRange,
     ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
-        *self.gets.lock().expect("lock").entry(key.to_string()).or_default() += 1;
+        *self
+            .gets
+            .lock()
+            .expect("lock")
+            .entry(key.to_string())
+            .or_default() += 1;
         self.inner.get(key, range).await
     }
 

@@ -911,8 +911,22 @@ async fn physical_sweep(
     };
     let holds_now = holds_now.as_ref();
     delete_all(store, lease, holds_now, &listing.commit_keys, dry_run).await?;
-    delete_all(store, lease, holds_now, &listing.compaction_record_keys, dry_run).await?;
-    delete_all(store, lease, holds_now, &listing.rewrite_record_keys, dry_run).await?;
+    delete_all(
+        store,
+        lease,
+        holds_now,
+        &listing.compaction_record_keys,
+        dry_run,
+    )
+    .await?;
+    delete_all(
+        store,
+        lease,
+        holds_now,
+        &listing.rewrite_record_keys,
+        dry_run,
+    )
+    .await?;
     delete_all(store, lease, holds_now, &l0_data_keys, dry_run).await?;
     delete_all(store, lease, holds_now, &l1_part_keys, dry_run).await?;
 
@@ -2201,7 +2215,11 @@ mod tests {
         );
 
         let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &part_key);
-        assert_eq!(found.len(), 1, "one evaluation at the part's delete: {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "one evaluation at the part's delete: {found:?}"
+        );
         assert!(found[0].0, "an unheld part's delete holds: {found:?}");
     }
 
@@ -2241,7 +2259,11 @@ mod tests {
         assert_eq!(outcome, RetentionOutcome::Swept, "the snapshot allows it");
 
         let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &part_key);
-        assert_eq!(found.len(), 1, "one evaluation at the part's delete: {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "one evaluation at the part's delete: {found:?}"
+        );
         assert!(
             found[0].0,
             "a hold placed after the snapshot never makes the property false: {found:?}"

@@ -4816,7 +4816,11 @@ mod tests {
 
     /// Seed one quarantine copy of a data object of `shard`, quarantined at
     /// `1`, and return the copy's key.
-    async fn put_quarantined(store: &dyn ObjectStoreBackend, tenant: &TenantHash, shard: u32) -> String {
+    async fn put_quarantined(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        shard: u32,
+    ) -> String {
         let original = orphan_data_key(tenant, Signal::Metrics, shard, 0);
         let key = quarantine_key(&original, 1);
         store
