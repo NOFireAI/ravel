@@ -148,7 +148,8 @@ impl WriteGateSlot {
     /// Runs one flush's encode for `site`, sized by the bytes the flush
     /// buffered so the gate's inline floor applies (decision 4). With no gate
     /// attached `job` runs inline on the flush task, as it always has, and
-    /// cannot fail.
+    /// fails only when the `ingest/encode-cancelled` fault fires, which
+    /// returns `CpuGateError::Cancelled` without running `job`.
     ///
     /// `job` owns everything it encodes and returns everything the flush
     /// still needs, the byte charges included, so a flush task dropped while

@@ -4,8 +4,9 @@
 //!
 //! - `ingest/encode-cancelled` answers a strict metrics write
 //!   `ShardUnavailable` and a strict logs write `LogWriteError::ShardUnavailable`,
-//!   with and without a write gate attached, and no data object, commit record
-//!   or durable token exists.
+//!   with and without a write gate attached, and a strict spans write
+//!   `SpanWriteError::ShardUnavailable` the same two ways; no data object,
+//!   commit record or durable token exists.
 //! - `ingest/data-put-refused` answers a strict metrics or logs write
 //!   `Abandoned` with zero data-object PUTs reaching the store, no commit record
 //!   and no durable token.
@@ -23,11 +24,11 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TestClock, make_point, tenant};
+use common::{TestClock, make_point, span_on_shard, tenant};
 use ravel_cpu_gate::{CpuGateConfig, InstantClock, WriteGate, WriteSite};
 use ravel_ingest::{
-    IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, PendingAckBudget, WriteError,
-    WriteMode,
+    IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, PendingAckBudget, SpanIngestRouter,
+    SpanWriteError, WriteError, WriteMode,
 };
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence};
 use ravel_object_store::memory::MemoryStore;
@@ -237,6 +238,44 @@ async fn logs_strict_write(gate: Option<Arc<WriteGate>>) -> LogsRun {
     }
 }
 
+struct SpansRun {
+    result: Result<ravel_ingest::SpanWriteReceipt, SpanWriteError>,
+    stored: Stored,
+    abandoned_retry_exhausted: u64,
+    flush_gate_faults: u64,
+    gate_jobs: Option<u64>,
+}
+
+async fn spans_strict_write(gate: Option<Arc<WriteGate>>) -> SpansRun {
+    let store = counting_store();
+    let mut router = SpanIngestRouter::new(
+        flush_on_first(),
+        store.clone() as Arc<dyn ObjectStoreBackend>,
+        TestClock::new(BASE_NS),
+        Arc::new(PendingAckBudget::new(0)),
+    );
+    if let Some(gate) = &gate {
+        router = router.with_write_gate(Arc::clone(gate));
+    }
+    let result = router
+        .write(
+            tenant("acme"),
+            vec![span_on_shard(0, 1, BASE_NS + 1_000)],
+            WriteMode::Strict,
+            ACK_DEADLINE,
+        )
+        .await;
+    let snapshot = router.metrics().snapshot();
+    router.shutdown().await;
+    SpansRun {
+        result,
+        stored: stored(&store).await,
+        abandoned_retry_exhausted: snapshot.abandoned_retry_exhausted,
+        flush_gate_faults: snapshot.flush_gate_faults,
+        gate_jobs: gate.map(|g| gate_jobs(&g, WriteSite::SpanFlush)),
+    }
+}
+
 fn assert_metrics_control(run: MetricsRun) {
     let receipt = run.result.expect("with the fault off the write succeeds");
     assert_eq!(receipt.tokens.len(), 1);
@@ -244,6 +283,12 @@ fn assert_metrics_control(run: MetricsRun) {
 }
 
 fn assert_logs_control(run: LogsRun) {
+    let receipt = run.result.expect("with the fault off the write succeeds");
+    assert_eq!(receipt.tokens.len(), 1);
+    assert_eq!(run.stored, ONE_COMMIT);
+}
+
+fn assert_spans_control(run: SpansRun) {
     let receipt = run.result.expect("with the fault off the write succeeds");
     assert_eq!(receipt.tokens.len(), 1);
     assert_eq!(run.stored, ONE_COMMIT);
@@ -341,6 +386,53 @@ async fn encode_cancelled_answers_a_logs_write_shard_unavailable_on_the_gate() {
         "the cancelled encode never ran a job"
     );
     assert_logs_encode_cancelled(run);
+}
+
+fn assert_spans_encode_cancelled(run: SpansRun) {
+    let err = run
+        .result
+        .expect_err("a cancelled encode must not answer the write as committed");
+    assert!(
+        matches!(err, SpanWriteError::ShardUnavailable),
+        "a cancelled encode is a gate fault, answered ShardUnavailable: {err:?}"
+    );
+    assert!(
+        err.durable_tokens().is_empty(),
+        "{:?}",
+        err.durable_tokens()
+    );
+    assert_eq!(
+        run.stored, NOTHING,
+        "no data PUT and no commit record follow a cancelled encode"
+    );
+    assert_eq!(run.flush_gate_faults, 1);
+    assert_eq!(run.abandoned_retry_exhausted, 0);
+}
+
+#[tokio::test]
+async fn encode_cancelled_answers_a_spans_write_shard_unavailable_without_a_gate() {
+    assert_spans_control(spans_strict_write(None).await);
+    let Some(_fault) = scoped_fault(ENCODE_CANCELLED, 1.0) else {
+        return;
+    };
+    assert_spans_encode_cancelled(spans_strict_write(None).await);
+}
+
+#[tokio::test]
+async fn encode_cancelled_answers_a_spans_write_shard_unavailable_on_the_gate() {
+    let control = spans_strict_write(Some(floor_zero_gate())).await;
+    assert_eq!(control.gate_jobs, Some(1), "the encode ran on the gate");
+    assert_spans_control(control);
+    let Some(_fault) = scoped_fault(ENCODE_CANCELLED, 1.0) else {
+        return;
+    };
+    let run = spans_strict_write(Some(floor_zero_gate())).await;
+    assert_eq!(
+        run.gate_jobs,
+        Some(0),
+        "the cancelled encode never ran a job"
+    );
+    assert_spans_encode_cancelled(run);
 }
 
 #[tokio::test]

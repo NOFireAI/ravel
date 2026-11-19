@@ -443,7 +443,8 @@ that takes each of those paths on demand.
   counts it.
 - `ingest/data-put-refused`, in the metrics and logs
   `put_data_object_with_retry`, returns `PutAbort::Exhausted` before the
-  first PUT, with no store call. The flush answers it as case one of that
+  first data PUT; the flush has already made its fencing call
+  (`ensure_fenced`) by then. The flush answers it as case one of that
   list: the strict waiter gets the retryable `Abandoned`, and
   `abandoned_retry_exhausted` counts it. The spans twin carries no switch.
 
@@ -455,8 +456,10 @@ needs no mutant image.
 
 The switches weaken no durability. Each answer they produce is one
 `docs/consistency-model.md` already defines; on both paths the flush ends
-before its data object is written, so the strict waiter is acknowledged with
-an error and no token and no commit record exists. A buffered write was
+before its data object is written, so that shard gives the strict waiter no
+token and writes no commit record. A write whose other shards committed
+answers `PartialWrite` with their tokens: the partial-shard commit named
+above. A buffered write was
 acknowledged at enqueue, before either switch, as it is for the store
 faults these switches stand in for. `check-release-profile.sh` refuses
 `antithesis` and `ravel-invariant/capture` in the published image build (the
