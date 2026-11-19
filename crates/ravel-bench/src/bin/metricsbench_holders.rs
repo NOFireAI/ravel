@@ -9,11 +9,13 @@
 //! the statement's fetch window on the run's query grid, how many of those
 //! hold a series of one of its metrics (what an unrouted resolve fetches
 //! when every selector names one metric), how many hold at least one
-//! matching series (a series-level index's bound), how many listed objects
-//! the ingest report's ravel row's commit tokens add to an unrouted fetch
-//! (the `min_commit_token` values the query lane passes, one per shard), and
-//! how many of the resolved objects' LABEL_DICTs hold the statement's values
-//! (the label-value router's bound). The window and counting rules and the
+//! series matching every matcher, how many listed objects the ingest
+//! report's ravel row's commit tokens add to an unrouted fetch (the
+//! `min_commit_token` values the query lane passes, one per shard), how many
+//! of the resolved objects' LABEL_DICTs hold the statement's values (the
+//! label-value router's bound), and how many of the resolved objects hold a
+//! series carrying its metric name and `label="value"` pairs (the series
+//! route's bound, ADR-4146). The window and counting rules and the
 //! method statement live in [`ravel_bench::metrics_holders`]; no router or
 //! key index is involved.
 //!

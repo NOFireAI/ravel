@@ -741,6 +741,20 @@ pub struct RavelCost {
     /// the ceiling among them).
     #[serde(rename = "labelIndexValues")]
     pub label_index_values: Option<Json>,
+    /// The series route's three members of `data.stats` (ADR-4146), all
+    /// copied when the stats carry `seriesIndex`, which the server writes
+    /// only when the series route ran, each `null` when the stats lack it;
+    /// all three left out of the record otherwise, so a run with no series
+    /// index writes the records it wrote before.
+    #[serde(
+        rename = "segmentsPrunedBySeriesIndex",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub segments_pruned_by_series_index: Option<Json>,
+    #[serde(rename = "seriesIndex", skip_serializing_if = "Option::is_none")]
+    pub series_index: Option<Json>,
+    #[serde(rename = "seriesIndexPasses", skip_serializing_if = "Option::is_none")]
+    pub series_index_passes: Option<Json>,
     pub estimate: Option<Json>,
     pub io: Option<Json>,
     /// Which harness pass this run belongs to (`unfolded`, `folded-unrouted`,
@@ -768,6 +782,8 @@ impl RavelCost {
         let body = answer_body(outcome);
         let stats = body.and_then(|body| body["data"].get("stats"));
         let field = |name: &str| stats.and_then(|stats| stats.get(name)).cloned();
+        let series_ran = field("seriesIndex").is_some();
+        let series_field = |name: &str| series_ran.then(|| field(name).unwrap_or(Json::Null));
         RavelCost {
             entry: entry.to_string(),
             pass,
@@ -781,6 +797,9 @@ impl RavelCost {
             segments_pruned_by_dictionary: field("segmentsPrunedByDictionary"),
             segments_pruned_by_label_index: field("segmentsPrunedByLabelIndex"),
             label_index_values: field("labelIndexValues"),
+            segments_pruned_by_series_index: series_field("segmentsPrunedBySeriesIndex"),
+            series_index: series_field("seriesIndex"),
+            series_index_passes: series_field("seriesIndexPasses"),
             estimate: field("estimate"),
             io: field("io"),
             pass_label: None,
@@ -2109,6 +2128,63 @@ mod tests {
                 && record["labelIndexValues"].is_null(),
             "stats without labelIndexValues record it as null, not left out"
         );
+    }
+
+    /// The series route's members are copied together when the stats carry
+    /// `seriesIndex`, a missing one as `null`, and all left out of the record
+    /// when they do not, even beside a `segmentsPrunedBySeriesIndex` of 0,
+    /// which a server writes whether or not the route ran.
+    #[test]
+    fn ravel_cost_copies_the_series_members_only_when_the_series_route_ran() {
+        use ravel_promql_difftest::prometheus_client::QueryTiming;
+        let record_of = |stats: Json| {
+            let outcome = QueryOutcome::Envelope {
+                http_status: 200,
+                body: serde_json::json!({"status": "success", "data": {
+                    "resultType": "vector", "result": [], "stats": stats,
+                }}),
+                timing: QueryTiming::default(),
+            };
+            serde_json::to_value(RavelCost::of("e", (1, 1), ResultStatus::Ok, 1.0, &outcome))
+                .expect("serializes")
+        };
+        let ran = record_of(serde_json::json!({
+            "segmentsPrunedBySeriesIndex": 3,
+            "seriesIndex": {"plansRouted": 1, "planPartsAnswered": 1, "declines": {}},
+            "seriesIndexPasses": [{"pass": "A", "partsProbed": 1}],
+        }));
+        assert_eq!(ran["segmentsPrunedBySeriesIndex"], 3);
+        assert_eq!(
+            ran["seriesIndex"],
+            serde_json::json!({"plansRouted": 1, "planPartsAnswered": 1, "declines": {}})
+        );
+        assert_eq!(
+            ran["seriesIndexPasses"],
+            serde_json::json!([{"pass": "A", "partsProbed": 1}])
+        );
+        let no_passes = record_of(serde_json::json!({
+            "segmentsPrunedBySeriesIndex": 0,
+            "seriesIndex": {"plansRouted": 1, "planPartsAnswered": 0,
+                            "declines": {"over_q_a": 1}},
+        }));
+        assert!(
+            no_passes
+                .as_object()
+                .expect("object")
+                .contains_key("seriesIndexPasses")
+                && no_passes["seriesIndexPasses"].is_null()
+        );
+        let off = record_of(serde_json::json!({"segmentsPrunedBySeriesIndex": 0}));
+        for field in [
+            "segmentsPrunedBySeriesIndex",
+            "seriesIndex",
+            "seriesIndexPasses",
+        ] {
+            assert!(
+                !off.as_object().expect("object").contains_key(field),
+                "{field} is left out when the series route did not run"
+            );
+        }
     }
 
     #[test]

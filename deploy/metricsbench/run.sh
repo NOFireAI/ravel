@@ -284,6 +284,33 @@
 #               records of route-bound statements whose keyIndex phase shows
 #               no leaf read; and the statements that are not route-bound
 #
+# MB_SERIES_INDEX=1 (ADR-4146 step M1; needs MB_STAGE1=1, else a usage error,
+# exit 64; 0 or unset is off, anything else a usage error) puts the metrics
+# series index on wherever the label index is on: step stage1-flags refuses
+# (exit 70, stamped as stage1.series_index "refused: ...", nothing up) unless
+# the saved ravel-server --help lists --fold-metrics-series-index and the
+# ravel-cli catalog fold --help lists --metrics-series-index as options, and
+# unless the routed server flags and the leaf-on fold flags put the label
+# index on (the series index is built and read only alongside it, and
+# ravel-server accepts its switch without it and does nothing with it). The
+# routed flags (and the Ravel-only shape's up flags taken from them) then
+# carry --fold-metrics-series-index, and every catalog fold run with the label
+# index on (stage1-leaves and the arms' leaf-on folds) --metrics-series-index;
+# unrouted, control and the leaf-off folds carry neither. stage1.series_index
+# stamps both flags and their help files. After stage1-leaves, step
+# stage1-leaves-series stamps the rebuild report's
+# series_index_parts_over_cap and the three series fields' field_pairs as
+# stage1.leaves.series_index. stage1-holders then reads each answered routed
+# record's seriesIndex: one the series route answered in full has its
+# prunes under segmentsPrunedBySeriesIndex alone, which must equal the
+# statement's expected_series_prunes (series_prune_mismatches, naming the
+# statement, expected_series_prunes, series_holders and the routed figures);
+# the routed prune check reads the statement's other records. Per statement
+# the stamp adds series_holders, expected_series_prunes, the routed records'
+# segmentsPrunedBySeriesIndex values, series_opened_minus_expected, and per
+# record its series route, prune counters, seriesIndex and seriesIndexPasses.
+# With the switch off none of this runs and no stamp changes.
+#
 # Four arms (issue #3969) add steps, each only when its switch is on;
 # stamps.json says which under stage1.arms, and an arm that is off stamps
 # each of its keys "skipped: arm off (...)". MB_CONTROL_IMAGE (with
@@ -518,6 +545,8 @@
 # the Stage 1 steps above; MB_STAGE1_ARMS, MB_CONTROL_IMAGE and
 # MB_CONTROL_SOURCE_COMMIT add its arms, and MB_L1_MAX_PART_BYTES (a positive
 # integer; the l1 arm only) sets compact-tenant's --max-l1-part-bytes.
+# MB_SERIES_INDEX (1, or 0 or unset for off; needs MB_STAGE1=1) puts the
+# metrics series index on wherever Stage 1 puts the label index on.
 # METRICSBENCH_SLEEP (default sleep)
 # waits for an hour to pass or seal; METRICSBENCH_ERASURE_TRIES and
 # METRICSBENCH_ERASURE_INTERVAL (default 120 tries 15 s apart) bound the
@@ -579,6 +608,12 @@ STAGE1_UNROUTED_FLAGS=""
 STAGE1_ROUTED_FLAGS=""
 STAGE1_CONTROL_FLAGS=""
 STAGE1_CLI_LABEL_INDEX_ON=""
+# MB_SERIES_INDEX=1 routes the Stage 1 label-index-on passes through the
+# metrics series index too (ADR-4146): stage1_label_index_flags adds
+# --fold-metrics-series-index to STAGE1_ROUTED_FLAGS and sets
+# STAGE1_CLI_SERIES_INDEX_ON, which every label-on catalog fold carries.
+SERIES_INDEX="${MB_SERIES_INDEX:-}"
+STAGE1_CLI_SERIES_INDEX_ON=""
 # Every stage1.* stamp a step writes: null until it runs, "skipped: why" when
 # the steps do not run.
 STAGE1_KEYS="background_fold fold_restart fold unrouted_restart unrouted_catalog unrouted unrouted_cold unrouted_cold_records leaves restart routed_catalog routed routed_cold routed_cold_records compare holders"
@@ -1721,6 +1756,31 @@ elif op in ("stage1-fold", "stage1-leaves"):
         requests["not_reported"] = "GETs of the snapshot HEAD (the rebuild report does not count them)"
         stamp["requests"] = requests
     print(json.dumps(stamp))
+elif op == "stage1-leaves-series":
+    # The stage1-leaves rebuild report, run with the series index on: print
+    # the stage1.leaves.series_index stamp. Exit 3 and why on stdout when
+    # series_index_parts_over_cap is missing or not a whole number, or
+    # field_pairs is not an object.
+    (report_path,) = args
+    name = os.path.basename(report_path)
+    try:
+        rep = load(report_path)
+        assert isinstance(rep, dict)
+    except (OSError, ValueError, AssertionError) as e:
+        print(f"{name} is not a JSON report ({type(e).__name__})")
+        sys.exit(3)
+    over = rep.get("series_index_parts_over_cap")
+    if not isinstance(over, int) or isinstance(over, bool) or over < 0:
+        print(f"{name} has no whole series_index_parts_over_cap")
+        sys.exit(3)
+    pairs = rep.get("field_pairs")
+    if not isinstance(pairs, dict):
+        print(f"{name} has no field_pairs object")
+        sys.exit(3)
+    fields = ("series_label", "series_class", "class_objects")
+    print(json.dumps({"file": name, "series_index_parts_over_cap": over,
+                      "field_pairs": {f: pairs.get(f) for f in fields},
+                      "method": "the rebuild report's series_index_parts_over_cap (metrics parts given none of the series-index fields, ADR-4146) and its field_pairs for the three series fields, null for a field no part built; the leaf bytes the series fields add are not reported apart from leaf_bytes_written"}))
 elif op == "stage1-compare":
     # The two passes' diagnostics files and the output path. Per entry, the
     # set of result_hash values each pass's records carry; equal when both are
@@ -2414,9 +2474,16 @@ elif op == "stage1-holders":
     # resolve returns plus those only a min_commit_token adds), and, for a
     # route_bound statement, every routed record's segmentsPrunedByLabelIndex
     # must equal expected_routed_prunes and its keyIndex phase must show a
-    # leaf read when the resolve returns an object; prints the stamp. Exit 3
+    # leaf read when the resolve returns an object; prints the stamp. With
+    # an eighth argument, series-index (MB_SERIES_INDEX=1), a routed record
+    # the series route answered in full is checked against
+    # expected_series_prunes with segmentsPrunedBySeriesIndex instead. Exit 3
     # and why on stdout when an input cannot be read.
-    holders_path, diag_path, routed_path, list_path, watermark, bucket, listing_state = args
+    holders_path, diag_path, routed_path, list_path, watermark, bucket, listing_state, *mode = args
+    series_mode = mode == ["series-index"]
+    if mode and not series_mode:
+        print(f"stage1-holders takes series-index or nothing after the listing state, got {mode}")
+        sys.exit(3)
     try:
         doc = load(holders_path)
         rows = load(diag_path)["ravel_cost"]
@@ -2460,10 +2527,30 @@ elif op == "stage1-holders":
     def timed_out(records, sid):
         mine = [r for r in records if r.get("entry") == sid]
         return bool(mine) and all(r.get("status") == "timeout" for r in mine)
+    def series_route(r):
+        # The series route's outcome on one record, from its seriesIndex:
+        # answered when it answered every (plan, part) pair, so its prunes
+        # count under segmentsPrunedBySeriesIndex alone; declined when it
+        # answered none and none when it routed no plan, so they count under
+        # segmentsPrunedByLabelIndex; mixed when both, which splits them;
+        # absent when the route did not run.
+        si = r.get("seriesIndex")
+        if si is None:
+            return "absent"
+        parts = si.get("planPartsAnswered") if isinstance(si, dict) else None
+        declines = si.get("declines") if isinstance(si, dict) else None
+        if not whole(parts) or not isinstance(declines, dict) or not all(whole(v) for v in declines.values()):
+            return "malformed"
+        declined = sum(declines.values())
+        if parts > 0:
+            return "answered" if declined == 0 else "mixed"
+        return "declined" if declined > 0 else "none"
     fetched = by_entry(answered(rows), "segmentsFetched")
     routed_pruned = by_entry(answered(routed_rows), "segmentsPrunedByLabelIndex")
     mismatches, unchecked, unchecked_timed_out, per, unbound = [], [], [], [], []
     prune_mismatches, prune_unchecked, prune_unchecked_timed_out, leaf_unread = [], [], [], []
+    series_mismatches, series_unchecked, series_records_checked, series_route_counts = [], [], 0, {}
+    label_routes = ("absent", "none", "declined")
     for s in statements:
         sid, want = s.get("id"), s.get("unrouted_fetched_expected")
         resolved = s.get("named_in_window") if s.get("name_pruned") else s.get("segments_in_window")
@@ -2487,6 +2574,27 @@ elif op == "stage1-holders":
                       if w is not None and whole(o) and o > 0]
         row["routed_probe_wire_bytes_per_opened_object"] = \
             median(per_object) if mine and len(per_object) == len(mine) else None
+        if series_mode:
+            # The series route's bound, as the routed open check reads
+            # value_holders: series-answered records open series_holders plus
+            # token_only_fetched objects.
+            sh = s.get("series_holders")
+            series_mine = [r for r in mine if series_route(r) == "answered"]
+            row["series_holders"] = sh
+            row["expected_series_prunes"] = s.get("expected_series_prunes")
+            row["routed_pruned_by_series_index"] = sorted(set(
+                r["segmentsPrunedBySeriesIndex"] for r in mine if whole(r.get("segmentsPrunedBySeriesIndex"))))
+            sdiffs = [r.get("segmentsFetched") - (sh + tok) for r in series_mine
+                      if whole(r.get("segmentsFetched"))] if whole(sh) and whole(tok) else []
+            row["series_opened_minus_expected"] = \
+                max(sdiffs, key=abs) if series_mine and len(sdiffs) == len(series_mine) else None
+            row["series_index_records"] = [
+                {"pass": r.get("pass"), "rep": r.get("rep"), "series_route": series_route(r),
+                 "segmentsFetched": r.get("segmentsFetched"),
+                 "segmentsPrunedBySeriesIndex": r.get("segmentsPrunedBySeriesIndex"),
+                 "segmentsPrunedByLabelIndex": r.get("segmentsPrunedByLabelIndex"),
+                 "seriesIndex": r.get("seriesIndex"), "seriesIndexPasses": r.get("seriesIndexPasses")}
+                for r in mine]
         per.append(row)
         if s.get("route_bound") is not True:
             unbound.append({"id": sid, "reason": s.get("route_bound_reason")})
@@ -2504,19 +2612,46 @@ elif op == "stage1-holders":
         if s.get("route_bound") is not True:
             continue
         expected_prunes = s.get("expected_routed_prunes")
-        if not seen_pruned and whole(expected_prunes) and timed_out(routed_rows, sid):
+        label_pruned, check_label = seen_pruned, True
+        if series_mode:
+            routes = [series_route(r) for r in mine]
+            for c in routes:
+                series_route_counts[c] = series_route_counts.get(c, 0) + 1
+            label_pruned = [v if whole(v) else None for v, c in
+                            ((r.get("segmentsPrunedByLabelIndex"), c) for r, c in zip(mine, routes))
+                            if c in label_routes]
+            series_seen = [v if whole(v) else None for v, c in
+                           ((r.get("segmentsPrunedBySeriesIndex"), c) for r, c in zip(mine, routes))
+                           if c == "answered"]
+            # A record the series route answered in full carries its prunes
+            # under the series counter alone; the label check reads the
+            # others, and runs as before when no record was answered.
+            check_label = bool(label_pruned) or not mine
+            odd = sorted(set(c for c in routes if c in ("mixed", "malformed")))
+            if odd:
+                series_unchecked.append({"id": sid, "why": "series_route " + " and ".join(odd)})
+            want_series = s.get("expected_series_prunes")
+            if series_seen and (None in series_seen or not whole(want_series)):
+                series_unchecked.append({"id": sid, "why": "no whole-number segmentsPrunedBySeriesIndex or expected_series_prunes"})
+            elif series_seen:
+                series_records_checked += len(series_seen)
+                if any(v != want_series for v in series_seen):
+                    series_mismatches.append({"id": sid, "expected_series_prunes": want_series,
+                                              "series_holders": s.get("series_holders"),
+                                              "routed_pruned_by_series_index": sorted(set(series_seen))})
+        if check_label and not label_pruned and whole(expected_prunes) and timed_out(routed_rows, sid):
             prune_unchecked_timed_out.append(sid)
-        elif not seen_pruned or None in seen_pruned or not whole(expected_prunes):
+        elif check_label and (not label_pruned or None in label_pruned or not whole(expected_prunes)):
             prune_unchecked.append(sid)
-        elif any(v != expected_prunes for v in seen_pruned):
+        elif check_label and any(v != expected_prunes for v in label_pruned):
             prune_mismatches.append({"id": sid, "expected_routed_prunes": expected_prunes,
                                      "value_holders": s.get("value_holders"),
-                                     "routed_pruned_by_label_index": sorted(set(seen_pruned))})
+                                     "routed_pruned_by_label_index": sorted(set(label_pruned))})
         if whole(resolved) and resolved > 0:
             unread = sum(1 for r in answered(routed_rows) if r.get("entry") == sid and not leaf_read(r))
             if unread:
                 leaf_unread.append({"id": sid, "records": unread})
-    print(json.dumps({"file": "holders.json", "bucket": bucket, "method": doc.get("method"),
+    out = {"file": "holders.json", "bucket": bucket, "method": doc.get("method"),
                       "listing_state": listing_state, "listing_watermark_hour": int(watermark),
                       "objects_listed": len(listed), "objects_above_watermark": above,
                       "objects_l0": doc.get("objects_l0"), "objects_l1": doc.get("objects_l1"),
@@ -2543,7 +2678,19 @@ elif op == "stage1-holders":
                       "routed_leaf_unread": leaf_unread,
                       "routed_open_check": "per statement, ADR-3694 row 3 restated: value_holders_beyond_resolved is value_holders minus the resolved set (named_in_window or segments_in_window, as the window check reads it), at most 0 when every value holder lies in that set; routed_opened_minus_expected is, over the answered (ok or incorrect) stage1-routed records of the statement, the segmentsFetched (objects opened, the post-pruning snapshot size) minus value_holders plus token_only_fetched of largest magnitude; routed_probe_wire_bytes_per_opened_object is the median over those records of the probe phase's s3GetWireBytes (wire bytes as transferred, retries and range reads as the server counts them) over that record's segmentsFetched; each is null when an input is not a whole number, a record has no probe phase or opened no object, or the statement has no answered routed record",
                       "route_bound_check": "a statement whose selectors each carry a label=\"value\" matcher with a non-empty value is route_bound; for any other the router probes only that selector's metric name and keeps every object holding it, so it carries no value_holders and is left out of every comparison with the routed pass",
-                      "route_unbound_count": len(unbound), "route_unbound": unbound}))
+                      "route_unbound_count": len(unbound), "route_unbound": unbound}
+    if series_mode:
+        out.update({
+            "series_index": True,
+            "series_prune_check": "MB_SERIES_INDEX=1: for each route_bound statement, segmentsPrunedBySeriesIndex of every answered (ok or incorrect) stage1-routed record the series route answered in full (its seriesIndex shows planPartsAnswered above 0 and no decline) == expected_series_prunes, the resolved set less series_holders (the resolved set's objects holding a series that carries, for at least one selector, its metric name and every label=\"value\" pair); such a record's prunes count under the series counter alone, so the routed prune check reads only the statement's other records (seriesIndex absent, routing no plan, or declining every pair) and skips the statement when it has none; a statement with a record the route answered in part (mixed) or whose seriesIndex is malformed, or with a series-answered record lacking a whole-number segmentsPrunedBySeriesIndex, or a null expected_series_prunes, is counted as series_prune_unchecked; series_opened_minus_expected is, over the series-answered records, the segmentsFetched minus series_holders plus token_only_fetched of largest magnitude; series_route_records counts the route_bound statements' answered routed records by series_route",
+            "series_prune_mismatches_count": len(series_mismatches),
+            "series_prune_mismatches": series_mismatches,
+            "series_prune_unchecked_count": len(series_unchecked),
+            "series_prune_unchecked": series_unchecked,
+            "series_prune_records_checked": series_records_checked,
+            "series_route_records": series_route_counts,
+        })
+    print(json.dumps(out))
 else:
     print(f"unknown op {op}", file=sys.stderr)
     sys.exit(2)
@@ -2673,6 +2820,14 @@ case "$STAGE1" in
 esac
 if [ "$stage1" -eq 1 ] && [ "$diagnostic" -eq 1 ]; then
   usage_error "MB_STAGE1=1 measures the folded Ravel passes; --diagnostic-prometheus-max-samples starts no Ravel"
+fi
+case "$SERIES_INDEX" in
+  "" | 0) series_index=0 ;;
+  1) series_index=1 ;;
+  *) usage_error "MB_SERIES_INDEX takes 1 (on) or 0 (off), got '$SERIES_INDEX'" ;;
+esac
+if [ "$series_index" -eq 1 ] && [ "$stage1" -eq 0 ]; then
+  usage_error "MB_SERIES_INDEX=1 routes the Stage 1 passes through the metrics series index and needs MB_STAGE1=1"
 fi
 arm_control=0 arm_extra_hour=0 arm_l1=0 arm_erasure=0
 if [ -n "${MB_STAGE1_ARMS:-}" ]; then
@@ -3038,6 +3193,7 @@ if [ "$stage1" -eq 1 ]; then
   stamp_set stage1.server_flags_up null
   stamp_set stage1.server_flags_unrouted null
   stamp_set stage1.server_flags_routed null
+  [ "$series_index" -eq 0 ] || stamp_set stage1.series_index null
   if [ "$arm_control" -eq 1 ]; then
     stamp_set stage1.server_flags_control null
   else
@@ -3848,6 +4004,49 @@ stage1_label_flag() {
   esac
 }
 
+# stage1_series_refuse WHY: stage1.series_index stamped refused and step
+# stage1-flags failed, before anything is up.
+stage1_series_refuse() {
+  stamp_str stage1.series_index "refused: $1"
+  fail_step stage1-flags "refused: $1"
+}
+
+# stage1_series_label_on SPELLING ON OFF FLAGS: whether FLAGS put the label
+# index on for a binary of SPELLING: the opt-in flag present on an opt-in
+# binary, the opt-out flag absent on either.
+stage1_series_label_on() {
+  case " $4 " in *" $3 "*) return 1 ;; esac
+  [ "$1" = opt-out ] && return 0
+  case " $4 " in *" $2 "*) return 0 ;; esac
+  return 1
+}
+
+# stage1_series_index_flags SERVER_SPELLING CLI_SPELLING CLI_ON: MB_SERIES_INDEX=1
+# within step stage1-flags. The help texts stage1_spelling saved must list the
+# series switch as an option (--fold-metrics-series-index for ravel-server,
+# --metrics-series-index for ravel-cli catalog fold), and the routed server
+# flags and the leaf-on fold flags must put the label index on, because the
+# series index is built and read only alongside it and ravel-server takes the
+# switch without the label index and silently does nothing with it. Then the
+# routed flags gain the server switch, STAGE1_CLI_SERIES_INDEX_ON the fold
+# switch, and stage1.series_index records both.
+stage1_series_index_flags() {
+  local server="$1" cli="$2" cli_on="$3" option='^ {0,6}(-[[:alnum:]], )?'
+  local server_flag="--fold-metrics-series-index" cli_flag="--metrics-series-index"
+  local server_help="stage1-flags.server.help.txt" cli_help="stage1-flags.cli.help.txt"
+  grep -Eq -- "${option}${server_flag}([ =]|\$)" "${out_dir}/${server_help}" ||
+    stage1_series_refuse "MB_SERIES_INDEX=1 needs ${server_flag}, and ravel-server --help in ${ravel_image} does not list it; see ${out_dir}/${server_help}"
+  grep -Eq -- "${option}${cli_flag}([ =]|\$)" "${out_dir}/${cli_help}" ||
+    stage1_series_refuse "MB_SERIES_INDEX=1 needs ${cli_flag}, and ravel-cli catalog fold --help in ${ravel_image} does not list it; see ${out_dir}/${cli_help}"
+  stage1_series_label_on "$server" --fold-metrics-label-index --no-fold-metrics-label-index "$STAGE1_ROUTED_FLAGS" ||
+    stage1_series_refuse "MB_SERIES_INDEX=1 needs the metrics label index on in the routed passes, and the routed ravel-server flags '${STAGE1_ROUTED_FLAGS}' leave it off"
+  stage1_series_label_on "$cli" --metrics-label-index --no-metrics-label-index "$cli_on" ||
+    stage1_series_refuse "MB_SERIES_INDEX=1 needs the metrics label index on in the leaf-on folds, and their ravel-cli catalog fold flags '${cli_on}' leave it off"
+  STAGE1_ROUTED_FLAGS="${STAGE1_ROUTED_FLAGS} ${server_flag}"
+  STAGE1_CLI_SERIES_INDEX_ON="$cli_flag"
+  stamp_set stage1.series_index "{\"enabled\": true, \"switch\": \"MB_SERIES_INDEX=1\", \"server_flag\": \"${server_flag}\", \"server_help\": \"${server_help}\", \"cli_flag\": \"${cli_flag}\", \"cli_help\": \"${cli_help}\", \"method\": \"each flag found as an option line in the help text step stage1-flags saved, and the label index on in the same flag sets (the series index is built and read only alongside it); the server flag rides on server_flags_routed (and the Ravel-only shape's up flags taken from it), the fold flag on every ravel-cli catalog fold run with the label index on (stage1-leaves and the extra-hour, l1 and erasure arms' leaf-on folds); unrouted, control and the leaf-off folds run without either\"}"
+}
+
 # stage1_label_index_flags: step stage1-flags, before up. The label-index
 # spelling of the main image's ravel-server and ravel-cli catalog fold, and of
 # the control image's ravel-server when the control arm is on, read from
@@ -3896,6 +4095,7 @@ print(json.dumps(d))' \
     control_server "$control_image" "ravel-server --help" "$control" "$control_on" "$control_off")"
   [ "$arm_control" -eq 1 ] ||
     stamp_str stage1.label_index_flags.control_server "skipped: arm off ($(stage1_arm_switch control))"
+  [ "$series_index" -eq 0 ] || stage1_series_index_flags "$server" "$cli" "$cli_on"
   stamp_str stage1.server_flags_up "$STAGE1_UP_FLAGS"
   stamp_str stage1.server_flags_unrouted "$STAGE1_UNROUTED_FLAGS"
   stamp_str stage1.server_flags_routed "$STAGE1_ROUTED_FLAGS"
@@ -3928,6 +4128,20 @@ stage1_catalog_fold() {
   fi
   stamp_set "$key" "$line"
   step_done "$step"
+}
+
+# stage1_leaves_series_stamp: with MB_SERIES_INDEX=1, the stage1-leaves
+# rebuild report's series-index figures stamped as stage1.leaves.series_index
+# (step stage1-leaves-series, which fails when the report lacks them).
+stage1_leaves_series_stamp() {
+  local code=0 line
+  line="$(py stage1-leaves-series "${out_dir}/stage1-leaves.json")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str stage1.leaves.series_index "failed: $line"
+    fail_step stage1-leaves-series "$line"
+  fi
+  stamp_set stage1.leaves.series_index "$line"
+  step_done stage1-leaves-series
 }
 
 # stage1_no_leaves_written STEP KEY REFUSAL_KEY: the fold stamped as KEY, run
@@ -4183,7 +4397,9 @@ stage1_compare() {
 # record's segmentsFetched against the statement's unrouted_fetched_expected,
 # each routed record of a route-bound statement's segmentsPrunedByLabelIndex
 # against its expected_routed_prunes and its keyIndex phase for a leaf read,
-# and lists the statements that are not route-bound.
+# and lists the statements that are not route-bound. With MB_SERIES_INDEX=1 a
+# routed record the series route answered in full is checked by its
+# segmentsPrunedBySeriesIndex against expected_series_prunes instead.
 stage1_holders_step() {
   local bucket code=0 dest="${out_dir}/stage1-objects" hours line
   local list_file="${out_dir}/stage1-objects.jsonl"
@@ -4235,7 +4451,8 @@ stage1_holders_step() {
   stage1_whole_figure holders stage1.routed_catalog.watermark_hour
   line="$(py stage1-holders "${out_dir}/holders.json" "${out_dir}/stage1-unrouted/diagnostics.json" \
     "${out_dir}/stage1-routed/diagnostics.json" "$list_file" "$STAGE1_FIGURE" "$bucket" \
-    "routed: listed after stage1-routed, objects_above_watermark against stage1.routed_catalog.watermark_hour")" || code=$?
+    "routed: listed after stage1-routed, objects_above_watermark against stage1.routed_catalog.watermark_hour" \
+    ${STAGE1_CLI_SERIES_INDEX_ON:+"series-index"})" || code=$?
   if [ "$code" -ne 0 ]; then
     stamp_str stage1.holders "failed: ${line:-stage1-holders exited $code}"
     fail_step stage1-holders "${line:-stage1-holders exited $code}"
@@ -4400,9 +4617,9 @@ stage1_extra_hour_step() {
   step_done stage1-extra-hour-ingest
   stage1_stop stage1-extra-hour-fold-on
   stage1_head_restore stage1-extra-hour-fold-on head-routed "$STAGE1_ROUTED_HEAD"
-  # shellcheck disable=SC2086 # STAGE1_CLI_LABEL_INDEX_ON is empty or one flag
+  # shellcheck disable=SC2086 # each STAGE1_CLI_*_INDEX_ON is empty or one flag
   stage1_catalog_fold stage1-extra-hour-fold-on stage1.extra_hour_fold_on stage1-fold stage1-extra-hour-fold-on \
-    --signal metrics --writers-stopped --key-index-leaves $STAGE1_CLI_LABEL_INDEX_ON
+    --signal metrics --writers-stopped --key-index-leaves $STAGE1_CLI_LABEL_INDEX_ON $STAGE1_CLI_SERIES_INDEX_ON
   stage1_head_fetch stage1-extra-hour-fold-off head-fold-on
   fold_on_head="$STAGE1_HEAD_SHA"
   stage1_head_restore stage1-extra-hour-fold-off head-leafless "$STAGE1_LEAFLESS_HEAD"
@@ -4466,9 +4683,9 @@ stage1_l1_step() {
   fi
   stamp_set stage1.l1_compact "$line"
   step_done stage1-l1-compact
-  # shellcheck disable=SC2086 # STAGE1_CLI_LABEL_INDEX_ON is empty or one flag
+  # shellcheck disable=SC2086 # each STAGE1_CLI_*_INDEX_ON is empty or one flag
   stage1_catalog_fold stage1-l1-fold stage1.l1_fold stage1-fold stage1-l1-fold \
-    --signal metrics --writers-stopped --key-index-leaves $STAGE1_CLI_LABEL_INDEX_ON
+    --signal metrics --writers-stopped --key-index-leaves $STAGE1_CLI_LABEL_INDEX_ON $STAGE1_CLI_SERIES_INDEX_ON
   stage1_recreate stage1-l1 stage1.l1_restart "$STAGE1_ROUTED_FLAGS"
   stage1_list stage1-l1 stage1-l1.objects.jsonl
   code=0
@@ -4632,9 +4849,9 @@ stage1_erasure_step() {
   stamp_str stage1.erasure_rewrite.path "a one-off ravel-server --mode maintain container (${name}, --maintain-tenant ${RAVEL_TENANT} --disable-fold), removed once erase status said COMPLETED"
   step_done stage1-erasure-rewrite
   stage1_stop stage1-erasure-fold
-  # shellcheck disable=SC2086 # STAGE1_CLI_LABEL_INDEX_ON is empty or one flag
+  # shellcheck disable=SC2086 # each STAGE1_CLI_*_INDEX_ON is empty or one flag
   stage1_catalog_fold stage1-erasure-fold stage1.erasure_fold stage1-fold stage1-erasure-fold \
-    --signal metrics --writers-stopped --key-index-leaves $STAGE1_CLI_LABEL_INDEX_ON
+    --signal metrics --writers-stopped --key-index-leaves $STAGE1_CLI_LABEL_INDEX_ON $STAGE1_CLI_SERIES_INDEX_ON
   stage1_catalog_state erasure
   stage1_list stage1-erasure stage1-erasure.objects.jsonl
   code=0
@@ -4688,9 +4905,10 @@ stage1_steps() {
     stage1_head_fetch stage1-leaves head-leafless
     STAGE1_LEAFLESS_HEAD="$STAGE1_HEAD_SHA"
   fi
-  # shellcheck disable=SC2086 # STAGE1_CLI_LABEL_INDEX_ON is empty or one flag
+  # shellcheck disable=SC2086 # each STAGE1_CLI_*_INDEX_ON is empty or one flag
   stage1_catalog_fold stage1-leaves stage1.leaves stage1-leaves stage1-leaves \
-    --rebuild-key-index --signal metrics $STAGE1_CLI_LABEL_INDEX_ON
+    --rebuild-key-index --signal metrics $STAGE1_CLI_LABEL_INDEX_ON $STAGE1_CLI_SERIES_INDEX_ON
+  [ "$series_index" -eq 0 ] || stage1_leaves_series_stamp
   if [ "$arm_extra_hour" -eq 1 ]; then
     stage1_head_fetch stage1-restart head-routed
     STAGE1_ROUTED_HEAD="$STAGE1_HEAD_SHA"
@@ -4837,9 +5055,9 @@ ravel_only_catalog() {
 ravel_only_l0_catalog() {
   stage1_stop stage1-l0-fold
   stage1_seal_wait stage1-l0-fold "the fold seals the last ingest hour only past the 5 minute clock-skew allowance"
-  # shellcheck disable=SC2086 # STAGE1_CLI_LABEL_INDEX_ON is empty or one flag
+  # shellcheck disable=SC2086 # each STAGE1_CLI_*_INDEX_ON is empty or one flag
   stage1_catalog_fold stage1-l0-fold stage1.l0_fold stage1-fold stage1-l0-fold \
-    --signal metrics --writers-stopped --key-index-leaves $STAGE1_CLI_LABEL_INDEX_ON
+    --signal metrics --writers-stopped --key-index-leaves $STAGE1_CLI_LABEL_INDEX_ON $STAGE1_CLI_SERIES_INDEX_ON
   stage1_recreate stage1-l0 stage1.l0_restart "$STAGE1_ROUTED_FLAGS"
   stage1_catalog_state l0
   ravel_only_catalog l0 stage1-l0
