@@ -416,11 +416,11 @@ pub(crate) async fn retention_sweep_bucket_observed(
         } else {
             ObservedExpiry::NoLaterThanOnly(tombstone.retired_at_ns)
         });
-        if now
+        let horizon_elapsed = now
             >= tombstone
                 .retired_at_ns
-                .saturating_add(config.protection_horizon_ns)
-        {
+                .saturating_add(config.protection_horizon_ns);
+        if horizon_elapsed || ravel_invariant::inv_mutant!("lifecycle/delete-before-horizon") {
             let anchor = MarkerAnchor {
                 kind: MarkerKind::Retention,
                 key: tombstone_key.clone(),
@@ -870,6 +870,31 @@ async fn physical_sweep(
         return Ok(RetentionOutcome::SweptPartial);
     }
 
+    // NoDeleteInsideProtectionWindow (ADR-4326 lifecycle): every physical
+    // retention delete below happens at or past the tombstone's protection
+    // horizon. Judged from the durable retired_at the anchor carries (read from
+    // the store tombstone) and a fresh clock read, not from the caller's gate
+    // decision, so the `delete-before-horizon` mutant that bypassed that gate
+    // is caught here.
+    if !dry_run {
+        let _now = clock.now_ns();
+        ravel_invariant::inv_always!(
+            _now >= anchor
+                .anchor_unix_ns
+                .saturating_add(config.protection_horizon_ns),
+            "gc: no object is deleted inside its protection window",
+            std::collections::BTreeMap::from([
+                ("tombstone_key", tombstone_key.to_string()),
+                ("now_ns", _now.to_string()),
+                ("retired_at_ns", anchor.anchor_unix_ns.to_string()),
+                (
+                    "protection_horizon_ns",
+                    config.protection_horizon_ns.to_string(),
+                ),
+            ])
+        );
+    }
+
     // Deletion order (docs/consistency-model.md "Deletion and GC", ADR-0019
     // decision 4): records, then data objects, then L1 parts, tombstone last.
     delete_all(store, lease, &listing.commit_keys, dry_run).await?;
@@ -900,6 +925,10 @@ async fn physical_sweep(
     }
     if !dry_run {
         store.delete(tombstone_key).await?;
+        ravel_invariant::inv_reachable!(
+            "gc: retention physical sweep delete",
+            std::collections::BTreeMap::from([("tombstone_key", tombstone_key.to_string())])
+        );
     }
     Ok(RetentionOutcome::Swept)
 }
@@ -1975,6 +2004,91 @@ mod tests {
             gets() - before,
             no_rewrite_gets,
             "a known answer reads no rewrite record"
+        );
+    }
+
+    const PROTECTION_WINDOW: &str = "gc: no object is deleted inside its protection window";
+
+    /// The tombstone key [`put_tombstone`] seeds for `bucket`, used as the
+    /// per-test needle that isolates this bucket's captured evaluations from
+    /// every other test sharing the in-process record.
+    fn tombstone_key_for(bucket: &Bucket) -> String {
+        let tombstone = RetentionTombstone {
+            format_version: 1,
+            tenant_hash: bucket.tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(bucket.signal) as i32,
+            shard: bucket.shard,
+            ingest_hour_bucket: bucket.ingest_hour_bucket,
+            retired_at_ns: RETIRED_AT_NS,
+            retention_window_ns: WINDOW_NS as u64,
+            record_count_observed: 1,
+        };
+        keys::retention_tombstone_key_for(&tombstone).expect("key")
+    }
+
+    /// The `delete-before-horizon` mutant bypasses the caller's horizon gate, so
+    /// the sweep runs at `retired_at + 1`, far short of the protection horizon.
+    /// The site re-derives the horizon from the durable tombstone and the clock,
+    /// so `NoDeleteInsideProtectionWindow` evaluates false at the delete.
+    #[tokio::test]
+    async fn mutant_delete_before_horizon_breaks_protection_window() {
+        let Some(_mutant) = crate::publish::tests::scoped_mutant("lifecycle/delete-before-horizon")
+        else {
+            return;
+        };
+        let store = MemoryStore::new();
+        let bucket = put_tombstone(&store, 41).await;
+        let needle = tombstone_key_for(&bucket);
+
+        let (outcome, _expiry) =
+            evaluate_at(&store, &bucket, RETIRED_AT_NS + 1, RewriteBound::Unread)
+                .await
+                .expect("retention pass");
+        assert_eq!(
+            outcome,
+            RetentionOutcome::Swept,
+            "the mutant forces the physical sweep before the horizon"
+        );
+
+        let found = crate::publish::tests::evaluations(PROTECTION_WINDOW, &needle);
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the protection-window invariant must evaluate false under the mutant: {found:?}"
+        );
+    }
+
+    /// Without the mutant, a sweep runs only once the clock is past
+    /// `retired_at + protection_horizon`, so the property is evaluated and holds
+    /// at the delete, never false.
+    #[tokio::test]
+    async fn protection_window_holds_for_a_delete_past_the_horizon() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let bucket = put_tombstone(&store, 42).await;
+        let needle = tombstone_key_for(&bucket);
+        let past = RETIRED_AT_NS
+            .saturating_add(CompactorConfig::default().protection_horizon_ns)
+            .saturating_add(1);
+
+        let (outcome, _expiry) = evaluate_at(&store, &bucket, past, RewriteBound::Unread)
+            .await
+            .expect("retention pass");
+        assert_eq!(
+            outcome,
+            RetentionOutcome::Swept,
+            "a real sweep past the horizon"
+        );
+
+        let found = crate::publish::tests::evaluations(PROTECTION_WINDOW, &needle);
+        assert!(
+            !found.is_empty(),
+            "the property is evaluated at the physical delete"
+        );
+        assert!(
+            found.iter().all(|(held, _)| *held),
+            "the protection-window invariant never evaluates false past the horizon: {found:?}"
         );
     }
 }

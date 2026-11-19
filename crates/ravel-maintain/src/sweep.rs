@@ -795,6 +795,22 @@ pub async fn sweep_orphans(
         });
     }
 
+    // ADR-4326 lifecycle: under the invariants build, re-read the tenant's
+    // holds at the delete as the independent evidence HeldObjectNeverDeleted and
+    // RefreshFailureNeverSweeps read, distinct from the `lease` this pass was
+    // handed. A failed re-read leaves the hold state unknown, so the pass
+    // deletes nothing this tick; the `refresh-failure-is-no-hold` mutant
+    // proceeds instead. A shipped build never evaluates this (EVALUATES is
+    // false), so the sweep's behaviour is unchanged there.
+    let gate_holds = if ravel_invariant::EVALUATES && !candidates.is_empty() {
+        match crate::legal_hold::sweep_delete_gate(store, tenant).await {
+            Some(holds) => Some(holds),
+            None => return Ok(OrphanSweepOutcome::default()),
+        }
+    } else {
+        None
+    };
+
     // Phase (d): quarantine. The breaker (phase (c)) already returned if the
     // pass should collect zero; here every surviving candidate is moved to the
     // `quarantine/` prefix, copy first and delete of the live key second, so a
@@ -812,7 +828,25 @@ pub async fn sweep_orphans(
         let dest = quarantine_key(&meta.key, quarantined_at_ns);
         match quarantine_object(store, &meta.key, &dest).await {
             Ok(QuarantineMove::Copied) => {
+                // HeldObjectNeverDeleted: judged from the holds re-read at the
+                // delete (the store's current hold set), not the `lease` handed
+                // in, so an empty lease substituted for a failed refresh does
+                // not hide a live hold on this key.
+                if let Some(_holds) = &gate_holds {
+                    ravel_invariant::inv_always!(
+                        !_holds.is_protected(&meta.key),
+                        "gc: a held object is never deleted",
+                        std::collections::BTreeMap::from([
+                            ("key", meta.key.clone()),
+                            ("tenant", tenant.to_hex()),
+                        ])
+                    );
+                }
                 store.delete(&meta.key).await?;
+                ravel_invariant::inv_reachable!(
+                    "gc: orphan sweep delete",
+                    std::collections::BTreeMap::from([("key", meta.key.clone())])
+                );
                 quarantined += 1;
             }
             // The live object vanished between the listing and the copy (a
@@ -4633,6 +4667,78 @@ mod tests {
         assert!(remaining.is_empty(), "all orphans deleted normally");
     }
 
+    const HELD_NEVER_DELETED: &str = "gc: a held object is never deleted";
+
+    /// With no hold on the tenant, every orphan delete re-reads an empty hold
+    /// set, so `HeldObjectNeverDeleted` is evaluated at each delete and holds.
+    #[tokio::test]
+    async fn held_object_never_deleted_holds_for_an_unheld_orphan_sweep() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let tenant = TenantHash([0x5a; 16]);
+        let signal = Signal::Metrics;
+        let shard = 3;
+        let store = MemoryStore::new();
+        for seq in 0..2u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("sweep");
+        assert_eq!(outcome.deleted, 2);
+
+        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &tenant.to_hex());
+        assert_eq!(found.len(), 2, "one evaluation per delete: {found:?}");
+        assert!(
+            found.iter().all(|(held, _)| *held),
+            "never false when nothing is held: {found:?}"
+        );
+    }
+
+    /// The site is not vacuous: an orphan sweep handed an empty `lease` (what a
+    /// refresh-failure substitution leaves) still re-reads the store's real hold
+    /// set at the delete, so a live hold on the swept key makes
+    /// `HeldObjectNeverDeleted` evaluate false. The passed-in `NoLeases` does not
+    /// hide it.
+    #[tokio::test]
+    async fn held_object_never_deleted_breaks_when_an_empty_lease_deletes_a_held_key() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let tenant = TenantHash([0x5b; 16]);
+        let signal = Signal::Metrics;
+        let shard = 4;
+        let store = MemoryStore::new();
+        put_orphan(&store, &tenant, signal, shard, 0).await;
+        // A hold whose scope is the shard's L0 data prefix covers the orphan key.
+        let scope = l0_data_prefix(&tenant, signal, shard).unwrap();
+        crate::legal_hold::write_hold_set(&store, &tenant, Uuid::from_u128(1), 0, &scope, "legal")
+            .await
+            .expect("place hold");
+
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+        // `NoLeases`: the lease the sweep is handed protects nothing, mirroring an
+        // empty snapshot substituted for a failed refresh.
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("sweep");
+        assert_eq!(
+            outcome.deleted, 1,
+            "the empty lease let the held key be swept"
+        );
+
+        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &tenant.to_hex());
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the re-read of the store's real holds makes the property false: {found:?}"
+        );
+    }
+
     #[tokio::test]
     async fn forced_pass_deletes_and_reports_override() {
         let tenant = tenant();
@@ -4671,6 +4777,9 @@ mod tests {
         // Four candidates, comfortably below orphan_breaker_min_count, so the
         // breaker never interferes with either half of this test.
         let config = CompactorConfig::default();
+        // This shard's commit prefix only: an invariants build also LISTs the
+        // audit hold shard's commit prefix before the deletes.
+        let shard_commits = keys::commit_shard_prefix(&tenant, signal, shard).unwrap();
 
         // The second commit-prefix LIST is the batched re-verify (ADR-0048
         // decision 5): faulting it aborts the pass before any delete, which
@@ -4683,7 +4792,7 @@ mod tests {
             let clock = aged_clock(&config);
             let plan = FaultPlan::empty().with_rule(
                 Rule::new(Op::List, ScriptedFault::Timeout)
-                    .with_key_contains("/c/")
+                    .with_key_contains(shard_commits.clone())
                     .with_occurrence(Occurrence::Nth(2)),
             );
             let store = FaultStore::new(mem, plan);
@@ -4719,7 +4828,7 @@ mod tests {
             let clock = aged_clock(&config);
             let plan = FaultPlan::empty().with_rule(
                 Rule::new(Op::List, ScriptedFault::Timeout)
-                    .with_key_contains("/c/")
+                    .with_key_contains(shard_commits.clone())
                     .with_occurrence(Occurrence::Nth(3)),
             );
             let store = FaultStore::new(mem, plan);

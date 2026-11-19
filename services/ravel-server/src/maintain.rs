@@ -2532,6 +2532,14 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
 
     let hold = match LegalHoldCheck::refresh(store, tenant).await {
         Ok(hold) => hold,
+        // Mutant lifecycle/refresh-failure-is-no-hold (ADR-4326): treat a failed
+        // refresh as an empty hold set and proceed into the tick's sweeps
+        // instead of skipping. The RefreshFailureNeverSweeps site in
+        // ravel-maintain's sweep then catches the delete under the failed
+        // refresh.
+        Err(_) if ravel_invariant::inv_mutant!("lifecycle/refresh-failure-is-no-hold") => {
+            LegalHoldCheck::empty()
+        }
         Err(err) => {
             tracing::error!(
                 tenant = %tenant.to_hex(),
@@ -2539,6 +2547,10 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 "maintenance: legal hold refresh failed; skipping this tenant's tick entirely, retried next tick"
             );
             safety.record_legal_hold_refresh_failure();
+            ravel_invariant::inv_reachable!(
+                "gc: a failed hold refresh skips the maintain tick",
+                std::collections::BTreeMap::from([("tenant", tenant.to_hex())])
+            );
             return MaintainReport::default();
         }
     };
@@ -3640,6 +3652,14 @@ struct ErasureRewritePass {
     /// `.done` is withheld even when `deferred` is false: completion follows the
     /// resolver the query path trusts, not the pass's own live-record hop.
     catalog_blocked: std::collections::HashSet<String>,
+    /// Every bucket this pass ran the completion resolver over. Kept only so the
+    /// completion-write invariant (ADR-4326
+    /// `CompletionImpliesNoPreRewriteExposure`) can re-derive the served set
+    /// from a fresh read at the write rather than trust `catalog_blocked`, the
+    /// flag the pass itself set. Populated only under the invariants build
+    /// (`ravel_invariant::EVALUATES`); empty in a shipped build, which runs no
+    /// such re-read.
+    checked_buckets: Vec<Bucket>,
 }
 
 /// Rewrite every bucket of one `(tenant, signal)` against `pending`
@@ -3805,6 +3825,11 @@ async fn erasure_rewrite_pass(
             // bucket the pass called `AlreadyApplied` or `NoApplicableRequests`
             // off its one-hop view, or a derived ack-open hour still unsealed,
             // is exactly where completion must be withheld.
+            // Record the bucket for the completion-write invariant's fresh
+            // re-read (invariants build only).
+            if ravel_invariant::EVALUATES {
+                pass.checked_buckets.push(bucket);
+            }
             match ravel_maintain::bucket_erasure_completion(
                 store, clock, compactor, hold, &bucket, pending,
             )
@@ -4054,6 +4079,33 @@ async fn run_erasure_pass(
                      request stays pending"
                 );
             } else {
+                // CompletionImpliesNoPreRewriteExposure (ADR-4326): the
+                // independent re-read of the served set the invariant below
+                // judges from, run once per tick over the buckets this pass
+                // checked. `None` on a re-read failure (the invariant then
+                // cannot tell). Fresh store reads, not `pass.catalog_blocked`,
+                // which the pass itself set. Invariants build only.
+                let _served_reread: Option<std::collections::HashSet<String>> =
+                    if ravel_invariant::EVALUATES {
+                        let mut fresh = std::collections::HashSet::new();
+                        let mut ok = true;
+                        for b in &pass.checked_buckets {
+                            match ravel_maintain::bucket_erasure_completion(
+                                store, clock, compactor, hold, b, &pending,
+                            )
+                            .await
+                            {
+                                Ok(completion) => fresh.extend(completion.blocked),
+                                Err(_) => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        ok.then_some(fresh)
+                    } else {
+                        None
+                    };
                 for entry in &pending {
                     // Completion follows the CATALOG resolver, not the rewrite
                     // pass's one-hop live-record classification (ADR-0064 §4
@@ -4064,7 +4116,14 @@ async fn run_erasure_pass(
                     // `contains` guard and a `.done` lands while a snapshot
                     // still resolves the subject out of an L0 input the one-hop
                     // resolver never saw.
-                    if pass.catalog_blocked.contains(&entry.request.request_id) {
+                    //
+                    // Mutant lifecycle/complete-ignores-served-set (ADR-4326):
+                    // drop the served-set guard, so a `.done` lands while the
+                    // subject is still served. The re-read invariant at the
+                    // write catches it.
+                    if pass.catalog_blocked.contains(&entry.request.request_id)
+                        && !ravel_invariant::inv_mutant!("lifecycle/complete-ignores-served-set")
+                    {
                         tracing::info!(
                             tenant = %tenant.to_hex(),
                             signal = ?signal,
@@ -4075,6 +4134,20 @@ async fn run_erasure_pass(
                         );
                         continue;
                     }
+                    // CompletionImpliesNoPreRewriteExposure: at the write, the
+                    // served set re-read from the store must no longer serve
+                    // this request's subject. `None` where the re-read could not
+                    // tell.
+                    ravel_invariant::inv_always_if_known!(
+                        _served_reread
+                            .as_ref()
+                            .map(|blocked| !blocked.contains(&entry.request.request_id)),
+                        "erasure: a completion is written only when no pre-rewrite object is still served",
+                        std::collections::BTreeMap::from([
+                            ("request_id", entry.request.request_id.clone()),
+                            ("tenant", tenant.to_hex()),
+                        ])
+                    );
                     match write_erasure_completion(
                         store,
                         clock.now_ns(),
@@ -4084,12 +4157,21 @@ async fn run_erasure_pass(
                     )
                     .await
                     {
-                        Ok(true) => tracing::info!(
-                            tenant = %tenant.to_hex(),
-                            signal = ?signal,
-                            request_id = %entry.request.request_id,
-                            "maintenance: erasure request complete; .done written"
-                        ),
+                        Ok(true) => {
+                            ravel_invariant::inv_reachable!(
+                                "erasure: a completion .done was written",
+                                std::collections::BTreeMap::from([(
+                                    "request_id",
+                                    entry.request.request_id.clone(),
+                                )])
+                            );
+                            tracing::info!(
+                                tenant = %tenant.to_hex(),
+                                signal = ?signal,
+                                request_id = %entry.request.request_id,
+                                "maintenance: erasure request complete; .done written"
+                            )
+                        }
                         Ok(false) => tracing::debug!(
                             tenant = %tenant.to_hex(),
                             signal = ?signal,
