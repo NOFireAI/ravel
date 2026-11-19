@@ -76,6 +76,31 @@ pub fn judge_held(reply: &str, tenant_prefix: &str) -> Held {
     }
 }
 
+/// The status the store answered the held PUT of `held_key` with, from the
+/// proxy's `held-result`; `None` when that names another key or none.
+pub fn held_status(held_key: &str, held_result: Option<&(String, u16)>) -> Option<u16> {
+    held_result
+        .filter(|(key, _)| key == held_key)
+        .map(|(_, status)| *status)
+}
+
+/// Whether a server's record PUT lost to the `ravel-cli` compaction, judged
+/// from the store: the CLI's record was in the store before the release, the
+/// driver released the held PUT before the proxy's cap forwarded it on its
+/// own (`released_at_age`, `None` when the release failed), and the store
+/// refused the held PUT as a create of a key that exists (`412`, or `409`).
+/// A `403` (a request signed on a clock the store no longer agrees with), a
+/// `5xx` or a `200` never reached `AlreadyExists` in the server.
+pub fn record_lost(
+    published_before_release: bool,
+    released_at_age: Option<Duration>,
+    held_status: Option<u16>,
+) -> bool {
+    published_before_release
+        && released_at_age.is_some_and(|age| age <= HOLD_CAP)
+        && matches!(held_status, Some(412) | Some(409))
+}
+
 /// How long the `ravel-cli` compaction may run before a PUT held for `age`
 /// is released.
 pub fn cli_budget(age: Duration) -> Duration {
@@ -112,6 +137,35 @@ pub fn unfolded_reached(
     inputs_before: usize,
 ) -> bool {
     head_after == Some(head_before) && record_present && inputs_before > 0
+}
+
+/// Whether the unreadable-HEAD sweep reached what it exists for: after the
+/// jump past the protection horizon and the wait for the servers' sweeps,
+/// HEAD still held the garbage the driver wrote, so every pass in the wait
+/// read an undecodable HEAD.
+pub fn unreadable_head_reached(head_after: Option<&[u8]>, garbage: &[u8]) -> bool {
+    head_after == Some(garbage)
+}
+
+/// The catalog snapshot prefix `t/<tenant>/catalog/<signal>/snap/` beside a
+/// HEAD key `t/<tenant>/catalog/<signal>/HEAD`.
+pub fn snap_prefix(head_key: &str) -> Option<String> {
+    let dir = head_key.strip_suffix("/HEAD")?;
+    dir.contains("/catalog/").then(|| format!("{dir}/snap/"))
+}
+
+/// The keys of `before` under `prefix` that `after` does not hold.
+pub fn deleted_under(
+    prefix: &str,
+    before: &BTreeSet<String>,
+    after: &BTreeSet<String>,
+) -> Vec<String> {
+    before
+        .range(prefix.to_string()..)
+        .take_while(|k| k.starts_with(prefix))
+        .filter(|k| !after.contains(*k))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -230,6 +284,92 @@ mod tests {
             ]
         );
         assert!(present_inputs(&inputs, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn only_a_store_refused_create_after_the_cli_published_is_a_lost_record_put() {
+        let fresh = Some(Duration::from_secs(10));
+        // The CLI's record was in place and the store refused the held create
+        // (412, or 409): lost.
+        assert!(record_lost(true, fresh, Some(412)));
+        assert!(record_lost(true, fresh, Some(409)));
+        // Published before the release, but the store refused the held PUT
+        // for skew (403): it never reached AlreadyExists in the server. This
+        // rules out the old rule, published_before_release alone.
+        assert!(!record_lost(true, fresh, Some(403)));
+        assert!(!record_lost(true, fresh, Some(503)));
+        assert!(!record_lost(true, fresh, Some(500)));
+        // A held PUT the store accepted (200) is a win, never lost. This
+        // rules out a rule that counts any held PUT.
+        assert!(!record_lost(true, fresh, Some(200)));
+        // No held-result for the held key.
+        assert!(!record_lost(true, fresh, None));
+        // The CLI had not published before the release.
+        assert!(!record_lost(false, fresh, Some(412)));
+        // The release failed, or came after the proxy's cap forwarded the
+        // PUT on its own.
+        assert!(!record_lost(true, None, Some(412)));
+        assert!(record_lost(true, Some(HOLD_CAP), Some(412)));
+        assert!(!record_lost(
+            true,
+            Some(HOLD_CAP + Duration::from_millis(1)),
+            Some(412)
+        ));
+    }
+
+    #[test]
+    fn the_held_status_is_the_held_keys_only() {
+        let record = key(3, HOUR, "l1.0011223344556677.cmt");
+        let other = key(2, HOUR, "l1.8899aabbccddeeff.cmt");
+        assert_eq!(
+            held_status(&record, Some(&(record.clone(), 412))),
+            Some(412)
+        );
+        assert_eq!(held_status(&record, Some(&(other, 412))), None);
+        assert_eq!(held_status(&record, None), None);
+    }
+
+    #[test]
+    fn the_unreadable_head_sweep_counts_only_the_garbage_still_in_place() {
+        let garbage = b"antithesis: not a catalog HEAD (unreadable-HEAD sweep 0)";
+        assert!(unreadable_head_reached(Some(garbage), garbage));
+        // A repair got through: HEAD holds valid bytes after the wait.
+        assert!(!unreadable_head_reached(
+            Some(b"\x0a\x04RHD1valid"),
+            garbage
+        ));
+        // Other garbage (another rule's), or no HEAD at all.
+        assert!(!unreadable_head_reached(
+            Some(b"antithesis: not a catalog HEAD"),
+            garbage
+        ));
+        assert!(!unreadable_head_reached(None, garbage));
+    }
+
+    #[test]
+    fn the_snapshot_prefix_sits_beside_head() {
+        assert_eq!(
+            snap_prefix("t/0a0b/catalog/l/HEAD").as_deref(),
+            Some("t/0a0b/catalog/l/snap/")
+        );
+        assert_eq!(snap_prefix("t/0a0b/catalog/l/HEADX"), None);
+        assert_eq!(snap_prefix("t/0a0b/l/HEAD"), None);
+    }
+
+    #[test]
+    fn deleted_keys_are_the_earlier_listings_under_the_prefix() {
+        let before = listing(&[
+            "t/0a0b/catalog/l/snap/1.aa.csnap".to_string(),
+            "t/0a0b/catalog/l/snap/2.bb.csnap".to_string(),
+            "t/0a0b/catalog/l/HEAD".to_string(),
+            "t/0a0b/l/x".to_string(),
+        ]);
+        let after = listing(&["t/0a0b/catalog/l/snap/2.bb.csnap".to_string()]);
+        assert_eq!(
+            deleted_under("t/0a0b/catalog/l/snap/", &before, &after),
+            vec!["t/0a0b/catalog/l/snap/1.aa.csnap".to_string()]
+        );
+        assert!(deleted_under("t/0a0b/catalog/l/snap/", &before, &before).is_empty());
     }
 
     #[test]
