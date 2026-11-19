@@ -432,30 +432,34 @@ answers for reaching it. Owner decision, 2026-11-18.
 <!-- amendment-applies: sections="3. Mutant controls|4. Workloads|Amendment (2026-11-17): the clock jump runs in the Antithesis config (#4334)" pointer="forced-situation amendment" -->
 
 Decision 3 counts a mutant only when its property goes false, and never
-reached does not count. Three catalog mutants change what a server does only
+reached does not count. Four catalog mutants change what a server does only
 in a situation that faults and the planned clock jumps rarely or never
 produce: `lost-cas-proceeds` needs a fold that loses its HEAD CAS to a HEAD
 it did not build, `compaction-loser-overwrites` a compaction record PUT that
-loses its create-only PUT to a concurrent compaction of the same bucket, and
+loses its create-only PUT to a concurrent compaction of the same bucket,
 `sweep-superseded-no-head-gate` a full sweep pass past a compaction record's
 protection horizon and pinned-query window while HEAD has not folded the
-record. A mutant like these gets a driver action that forces its situation,
-and each such action:
+record, and `corrupt-head-ignores-delete-gate` a server sweep past the
+protection horizon while HEAD does not decode. A mutant like these gets a
+driver action that forces its situation, and each such action:
 
 - uses only steps the system must survive in production: every clock moving
   forward together, a concurrent `ravel-cli` maintenance run, one store
-  request delayed in the network or refused;
+  request delayed in the network or refused, HEAD overwritten with garbage
+  through raw S3 as the driver's `corrupt_head` rule already does;
 - runs in the plain config as well as in the mutant run, and asserts that it
   reached its situation with a sometimes-assertion the local loop requires,
   so a plain run that never got there fails instead of passing every mutant
   that needs it;
-- runs again in the `eventually` until it was reached once.
+- runs again in the `eventually` until it was reached once (the
+  unreadable-HEAD sweep runs there once).
 
 Two parts of the catalog-maintenance topology change with it. Decision 4's
 topology gains an `s3proxy` container between the ravel-server containers
 and the store. It forwards every byte unchanged until the driver sets a rule
-over its control port (hold the next compaction record PUT, refuse record
-PUTs, refuse one key's PUTs), and it is a container of its own because the
+over its control port (hold the next compaction record PUT or one key's next
+PUT and report the store's answer to it, refuse record PUTs, refuse one key's
+PUTs), and it is a container of its own because the
 driver is excluded from faults. It signs nothing and keeps no wall-clock
 state, so it is the one container that does not run under libfaketime. And
 the clock-jump amendment's three planned jumps are no longer the only clock

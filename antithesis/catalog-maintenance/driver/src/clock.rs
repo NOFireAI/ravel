@@ -18,6 +18,17 @@ pub const MAX_FLUSH_LIFETIME_S: u64 = 3600;
 pub const CLOCK_SKEW_ALLOWANCE_S: u64 = 300;
 pub const FOLD_SAFETY_MARGIN_S: u64 = 900;
 
+/// libfaketime's reread interval, `FAKETIME_CACHE_DURATION` in
+/// config/docker-compose.yaml: a process picks a new offset up at most this
+/// long after the file changes.
+pub const FAKETIME_CACHE_DURATION_S: u64 = 2;
+
+/// How long after a clock move reached the driver's own clock it has reached
+/// every faked clock: one reread interval plus a second's margin.
+pub fn reach_wait_s(reread_s: u64) -> u64 {
+    reread_s + 1
+}
+
 /// The offset the compose and the driver use: 150 minutes.
 pub const DEFAULT_JUMP_S: u64 = 9000;
 
@@ -411,6 +422,16 @@ mod tests {
         // And the first jump is past the horizon of a record written just
         // before it.
         assert!(check_sweep_jumps(DEFAULT_HORIZON_JUMP_S, jump).is_ok());
+    }
+
+    #[test]
+    fn the_reread_interval_matches_the_compose() {
+        let compose = include_str!("../../config/docker-compose.yaml");
+        let line = format!("  FAKETIME_CACHE_DURATION: \"{FAKETIME_CACHE_DURATION_S}\"\n");
+        assert_eq!(compose.matches(&line).count(), 1, "{line:?}");
+        assert_eq!(compose.matches("FAKETIME_CACHE_DURATION:").count(), 1);
+        // A held PUT is taken only once the move reached every clock.
+        assert!(reach_wait_s(FAKETIME_CACHE_DURATION_S) >= 3);
     }
 
     #[test]
