@@ -421,7 +421,10 @@
 #                                       shape's up and folds; si8: the
 #                                       switch off, no series flag or stamp,
 #                                       the holders stamp and
-#                                       stage1-compare.json equal z's.
+#                                       stage1-compare.json equal z's; si10:
+#                                       a rebuild report without the series
+#                                       figures exit 70 at
+#                                       stage1-leaves-series.
 #                                       History l1 and the Ravel-only shape
 #                                       (issue #4392): hl1: history with
 #                                       MB_STAGE1_ARMS=l1 runs; hl2: history
@@ -4550,6 +4553,12 @@ check "si8: the holders stamp and stage1-compare.json equal case z's" 'j("stamps
 OUT="${TMP}/z/out"
 LOG="${TMP}/z/calls.log"
 expect_no_log "si8 (z's run): the switch unset passes no series flag" "series-index"
+
+# si10: a rebuild report without a whole series_index_parts_over_cap fails
+# stage1-leaves-series before the routed pass.
+MB_STAGE1=1 MB_SERIES_INDEX=1 STUB_SERIES_HELP=both STUB_SERIES_PARTS_OVER_CAP=null run_stage1 si10 ci
+expect_rc si10 70
+check "si10: stage1-leaves-series named, its stamp says what the report lacks, no routed pass" 'j("stamps.json")["failed_step"] == "stage1-leaves-series" and j("stamps.json")["stage1"]["leaves"]["series_index"] == "failed: stage1-leaves.json has no whole series_index_parts_over_cap" and "stage1-leaves" in j("stamps.json")["steps_completed"] and "stage1-routed" not in j("stamps.json")["steps_completed"]'
 
 # --- z: stage1-check.sh ------------------------------------------------------------------
 CHECK="${HERE}/../stage1-check.sh"
