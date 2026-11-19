@@ -1231,8 +1231,20 @@ pub async fn build_rewrite(
                             timestamps.into_iter().zip(values).enumerate()
                         {
                             match first_dropping_request(&applicable, requests, &labels, ts) {
-                                Some(i) => dropped_counts[i] += 1,
-                                None => {
+                                // Mutant lifecycle/rewrite-keeps-erased-records
+                                // (ADR-4326): keep the erased sample in the
+                                // output instead of dropping it. The counts-only
+                                // conservation gate still passes (nothing is
+                                // dropped, so output == input); only the
+                                // output-content invariant catches it.
+                                Some(i)
+                                    if !ravel_invariant::inv_mutant!(
+                                        "lifecycle/rewrite-keeps-erased-records"
+                                    ) =>
+                                {
+                                    dropped_counts[i] += 1
+                                }
+                                _ => {
                                     survivors.push(Sample { ts_ns: ts, value });
                                     kept.push(in_page_index);
                                 }
@@ -1274,8 +1286,16 @@ pub async fn build_rewrite(
                         let mut kept = Vec::with_capacity(decoded);
                         for (in_page_index, s) in samples.into_iter().enumerate() {
                             match first_dropping_request(&applicable, requests, &labels, s.ts_ns) {
-                                Some(i) => dropped_counts[i] += 1,
-                                None => {
+                                // Mutant lifecycle/rewrite-keeps-erased-records:
+                                // keep the erased histogram sample in the output.
+                                Some(i)
+                                    if !ravel_invariant::inv_mutant!(
+                                        "lifecycle/rewrite-keeps-erased-records"
+                                    ) =>
+                                {
+                                    dropped_counts[i] += 1
+                                }
+                                _ => {
                                     survivors.push(s);
                                     kept.push(in_page_index);
                                 }
@@ -2061,6 +2081,10 @@ pub async fn publish_rewrite_record(
                 drops = record.drops.len(),
                 "erasure rewrite record published"
             );
+            ravel_invariant::inv_reachable!(
+                "erasure: a rewrite record published",
+                std::collections::BTreeMap::from([("record_key", record_key.clone())])
+            );
             Ok(PublishOutcome::Published)
         }
         Err(StoreError::AlreadyExists) => {
@@ -2725,12 +2749,153 @@ async fn build_and_publish_rewrite(
         ));
     }
     let parts = build.parts.len();
+    // The written output's part keys, captured before `build` is consumed, so
+    // the output-content invariant below re-reads exactly the objects this
+    // publish wrote. Empty where assertions compile out.
+    let output_part_keys: Vec<String> = if ravel_invariant::EVALUATES {
+        build.parts.iter().map(|p| p.key.clone()).collect()
+    } else {
+        Vec::new()
+    };
     let publish =
         publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns).await?;
     // `publish_rewrite_record` abandons at its deadline check and nowhere else.
     let abandoned =
         matches!(publish, PublishOutcome::Abandoned).then_some(ErasureAbandon::Deadline);
+
+    // RewriteOutputsAreInputsMinusErased (ADR-4326 lifecycle), metrics: re-read
+    // the written output and confirm no surviving sample matches an applied
+    // erasure request. Judged from the published part bytes, not the build-time
+    // keep/drop decision, so the `rewrite-keeps-erased-records` mutant that
+    // carried an erased sample into the output is caught here. A re-read or
+    // decode that fails records nothing and leaves the publish's result as it
+    // is.
+    if ravel_invariant::EVALUATES
+        && bucket.signal == Signal::Metrics
+        && matches!(publish, PublishOutcome::Published)
+    {
+        let _clean =
+            rewrite_output_minus_erased(store, config, &output_part_keys, overlapping).await;
+        ravel_invariant::inv_always_if_known!(
+            _clean,
+            "erasure: a rewrite's output is its inputs minus the erased records",
+            std::collections::BTreeMap::from([
+                ("bucket", bucket_prefix_for_error(bucket)),
+                // Content-addressed, so a test isolates its own evaluation by
+                // part key even though every metrics rewrite shares the message
+                // and bucket prefix.
+                ("parts", output_part_keys.join(",")),
+            ])
+        );
+    }
+
     Ok((parts, publish, abandoned))
+}
+
+/// Whether the metrics rewrite output parts named by `part_keys` hold no
+/// surviving sample that any `overlapping` request's erasure predicate matches
+/// (`RewriteOutputsAreInputsMinusErased`): `Some(true)` when the output is
+/// clean, `Some(false)` when it carries an erased sample, `None` when a part
+/// could not be re-read or decoded. The evidence is the decoded output bytes,
+/// independent of the build's own keep/drop decision.
+async fn rewrite_output_minus_erased(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    part_keys: &[String],
+    overlapping: &[&PendingErasureRequest],
+) -> Option<bool> {
+    match output_erased_leak(store, config, part_keys, overlapping).await {
+        Ok(leak) => {
+            if let Some((series, ts_ns)) = &leak {
+                tracing::error!(
+                    parts = %part_keys.join(","),
+                    series = %series,
+                    ts_ns,
+                    "erasure rewrite output still carries a sample an applied request erases"
+                );
+            }
+            Some(leak.is_none())
+        }
+        Err(_) => None,
+    }
+}
+
+/// The first `(series_id_hex, ts_ns)` in the written metrics output parts that
+/// an applied erasure request still drops, or `None` when the output is clean.
+/// The evidence for `rewrite_output_minus_erased`.
+async fn output_erased_leak(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    part_keys: &[String],
+    overlapping: &[&PendingErasureRequest],
+) -> Result<Option<(String, i64)>> {
+    let matchers: Vec<ErasureMatcher> = overlapping
+        .iter()
+        .map(|p| ErasureMatcher::from_request(&p.request))
+        .collect();
+    let limits = ReaderLimits::default();
+
+    for key in part_keys {
+        let catalog =
+            crate::read::load_catalog_from_object(store, config, key.clone(), 0, 0, 0).await?;
+        let whole = store.get(key, GetRange::Full).await?.data;
+        for series in &catalog.series {
+            let labels = series.labels.as_ref();
+            if !matchers.iter().any(|m| m.matches_labels(labels)) {
+                continue;
+            }
+            for run in &series.runs {
+                let entry = RunEntry {
+                    created_unix_ns: run.created_unix_ns,
+                    writer_epoch: run.writer_epoch,
+                    writer_seq: run.writer_seq,
+                    sample_count: run.sample_count,
+                    min_ts_ns: run.min_ts_ns,
+                    max_ts_ns: run.max_ts_ns,
+                    ts_page: (0, 0),
+                    val_page: (0, 0),
+                    hist_page: (0, 0),
+                };
+                let ts_page = slice_whole(&whole, run.ts_abs)?;
+                let val_page = slice_whole(&whole, run.page_abs)?;
+                let surviving_ts: Vec<i64> = match run.kind {
+                    ValueKind::Scalar => {
+                        let mut scratch = Vec::new();
+                        let mut timestamps = Vec::new();
+                        let mut values = Vec::new();
+                        decode_run_pages_soa(
+                            &series.series_id,
+                            &entry,
+                            ts_page.as_ref(),
+                            val_page.as_ref(),
+                            limits,
+                            &mut scratch,
+                            &mut timestamps,
+                            &mut values,
+                        )?;
+                        timestamps
+                    }
+                    ValueKind::Histogram => decode_run_histogram_pages(
+                        &series.series_id,
+                        &entry,
+                        ts_page.as_ref(),
+                        val_page.as_ref(),
+                        limits,
+                    )?
+                    .into_iter()
+                    .map(|s| s.ts_ns)
+                    .collect(),
+                };
+                for ts in surviving_ts {
+                    if matchers.iter().any(|m| m.drops_sample(labels, ts)) {
+                        return Ok(Some((hex::encode(series.series_id.0), ts)));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// The catalog-resolver completion verdict for one bucket (ADR-0064 §4 F1).
@@ -8469,5 +8634,115 @@ mod tests {
             }
             other => panic!("expected MultipleLiveRecords, got {other:?}"),
         }
+    }
+
+    const OUTPUTS_MINUS_ERASED: &str =
+        "erasure: a rewrite's output is its inputs minus the erased records";
+
+    /// The `rewrite-keeps-erased-records` mutant carries the erased subject into
+    /// the output, which the counts-only conservation gate (output == input,
+    /// nothing dropped) accepts. The output-content invariant, re-reading the
+    /// published part, catches it: an erased sample is still served, so
+    /// `RewriteOutputsAreInputsMinusErased` evaluates false. Isolated from other
+    /// metrics rewrites by this run's content-addressed part key.
+    #[tokio::test]
+    async fn mutant_rewrite_keeps_erased_breaks_outputs_minus_erased() {
+        let Some(_mutant) =
+            crate::publish::tests::scoped_mutant("lifecycle/rewrite-keeps-erased-records")
+        else {
+            return;
+        };
+        let store = MemoryStore::new();
+        seed(
+            &store,
+            1,
+            vec![
+                series("alpha", &[(11, 1.0), (21, 2.0)]),
+                series("gamma", &[(31, 3.0)]),
+            ],
+        )
+        .await;
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused".to_string(),
+            request: erasure_request(1, "alpha"),
+        }];
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(outcome, ErasureRewriteOutcome::Rewritten { .. }),
+            "{outcome:?}"
+        );
+
+        let record = read_rewrite_record(&store).await;
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let found = crate::publish::tests::evaluations(OUTPUTS_MINUS_ERASED, &part_key);
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the output-content invariant must evaluate false under the mutant: {found:?}"
+        );
+    }
+
+    /// Without the mutant, the erased subject is dropped, so the re-read output
+    /// serves none of it and the property holds.
+    #[tokio::test]
+    async fn outputs_minus_erased_holds_when_the_subject_is_dropped() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        seed(
+            &store,
+            1,
+            vec![
+                series("delta", &[(12, 1.0), (22, 2.0)]),
+                series("omega", &[(32, 9.0)]),
+            ],
+        )
+        .await;
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused".to_string(),
+            request: erasure_request(2, "delta"),
+        }];
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(outcome, ErasureRewriteOutcome::Rewritten { .. }),
+            "{outcome:?}"
+        );
+
+        let record = read_rewrite_record(&store).await;
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let found = crate::publish::tests::evaluations(OUTPUTS_MINUS_ERASED, &part_key);
+        assert!(!found.is_empty(), "the property is evaluated at publish");
+        assert!(
+            found.iter().all(|(held, _)| *held),
+            "never false when the subject is dropped: {found:?}"
+        );
     }
 }

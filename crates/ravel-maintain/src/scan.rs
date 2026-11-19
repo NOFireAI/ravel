@@ -336,6 +336,11 @@ pub struct MaintainReport {
     /// whose exact expiry, or whose earlier complete read, [`MaintainMemo`]
     /// holds.
     pub lag_bound_gets: usize,
+    /// Objects retention's physical sweep deleted this pass: commit,
+    /// compaction and rewrite records, L0 data objects, L1 parts and
+    /// tombstones, one per delete the store accepted. [`Self::retired`] counts
+    /// buckets, not objects.
+    pub retention_objects_deleted: usize,
 }
 
 /// The claim hold a skipped bucket earns, as the injected clock reads it: the
@@ -2103,6 +2108,7 @@ pub async fn scan_and_maintain_with_memo(
         } else {
             RewriteBound::Read(&mut bound_read)
         };
+        let mut swept_objects = 0usize;
         let (retention_outcome, observed_expiry, compaction, acquisition, part_index_refused) =
             if claim_deferred || geometry_refused {
                 let (outcome, expiry) = retention_sweep_bucket_observed(
@@ -2114,6 +2120,7 @@ pub async fn scan_and_maintain_with_memo(
                     lease,
                     &bucket,
                     rewrite_bound,
+                    &mut swept_objects,
                 )
                 .await?;
                 (outcome, expiry, None, None, None)
@@ -2127,6 +2134,7 @@ pub async fn scan_and_maintain_with_memo(
                     lease,
                     &bucket,
                     rewrite_bound,
+                    &mut swept_objects,
                 )
                 .await?
             };
@@ -2151,15 +2159,18 @@ pub async fn scan_and_maintain_with_memo(
             // still-present expired bucket and contributes no retention lag.
             RetentionOutcome::Swept => {
                 report.retired += 1;
+                report.retention_objects_deleted += swept_objects;
                 memo.exact_expiry_ns.remove(&key);
                 memo.rewrites_keep_nominal_bound.remove(&key);
             }
             // Expired but still present (tombstoned within the horizon, or
             // horizon elapsed with residue left for the next pass); compaction
             // was skipped by design. Its retention lag is a candidate for this
-            // pass's maximum.
+            // pass's maximum. A partial sweep may have deleted some objects;
+            // a tombstoned bucket deleted none.
             RetentionOutcome::Tombstoned | RetentionOutcome::SweptPartial => {
                 report.retired += 1;
+                report.retention_objects_deleted += swept_objects;
                 report.retention_lag_ns = report.retention_lag_ns.max(
                     expired_bucket_retention_lag_ns(hour, now, retention_window_ns, expiry),
                 );
