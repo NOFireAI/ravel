@@ -25,6 +25,7 @@ mod multiset;
 mod race;
 mod s3;
 mod seed;
+mod stop;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -51,6 +52,7 @@ use cli::Cli;
 use forced::Held;
 use s3::Store;
 use seed::Plan;
+use stop::Stop;
 
 /// The S3 object the ravel-server entrypoints wait for. It sits outside the
 /// `t/` and `sys/` prefixes, so no ravel process reads or deletes it.
@@ -95,6 +97,11 @@ const FILL_WRITES: u32 = 16;
 /// maintenance servers' scheduled sweeps: several maintenance intervals.
 const UNFOLDED_PASS_WAIT: Duration = Duration::from_secs(150);
 const NS_PER_SECOND: u64 = 1_000_000_000;
+const FORCED_REASON: &str = "forced by WORKLOAD_EVENTUALLY_AFTER_SECS";
+/// How long the timer waits, once it requested the forced eventually, for a
+/// rule to start it before running it itself. Longer than any rule takes, so
+/// it only fires when no rule runs any more.
+const FORCED_BACKSTOP: Duration = Duration::from_secs(600);
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -279,8 +286,7 @@ struct Shared {
     /// rule's sweep check; the clock jump and the eventually take the write
     /// guard.
     gate: RwLock<()>,
-    stopping: AtomicBool,
-    eventually_lock: Mutex<()>,
+    stop: Stop,
     eventually_on: bool,
 }
 
@@ -288,6 +294,13 @@ struct Workload(Arc<Shared>);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Halts a rule that saw faults stop while it held the gate, releasing the
+/// gate first so the eventually can take it.
+fn release_and_halt<G>(guard: G) -> ! {
+    drop(guard);
+    stop::halt()
 }
 
 fn draw_node(tc: &TestCase, n: usize) -> usize {
@@ -351,16 +364,25 @@ impl Shared {
         v
     }
 
-    /// A read guard for one rule, or `None` once the eventually started.
-    fn enter(&self) -> Option<RwLockReadGuard<'_, ()>> {
-        if self.stopping.load(Ordering::SeqCst) {
-            return None;
+    /// Every rule's first statement. Runs the forced eventually if it was
+    /// requested, and parks the thread for good once faults stopped: a rule
+    /// that returned then would let the engine schedule rounds with nothing
+    /// to do. Never call it while holding the gate.
+    fn halt_if_stopping(&self) {
+        if self.stop.forced() {
+            run_eventually(self, FORCED_REASON);
         }
+        self.stop.halt_if_stopping();
+    }
+
+    /// A read guard for one rule; halts once the eventually started.
+    fn enter(&self) -> RwLockReadGuard<'_, ()> {
+        self.halt_if_stopping();
         let guard = self.gate.read().unwrap_or_else(|e| e.into_inner());
-        if self.stopping.load(Ordering::SeqCst) {
-            return None;
+        if self.stop.stopping() {
+            release_and_halt(guard);
         }
-        Some(guard)
+        guard
     }
 
     fn register(&self, records: u32) -> Option<Write> {
@@ -1799,10 +1821,9 @@ fn pick<'a>(choose: &dyn Fn(usize) -> usize, keys: &'a [String]) -> Option<&'a s
 impl Workload {
     #[rule(groups = ["main"], weight = 6)]
     fn write_logs(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        let Some(_g) = s.enter() else {
-            return;
-        };
+        let _g = s.enter();
         let records = tc.draw(gs::integers::<u32>().min_value(1).max_value(8));
         let streams = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
         s.write(records, streams, &mut || {
@@ -1812,19 +1833,17 @@ impl Workload {
 
     #[rule(groups = ["main"], weight = 1)]
     fn fold(&self, _tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        let Some(_g) = s.enter() else {
-            return;
-        };
+        let _g = s.enter();
         s.fold();
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn compact(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        let Some(_g) = s.enter() else {
-            return;
-        };
+        let _g = s.enter();
         if s.compact() {
             let node = draw_node(&tc, s.ravel.nodes.len());
             s.check_bounds(node, "on-demand compaction");
@@ -1833,20 +1852,17 @@ impl Workload {
 
     #[rule(groups = ["main"], weight = 1)]
     fn sweep(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        let Some(_g) = s.enter() else {
-            return;
-        };
+        let _g = s.enter();
         let shard = tc.draw(gs::integers::<u32>().min_value(0).max_value(SHARDS - 1));
         s.sweep(shard);
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn jump_clock(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        if s.stopping.load(Ordering::SeqCst) {
-            return;
-        }
         let sealed = lock(&s.jump).is_some();
         if sealed
             && (!s.compacted.load(Ordering::SeqCst) || s.sweep_jump_started.load(Ordering::SeqCst))
@@ -1859,9 +1875,9 @@ impl Workload {
         if !tc.draw(gs::weighted_booleans(0.05)) {
             return;
         }
-        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
-        if s.stopping.load(Ordering::SeqCst) {
-            return;
+        let quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stop.stopping() {
+            release_and_halt(quiet);
         }
         if sealed {
             s.sweep_jump("drawn");
@@ -1872,50 +1888,53 @@ impl Workload {
 
     #[rule(groups = ["main"], weight = 1)]
     fn race_folds(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        if s.stopping.load(Ordering::SeqCst) || lock(&s.head_key).is_none() {
+        if lock(&s.head_key).is_none() {
             return;
         }
         if !tc.draw(gs::weighted_booleans(0.03)) {
             return;
         }
-        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
-        if s.stopping.load(Ordering::SeqCst) {
-            return;
+        let quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stop.stopping() {
+            release_and_halt(quiet);
         }
         s.fold_race("drawn");
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn race_records(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        if s.stopping.load(Ordering::SeqCst) || lock(&s.head_key).is_none() {
+        if lock(&s.head_key).is_none() {
             return;
         }
         if !tc.draw(gs::weighted_booleans(0.03)) {
             return;
         }
-        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
-        if s.stopping.load(Ordering::SeqCst) {
-            return;
+        let quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stop.stopping() {
+            release_and_halt(quiet);
         }
         s.record_race("drawn");
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn sweep_unfolded(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        if s.stopping.load(Ordering::SeqCst)
-            || s.unfolded_started.load(Ordering::SeqCst)
-            || lock(&s.head_key).is_none()
-        {
+        if s.unfolded_started.load(Ordering::SeqCst) || lock(&s.head_key).is_none() {
             return;
         }
         if !tc.draw(gs::weighted_booleans(0.02)) {
             return;
         }
-        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
-        if s.stopping.load(Ordering::SeqCst) || s.unfolded_started.load(Ordering::SeqCst) {
+        let quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stop.stopping() {
+            release_and_halt(quiet);
+        }
+        if s.unfolded_started.load(Ordering::SeqCst) {
             return;
         }
         s.unfolded_sweep("drawn");
@@ -1923,18 +1942,19 @@ impl Workload {
 
     #[rule(groups = ["main"], weight = 1)]
     fn sweep_unreadable_head(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        if s.stopping.load(Ordering::SeqCst)
-            || s.unreadable_started.load(Ordering::SeqCst)
-            || lock(&s.head_key).is_none()
-        {
+        if s.unreadable_started.load(Ordering::SeqCst) || lock(&s.head_key).is_none() {
             return;
         }
         if !tc.draw(gs::weighted_booleans(0.02)) {
             return;
         }
-        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
-        if s.stopping.load(Ordering::SeqCst) || s.unreadable_started.load(Ordering::SeqCst) {
+        let quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stop.stopping() {
+            release_and_halt(quiet);
+        }
+        if s.unreadable_started.load(Ordering::SeqCst) {
             return;
         }
         s.unreadable_head_sweep("drawn");
@@ -1942,10 +1962,9 @@ impl Workload {
 
     #[rule(groups = ["main"], weight = 1)]
     fn corrupt_head(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        let Some(_g) = s.enter() else {
-            return;
-        };
+        let _g = s.enter();
         if !tc.draw(gs::weighted_booleans(0.1)) {
             return;
         }
@@ -1963,11 +1982,10 @@ impl Workload {
 
     #[rule(groups = ["main"], weight = 2)]
     fn audit(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
         let listing = {
-            let Some(_g) = s.enter() else {
-                return;
-            };
+            let _g = s.enter();
             s.audit_head(&|n| draw_node(&tc, n))
         };
         // The sweep check reads only the shared ledger and the store, so it
@@ -1979,18 +1997,20 @@ impl Workload {
 
     #[rule(groups = ["main"], weight = 2)]
     fn check_bounds(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         let s = &self.0;
-        let Some(_g) = s.enter() else {
-            return;
-        };
+        let _g = s.enter();
         let node = draw_node(&tc, s.ravel.nodes.len());
         s.check_bounds(node, "scan");
     }
 
     #[rule(groups = ["main"])]
     fn eventually(&self, tc: TestCase) {
+        // The helper runs no eventually of its own unless one was forced, so
+        // a drawn one below still reaches run_eventually.
+        self.0.halt_if_stopping();
         let s = &self.0;
-        if !s.eventually_on || s.stopping.load(Ordering::SeqCst) {
+        if !s.eventually_on {
             return;
         }
         if !tc.draw(gs::weighted_booleans(0.003)) {
@@ -2005,8 +2025,11 @@ impl Workload {
 /// every shard, fold and audit again, then check the whole multiset and end
 /// the timeline.
 fn run_eventually(s: &Shared, reason: &str) -> ! {
-    s.stopping.store(true, Ordering::SeqCst);
-    let _only = lock(&s.eventually_lock);
+    // A drawn and a forced eventually can race here: the loser halts, with
+    // faults already stopping.
+    if !s.stop.begin_eventually() {
+        stop::halt();
+    }
     let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
     println!("eventually ({reason}): stopping faults");
     // The Antithesis platform sets ANTITHESIS_STOP_FAULTS in every container
@@ -2380,8 +2403,7 @@ fn main(tc: TestCase) {
         sweeps: Mutex::new(audit::SweepLedger::default()),
         inputs_of: Mutex::new(BTreeMap::new()),
         gate: RwLock::new(()),
-        stopping: AtomicBool::new(false),
-        eventually_lock: Mutex::new(()),
+        stop: Stop::default(),
         eventually_on,
     });
 
@@ -2419,9 +2441,15 @@ fn main(tc: TestCase) {
 
     if let Some(secs) = eventually_after {
         let s = Arc::clone(&shared);
+        // The next rule runs the forced eventually, inside the machine; the
+        // timer runs it only if no rule does, once the machine has ended.
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
-            run_eventually(&s, "forced by WORKLOAD_EVENTUALLY_AFTER_SECS");
+            s.stop.request_forced();
+            if !s.stop.wait_started(FORCED_BACKSTOP, Duration::from_secs(1)) {
+                println!("eventually: no rule ran it within {FORCED_BACKSTOP:?}");
+                run_eventually(&s, FORCED_REASON);
+            }
         });
     }
 

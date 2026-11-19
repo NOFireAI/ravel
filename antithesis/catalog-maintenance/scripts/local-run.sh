@@ -55,7 +55,13 @@ if [ -n "$MUTANT" ]; then
     # one going false is the property going false.
     ACCEPTED=("$expected")
     if [ "$MUTANT" = catalog/corrupt-head-ignores-delete-gate ]; then
-        ACCEPTED+=("catalog: a catalog sweep never deletes under an unreadable HEAD")
+        sweep_literal="catalog: a catalog sweep never deletes under an unreadable HEAD"
+        sweep_rs="$(cd "$WL/../.." && pwd)/crates/ravel-maintain/src/sweep.rs"
+        if ! grep -qF "$sweep_literal" "$sweep_rs"; then
+            echo "refused: $sweep_rs does not assert '$sweep_literal'; update the literal here"
+            exit 1
+        fi
+        ACCEPTED+=("$sweep_literal")
     fi
     # A ravel-server built without antithesis-mutants ignores
     # RAVEL_ANTITHESIS_MUTANT, and the run would test no mutant at all.
