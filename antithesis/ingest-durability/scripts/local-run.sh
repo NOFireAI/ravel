@@ -19,6 +19,13 @@
 #                                     unless every "required" assertion in
 #                                     local/coverage-required.tsv was hit with
 #                                     its condition true.
+#   WORKLOAD_COVERAGE_SELF_CHECK=1    with CONFIG=config-coverage: the
+#                                     variant's self-check, which breaks each
+#                                     of its properties on purpose; the run
+#                                     passes only if every "self-check" line
+#                                     of local/coverage-required.tsv was
+#                                     violated. Needs
+#                                     WORKLOAD_EVENTUALLY_AFTER_SECS.
 #   LOCAL_COMPOSE_OVERRIDE=<file>     one more compose file layered last, such
 #                                     as one naming other image tags on a
 #                                     shared build host.
@@ -64,6 +71,14 @@ if [ -n "$MUTANT" ]; then
     export RAVEL_ANTITHESIS_MUTANT="$MUTANT"
     COMPOSE_FILE="$COMPOSE_FILE:$WL/local/docker-compose.mutant.yaml"
     echo "mutant $MUTANT: expecting \"$expected\" to be violated"
+fi
+COVERAGE_SELF_CHECK="${WORKLOAD_COVERAGE_SELF_CHECK:-}"
+if [ -n "$COVERAGE_SELF_CHECK" ]; then
+    if [ "$COVERAGE_SELF_CHECK" != 1 ] || [ "$VARIANT" != coverage ] || [ -z "${WORKLOAD_EVENTUALLY_AFTER_SECS:-}" ]; then
+        echo "refused: WORKLOAD_COVERAGE_SELF_CHECK=1 needs CONFIG=config-coverage and WORKLOAD_EVENTUALLY_AFTER_SECS"
+        exit 1
+    fi
+    COMPOSE_FILE="$COMPOSE_FILE:$WL/local/docker-compose.coverage-self-check.yaml"
 fi
 if [ -n "${LOCAL_COMPOSE_OVERRIDE:-}" ]; then
     [ -f "$LOCAL_COMPOSE_OVERRIDE" ] || { echo "refused: no compose file at $LOCAL_COMPOSE_OVERRIDE"; exit 1; }
@@ -161,6 +176,21 @@ if [ "${WORKLOAD_INJECT_MISSING_RECORD:-}" = 1 ]; then
     fi
     echo "FAIL: self-check run, but the presence assertion did not fail"
     exit 1
+fi
+if [ -n "$COVERAGE_SELF_CHECK" ]; then
+    awk -F'\t' '$1 == "self-check" { print $2 }' "$WL/local/coverage-required.tsv" > "$OUT/self-check-expected.tsv"
+    if [ ! -s "$OUT/self-check-expected.tsv" ]; then
+        echo "FAIL: no self-check line read from local/coverage-required.tsv"
+        exit 1
+    fi
+    grep -vxF -f "$OUT/violated.tsv" "$OUT/self-check-expected.tsv" > "$OUT/self-check-unmet.tsv"
+    if [ -s "$OUT/self-check-unmet.tsv" ]; then
+        echo "FAIL: coverage self-check ran, but these properties were not violated:"
+        cat "$OUT/self-check-unmet.tsv"
+        exit 1
+    fi
+    echo "coverage self-check OK: all $(wc -l < "$OUT/self-check-expected.tsv") properties violated"
+    exit 0
 fi
 if [ -s "$OUT/violated.tsv" ]; then
     echo "FAIL: always-type assertions violated:"

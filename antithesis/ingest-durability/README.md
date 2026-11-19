@@ -156,12 +156,17 @@ unchanged; three levers do it:
   (`/usr/local/bin/ravel-antithesis-supervise`), which starts ravel-server
   as its child. About once a minute, the driver's `drain` rule writes a
   nonce to `/control/drain-<host>`, a volume shared with the nodes. Once the
-  child has been ready for 2 s, the supervisor sends it SIGTERM, writes the
-  exit code to `/control/drained-<host>`, and starts it again. A stop or kill
-  of the container is passed on to ravel-server, and any exit the supervisor
-  did not ask for ends it with ravel-server's exit code, as in the base
-  config. The driver keeps one drain in flight at a time and drops a request
-  that gets no answer within 180 s, such as one whose container was killed.
+  child has answered `/readyz` and 25 more polls of 0.2 s have passed
+  (counted in sleeps, so a clock jump does not shorten the wait), the
+  supervisor moves the nonce to `/control/draining-<host>`, sends the child
+  SIGTERM, writes the exit code to `/control/drained-<host>`, and starts it
+  again. At startup it answers a request or an unfinished drain left by a
+  killed container as `interrupted`, so every drain it took gets an answer.
+  A stop or kill of the container is passed on to ravel-server, and any exit
+  the supervisor did not ask for ends it with ravel-server's exit code, as in
+  the base config. The driver keeps one drain in flight at a time. When the
+  eventually starts, it withdraws a request the supervisor has not taken and
+  waits up to 180 s for the answer to one it has.
 
 A strict 2xx whose partial success rejected exactly the poison records, with
 a commit token, counts as an acknowledgement of the write's other records:
@@ -179,6 +184,7 @@ catalogues them at startup, so a base run's property list does not change.
 | a strict write's partial success rejects every poison record | always | Rejection, per record |
 | a strict partial success that rejected only the poison records carries a commit token | always | Acknowledgement semantics (strict): the accepted records are committed |
 | a write answered with an error status carries no commit token | always | Acknowledgement semantics: only a commit issues a token |
+| a driver-requested drain is answered or reported interrupted | always | Graceful shutdown: a drain ends, within `--shutdown-timeout`; false when a drain the supervisor took has no answer 180 s after faults stop |
 | a driver-requested drain exits with status 0 or 1 | always | Graceful shutdown: a drain completes, or reports its failure and exits 1 |
 | a driver-requested drain exited cleanly | sometimes | same |
 | a strict write with poison records was acknowledged with commit tokens | reachable | |
@@ -187,9 +193,13 @@ catalogues them at startup, so a base run's property list does not change.
 
 The flush deferral cap's 429 is left out of the head-shed property: a log
 write that spans several shards can commit on one shard before another
-refuses it. Exit code 143 from a drain would mean SIGTERM reached
-ravel-server before its handler was installed, which the 2 s wait after
-readiness is there to prevent.
+refuses it. ravel-server reports ready a little before it installs its
+SIGTERM handler (#4493), so a drain can still end with exit code 143 despite
+the wait after readiness. The driver logs that case
+(`exited 143: SIGTERM arrived before ravel-server installed its shutdown
+handler`) and leaves it out of the exit-code property. It is not an
+assertion: a reachable that fault-free timing rarely reaches would fail most
+runs.
 
 `CONFIG=config-coverage` selects the variant in `scripts/local-run.sh` and
 `scripts/launch.sh`. A run is named `ravel-ingest-durability-coverage`
@@ -200,9 +210,21 @@ lines there (a partial multi-shard commit, `ShardUnavailable`, metrics
 `Abandoned`) need fault switches inside Ravel that are not built yet; the
 loop reports them and does not gate on them.
 
+`WORKLOAD_COVERAGE_SELF_CHECK=1` shows that each always-property of the
+variant can fail. The driver then reads a 429 as if it carried a commit
+token, a partial success as if it carried none, expects one poison record
+more than it sent, and counts every acknowledged write whose id is a
+multiple of 7 as shed at the head; the supervisors kill the first drain with
+SIGKILL and take every later one without answering. The drawn eventually is
+off, so the forced one runs after the broken drains. The run passes only if
+every `self-check` line of `local/coverage-required.tsv` was violated.
+
 ```sh
+CONFIG=config-coverage antithesis/ingest-durability/scripts/local-run.sh out/coverage1 900
 CONFIG=config-coverage WORKLOAD_EVENTUALLY_AFTER_SECS=600 \
-    antithesis/ingest-durability/scripts/local-run.sh out/coverage1 900
+    antithesis/ingest-durability/scripts/local-run.sh out/coverage2 900
+CONFIG=config-coverage WORKLOAD_COVERAGE_SELF_CHECK=1 WORKLOAD_EVENTUALLY_AFTER_SECS=180 \
+    antithesis/ingest-durability/scripts/local-run.sh out/coverage-self-check 900
 CONFIG=config-coverage antithesis/ingest-durability/scripts/launch.sh <max-compute-hours> "<description>"
 ```
 

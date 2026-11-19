@@ -5,7 +5,10 @@
 //! sent, so a query that runs while the request is in flight never sees rows
 //! the model cannot attribute. Each attempt then records what the client saw.
 //! Only a strict 200 with no partial success and a commit-token header is an
-//! acknowledgement; every other outcome may or may not have stored the
+//! acknowledgement, plus, in the ingest-durability coverage variant, a strict
+//! 200 with a commit-token header whose partial success rejected exactly the
+//! write's poison records (`Write::records` counts only the others); every
+//! other outcome may or may not have stored the
 //! records, now or later, for the rest of the timeline (an `Abandoned` or
 //! timed-out flush can still commit up to `max_flush_lifetime` later).
 
@@ -44,7 +47,8 @@ pub enum Attempt {
     /// Sent, no outcome recorded yet.
     InFlight,
     /// A strict 200 with no partial success, carrying this commit-token
-    /// header value.
+    /// header value; in the coverage variant, also one whose partial success
+    /// rejected exactly the write's poison records.
     Acked { header: String },
     /// A buffered-mode 200: admitted, not durable.
     BufferedAck,

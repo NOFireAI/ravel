@@ -52,10 +52,17 @@ const HEAD_SHED_BODIES: [&str; 2] = [
 /// The least time between two drain requests, so the nodes spend most of
 /// the run serving.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(60);
-/// How long a drain request may go unanswered before the driver drops it:
-/// above ravel-server's 25 s shutdown timeout plus a restart. A container
-/// killed during its drain never answers.
-const DRAIN_GIVE_UP: Duration = Duration::from_secs(180);
+/// The same under the self-check, so its broken drains come early in a run.
+const SELF_CHECK_DRAIN_INTERVAL: Duration = Duration::from_secs(10);
+/// How long the eventually waits, once faults stop, for the answer to a drain
+/// the supervisor already took: above ravel-server's 25 s shutdown timeout
+/// plus a container restart, after which the supervisor reports a drain that
+/// a kill cut short.
+const DRAIN_SETTLE: Duration = Duration::from_secs(180);
+/// The exit status of a ravel-server that got SIGTERM before it installed its
+/// handler (#4493): the supervisor's wait after readiness makes it rare, but
+/// does not rule it out, so it is logged rather than judged.
+const SIGTERM_BEFORE_HANDLER: i32 = 143;
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -101,12 +108,17 @@ const DRAIN_CLEAN: Prop = Prop {
     kind: Kind::Sometimes,
     message: "a driver-requested drain exited cleanly",
 };
+const DRAIN_ANSWERED: Prop = Prop {
+    kind: Kind::Always,
+    message: "a driver-requested drain is answered or reported interrupted",
+};
 const METRICS_429: Prop = Prop {
     kind: Kind::Reachable,
     message: "a metrics write was answered 429",
 };
 
-const PROPS: [&Prop; 9] = [
+const PROPS: [&Prop; 10] = [
+    &DRAIN_ANSWERED,
     &HEAD_SHED_STORES_NOTHING,
     &POISON_REJECTED,
     &POISON_ONLY_HAS_TOKEN,
@@ -148,7 +160,6 @@ fn check(p: &Prop, condition: bool, details: Value) {
 struct PendingDrain {
     host: String,
     seq: u64,
-    at: Instant,
 }
 
 #[derive(Default)]
@@ -168,6 +179,10 @@ pub struct Coverage {
     /// Per write: how many poison records or points it carries.
     poison: Mutex<HashMap<u64, u32>>,
     drains: Mutex<Drains>,
+    /// `WORKLOAD_COVERAGE_SELF_CHECK=1`: the local loop's self-check. Each of
+    /// the variant's always-properties is fed an input that breaks it, so
+    /// each must fail; the supervisor breaks the drains to match.
+    pub self_check: bool,
 }
 
 impl Coverage {
@@ -181,13 +196,22 @@ impl Coverage {
             emit(p, false, false, &Value::Null);
         }
         let control = std::env::var("RAVEL_CONTROL_DIR").unwrap_or_else(|_| "/control".to_string());
-        println!("coverage variant: on, control directory {control}");
-        Some(Coverage {
-            control: PathBuf::from(control),
+        let self_check = std::env::var("WORKLOAD_COVERAGE_SELF_CHECK")
+            .ok()
+            .as_deref()
+            == Some("1");
+        println!("coverage variant: on, control directory {control}, self-check {self_check}");
+        Some(Coverage::new(PathBuf::from(control), self_check))
+    }
+
+    fn new(control: PathBuf, self_check: bool) -> Coverage {
+        Coverage {
+            control,
             head_shed: Mutex::new(HashMap::new()),
             poison: Mutex::new(HashMap::new()),
             drains: Mutex::new(Drains::default()),
-        })
+            self_check,
+        }
     }
 
     /// Poison records for a log write: only strict and unkeyed ones, since a
@@ -266,8 +290,15 @@ impl Coverage {
                 "body": String::from_utf8_lossy(&body[..body.len().min(400)]),
             });
             let ok = (200..300).contains(status);
+            // The self-check reads every response as if the header were
+            // flipped: present on an error, absent on a partial success.
+            let token_seen = commit_token.as_deref().is_some_and(|t| !t.is_empty());
+            let token_seen_on_error = token_seen || (self.self_check && *status == 429);
+            let token_seen_on_partial = token_seen && !self.self_check;
+            // The self-check also expects one poison record more than was sent.
+            let expected_poison = i64::from(poison) + i64::from(self.self_check);
             if !ok {
-                check(&ERROR_HAS_NO_TOKEN, commit_token.is_none(), details.clone());
+                check(&ERROR_HAS_NO_TOKEN, !token_seen_on_error, details.clone());
             }
             if *status == 429 {
                 if !logs {
@@ -285,15 +316,11 @@ impl Coverage {
                 };
                 check(
                     &POISON_REJECTED,
-                    rejected.is_some_and(|n| n >= i64::from(poison)),
+                    rejected.is_some_and(|n| n >= expected_poison),
                     details.clone(),
                 );
                 if rejected == Some(i64::from(poison)) {
-                    check(
-                        &POISON_ONLY_HAS_TOKEN,
-                        commit_token.as_deref().is_some_and(|t| !t.is_empty()),
-                        details,
-                    );
+                    check(&POISON_ONLY_HAS_TOKEN, token_seen_on_partial, details);
                 }
             }
         }
@@ -320,9 +347,10 @@ impl Coverage {
     }
 
     /// Writes of `signal` whose every attempt so far was shed at the request
-    /// head. Call with the model locked.
+    /// head. Call with the model locked. The self-check also counts every
+    /// acknowledged write whose id is a multiple of 7, which is stored.
     fn fully_shed(&self, m: &Model, signal: Signal) -> HashSet<u64> {
-        lock(&self.head_shed)
+        let mut shed: HashSet<u64> = lock(&self.head_shed)
             .iter()
             .filter(|(id, shed)| {
                 m.writes
@@ -330,7 +358,16 @@ impl Coverage {
                     .is_some_and(|w| w.signal == signal && w.attempts.len() == **shed)
             })
             .map(|(id, _)| *id)
-            .collect()
+            .collect();
+        if self.self_check {
+            shed.extend(
+                m.writes
+                    .values()
+                    .filter(|w| w.signal == signal && w.id % 7 == 0 && w.is_acked())
+                    .map(|w| w.id),
+            );
+        }
+        shed
     }
 
     /// Head-shed check on the rows of a log scan, `(write, record) -> count`.
@@ -390,7 +427,12 @@ impl Coverage {
     pub fn drain_step(&self, tc: &TestCase, nodes: &[String]) {
         let mut d = lock(&self.drains);
         self.collect_drain(&mut d);
-        if d.pending.is_some() || d.last_request.is_some_and(|t| t.elapsed() < DRAIN_INTERVAL) {
+        let interval = if self.self_check {
+            SELF_CHECK_DRAIN_INTERVAL
+        } else {
+            DRAIN_INTERVAL
+        };
+        if d.pending.is_some() || d.last_request.is_some_and(|t| t.elapsed() < interval) {
             return;
         }
         let node = draw_node(tc, nodes.len());
@@ -401,22 +443,28 @@ impl Coverage {
         d.next_seq += 1;
         let seq = d.next_seq;
         let request = self.control.join(format!("drain-{host}"));
-        let tmp = self.control.join(format!(".drain-{host}.tmp"));
-        let written =
-            std::fs::write(&tmp, format!("{seq}\n")).and_then(|()| std::fs::rename(&tmp, &request));
-        if let Err(e) = written {
+        if let Err(e) = self.put(&request, &format!("{seq}\n")) {
             println!("coverage: writing drain request {}: {e}", request.display());
             return;
         }
         println!("coverage: asked {host} to drain (seq {seq})");
-        d.pending = Some(PendingDrain {
-            host,
-            seq,
-            at: Instant::now(),
-        });
+        d.pending = Some(PendingDrain { host, seq });
         d.last_request = Some(Instant::now());
     }
 
+    /// Write `path` through a temporary file and a rename, synced, so the
+    /// supervisor never reads a partial request and a crash keeps it.
+    fn put(&self, path: &std::path::Path, content: &str) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let tmp = path.with_extension("tmp");
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        std::fs::File::open(&self.control)?.sync_all()
+    }
+
+    /// Judge the supervisor's answer to the pending drain, if it has come.
     fn collect_drain(&self, d: &mut Drains) {
         let Some(p) = &d.pending else {
             return;
@@ -424,17 +472,7 @@ impl Coverage {
         let result = self.control.join(format!("drained-{}", p.host));
         let text = match std::fs::read_to_string(&result) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if p.at.elapsed() > DRAIN_GIVE_UP {
-                    println!(
-                        "coverage: drain {} of {} unanswered after {:?}, dropped",
-                        p.seq, p.host, DRAIN_GIVE_UP
-                    );
-                    let _ = std::fs::remove_file(self.control.join(format!("drain-{}", p.host)));
-                    d.pending = None;
-                }
-                return;
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
                 println!("coverage: reading {}: {e}", result.display());
                 return;
@@ -451,7 +489,13 @@ impl Coverage {
             return;
         }
         let details = json!({ "host": p.host, "seq": p.seq, "answer": text.trim() });
+        check(&DRAIN_ANSWERED, true, details.clone());
         match answer.code {
+            Some(SIGTERM_BEFORE_HANDLER) => println!(
+                "coverage: drain {} of {} exited 143: SIGTERM arrived before ravel-server \
+                 installed its shutdown handler (#4493)",
+                p.seq, p.host
+            ),
             Some(code) => {
                 println!("coverage: drain {} of {} exited {code}", p.seq, p.host);
                 check(&DRAIN_EXIT, code == 0 || code == 1, details.clone());
@@ -460,6 +504,45 @@ impl Coverage {
             None => println!("coverage: drain {} of {} was interrupted", p.seq, p.host),
         }
         d.pending = None;
+    }
+
+    /// Settle the pending drain once faults have stopped, before the
+    /// eventually's checks: withdraw a request the supervisor has not taken,
+    /// or wait for the answer to one it has. A drain the supervisor took and
+    /// never answered, not even as interrupted after a restart, fails
+    /// "a driver-requested drain is answered or reported interrupted".
+    pub fn settle_drains(&self) {
+        let mut d = lock(&self.drains);
+        let deadline = Instant::now() + DRAIN_SETTLE;
+        loop {
+            self.collect_drain(&mut d);
+            let Some(p) = &d.pending else {
+                return;
+            };
+            let request = self.control.join(format!("drain-{}", p.host));
+            if std::fs::remove_file(&request).is_ok() {
+                println!(
+                    "coverage: withdrew drain {} of {} before it was taken",
+                    p.seq, p.host
+                );
+                d.pending = None;
+                return;
+            }
+            if Instant::now() >= deadline {
+                println!(
+                    "coverage: drain {} of {} unanswered {:?} after faults stopped",
+                    p.seq, p.host, DRAIN_SETTLE
+                );
+                check(
+                    &DRAIN_ANSWERED,
+                    false,
+                    json!({ "host": p.host, "seq": p.seq, "waited_s": DRAIN_SETTLE.as_secs() }),
+                );
+                d.pending = None;
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
     }
 }
 
@@ -614,60 +697,60 @@ mod tests {
         assert_eq!((r.seq, r.code), (None, None));
     }
 
-    #[test]
-    fn poison_log_records_follow_the_good_ones_in_one_request() {
-        let body = logs_request(7, 3, 2, 1_000, 2);
-        let req = ExportLogsServiceRequest::decode(body.as_slice()).expect("decodes");
-        let mut recs: Vec<(u32, usize)> = req
+    use opentelemetry_proto::tonic::collector::logs::v1::{
+        ExportLogsPartialSuccess, ExportLogsServiceResponse,
+    };
+    use ravel_antithesis_driver::model;
+
+    fn write(id: u64, signal: Signal, mode: Mode, records: u32, attempts: Vec<Attempt>) -> Write {
+        Write {
+            id,
+            signal,
+            mode,
+            key: None,
+            records,
+            samples: Vec::new(),
+            ts_ns: 1_000,
+            attempts,
+        }
+    }
+
+    fn str_attr(attrs: &[KeyValue], key: &str) -> Option<String> {
+        attrs
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| match &v.value {
+                Some(any_value::Value::StringValue(s)) => Some(s.clone()),
+                _ => None,
+            })
+    }
+
+    /// The rows a store that kept every record of `body` would return to the
+    /// driver's logs count query, `(write, record) -> count`.
+    fn log_rows_if_all_stored(body: &[u8]) -> HashMap<(u64, u32), u64> {
+        let req = ExportLogsServiceRequest::decode(body).expect("decodes");
+        let mut counts = HashMap::new();
+        for r in req
             .resource_logs
             .iter()
             .flat_map(|rl| rl.scope_logs.iter())
             .flat_map(|sl| sl.log_records.iter())
-            .map(|r| {
-                let rec = r
-                    .attributes
-                    .iter()
-                    .find(|kv| kv.key == otlp::LOG_REC_ATTR)
-                    .and_then(|kv| kv.value.as_ref())
-                    .and_then(|v| match &v.value {
-                        Some(any_value::Value::StringValue(s)) => s.parse().ok(),
-                        _ => None,
-                    })
-                    .expect("record index");
-                let len = match r.body.as_ref().and_then(|b| b.value.as_ref()) {
-                    Some(any_value::Value::StringValue(s)) => s.len(),
-                    _ => 0,
-                };
-                (rec, len)
-            })
-            .collect();
-        recs.sort_unstable();
-        assert_eq!(recs.len(), 5);
-        assert!(recs[..3].iter().all(|(_, len)| *len < 1_000));
-        assert_eq!(recs[3], (3, POISON_BODY_BYTES));
-        assert_eq!(recs[4], (4, POISON_BODY_BYTES));
+        {
+            let w = str_attr(&r.attributes, otlp::LOG_WRITE_ATTR).expect("write id");
+            let rec = str_attr(&r.attributes, otlp::LOG_REC_ATTR).expect("record index");
+            *counts
+                .entry((w.parse().expect("u64"), rec.parse().expect("u32")))
+                .or_insert(0) += 1;
+        }
+        counts
     }
 
-    #[test]
-    fn a_poison_point_is_attributed_to_no_sample() {
-        let w = Write {
-            id: 5,
-            signal: Signal::Metrics,
-            mode: Mode::Strict,
-            key: None,
-            records: 0,
-            samples: vec![otlp::Sample {
-                series: 1,
-                ts_ns: 2_000,
-                value: 500.0,
-            }],
-            ts_ns: 2_000,
-            attempts: Vec::new(),
-        };
-        let body = metrics_request(&w, 1);
-        let req = ExportMetricsServiceRequest::decode(body.as_slice()).expect("decodes");
-        let values: Vec<f64> = req
-            .resource_metrics
+    /// The rows a store that kept every point of `body` would return to the
+    /// driver's samples query, `(ts, value, series)`.
+    fn metric_rows_if_all_stored(body: &[u8]) -> Vec<(i64, f64, String)> {
+        let req = ExportMetricsServiceRequest::decode(body).expect("decodes");
+        req.resource_metrics
             .iter()
             .flat_map(|rm| rm.scope_metrics.iter())
             .flat_map(|sm| sm.metrics.iter())
@@ -676,11 +759,220 @@ mod tests {
                 _ => None,
             })
             .flatten()
-            .filter_map(|p| match p.value {
-                Some(number_data_point::Value::AsDouble(v)) => Some(v),
-                _ => None,
+            .map(|p| {
+                let v = match p.value {
+                    Some(number_data_point::Value::AsDouble(v)) => v,
+                    _ => f64::NAN,
+                };
+                let series = str_attr(&p.attributes, otlp::METRIC_SERIES_LABEL).expect("series");
+                (i64::try_from(p.time_unix_nano).expect("ts"), v, series)
             })
-            .collect();
-        assert_eq!(values, vec![500.0, 599.0]);
+            .collect()
+    }
+
+    #[test]
+    fn a_stored_poison_log_record_is_judged_a_phantom() {
+        let mut m = Model::default();
+        m.writes
+            .insert(7, write(7, Signal::Logs, Mode::Strict, 3, Vec::new()));
+        let counts = log_rows_if_all_stored(&logs_request(7, 3, 2, 1_000, 2));
+        assert_eq!(counts.len(), 5);
+        let j = model::judge_logs(&m, &counts, &[7]);
+        let mut phantoms = j.phantoms.clone();
+        phantoms.sort();
+        assert_eq!(
+            phantoms,
+            vec![
+                "write 7 rec 3 x1: write has 3 records".to_string(),
+                "write 7 rec 4 x1: write has 3 records".to_string(),
+            ]
+        );
+        assert!(j.missing.is_empty());
+    }
+
+    #[test]
+    fn a_stored_poison_point_is_judged_foreign() {
+        let mut m = Model::default();
+        let mut w = write(5, Signal::Metrics, Mode::Strict, 0, Vec::new());
+        w.samples = vec![otlp::Sample {
+            series: 1,
+            ts_ns: 2_000,
+            value: 500.0,
+        }];
+        m.writes.insert(5, w.clone());
+        let rows = metric_rows_if_all_stored(&metrics_request(&w, 1));
+        assert_eq!(rows.len(), 2);
+        let j = model::judge_metrics(&m, &rows, &[5]);
+        assert_eq!(
+            j.foreign,
+            vec![format!(
+                "sample ts=2000 value=599 {}=s0: matches no sent sample",
+                otlp::METRIC_SERIES_LABEL
+            )]
+        );
+        assert!(j.missing.is_empty());
+    }
+
+    fn logs_reply(rejected: Option<i64>, token: Option<&str>) -> Reply {
+        let body = ExportLogsServiceResponse {
+            partial_success: rejected.map(|n| ExportLogsPartialSuccess {
+                rejected_log_records: n,
+                error_message: "too long".to_string(),
+            }),
+        }
+        .encode_to_vec();
+        Reply::Status {
+            status: 200,
+            commit_token: token.map(str::to_string),
+            body,
+        }
+    }
+
+    #[test]
+    fn reclassify_acks_only_a_rejection_of_exactly_the_poison_with_a_token() {
+        let cov = Coverage::new(std::env::temp_dir(), false);
+        let w = write(9, Signal::Logs, Mode::Strict, 3, Vec::new());
+        cov.set_poison(9, 2);
+        let acked = Attempt::Acked {
+            header: "t1,t2".to_string(),
+        };
+        assert_eq!(
+            cov.reclassify(&w, &logs_reply(Some(2), Some("t1,t2")), Attempt::Partial),
+            acked
+        );
+        // More rejected than the poison: some good record may be lost too.
+        assert_eq!(
+            cov.reclassify(&w, &logs_reply(Some(3), Some("t1,t2")), Attempt::Partial),
+            Attempt::Partial
+        );
+        // No token, or an empty one, is no acknowledgement.
+        assert_eq!(
+            cov.reclassify(&w, &logs_reply(Some(2), None), Attempt::Partial),
+            Attempt::Partial
+        );
+        assert_eq!(
+            cov.reclassify(&w, &logs_reply(Some(2), Some("")), Attempt::Partial),
+            Attempt::Partial
+        );
+        // A write with no poison, and a buffered one, keep the base class.
+        let clean = write(10, Signal::Logs, Mode::Strict, 3, Vec::new());
+        assert_eq!(
+            cov.reclassify(&clean, &logs_reply(Some(0), Some("t1")), Attempt::Partial),
+            Attempt::Partial
+        );
+        let buffered = write(11, Signal::Logs, Mode::Buffered, 3, Vec::new());
+        cov.set_poison(11, 2);
+        assert_eq!(
+            cov.reclassify(
+                &buffered,
+                &logs_reply(Some(2), Some("t1")),
+                Attempt::Partial
+            ),
+            Attempt::Partial
+        );
+        let error = Reply::Status {
+            status: 503,
+            commit_token: Some("t1".to_string()),
+            body: Vec::new(),
+        };
+        assert_eq!(
+            cov.reclassify(&w, &error, Attempt::Refused { status: 503 }),
+            Attempt::Refused { status: 503 }
+        );
+    }
+
+    #[test]
+    fn fully_shed_holds_only_writes_whose_every_attempt_was_shed() {
+        let cov = Coverage::new(std::env::temp_dir(), false);
+        let shed = Attempt::Refused { status: 429 };
+        let mut m = Model::default();
+        // Shed once, one attempt.
+        m.writes.insert(
+            1,
+            write(1, Signal::Logs, Mode::Strict, 1, vec![shed.clone()]),
+        );
+        // Shed once, then retried: the retry may have stored it.
+        m.writes.insert(
+            2,
+            write(
+                2,
+                Signal::Logs,
+                Mode::Strict,
+                1,
+                vec![shed.clone(), Attempt::InFlight],
+            ),
+        );
+        // Shed twice, two attempts.
+        m.writes.insert(
+            3,
+            write(
+                3,
+                Signal::Logs,
+                Mode::Strict,
+                1,
+                vec![shed.clone(), shed.clone()],
+            ),
+        );
+        // A metrics write shed once.
+        m.writes.insert(
+            4,
+            write(4, Signal::Metrics, Mode::Strict, 0, vec![shed.clone()]),
+        );
+        // Acked, never shed.
+        m.writes.insert(
+            7,
+            write(
+                7,
+                Signal::Logs,
+                Mode::Strict,
+                1,
+                vec![Attempt::Acked {
+                    header: "t".to_string(),
+                }],
+            ),
+        );
+        {
+            let mut h = lock(&cov.head_shed);
+            h.insert(1, 1);
+            h.insert(2, 1);
+            h.insert(3, 2);
+            h.insert(4, 1);
+        }
+        let logs = cov.fully_shed(&m, Signal::Logs);
+        assert_eq!(logs, HashSet::from([1, 3]));
+        assert_eq!(cov.fully_shed(&m, Signal::Metrics), HashSet::from([4]));
+        // The self-check adds acked writes whose id is a multiple of 7.
+        let broken = Coverage::new(std::env::temp_dir(), true);
+        *lock(&broken.head_shed) = lock(&cov.head_shed).clone();
+        assert_eq!(
+            broken.fully_shed(&m, Signal::Logs),
+            HashSet::from([1, 3, 7])
+        );
+    }
+
+    #[test]
+    fn settle_withdraws_a_request_the_supervisor_has_not_taken() {
+        let dir = std::env::temp_dir().join(format!("a2cov-settle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let cov = Coverage::new(dir.clone(), false);
+        cov.put(&dir.join("drain-ravel1"), "1\n").expect("request");
+        lock(&cov.drains).pending = Some(PendingDrain {
+            host: "ravel1".to_string(),
+            seq: 1,
+        });
+        cov.settle_drains();
+        assert!(lock(&cov.drains).pending.is_none());
+        assert!(!dir.join("drain-ravel1").exists());
+        // An answer to the pending drain clears it too.
+        cov.put(&dir.join("drained-ravel1"), "seq=2 code=0\n")
+            .expect("answer");
+        lock(&cov.drains).pending = Some(PendingDrain {
+            host: "ravel1".to_string(),
+            seq: 2,
+        });
+        cov.settle_drains();
+        assert!(lock(&cov.drains).pending.is_none());
+        assert!(!dir.join("drained-ravel1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
