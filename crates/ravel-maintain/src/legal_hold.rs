@@ -224,6 +224,28 @@ impl LeaseCheck for LegalHoldCheck {
     }
 }
 
+/// `HeldObjectNeverDeleted`'s verdict (ADR-4326 lifecycle) for one physical
+/// delete that removes `keys`: `false` when a key is held both by `fresh`, the
+/// tenant's hold set re-read from the store at the delete, and by `lease`, the
+/// snapshot the pass was handed. `None` when the re-read failed.
+///
+/// A hold counts only when the pass's snapshot also holds the key: the
+/// snapshot is taken once per pass by design (see the module docs), so a hold
+/// placed after it is not one the pass could honour, and a correct pass that
+/// deletes under it must not read as a violation. The fresh re-read keeps a
+/// hold the store has since cleared from counting against the delete.
+pub(crate) fn held_object_verdict(
+    fresh: Option<&LegalHoldCheck>,
+    lease: &dyn LeaseCheck,
+    keys: &[&str],
+) -> Option<bool> {
+    fresh.map(|fresh| {
+        !keys
+            .iter()
+            .any(|key| fresh.is_protected(key) && lease.is_protected(key))
+    })
+}
+
 /// Fold decoded hold records to the sorted set of currently-active scopes:
 /// per distinct `hold.scope`, the record with the greatest `(ts_ns, op.rank())`
 /// wins, and the scope is active iff that winner is a `set` (ADR-0040 decision
@@ -404,7 +426,12 @@ pub async fn write_hold_set_with_compat(
         attrs.push((ATTR_REASON.to_string(), AttrValue::Str(reason.into())));
     }
     let body = format!("legal hold set scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await?;
+    ravel_invariant::inv_reachable!(
+        "gc: a legal hold is placed",
+        std::collections::BTreeMap::from([("scope", scope.to_string())])
+    );
+    Ok(())
 }
 
 /// Write a new immutable `clear` record releasing the legal hold on `scope` at
@@ -446,7 +473,12 @@ pub async fn write_hold_clear_with_compat(
         (ATTR_SCOPE.to_string(), AttrValue::Str(scope.into())),
     ];
     let body = format!("legal hold clear scope={scope}");
-    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await
+    write_hold_object(store, tenant, record_id, now_ns, body, attrs, compat).await?;
+    ravel_invariant::inv_reachable!(
+        "gc: a legal hold is released",
+        std::collections::BTreeMap::from([("scope", scope.to_string())])
+    );
+    Ok(())
 }
 
 /// Encode one legal-hold RLOG record as an L0 [`Signal::Audit`] object and its
@@ -665,5 +697,36 @@ mod tests {
             ),
             refused + 1
         );
+    }
+
+    /// `HeldObjectNeverDeleted`'s verdict is false only for a key both the
+    /// store re-read and the pass's snapshot hold, and unknown without a
+    /// re-read.
+    #[test]
+    fn held_object_verdict_needs_the_store_and_the_snapshot_to_hold_the_key() {
+        let held = LegalHoldCheck {
+            held_prefixes: vec!["t/acme/m/l0/0007/".to_string()],
+        };
+        let key = "t/acme/m/l0/0007/obj";
+        let other = "t/acme/m/l0/0008/obj";
+        let empty = LegalHoldCheck::empty();
+
+        assert_eq!(held_object_verdict(Some(&held), &held, &[key]), Some(false));
+        assert_eq!(
+            held_object_verdict(Some(&held), &held, &[other, key]),
+            Some(false),
+            "any removed key held by both"
+        );
+        assert_eq!(
+            held_object_verdict(Some(&held), &empty, &[key]),
+            Some(true),
+            "a hold the snapshot does not have was placed after it"
+        );
+        assert_eq!(
+            held_object_verdict(Some(&empty), &held, &[key]),
+            Some(true),
+            "a hold the store has since cleared"
+        );
+        assert_eq!(held_object_verdict(None, &held, &[key]), None);
     }
 }

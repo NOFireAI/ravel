@@ -416,11 +416,11 @@ pub(crate) async fn retention_sweep_bucket_observed(
         } else {
             ObservedExpiry::NoLaterThanOnly(tombstone.retired_at_ns)
         });
-        if now
+        let horizon_elapsed = now
             >= tombstone
                 .retired_at_ns
-                .saturating_add(config.protection_horizon_ns)
-        {
+                .saturating_add(config.protection_horizon_ns);
+        if horizon_elapsed || ravel_invariant::inv_mutant!("lifecycle/delete-before-horizon") {
             let anchor = MarkerAnchor {
                 kind: MarkerKind::Retention,
                 key: tombstone_key.clone(),
@@ -870,13 +870,65 @@ async fn physical_sweep(
         return Ok(RetentionOutcome::SweptPartial);
     }
 
+    // NoDeleteInsideProtectionWindow (ADR-4326 lifecycle): every physical
+    // retention delete below happens at or past the tombstone's protection
+    // horizon. Judged from the durable retired_at the anchor carries (read from
+    // the store tombstone) and a fresh clock read, not from the caller's gate
+    // decision, so the `delete-before-horizon` mutant that bypassed that gate
+    // is caught here.
+    if !dry_run {
+        let _now = clock.now_ns();
+        ravel_invariant::inv_always!(
+            _now >= anchor
+                .anchor_unix_ns
+                .saturating_add(config.protection_horizon_ns),
+            "gc: no object is deleted inside its protection window",
+            std::collections::BTreeMap::from([
+                ("tombstone_key", tombstone_key.to_string()),
+                ("now_ns", _now.to_string()),
+                ("retired_at_ns", anchor.anchor_unix_ns.to_string()),
+                (
+                    "protection_horizon_ns",
+                    config.protection_horizon_ns.to_string(),
+                ),
+            ])
+        );
+    }
+
     // Deletion order (docs/consistency-model.md "Deletion and GC", ADR-0019
     // decision 4): records, then data objects, then L1 parts, tombstone last.
-    delete_all(store, lease, &listing.commit_keys, dry_run).await?;
-    delete_all(store, lease, &listing.compaction_record_keys, dry_run).await?;
-    delete_all(store, lease, &listing.rewrite_record_keys, dry_run).await?;
-    delete_all(store, lease, &l0_data_keys, dry_run).await?;
-    delete_all(store, lease, &l1_part_keys, dry_run).await?;
+    //
+    // The tenant's holds re-read from the store, the evidence the
+    // HeldObjectNeverDeleted assertion in `delete_all` judges from. A failed
+    // re-read leaves `None`, the assertion records nothing, and the sweep goes
+    // on.
+    let holds_now = if ravel_invariant::EVALUATES && !dry_run {
+        crate::legal_hold::LegalHoldCheck::refresh(store, &bucket.tenant_hash)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let holds_now = holds_now.as_ref();
+    delete_all(store, lease, holds_now, &listing.commit_keys, dry_run).await?;
+    delete_all(
+        store,
+        lease,
+        holds_now,
+        &listing.compaction_record_keys,
+        dry_run,
+    )
+    .await?;
+    delete_all(
+        store,
+        lease,
+        holds_now,
+        &listing.rewrite_record_keys,
+        dry_run,
+    )
+    .await?;
+    delete_all(store, lease, holds_now, &l0_data_keys, dry_run).await?;
+    delete_all(store, lease, holds_now, &l1_part_keys, dry_run).await?;
 
     // Verify the bucket is empty before deleting the tombstone: the commit
     // prefix must contain only the tombstone, and the l1/ prefix must be empty.
@@ -900,6 +952,10 @@ async fn physical_sweep(
     }
     if !dry_run {
         store.delete(tombstone_key).await?;
+        ravel_invariant::inv_reachable!(
+            "gc: retention physical sweep delete",
+            std::collections::BTreeMap::from([("tombstone_key", tombstone_key.to_string())])
+        );
     }
     Ok(RetentionOutcome::Swept)
 }
@@ -1089,9 +1145,13 @@ fn protected_sweep_keys<'a>(
 /// any of these keys is protected. It stays as the last line of defence, so a
 /// future caller that reaches the deletes by another route still cannot delete
 /// a held key.
+///
+/// `holds_now` is the tenant's hold set re-read from the store, read only by
+/// the HeldObjectNeverDeleted assertion; `None` records nothing.
 async fn delete_all(
     store: &dyn ObjectStoreBackend,
     lease: &dyn LeaseCheck,
+    holds_now: Option<&crate::legal_hold::LegalHoldCheck>,
     keys: &[String],
     dry_run: bool,
 ) -> Result<()> {
@@ -1100,6 +1160,13 @@ async fn delete_all(
             continue;
         }
         if !dry_run {
+            let _verdict =
+                crate::legal_hold::held_object_verdict(holds_now, lease, &[key.as_str()]);
+            ravel_invariant::inv_always_if_known!(
+                _verdict,
+                "gc: a held object is never deleted",
+                std::collections::BTreeMap::from([("key", key.clone())])
+            );
             store.delete(key).await?;
         }
     }
@@ -1975,6 +2042,231 @@ mod tests {
             gets() - before,
             no_rewrite_gets,
             "a known answer reads no rewrite record"
+        );
+    }
+
+    const PROTECTION_WINDOW: &str = "gc: no object is deleted inside its protection window";
+
+    /// The tombstone key [`put_tombstone`] seeds for `bucket`, used as the
+    /// per-test needle that isolates this bucket's captured evaluations from
+    /// every other test sharing the in-process record.
+    fn tombstone_key_for(bucket: &Bucket) -> String {
+        let tombstone = RetentionTombstone {
+            format_version: 1,
+            tenant_hash: bucket.tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(bucket.signal) as i32,
+            shard: bucket.shard,
+            ingest_hour_bucket: bucket.ingest_hour_bucket,
+            retired_at_ns: RETIRED_AT_NS,
+            retention_window_ns: WINDOW_NS as u64,
+            record_count_observed: 1,
+        };
+        keys::retention_tombstone_key_for(&tombstone).expect("key")
+    }
+
+    /// The `delete-before-horizon` mutant bypasses the caller's horizon gate, so
+    /// the sweep runs at `retired_at + 1`, far short of the protection horizon.
+    /// The site re-derives the horizon from the durable tombstone and the clock,
+    /// so `NoDeleteInsideProtectionWindow` evaluates false at the delete.
+    #[tokio::test]
+    async fn mutant_delete_before_horizon_breaks_protection_window() {
+        let Some(_mutant) = crate::publish::tests::scoped_mutant("lifecycle/delete-before-horizon")
+        else {
+            return;
+        };
+        let store = MemoryStore::new();
+        let bucket = put_tombstone(&store, 41).await;
+        let needle = tombstone_key_for(&bucket);
+
+        let (outcome, _expiry) =
+            evaluate_at(&store, &bucket, RETIRED_AT_NS + 1, RewriteBound::Unread)
+                .await
+                .expect("retention pass");
+        assert_eq!(
+            outcome,
+            RetentionOutcome::Swept,
+            "the mutant forces the physical sweep before the horizon"
+        );
+
+        let found = crate::publish::tests::evaluations(PROTECTION_WINDOW, &needle);
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the protection-window invariant must evaluate false under the mutant: {found:?}"
+        );
+    }
+
+    /// Without the mutant, a sweep runs only once the clock is past
+    /// `retired_at + protection_horizon`, so the property is evaluated and holds
+    /// at the delete, never false.
+    #[tokio::test]
+    async fn protection_window_holds_for_a_delete_past_the_horizon() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let bucket = put_tombstone(&store, 42).await;
+        let needle = tombstone_key_for(&bucket);
+        let past = RETIRED_AT_NS
+            .saturating_add(CompactorConfig::default().protection_horizon_ns)
+            .saturating_add(1);
+
+        let (outcome, _expiry) = evaluate_at(&store, &bucket, past, RewriteBound::Unread)
+            .await
+            .expect("retention pass");
+        assert_eq!(
+            outcome,
+            RetentionOutcome::Swept,
+            "a real sweep past the horizon"
+        );
+
+        let found = crate::publish::tests::evaluations(PROTECTION_WINDOW, &needle);
+        assert!(
+            !found.is_empty(),
+            "the property is evaluated at the physical delete"
+        );
+        assert!(
+            found.iter().all(|(held, _)| *held),
+            "the protection-window invariant never evaluates false past the horizon: {found:?}"
+        );
+    }
+
+    const HELD_NEVER_DELETED: &str = "gc: a held object is never deleted";
+
+    /// Seed a tombstone for `hour` and one L1 part under that bucket's `l1/`
+    /// prefix, the object `delete_all` removes; returns the bucket and the
+    /// part's key.
+    async fn put_tombstoned_part(store: &dyn ObjectStoreBackend, hour: u32) -> (Bucket, String) {
+        let bucket = put_tombstone(store, hour).await;
+        let part_key = format!("{}p.0", l1_bucket_prefix(&bucket));
+        store
+            .put(
+                &part_key,
+                bytes::Bytes::from_static(b"part"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed part");
+        (bucket, part_key)
+    }
+
+    /// One retention evaluation of `bucket` past its protection horizon, under
+    /// `lease`.
+    async fn sweep_past_horizon(
+        store: &dyn ObjectStoreBackend,
+        bucket: &Bucket,
+        lease: &dyn LeaseCheck,
+    ) -> RetentionOutcome {
+        let config = CompactorConfig {
+            max_query_duration_ns: 0,
+            head_cache_ttl_ns: 0,
+            clock_skew_allowance_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let past = RETIRED_AT_NS
+            .saturating_add(config.protection_horizon_ns)
+            .saturating_add(1);
+        let (outcome, _expiry) = retention_sweep_bucket_observed(
+            &mut SnapshotReachability::new(),
+            store,
+            &crate::clock::FixedClock::new(past),
+            &config,
+            Some(WINDOW_NS),
+            lease,
+            bucket,
+            RewriteBound::Unread,
+        )
+        .await
+        .expect("retention pass");
+        outcome
+    }
+
+    /// Retention's physical delete under a real hold snapshot that holds
+    /// another shard: `HeldObjectNeverDeleted` is evaluated at the part's
+    /// delete and holds.
+    #[tokio::test]
+    async fn held_object_never_deleted_holds_at_the_retention_delete() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let (bucket, part_key) = put_tombstoned_part(&store, 43).await;
+        let other_shard = crate::legal_hold::shard_hold_scopes(&tenant(), Signal::Metrics, 1)
+            .expect("scopes")[2]
+            .clone();
+        crate::legal_hold::write_hold_set(
+            &store,
+            &tenant(),
+            uuid::Uuid::from_u128(0x4301),
+            1,
+            &other_shard,
+            "litigation",
+        )
+        .await
+        .expect("place hold");
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant())
+            .await
+            .expect("refresh");
+
+        let outcome = sweep_past_horizon(&store, &bucket, &snapshot).await;
+        assert_eq!(outcome, RetentionOutcome::Swept);
+        assert!(
+            store.get(&part_key, GetRange::Full).await.is_err(),
+            "the part is deleted"
+        );
+
+        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &part_key);
+        assert_eq!(
+            found.len(),
+            1,
+            "one evaluation at the part's delete: {found:?}"
+        );
+        assert!(found[0].0, "an unheld part's delete holds: {found:?}");
+    }
+
+    /// A hold placed after the pass's snapshot is not one the pass could
+    /// honour: the delete the snapshot allows goes ahead, and although the
+    /// store re-read at the delete now holds the part, `HeldObjectNeverDeleted`
+    /// is evaluated and holds.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_does_not_fail_the_retention_delete() {
+        if !crate::publish::tests::capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let (bucket, part_key) = put_tombstoned_part(&store, 44).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant())
+            .await
+            .expect("refresh");
+        crate::legal_hold::write_hold_set(
+            &store,
+            &tenant(),
+            uuid::Uuid::from_u128(0x4401),
+            1,
+            &l1_bucket_prefix(&bucket),
+            "litigation",
+        )
+        .await
+        .expect("place hold after the snapshot");
+        let fresh = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant())
+            .await
+            .expect("refresh");
+        assert!(
+            fresh.is_protected(&part_key) && !snapshot.is_protected(&part_key),
+            "the store now holds the part; the pass's snapshot does not"
+        );
+
+        let outcome = sweep_past_horizon(&store, &bucket, &snapshot).await;
+        assert_eq!(outcome, RetentionOutcome::Swept, "the snapshot allows it");
+
+        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &part_key);
+        assert_eq!(
+            found.len(),
+            1,
+            "one evaluation at the part's delete: {found:?}"
+        );
+        assert!(
+            found[0].0,
+            "a hold placed after the snapshot never makes the property false: {found:?}"
         );
     }
 }
