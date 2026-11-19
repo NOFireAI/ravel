@@ -781,6 +781,9 @@ fn captured_evaluations(message: &'static str) -> Vec<(bool, String)> {
     found.into_inner()
 }
 
+const COMPLETION_NOT_SERVED: &str =
+    "erasure: a completion is written only when no pre-rewrite object is still served";
+
 /// CompletionImpliesNoPreRewriteExposure (ADR-4326): the served-set gate holds a
 /// request's `.done` while an in-scope bucket still serves the subject -- here
 /// the ingest hour open at the request's acknowledgement is unsealed, so the
@@ -832,6 +835,24 @@ async fn completion_waits_for_the_served_set() {
             object_exists(store.as_ref(), &done_key).await,
             "once no in-scope bucket serves the subject, the completion is written"
         );
+
+        // Under the invariants build the shipped gate's completion write was
+        // judged against the re-read served set: evaluated, and never false.
+        if ravel_invariant::EVALUATES {
+            let found: Vec<(bool, String)> = captured_evaluations(COMPLETION_NOT_SERVED)
+                .into_iter()
+                .filter(|(_, details)| details.contains(&request_id.to_string()))
+                .collect();
+            assert!(
+                !found.is_empty(),
+                "the completion write is judged against the re-read served set"
+            );
+            assert!(
+                found.iter().all(|(violation, _)| !violation),
+                "CompletionImpliesNoPreRewriteExposure never evaluates false on the shipped \
+                 gate: {found:?}"
+            );
+        }
     }
 
     // --- Part B: the complete-ignores-served-set mutant arm --------------
@@ -868,12 +889,10 @@ async fn completion_waits_for_the_served_set() {
          the shipped build's `assert!(!object_exists(done_key))` from Part A is the assertion that \
          fails under this mutant"
     );
-    let found: Vec<(bool, String)> = captured_evaluations(
-        "erasure: a completion is written only when no pre-rewrite object is still served",
-    )
-    .into_iter()
-    .filter(|(_, details)| details.contains(&request_id.to_string()))
-    .collect();
+    let found: Vec<(bool, String)> = captured_evaluations(COMPLETION_NOT_SERVED)
+        .into_iter()
+        .filter(|(_, details)| details.contains(&request_id.to_string()))
+        .collect();
     assert!(
         found.iter().any(|(violation, _)| *violation),
         "CompletionImpliesNoPreRewriteExposure must evaluate false under the mutant: {found:?}"
