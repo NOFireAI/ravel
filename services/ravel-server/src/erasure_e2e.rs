@@ -1018,27 +1018,34 @@ async fn forge_partial_rewrite(
         .expect("put forged rewrite");
 }
 
-/// Retire `(Metrics, shard 0, hour 0)` as retention does: its tombstone hides
-/// the bucket from every snapshot, so the bucket no longer serves anything.
-async fn tombstone_hour_zero(store: &dyn ObjectStoreBackend, tenant: &TenantHash) {
-    let tombstone = ravel_proto::commit::v1::RetentionTombstone {
-        format_version: 1,
-        tenant_hash: tenant.0.to_vec(),
-        signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
-        shard: 0,
-        ingest_hour_bucket: 0,
-        retired_at_ns: TEST_NOW_NS,
-        retention_window_ns: NS_PER_HOUR as u64,
-        record_count_observed: 2,
-    };
-    store
-        .put(
-            &keys::retention_tombstone_key_for(&tombstone).expect("tombstone key"),
-            record::encode_tombstone(&tombstone),
-            PutOptions::create_if_absent(),
-        )
+/// Delete the L0 input whose commit record is `commit_key`, record and data
+/// object both: what a sweep of a superseded input leaves behind. Returns the
+/// data object's key.
+async fn sweep_l0_input(store: &dyn ObjectStoreBackend, commit_key: &str) -> String {
+    let got = store
+        .get(commit_key, GetRange::Full)
         .await
-        .expect("put tombstone");
+        .expect("get commit record");
+    let rec = record::decode(&got.data).expect("decode commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .delete(commit_key)
+        .await
+        .expect("delete commit record");
+    store.delete(&data_key).await.expect("delete data object");
+    data_key
+}
+
+/// Every key under `(tenant, Metrics, shard 0, hour 0)`'s commit prefix.
+async fn hour_zero_commit_keys(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> Vec<String> {
+    let prefix =
+        keys::commit_shard_hour_prefix(tenant, Signal::Metrics, 0, 0).expect("bucket prefix");
+    list_all(store, &prefix)
+        .await
+        .expect("list bucket")
+        .into_iter()
+        .map(|meta| meta.key)
+        .collect()
 }
 
 /// The served-set state every completion attempt below runs over: two live
@@ -1100,9 +1107,12 @@ const COMPLETION_NOT_SERVED: &str =
 /// the unsealed-bucket branch withholds nothing. The only thing that withholds
 /// `.done` is a store-visible L0 input the catalog resolver still serves for
 /// the subject: the second input, which the bucket's rewrite does not
-/// supersede. Once retention's tombstone hides the bucket, nothing serves the
-/// subject and `.done` is written. The `complete-ignores-served-set` mutant arm
-/// writes `.done` on the first attempt, and the property evaluates false.
+/// supersede. Once that input's commit record and data object are gone, as a
+/// sweep of a superseded input leaves them, hour 0 is still sealed, still
+/// untombstoned and still read record by record, but the resolver finds
+/// nothing serving the subject and `.done` is written. The
+/// `complete-ignores-served-set` mutant arm writes `.done` on the first
+/// attempt, and the property evaluates false.
 #[tokio::test]
 async fn completion_waits_for_the_served_set() {
     let mut harness = TickHarness::new();
@@ -1124,8 +1134,19 @@ async fn completion_waits_for_the_served_set() {
         let (l0_two_commit, dreq_key, done_key) =
             served_set_fixture(&store, &tenant_id, request_id).await;
         let l0_two_gets = store.gets_of(&l0_two_commit);
+        let rewrite_key = hour_zero_commit_keys(&store, &tenant)
+            .await
+            .into_iter()
+            .find(|key| key.contains("/rw."))
+            .expect("the forged rewrite record");
+        let rewrite_gets = store.gets_of(&rewrite_key);
 
         erasure_pass_at(&store, &mut harness, &tenant, sealed_ns).await;
+        let pass_one_rewrite_gets = store.gets_of(&rewrite_key) - rewrite_gets;
+        assert_eq!(
+            pass_one_rewrite_gets, 2,
+            "pass 1 reads the rewrite record in the rewrite pass and the completion gate"
+        );
         assert!(
             !object_exists(&store, &done_key).await,
             "the second L0 input still serves the subject, so the completion is withheld"
@@ -1141,13 +1162,35 @@ async fn completion_waits_for_the_served_set() {
             "the request stays pending while the served set blocks it"
         );
 
-        tombstone_hour_zero(&store, &tenant).await;
+        let l0_two_data = sweep_l0_input(&store, &l0_two_commit).await;
+        assert!(!object_exists(&store, &l0_two_data).await);
+        let hour_zero = hour_zero_commit_keys(&store, &tenant).await;
+        assert!(
+            !hour_zero.iter().any(|key| matches!(
+                keys::partition_bucket_entry(key),
+                Ok(keys::BucketEntry::Tombstone(_))
+            )),
+            "hour 0 carries no tombstone at pass 2: {hour_zero:?}"
+        );
+        assert!(
+            !hour_zero.contains(&l0_two_commit),
+            "the second input's commit record is gone"
+        );
+        let rewrite_gets = store.gets_of(&rewrite_key);
         erasure_pass_at(&store, &mut harness, &tenant, sealed_ns).await;
         assert!(
             object_exists(&store, &done_key).await,
             "once no in-scope bucket serves the subject, the completion is written"
         );
         assert_eq!(store.puts_of(&done_key), 1, "exactly one .done PUT");
+        // The completion gate decodes the bucket's rewrite record as pass 1
+        // did, so pass 2 went past the tombstone check; the invariants build
+        // adds the served-set re-read's one GET.
+        assert_eq!(
+            store.gets_of(&rewrite_key) - rewrite_gets,
+            pass_one_rewrite_gets + u64::from(ravel_invariant::EVALUATES),
+            "pass 2 reads hour 0's rewrite record as pass 1 did"
+        );
 
         if ravel_invariant::EVALUATES {
             let found: Vec<(bool, String)> = captured_evaluations(COMPLETION_NOT_SERVED)

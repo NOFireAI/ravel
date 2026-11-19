@@ -4274,6 +4274,11 @@ pub(crate) async fn run_erasure_pass(
 /// `Some(false)` when one does, and `None` when a listing, a resolve or a held
 /// bucket leaves that unknown. An unsealed bucket is left out:
 /// CompletionCoversEveryBucketOpenAtRequest owns that case.
+///
+/// The listing is fresh, but each bucket is judged by the same
+/// [`ravel_maintain::bucket_erasure_completion`] the pass uses. This checks
+/// the pass's decision against a fresh listing; a bug inside
+/// `bucket_erasure_completion` itself is not visible to it.
 #[allow(clippy::too_many_arguments)]
 async fn served_after_completion(
     store: &dyn ObjectStoreBackend,
