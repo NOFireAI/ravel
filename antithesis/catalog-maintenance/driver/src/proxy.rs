@@ -8,15 +8,18 @@
 //!   `release` or [`HOLD_CAP`], whichever comes first. This is a delay of one
 //!   request in the network, after the sender's last LIST.
 //! - `hold-key <key>`: hold the next PUT of exactly that key the same way.
-//!   When the held request is forwarded (on `release`, `pass` or the cap) the
-//!   proxy reads its upstream response status and keeps the last such status,
-//!   so the driver can tell a lost CAS (`412`/`409`) from a win (`200`).
+//!
+//! When a held request of either rule is forwarded (on `release`, `pass` or
+//! the cap) the proxy reads its upstream response status and keeps the last
+//! such status, so the driver can tell a lost create or CAS (`412`/`409`) from
+//! a win (`200`) or a refusal for another reason (a `403`, a `5xx`). Setting
+//! either rule clears the kept status.
 //! - `refuse-records`, `refuse-key <key>`: answer every PUT of a compaction
 //!   record, or of that key, `503 SlowDown` without forwarding it, as a store
 //!   failing those writes would.
 //! - `held`: `held <key> <age_ms>`, or `none`.
-//! - `held-result`: `<key> <status>` of the last forwarded `hold-key` request,
-//!   or `none`.
+//! - `held-result`: `<key> <status>` of the last forwarded held request, or
+//!   `none`.
 //! - `release`, `pass`: release the hold; `pass` also lifts every rule.
 //!
 //! A restarted proxy starts with no rules, so a proxy killed mid-race
@@ -47,7 +50,7 @@ struct State {
     releases: u64,
     refuse_records: bool,
     refuse_keys: BTreeSet<String>,
-    /// The key and upstream status of the last forwarded `hold-key` request.
+    /// The key and upstream status of the last forwarded held request.
     held_result: Option<(String, u16)>,
 }
 
@@ -56,7 +59,7 @@ struct State {
 pub enum Admit {
     Forward,
     Refuse,
-    /// A released `hold-key` request: forward it on a dedicated upstream
+    /// A released held request: forward it on a dedicated upstream
     /// connection, read its response status, and record it as `held-result`.
     Capture(String),
 }
@@ -88,8 +91,14 @@ impl Rules {
                 };
                 self.released.notify_all();
             }
-            ("hold-record", "") => s.hold_next_record = true,
-            ("hold-key", key) if !key.is_empty() => s.hold_key = Some(key.to_string()),
+            ("hold-record", "") => {
+                s.hold_next_record = true;
+                s.held_result = None;
+            }
+            ("hold-key", key) if !key.is_empty() => {
+                s.hold_key = Some(key.to_string());
+                s.held_result = None;
+            }
             ("refuse-records", "") => s.refuse_records = true,
             ("refuse-key", key) if !key.is_empty() => {
                 s.refuse_keys.insert(key.to_string());
@@ -118,7 +127,8 @@ impl Rules {
     }
 
     /// The verdict on one request for `key`. A held request blocks here
-    /// until released or `cap` passes, then is forwarded.
+    /// until released or `cap` passes, then is forwarded with its status
+    /// captured.
     pub fn admit(&self, method: &str, key: &str, cap: Duration) -> Admit {
         if method != "PUT" {
             return Admit::Forward;
@@ -152,14 +162,10 @@ impl Rules {
                 .0;
         }
         s.held = None;
-        if hold_this_key {
-            Admit::Capture(key.to_string())
-        } else {
-            Admit::Forward
-        }
+        Admit::Capture(key.to_string())
     }
 
-    /// Record the upstream status of a forwarded `hold-key` request.
+    /// Record the upstream status of a forwarded held request.
     pub fn record_held_result(&self, key: &str, status: u16) {
         self.lock().held_result = Some((key.to_string(), status));
     }
@@ -460,7 +466,7 @@ fn requests(
     Ok(())
 }
 
-/// Forward one released `hold-key` request on a dedicated upstream connection,
+/// Forward one released held request on a dedicated upstream connection,
 /// relay its response to the client, and record the response status as
 /// `held-result`. A dedicated connection carries only this one request, so its
 /// response is unambiguously the one to read, and the original `up` connection
@@ -697,7 +703,11 @@ mod tests {
         // The hold is one-shot: a second record PUT goes straight through.
         assert_eq!(rules.admit("PUT", RECORD, HOLD_CAP), Admit::Forward);
         assert_eq!(rules.apply("release"), "ok");
-        assert_eq!(held.join().expect("joins"), Admit::Forward);
+        // A released held record PUT is forwarded with its status captured.
+        assert_eq!(
+            held.join().expect("joins"),
+            Admit::Capture(RECORD.to_string())
+        );
         assert!(started.elapsed() < HOLD_CAP);
         assert_eq!(rules.apply("held"), "none");
     }
@@ -709,7 +719,7 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             rules.admit("PUT", RECORD, Duration::from_millis(50)),
-            Admit::Forward
+            Admit::Capture(RECORD.to_string())
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(rules.apply("held"), "none");
@@ -908,42 +918,87 @@ mod tests {
         assert_eq!(seen.lock().expect("locks").len(), put.len() + chunked.len());
     }
 
+    /// Hold one PUT of `key` under `rule`, release it, and return the
+    /// client's answer and the `held-result` reply after it.
+    fn hold_and_release(status: u16, rule: &str, key: &str) -> (String, String) {
+        let (up, seen) = status_upstream(status);
+        let rules = Arc::new(Rules::default());
+        let addr = proxy(up, Arc::clone(&rules));
+        assert_eq!(rules.apply(rule), "ok");
+        let mut conn = TcpStream::connect(&addr).expect("connects");
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("sets a read timeout");
+        let put = format!(
+            "PUT /ravel/{key} HTTP/1.1\r\nHost: s3proxy:9000\r\nContent-Length: 3\r\n\r\nabc"
+        );
+        conn.write_all(put.as_bytes()).expect("writes");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rules.apply("held") == "none" && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            parse_held(&rules.apply("held")).expect("a held reply").0,
+            key
+        );
+        assert_eq!(rules.apply("held-result"), "none");
+        assert_eq!(rules.apply("release"), "ok");
+        let mut answer = Vec::new();
+        conn.read_to_end(&mut answer).expect("reads to the close");
+        // The released PUT reached the upstream.
+        assert!(String::from_utf8_lossy(&seen.lock().expect("locks").clone()).contains(key));
+        (
+            String::from_utf8(answer).expect("text"),
+            rules.apply("held-result"),
+        )
+    }
+
     #[test]
     fn a_hold_key_records_the_forwarded_response_status() {
         // Both a lost CAS (412) and a win (200): held-result reports whichever
         // the upstream answered, and the client gets that response.
         for status in [200u16, 412] {
-            let (up, seen) = status_upstream(status);
-            let rules = Arc::new(Rules::default());
-            let addr = proxy(up, Arc::clone(&rules));
-            assert_eq!(rules.apply(&format!("hold-key {HEAD_KEY}")), "ok");
-            let mut conn = TcpStream::connect(&addr).expect("connects");
-            let put = format!(
-                "PUT /ravel/{HEAD_KEY} HTTP/1.1\r\nHost: s3proxy:9000\r\nContent-Length: 3\r\n\r\nabc"
+            let (answer, result) =
+                hold_and_release(status, &format!("hold-key {HEAD_KEY}"), HEAD_KEY);
+            assert!(
+                answer.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{answer:?}"
             );
-            conn.write_all(put.as_bytes()).expect("writes");
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while rules.apply("held") == "none" && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
-            }
             assert_eq!(
-                parse_held(&rules.apply("held")).expect("a held reply").0,
-                HEAD_KEY
-            );
-            assert_eq!(rules.apply("release"), "ok");
-            let mut answer = Vec::new();
-            conn.read_to_end(&mut answer).expect("reads to the close");
-            let text = String::from_utf8(answer).expect("text");
-            assert!(text.starts_with(&format!("HTTP/1.1 {status} ")), "{text:?}");
-            assert_eq!(
-                parse_held_result(&rules.apply("held-result")),
+                parse_held_result(&result),
                 Some((HEAD_KEY.to_string(), status))
             );
-            // The released PUT reached the upstream.
+        }
+    }
+
+    #[test]
+    fn a_hold_record_records_the_forwarded_response_status() {
+        // A lost create (412), a win (200) and a refusal for skew (403): the
+        // held record PUT's own status, under the record key, whichever it is.
+        // A hold-record request forwarded without capture leaves held-result
+        // at none.
+        for status in [200u16, 403, 412] {
+            let (answer, result) = hold_and_release(status, "hold-record", RECORD);
             assert!(
-                String::from_utf8_lossy(&seen.lock().expect("locks").clone()).contains(HEAD_KEY)
+                answer.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{answer:?}"
+            );
+            assert_eq!(
+                parse_held_result(&result),
+                Some((RECORD.to_string(), status))
             );
         }
+    }
+
+    #[test]
+    fn setting_a_hold_clears_the_last_held_result() {
+        let rules = Rules::default();
+        rules.record_held_result(RECORD, 412);
+        assert_eq!(rules.apply("held-result"), format!("{RECORD} 412"));
+        assert_eq!(rules.apply("hold-record"), "ok");
+        assert_eq!(rules.apply("held-result"), "none");
+        rules.record_held_result(HEAD_KEY, 200);
+        assert_eq!(rules.apply(&format!("hold-key {HEAD_KEY}")), "ok");
+        assert_eq!(rules.apply("held-result"), "none");
     }
 
     #[test]

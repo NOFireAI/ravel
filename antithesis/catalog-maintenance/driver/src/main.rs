@@ -8,11 +8,12 @@
 //! hours and later past the sweep's protection horizon, overwrite HEAD with
 //! garbage through raw S3, audit the store against what HEAD names and for
 //! swept compaction inputs, and check that no scan exceeds the stored
-//! multiset of seeded and live records. Three forced races, run as drawn
-//! rules and again in the eventually, put the servers in situations a fault
-//! schedule alone rarely reaches: a fold losing its HEAD CAS, a compaction
-//! record PUT losing to a concurrent compaction, and a sweep past a
-//! compaction record that HEAD has not folded. The eventually stops faults,
+//! multiset of seeded and live records. Four forced situations, run as drawn
+//! rules and again in the eventually, put the servers where a fault schedule
+//! alone rarely reaches: a fold losing its HEAD CAS, a compaction record PUT
+//! losing to a concurrent compaction, a sweep past a compaction record that
+//! HEAD has not folded, and a sweep past the protection horizon while HEAD
+//! is unreadable. The eventually stops faults,
 //! sweeps every shard and checks the whole multiset. See
 //! antithesis/catalog-maintenance/README.md for the properties.
 
@@ -77,8 +78,13 @@ const FOLD_HELD_WAIT: Duration = Duration::from_secs(10);
 const _: () = assert!(FOLD_HELD_WAIT.as_secs() < proxy::HOLD_CAP.as_secs());
 /// Fold races the eventually runs until a server fold is overtaken.
 const FOLD_RACES_EVENTUALLY: u32 = 6;
-/// Record races the eventually runs until a server's record PUT loses.
-const RECORD_RACES_EVENTUALLY: u32 = 3;
+/// Record races the eventually runs until a server's record PUT loses: room
+/// for a race the store refused for another reason and for races in which
+/// no server sent a record PUT in time.
+const RECORD_RACES_EVENTUALLY: u32 = 5;
+/// How long a record race waits, after the release, for the proxy to report
+/// the store's answer to the held PUT.
+const HELD_RESULT_WAIT: Duration = Duration::from_secs(10);
 /// How long a record race waits for a server to send a record PUT after the
 /// nudge: several maintenance intervals.
 const HELD_WAIT: Duration = Duration::from_secs(120);
@@ -189,7 +195,7 @@ impl Config {
                     "CLOCK_SWEEP_WINDOW_JUMP_SECS",
                     clock::DEFAULT_WINDOW_JUMP_S,
                 ),
-                reread_s: env_u64("FAKETIME_CACHE_DURATION", 2),
+                reread_s: env_u64("FAKETIME_CACHE_DURATION", clock::FAKETIME_CACHE_DURATION_S),
                 min_acked: usize::try_from(env_u32("CLOCK_JUMP_MIN_ACKED", 20)).unwrap_or(20),
             },
             proxy: std::env::var("S3_PROXY_CONTROL").unwrap_or_else(|_| "s3proxy:9001".to_string()),
@@ -257,6 +263,11 @@ struct Shared {
     /// Whether an unfolded-record sweep reached its situation; the
     /// eventually runs one until it has.
     unfolded_reached: AtomicBool,
+    /// Set once the unreadable-HEAD sweep started; the rule runs it once per
+    /// timeline.
+    unreadable_started: AtomicBool,
+    /// Unreadable-HEAD sweeps run; numbers each one's HEAD garbage.
+    unreadable_sweeps: AtomicU64,
     /// Every key an audit or the sweep jump has listed, and the swept
     /// inputs confirmed gone. Keys are never reused, so one listed here and
     /// absent from a later LIST was deleted.
@@ -763,7 +774,9 @@ impl Shared {
     /// After a jump reached the driver: wait one more reread, within which
     /// every other process picks the offset up too, then for every node.
     fn settle(&self, what: &str) {
-        std::thread::sleep(Duration::from_secs(self.clock.reread_s + 1));
+        std::thread::sleep(Duration::from_secs(clock::reach_wait_s(
+            self.clock.reread_s,
+        )));
         if let Err(e) = self.wait_serving(Duration::from_secs(120), what) {
             println!("clock: a node is not serving two minutes after the {what}: {e}");
         }
@@ -1072,6 +1085,22 @@ impl Shared {
         reply
     }
 
+    /// The proxy's `held-result` once it names `key`, polled for up to
+    /// [`HELD_RESULT_WAIT`] after the release; else the last reply seen.
+    fn held_result_of(&self, key: &str) -> Option<(String, u16)> {
+        let deadline = Instant::now() + HELD_RESULT_WAIT;
+        loop {
+            let result = self
+                .proxy_cmd("held-result")
+                .ok()
+                .and_then(|r| proxy::parse_held_result(&r));
+            if result.as_ref().is_some_and(|(k, _)| k == key) || Instant::now() >= deadline {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// A `(hour, shard)` bucket of the current or the previous hour that a
     /// compaction would publish a record for, after up to [`FILL_WRITES`]
     /// live writes if none has one yet. The caller holds the gate's write
@@ -1109,13 +1138,14 @@ impl Shared {
         None
     }
 
-    /// One record race (README.md, "The forced races"): hold the next
-    /// compaction record PUT a server sends, nudge every clock until a
-    /// compactable bucket seals for compaction, and while the PUT is held
-    /// run a `ravel-cli` compaction of the held record's bucket, which
-    /// publishes the same record key first. The released create-only PUT
-    /// then finds the record in place. The caller holds the gate's write
-    /// guard. Returns whether the server's PUT lost.
+    /// One record race (README.md, "The forced races"): nudge every clock
+    /// until a compactable bucket seals for compaction, and once the move
+    /// reached every clock hold the next compaction record PUT a server
+    /// sends. While the PUT is held run a `ravel-cli` compaction of the held
+    /// record's bucket, which publishes the same record key first. The
+    /// released create-only PUT then finds the record in place, and the store
+    /// answers it 412. The caller holds the gate's write guard. Returns
+    /// whether the server's PUT lost.
     fn record_race(&self, reason: &str) -> bool {
         let Some(prefix) = self.known_prefix() else {
             println!("record race: no HEAD key known yet");
@@ -1124,11 +1154,7 @@ impl Shared {
         let Some((hour, shard)) = self.compactable_bucket(&prefix, "record race") else {
             return false;
         };
-        if self
-            .proxy_cmd("pass")
-            .and_then(|_| self.proxy_cmd("hold-record"))
-            .is_err()
-        {
+        if self.proxy_cmd("pass").is_err() {
             return false;
         }
         let n = self.record_races.fetch_add(1, Ordering::SeqCst);
@@ -1140,11 +1166,14 @@ impl Shared {
         lost
     }
 
-    /// [`Shared::record_race`] once the proxy holds the next record PUT.
+    /// [`Shared::record_race`] once the proxy runs with no rules.
     fn record_race_held(&self, n: u64, prefix: &str, bucket: (u64, u32), reason: &str) -> bool {
         let now_s = now_ns() / NS_PER_SECOND;
         let nudge_s = clock::seal_nudge_s(now_s, bucket.0, clock::compaction_seal_margin_s());
-        if !self.nudge(nudge_s, "record race") {
+        // The nudge's settle waits `clock::reach_wait_s` after the move
+        // reached the driver, so every record PUT held below was signed on
+        // the moved clock, which rustfs shares: none is refused for skew.
+        if !self.nudge(nudge_s, "record race") || self.proxy_cmd("hold-record").is_err() {
             return false;
         }
         let deadline = Instant::now() + HELD_WAIT;
@@ -1188,32 +1217,37 @@ impl Shared {
         ]);
         let budget = forced::cli_budget(age);
         let started = Instant::now();
-        let ((cli_out, cli_took), before, released, after) = std::thread::scope(|scope| {
-            let cli = scope.spawn(|| {
-                let out = self.cli.run(&args, CLI_TIMEOUT_S);
-                (out, started.elapsed())
+        let ((cli_out, cli_took), before, released_at_age, held_result, after) =
+            std::thread::scope(|scope| {
+                let cli = scope.spawn(|| {
+                    let out = self.cli.run(&args, CLI_TIMEOUT_S);
+                    (out, started.elapsed())
+                });
+                while !cli.is_finished() && started.elapsed() < budget {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let before = self.store.get(&key);
+                let released_at_age = age + started.elapsed();
+                let released = self.proxy_cmd("release").ok().map(|_| released_at_age);
+                let cli = cli.join().unwrap_or_else(|_| {
+                    (
+                        cli::Output {
+                            code: None,
+                            stdout: String::new(),
+                            stderr: "the compaction thread panicked".to_string(),
+                        },
+                        Duration::ZERO,
+                    )
+                });
+                // The store's answer to the released PUT, once the proxy read
+                // it; then time for the server's handling of that answer.
+                let held_result = self.held_result_of(&key);
+                std::thread::sleep(Duration::from_secs(2));
+                (cli, before, released, held_result, self.store.get(&key))
             });
-            while !cli.is_finished() && started.elapsed() < budget {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            let before = self.store.get(&key);
-            let released = self.proxy_cmd("release");
-            let cli = cli.join().unwrap_or_else(|_| {
-                (
-                    cli::Output {
-                        code: None,
-                        stdout: String::new(),
-                        stderr: "the compaction thread panicked".to_string(),
-                    },
-                    Duration::ZERO,
-                )
-            });
-            // Time for the released PUT and the server's handling of its
-            // answer.
-            std::thread::sleep(Duration::from_secs(3));
-            (cli, before, released, self.store.get(&key))
-        });
-        let lost = released.is_ok() && matches!(before, Ok(Some(_)));
+        let held_status = forced::held_status(&key, held_result.as_ref());
+        let published_before_release = matches!(before, Ok(Some(_)));
+        let lost = forced::record_lost(published_before_release, released_at_age, held_status);
         let changed = match (&before, &after) {
             (Ok(Some(b)), Ok(Some(a))) => Some(a != b),
             _ => None,
@@ -1229,7 +1263,10 @@ impl Shared {
             "cli_s": cli_took.as_secs_f64(),
             "cli": cli_out.summary(),
             "published_before_release": before.as_ref().map(Option::is_some),
-            "released": released.is_ok(),
+            "released": released_at_age.is_some(),
+            "released_at_age_ms": released_at_age.map(|a| a.as_millis()),
+            "held_status": held_status,
+            "held_result": held_result.as_ref().map(|(k, s)| format!("{k} {s}")),
             "record_bytes_changed_after_release": changed,
         });
         println!("record race: {details}");
@@ -1449,6 +1486,121 @@ impl Shared {
             reached,
             "catalog: the clocks passed a compaction record's protection horizon and \
              pinned-query window while HEAD had not folded it",
+            &details
+        );
+        reached
+    }
+
+    /// The unreadable-HEAD sweep (README.md, "The forced races"): refuse every
+    /// server's PUT of HEAD, PUT garbage over HEAD through raw S3, move every
+    /// clock past the sweep's protection horizon and wait for the servers'
+    /// sweep passes, which read the undecodable HEAD and must delete nothing
+    /// on its account. Then lift the refusal and rebuild HEAD with a
+    /// `ravel-cli` fold. The caller holds the gate's write guard. Returns
+    /// whether the servers' sweeps ran past the horizon while HEAD was
+    /// unreadable.
+    fn unreadable_head_sweep(&self, reason: &str) -> bool {
+        let (Some(prefix), Some(head_key)) = (self.known_prefix(), lock(&self.head_key).clone())
+        else {
+            println!("unreadable-HEAD sweep: no HEAD key known yet");
+            return false;
+        };
+        let Some(snap) = forced::snap_prefix(&head_key) else {
+            println!("unreadable-HEAD sweep: {head_key} is not a catalog HEAD key");
+            return false;
+        };
+        self.unreadable_started.store(true, Ordering::SeqCst);
+        let reached = self
+            .proxy_cmd("pass")
+            .and_then(|_| self.proxy_cmd(&format!("refuse-key {head_key}")))
+            .is_ok()
+            && self.unreadable_head_sweep_refused(&head_key, &prefix, &snap, reason);
+        let _ = self.proxy_cmd("pass");
+        let rebuilt = (0..3).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            self.fold()
+        });
+        if !rebuilt {
+            println!("unreadable-HEAD sweep: the fold that rebuilds HEAD failed three times");
+        }
+        reached
+    }
+
+    /// [`Shared::unreadable_head_sweep`] once the proxy refuses HEAD PUTs.
+    fn unreadable_head_sweep_refused(
+        &self,
+        head_key: &str,
+        prefix: &str,
+        snap: &str,
+        reason: &str,
+    ) -> bool {
+        let n = self.unreadable_sweeps.fetch_add(1, Ordering::SeqCst);
+        let garbage = format!("antithesis: not a catalog HEAD (unreadable-HEAD sweep {n})");
+        if let Err(e) = self.store.put(head_key, garbage.as_bytes()) {
+            println!("unreadable-HEAD sweep: overwriting HEAD: {e}");
+            return false;
+        }
+        let before: BTreeSet<String> = match self.store.list(prefix) {
+            Ok(keys) => keys.into_iter().collect(),
+            Err(e) => {
+                println!("unreadable-HEAD sweep: listing {prefix}: {e}");
+                return false;
+            }
+        };
+        lock(&self.sweeps).observe(before.iter().cloned());
+        let inputs: Vec<InputKeys> = lock(&self.inputs_of).values().flatten().cloned().collect();
+        let inputs_before = forced::present_inputs(&inputs, &before);
+        if !self.nudge(
+            self.clock.horizon_jump_s,
+            "unreadable-HEAD sweep: protection horizon",
+        ) {
+            return false;
+        }
+        std::thread::sleep(UNFOLDED_PASS_WAIT);
+        let head_after = self.store.get(head_key).ok().flatten();
+        let after: Option<BTreeSet<String>> = match self.store.list(prefix) {
+            Ok(keys) => Some(keys.into_iter().collect()),
+            Err(e) => {
+                println!("unreadable-HEAD sweep: listing {prefix} after the wait: {e}");
+                None
+            }
+        };
+        let reached = forced::unreadable_head_reached(head_after.as_deref(), garbage.as_bytes());
+        let snaps_before = forced::deleted_under(snap, &before, &BTreeSet::new());
+        let (snaps_deleted, inputs_deleted) =
+            after.as_ref().map_or((Vec::new(), Vec::new()), |a| {
+                (
+                    forced::deleted_under(snap, &before, a),
+                    inputs_before
+                        .iter()
+                        .filter(|k| !a.contains(*k))
+                        .cloned()
+                        .collect(),
+                )
+            });
+        let details = json!({
+            "reason": reason,
+            "sweep": n,
+            "head_key": head_key,
+            "head_still_garbage": reached,
+            "head_after_len": head_after.as_ref().map(Vec::len),
+            "snapshots_before": snaps_before.len(),
+            "snapshots_after": after.as_ref().map(|a| forced::deleted_under(snap, a, &BTreeSet::new()).len()),
+            "snapshots_deleted": first(&snaps_deleted),
+            "superseded_inputs_before": inputs_before.len(),
+            "superseded_inputs_deleted": first(&inputs_deleted),
+            "listed_after": after.is_some(),
+            "horizon_jump_s": self.clock.horizon_jump_s,
+            "protection_horizon_s": clock::protection_horizon_s(),
+            "wait_s": UNFOLDED_PASS_WAIT.as_secs(),
+            "offset_s": *lock(&self.offset_s),
+        });
+        println!("unreadable-HEAD sweep: {details}");
+        assert_sometimes!(
+            reached,
+            "catalog: the servers' sweeps ran past the protection horizon while HEAD was unreadable",
             &details
         );
         reached
@@ -1770,6 +1922,25 @@ impl Workload {
     }
 
     #[rule(groups = ["main"], weight = 1)]
+    fn sweep_unreadable_head(&self, tc: TestCase) {
+        let s = &self.0;
+        if s.stopping.load(Ordering::SeqCst)
+            || s.unreadable_started.load(Ordering::SeqCst)
+            || lock(&s.head_key).is_none()
+        {
+            return;
+        }
+        if !tc.draw(gs::weighted_booleans(0.02)) {
+            return;
+        }
+        let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stopping.load(Ordering::SeqCst) || s.unreadable_started.load(Ordering::SeqCst) {
+            return;
+        }
+        s.unreadable_head_sweep("drawn");
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
     fn corrupt_head(&self, tc: TestCase) {
         let s = &self.0;
         let Some(_g) = s.enter() else {
@@ -1882,6 +2053,7 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     if !s.unfolded_reached.load(Ordering::SeqCst) {
         s.unfolded_sweep("eventually");
     }
+    s.unreadable_head_sweep("eventually");
     // With faults stopped the fold and the compaction run over every hour
     // the jump sealed, so the multiset below is checked after both.
     for (what, op) in [
@@ -2203,6 +2375,8 @@ fn main(tc: TestCase) {
         record_lost: AtomicBool::new(false),
         unfolded_started: AtomicBool::new(false),
         unfolded_reached: AtomicBool::new(false),
+        unreadable_started: AtomicBool::new(false),
+        unreadable_sweeps: AtomicU64::new(0),
         sweeps: Mutex::new(audit::SweepLedger::default()),
         inputs_of: Mutex::new(BTreeMap::new()),
         gate: RwLock::new(()),
