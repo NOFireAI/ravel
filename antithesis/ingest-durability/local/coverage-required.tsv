@@ -1,8 +1,9 @@
 # The coverage variant's local gate (scripts/local-run.sh with
 # CONFIG=config-coverage; README.md, "Coverage variant"). One assertion
 # message per line, after its class and a tab:
-#   required  must be hit with its condition true at least once, or the run fails
-#   phase-b   needs a fault switch that is not built yet; reported, not gated
+#   required    must be hit with its condition true at least once, or the run fails
+#   phase-b     needs a fault switch that is not built yet; reported, not gated
+#   self-check  must be violated in a WORKLOAD_COVERAGE_SELF_CHECK=1 run
 required	a log write was answered 429
 required	a metrics write was answered 429
 required	a strict write was answered with a partial success
@@ -12,11 +13,17 @@ required	a strict partial success that rejected only the poison records carries 
 required	a strict write with poison records was acknowledged with commit tokens
 required	a token read checked an acknowledged write that carried poison records
 required	a write answered with an error status carries no commit token
+required	a driver-requested drain is answered or reported interrupted
 required	a driver-requested drain exits with status 0 or 1
 required	a driver-requested drain exited cleanly
-required	server: a shutdown signal started a graceful drain
 phase-b	logs ingest: a write committed on some shards before a sibling shard failed
 phase-b	metrics ingest: a write committed on some shards before a sibling shard failed
 phase-b	logs ingest: a write found its shard actor unavailable
 phase-b	metrics ingest: a write found its shard actor unavailable
 phase-b	metrics ingest: a write was answered Abandoned
+self-check	a write shed at the request head on every attempt stores nothing
+self-check	a strict write's partial success rejects every poison record
+self-check	a strict partial success that rejected only the poison records carries a commit token
+self-check	a write answered with an error status carries no commit token
+self-check	a driver-requested drain is answered or reported interrupted
+self-check	a driver-requested drain exits with status 0 or 1

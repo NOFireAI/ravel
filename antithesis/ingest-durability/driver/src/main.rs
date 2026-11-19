@@ -778,6 +778,11 @@ impl Shared {
         if !s.eventually_on || s.stopping.load(Ordering::SeqCst) {
             return;
         }
+        // The coverage self-check runs its eventually only when forced, so
+        // its broken drains always come first.
+        if s.cov.as_ref().is_some_and(|c| c.self_check) {
+            return;
+        }
         if !tc.draw(gs::weighted_booleans(0.003)) {
             return;
         }
@@ -876,6 +881,10 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
             Ok(st) => println!("eventually: {cmd} 3600 exited {st}"),
             Err(e) => println!("eventually: running {cmd} failed: {e}"),
         }
+    }
+    // No drain may start once the checks below begin.
+    if let Some(cov) = &s.cov {
+        cov.settle_drains();
     }
 
     let deadline = Instant::now() + Duration::from_secs(300);

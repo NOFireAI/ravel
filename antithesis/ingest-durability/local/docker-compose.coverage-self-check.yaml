@@ -1,0 +1,16 @@
+# Coverage self-check overrides (scripts/local-run.sh with CONFIG=config-coverage
+# and WORKLOAD_COVERAGE_SELF_CHECK=1), layered over
+# ../config-coverage/docker-compose.yaml and docker-compose.local.yaml. The
+# driver feeds each coverage property an input that breaks it, and the
+# supervisors break the drains, so every self-check line of
+# coverage-required.tsv must be violated.
+services:
+  ravel1:
+    environment:
+      RAVEL_SUPERVISE_SELF_CHECK: "1"
+  ravel2:
+    environment:
+      RAVEL_SUPERVISE_SELF_CHECK: "1"
+  driver:
+    environment:
+      WORKLOAD_COVERAGE_SELF_CHECK: "1"
