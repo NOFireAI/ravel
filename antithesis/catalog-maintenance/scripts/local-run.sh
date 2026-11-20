@@ -12,6 +12,10 @@
 #   WORKLOAD_INJECT_SWAPPED_RECORD=1  the self-check: the model expects one
 #             seeded record moved to another write, so the multiset assertion
 #             must fail, and nothing else may.
+#   WORKLOAD_INJECT_STALE_TOKEN_RESULT=1  the token-read self-check: the
+#             driver counts one returned record twice in every token read it
+#             judges, so the exactly-once token-read assertion must fail, and
+#             nothing else may.
 #   RAVEL_ANTITHESIS_MUTANT=catalog/<stem>  a mutant control run (ADR-4326
 #             decision 3): the stack runs the config copy
 #             scripts/mutant-config.sh writes, over the
@@ -35,9 +39,13 @@ MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
 TSV="$(cd "$WL/../.." && pwd)/formal/tla/catalog/antithesis-mutants.tsv"
 COMPOSE_BASE="$WL/config/docker-compose.yaml"
 GATE=FAIL
+if [ "${WORKLOAD_INJECT_SWAPPED_RECORD:-}" = 1 ] && [ "${WORKLOAD_INJECT_STALE_TOKEN_RESULT:-}" = 1 ]; then
+    echo "refused: the two self-checks are separate runs; unset one of WORKLOAD_INJECT_SWAPPED_RECORD and WORKLOAD_INJECT_STALE_TOKEN_RESULT"
+    exit 1
+fi
 if [ -n "$MUTANT" ]; then
-    if [ "${WORKLOAD_INJECT_SWAPPED_RECORD:-}" = 1 ]; then
-        echo "refused: the self-check and a mutant run are separate runs; unset one of WORKLOAD_INJECT_SWAPPED_RECORD and RAVEL_ANTITHESIS_MUTANT"
+    if [ "${WORKLOAD_INJECT_SWAPPED_RECORD:-}" = 1 ] || [ "${WORKLOAD_INJECT_STALE_TOKEN_RESULT:-}" = 1 ]; then
+        echo "refused: a self-check and a mutant run are separate runs; unset the WORKLOAD_INJECT_ variable or RAVEL_ANTITHESIS_MUTANT"
         exit 1
     fi
     mkdir -p "$OUT"
@@ -91,6 +99,7 @@ END_LIMIT=$((SECS + 4800))
 SERVERS="ravel1 ravel2 maint1 maint2"
 MULTISET="catalog: compaction preserves the acked multiset"
 UPPER="catalog: no scan shows a phantom or an excess copy"
+TOKEN_READ="catalog: a token read returns each acked record of its write exactly once"
 # Reachable in every plain local run: the clock jump, the sealing it exists
 # for, the compaction the sealing enables (ADR-4326 decision 5), and the sweep
 # jumps, sweep and deletion of a superseded input the compaction enables.
@@ -103,7 +112,14 @@ UPPER="catalog: no scan shows a phantom or an excess copy"
 # that never reaches it cannot tell that mutant from clean code. The driver
 # cannot see a server's sweep pass, so the SUT's own "delete pass refused on
 # an unreadable HEAD" (both delete paths in ravel-maintain) is required too:
-# it proves a server sweep read the undecodable HEAD and stopped.
+# it proves a server sweep read the undecodable HEAD and stopped. Last, the
+# token reads (README.md, "Token reads across the lifecycle") at each state:
+# after compaction with the input's commit record still there, after HEAD
+# named the compaction output, after the sweep deleted the input's commit
+# record, twice on one node, and on a node restarted since the write (the
+# restart below); and the SUT's own evidence read on the token fallback,
+# which runs only on a node that has not cached the gone commit record
+# (issue #4490).
 REQUIRED=(
     "catalog: the workload starts"
     "clock: the driver's clock jumped forward"
@@ -119,6 +135,12 @@ REQUIRED=(
     "catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it"
     "catalog: HEAD stayed unreadable while the clocks passed the protection horizon"
     "catalog: delete pass refused on an unreadable HEAD"
+    "catalog: a token read ran after its input was compacted"
+    "catalog: a token read ran after HEAD named the compaction output"
+    "catalog: a token read ran after its input commit record was swept"
+    "catalog: a token read ran twice on one node"
+    "catalog: a token read ran on a node restarted since the write"
+    "commit: a commit token's stale-answer evidence read evaluated"
 )
 mkdir -p "$OUT"
 export COMPOSE_FILE="$COMPOSE_BASE:$WL/local/docker-compose.local.yaml"
@@ -168,14 +190,47 @@ docker compose exec -T driver /opt/antithesis/test/v1/main/first_start_workload 
     || abort "first_start_workload failed"
 
 # The driver ends the timeline itself, exiting 0 after the eventually.
+# Meanwhile, when the eventually asks for it (`eventually: local loop:
+# restart <url> now`, before its token reads after the sweep), restart the
+# node local/docker-compose.local.yaml names and tell the driver, which
+# waits for that. A ravel-server keeps every commit record it read in
+# memory, and both nodes read every live write's record while its hour was
+# unsealed, so only a restarted node GETs a swept record, finds it gone and
+# takes the token fallback (README.md, "Token reads across the lifecycle").
+# In Antithesis the faults restart nodes; here nothing else does. The SDK
+# output file is appended to, so the restart loses none of it.
+RESTART_NODE=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' driver \
+    | sed -n 's/^WORKLOAD_LOCAL_RESTART_NODE=//p')
+case "$RESTART_NODE" in
+    ravel1 | ravel2) ;;
+    *) abort "WORKLOAD_LOCAL_RESTART_NODE in the driver container is '$RESTART_NODE', not ravel1 or ravel2" ;;
+esac
+restarted=""
+: > "$OUT/node-restart.txt"
 start=$(date +%s)
 while read -r _ st code <<< "$(container_state driver)" && [ "${st:-}" = running ]; do
     if [ $(($(date +%s) - start)) -gt "$END_LIMIT" ]; then
         fail "the driver did not end the timeline within ${END_LIMIT}s"
         break
     fi
-    sleep 10
+    # Through a file: under pipefail, grep -q closing the pipe early would
+    # fail the pipeline on the very line it matched.
+    if [ -z "$restarted" ] \
+        && docker compose logs --no-color driver > "$OUT/driver-poll.log" 2>/dev/null \
+        && grep -q "eventually: local loop: restart http://$RESTART_NODE:[0-9]* now" "$OUT/driver-poll.log"; then
+        restarted=1
+        if docker restart -t 30 "$RESTART_NODE" > /dev/null \
+            && docker compose exec -T driver touch /tmp/local-restart-done; then
+            echo "$RESTART_NODE restarted at $(date +%s), when the eventually asked" \
+                | tee -a "$OUT/node-restart.txt"
+        else
+            echo "restarting $RESTART_NODE failed" | tee -a "$OUT/node-restart.txt"
+        fi
+    fi
+    sleep 5
 done
+grep -q "^$RESTART_NODE restarted at " "$OUT/node-restart.txt" \
+    || fail "$RESTART_NODE was not restarted when the eventually asked (see node-restart.txt)"
 read -r _ st code <<< "$(container_state driver)"
 # Read whatever the driver's state: the clock probe below adds up the moves
 # its log reports.
@@ -370,6 +425,14 @@ if [ "${WORKLOAD_INJECT_SWAPPED_RECORD:-}" = 1 ]; then
     while IFS= read -r m; do
         [ "$m" = "$MULTISET" ] || [ "$m" = "$UPPER" ] || fail "always-type assertion violated besides the injected one: $m"
     done < "$OUT/violated.tsv"
+elif [ "${WORKLOAD_INJECT_STALE_TOKEN_RESULT:-}" = 1 ]; then
+    # The token-read self-check: the duplicated record must make the
+    # exactly-once token-read assertion fail, and nothing else.
+    grep -qxF "$TOKEN_READ" "$OUT/violated.tsv" \
+        || fail "token-read self-check run, but the token-read assertion did not fail"
+    while IFS= read -r m; do
+        [ "$m" = "$TOKEN_READ" ] || fail "always-type assertion violated besides the injected one: $m"
+    done < "$OUT/violated.tsv"
 else
     while IFS= read -r m; do fail "always-type assertion violated: $m"; done < "$OUT/violated.tsv"
 fi
@@ -380,6 +443,8 @@ if [ "${#failures[@]}" -gt 0 ]; then
 fi
 if [ "${WORKLOAD_INJECT_SWAPPED_RECORD:-}" = 1 ]; then
     echo "self-check OK: the multiset assertion failed as injected, and nothing else did"
+elif [ "${WORKLOAD_INJECT_STALE_TOKEN_RESULT:-}" = 1 ]; then
+    echo "self-check OK: the token-read assertion failed as injected, and nothing else did"
 else
     echo "OK: no always-type assertion violated or unhit, every required assertion held, every container healthy, every clock jumped"
 fi

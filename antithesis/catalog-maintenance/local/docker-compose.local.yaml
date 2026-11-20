@@ -18,6 +18,11 @@ services:
     environment:
       ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
       WORKLOAD_INJECT_SWAPPED_RECORD: ${WORKLOAD_INJECT_SWAPPED_RECORD:-}
+      WORKLOAD_INJECT_STALE_TOKEN_RESULT: ${WORKLOAD_INJECT_STALE_TOKEN_RESULT:-}
+      # Before its token reads after the sweep, the eventually asks
+      # scripts/local-run.sh to restart this node and waits for it: the
+      # local loop's stand-in for a restart fault.
+      WORKLOAD_LOCAL_RESTART_NODE: ravel2
       # The local loop has no ANTITHESIS_STOP_FAULTS and no fault-free phase,
       # so the driver forces its eventually after this long (scripts/local-run.sh).
       WORKLOAD_EVENTUALLY_AFTER_SECS: ${WORKLOAD_EVENTUALLY_AFTER_SECS:-240}
