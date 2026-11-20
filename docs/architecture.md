@@ -265,7 +265,11 @@ label set so that Ravel's own telemetry cannot explode
 
 The server installs its SIGTERM and SIGINT handlers before `/readyz` reports
 200, so a signal delivered the instant the pod becomes ready drains rather than
-taking the signal's default disposition and killing the process.
+taking the signal's default disposition and killing the process. It installs
+them after the startup store checks, so a signal during those checks is not
+handled yet. A signal while the server starts, which can retry the ipcrypt
+startup marker read up to `--startup-store-deadline`, is held and drained once
+startup succeeds; a failed startup exits non-zero instead.
 
 On SIGTERM, `/readyz` is the drain signal. The process does these steps in
 order:

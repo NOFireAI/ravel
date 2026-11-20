@@ -758,14 +758,13 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    // Install the SIGTERM and SIGINT handlers here, after the startup store
-    // checks and before `start` reports the process ready, so a signal
-    // delivered the instant `/readyz` turns 200 is buffered by an already
-    // installed handler and drained on the await below, instead of taking the
-    // signal's default disposition and killing the process between readiness
-    // and that await (issue #4493). A signal during `run_startup_store_checks`
-    // above keeps its current behaviour: no handler exists until this line, so
-    // issue #4438's startup-window behaviour is unchanged.
+    // The SIGTERM and SIGINT handlers are installed after the startup store
+    // checks and before `start`. A signal during the startup store checks
+    // still takes its default action (or is discarded when the server is
+    // PID 1, issue #4438). A signal during `start`, including its retried
+    // ipcrypt startup marker read, or between readiness and the await below,
+    // is held by the installed handler and drained once `start` returns Ok
+    // (an `Err` from `start` ends `main` with that error instead).
     let mut shutdown_listener = ShutdownListener::install();
 
     let running = ravel_server::start_with_heartbeat_and_ipcrypt(
@@ -789,9 +788,8 @@ async fn main() -> anyhow::Result<()> {
     // Test seam (issue #4493): hold the process in the window between
     // readiness reporting 200 and the shutdown await, so a test can deliver a
     // signal inside that window and prove the handler installed before `start`
-    // buffers it. Read only in a debug-assertions build, so the published
-    // (release) binary never sleeps here and
-    // `scripts/guards/check-release-profile.sh` keeps it out of shipped builds.
+    // buffers it. The block is compiled only with debug assertions, which the
+    // release profile leaves off.
     #[cfg(debug_assertions)]
     if let Some(ms) = std::env::var("RAVEL_SHUTDOWN_WINDOW_TEST_SLEEP_MS")
         .ok()
@@ -868,31 +866,27 @@ fn rules_ignored_by_mode(mode: Mode, has_rules: bool) -> bool {
     has_rules && !matches!(mode, Mode::All | Mode::Query)
 }
 
-/// A shutdown-signal listener whose OS handlers are installed when it is built,
-/// not when it is first awaited. Built before `start` so a SIGTERM or SIGINT
-/// arriving in the window between `/readyz` reporting 200 and the drain await
-/// is delivered on that await (tokio buffers one pending signal per stream),
-/// rather than taking the signal's default disposition and killing the process
-/// mid-startup (issue #4493).
+/// A shutdown-signal listener. On unix its OS handlers are installed when it is
+/// built, not when it is first awaited, so a SIGTERM or SIGINT arriving
+/// between the build and the drain await is delivered on that await (tokio
+/// buffers one pending signal per stream) rather than taking the signal's
+/// default action (issue #4493). On other targets [`recv`](Self::recv)
+/// awaits `tokio::signal::ctrl_c` on its first poll.
 struct ShutdownListener {
     /// `None` when the SIGTERM handler failed to install; that branch then never
-    /// resolves [`recv`](Self::recv), as the previous code mapped a failed
-    /// terminate `signal(...)` to `std::future::pending()`.
+    /// resolves [`recv`](Self::recv).
     #[cfg(unix)]
     sigterm: Option<tokio::signal::unix::Signal>,
     /// `None` when the SIGINT handler failed to install; that branch then
-    /// resolves [`recv`](Self::recv) at once, as the previous
-    /// `let _ = tokio::signal::ctrl_c().await` returned its install error
-    /// immediately and started the drain.
+    /// resolves [`recv`](Self::recv) at once and the drain starts.
     #[cfg(unix)]
     sigint: Option<tokio::signal::unix::Signal>,
 }
 
 impl ShutdownListener {
-    /// Install the handlers. On unix these are SIGTERM and SIGINT, the two
-    /// signals the previous `wait_for_shutdown_signal` awaited (SIGINT is the
-    /// signal `tokio::signal::ctrl_c` listens for). A handler that fails to
-    /// install is kept as `None`, with no `unwrap`.
+    /// Install the handlers. On unix these are SIGTERM and SIGINT (SIGINT is
+    /// the signal `tokio::signal::ctrl_c` listens for). A handler that fails
+    /// to install is kept as `None`.
     fn install() -> Self {
         #[cfg(unix)]
         {
@@ -1192,10 +1186,7 @@ mod tests {
         let recv_at = main_src
             .find(concat!("shutdown_listener.", "recv().await"))
             .expect("main awaits the shutdown listener");
-        assert!(
-            start_at < recv_at,
-            "the drain await runs after start, where the old wait sat"
-        );
+        assert!(start_at < recv_at, "the drain await runs after start");
     }
 
     /// Issue #4325: `main` makes its startup store checks through the one

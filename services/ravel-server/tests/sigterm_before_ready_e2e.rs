@@ -9,9 +9,9 @@
 //! process goes through. `main` installs the SIGTERM/SIGINT handlers before it
 //! calls `start`, so a signal arriving in the window between readiness and the
 //! drain await is buffered by the already-installed handler and delivered on
-//! that await. Before the fix the handler was created only when the await was
-//! first polled, so a SIGTERM in that window took its default disposition and
-//! killed the process (exit by signal 15, shell code 143).
+//! that await. If the listener were created only when the await is first
+//! polled, a SIGTERM in this window would take its default action and the
+//! process would die by signal 15 (shell code 143).
 //!
 //! The window is made deterministic with the `RAVEL_SHUTDOWN_WINDOW_TEST_SLEEP_MS`
 //! seam `main` reads only under `cfg(debug_assertions)` (and so never in a
@@ -72,11 +72,10 @@ fn send_sigterm(pid: u32) {
 /// 200 and the drain await must drain gracefully and exit 0, not die by the
 /// signal.
 ///
-/// This fails on the pre-#4493 order: move `ShutdownListener::install()` in
-/// `main` down to just before `shutdown_listener.recv().await` (its position
-/// before the fix, where the handler is created only when the await is first
-/// polled) and the process is killed by SIGTERM during the seam sleep, exiting
-/// by signal 15 with no drain line and a non-zero code.
+/// If the listener were created only when the await is first polled, a SIGTERM
+/// in this window would take its default action and the process would die by
+/// signal 15; moving `ShutdownListener::install()` to just before
+/// `shutdown_listener.recv().await` makes this test fail that way.
 #[test]
 fn sigterm_in_the_readiness_window_drains_and_exits_zero() {
     let mut child = Command::new(BINARY)
@@ -121,10 +120,21 @@ fn sigterm_in_the_readiness_window_drains_and_exits_zero() {
     if marker_rx.recv_timeout(DEADLINE).is_err() {
         let _ = child.kill();
         let _ = child.wait();
+        let out = stdout.join().unwrap_or_default();
         let err = stderr.join().unwrap_or_default();
-        panic!("ravel-server never reached the shutdown window within {DEADLINE:?}; stderr: {err}");
+        panic!(
+            "ravel-server never reached the shutdown window within {DEADLINE:?}; \
+             stdout: {out}; stderr: {err}"
+        );
     }
+    let marker_at = Instant::now();
     send_sigterm(pid);
+    let signalled_after = marker_at.elapsed();
+    assert!(
+        signalled_after < WINDOW_SLEEP,
+        "the SIGTERM landed {signalled_after:?} after the window marker, after the \
+         {WINDOW_SLEEP:?} window closed, so this run cannot tell the two orders apart"
+    );
 
     // The process must now drain and exit on its own, well within the deadline.
     let exit_deadline = Instant::now() + DEADLINE;
