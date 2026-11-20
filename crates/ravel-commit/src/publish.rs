@@ -601,6 +601,9 @@ mod tests {
     /// property's HEAD of the data key answers NotFound.
     #[tokio::test]
     async fn mutant_commit_before_data_breaks_no_commit_without_data() {
+        if !capturing() {
+            return;
+        }
         let Some(_mutant) = scoped_mutant("commit/commit-before-data") else {
             return;
         };
@@ -702,6 +705,9 @@ mod tests {
     /// compares the hash the GET returned.
     #[tokio::test]
     async fn mutant_skip_hash_compare_breaks_one_identity_one_content() {
+        if !capturing() {
+            return;
+        }
         let Some(_mutant) = scoped_mutant("commit/mismatched-identity-idempotent") else {
             return;
         };

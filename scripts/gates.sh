@@ -512,9 +512,10 @@ run_feature_lanes() {
 
   # ADR-4326 assertion sites and mutant switches: each crate's tests with every
   # evaluation recorded in process and every mutant compiled in, so a test can
-  # show a site holding and its mutant breaking it. No SDK. Then a clippy with
-  # `antithesis` alone, which compiles every assertion condition but neither
-  # the capture nor the mutant module (#4497).
+  # show a site holding and its mutant breaking it. No SDK. Then a clippy and
+  # a test run with `antithesis` alone, which compiles every assertion
+  # condition but neither the capture nor the mutant module (#4497), so the
+  # test_support fallbacks run.
   # Mirrors CI's `invariants` job.
   if [[ ${want_invariants} -eq 1 ]]; then
     run_feature_lane ravel-invariant/capture,ravel-invariant/antithesis-mutants \
@@ -522,6 +523,10 @@ run_feature_lanes() {
     run cargo clippy --locked \
       -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet \
       --features ravel-invariant/antithesis --all-targets -- -D warnings
+    # ravel-catalog is linted above but not tested here: its tests fail
+    # under `antithesis` alone (#4508).
+    run_lane_tests -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-maintain -p ravel-fleet \
+      --features ravel-invariant/antithesis
   fi
 
   # The same features for ravel-server and ravel-cli, a lane of its own as CI's
@@ -563,12 +568,18 @@ run_feature_lanes() {
 #     edited crates it names;
 #   - a test line with features contributes those features, per edited
 #     crate, to ONE test run of the edited crates with all of them unified;
+#   - except a test line whose features are in executor_ci_only_test_features:
+#     it tests the absence of the other lane features, so unifying would
+#     defeat it, and a run of its own would put `-p ravel-ingest` over the
+#     40 percent bar, so it is left to the merge tier and CI;
 #   - a test line with an environment prefix runs restricted, on ci;
 #   - a test line with neither is a test of a crate's default build, which
 #     the edited crates' own test run already covers;
 #   - every feature a lane line gives a non-edited crate goes on the one
 #     `cargo check` of the rest of the closure.
 # Commands are kept as space-joined words: no lane argument contains a space.
+executor_ci_only_test_features="ravel-invariant/antithesis"
+
 executor_test_cmd() {
   if [[ ${have_nextest} -eq 1 ]]; then
     echo "cargo nextest run --locked $* --cargo-profile ci"
@@ -655,6 +666,9 @@ run_executor_gates() {
         *) other="${other:+${other} }${words[i]}" i=$((i + 1)) ;;
       esac
     done
+    if [[ "${kind}" == "test" && -n "${feats}" && " ${executor_ci_only_test_features} " == *" ${feats} "* ]]; then
+      continue
+    fi
     restricted=""
     for p in ${pkgs}; do
       if [[ " ${edited} " == *" ${p} "* ]]; then
