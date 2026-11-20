@@ -4267,8 +4267,7 @@ pub async fn sweep_erasure_requests(
         });
     }
 
-    let Some(holds) =
-        observe_superseded_holds(store, clock, config, lease, tenant, signal).await?
+    let Some(holds) = observe_superseded_holds(store, clock, config, lease, tenant, signal).await?
     else {
         // The observation's hold re-read failed: no chain's hold can be ruled
         // out, so every candidate stays this pass.
