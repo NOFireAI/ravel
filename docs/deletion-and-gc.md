@@ -743,6 +743,14 @@ optional event-time range; v1 predicates are equality-only (exact semantics by
 default). The `CreateIfAbsent` ack timestamp is `t = 0`, the point from which
 every bound is measured.
 
+What a matcher tests depends on the signal: series labels for metrics; for
+logs, a record's own attributes or its merged resource, scope and record
+attributes (a record attribute wins on a key collision); for spans, the
+span's attributes, which already merge resource and scope at ingest. Only a
+string value matches. Query-time exclusion and the rewrite apply the same
+rule, so a subject named only in a log record's resource or scope attributes
+is dropped by the rewrite and stays erased after the request is swept.
+
 ### Erasure under IPCrypt
 
 Under an IPCrypt policy ([ingest.md](ingest.md#pseudonymization-ipcrypt)) the
