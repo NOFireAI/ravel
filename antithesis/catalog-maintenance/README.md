@@ -464,10 +464,12 @@ keeps every input, because HEAD still names it.
    unreadable HEAD` or `catalog: a delete gate never clears under an
    unreadable HEAD` goes false.
 4. GET HEAD and LIST the tenant prefix again; the snapshots and inputs gone
-   since step 2 go into the details. Assert `catalog: the servers' sweeps ran
-   past the protection horizon while HEAD was unreadable` only when HEAD
-   still holds this sweep's garbage: a HEAD rebuilt during the wait means
-   the sweeps may have read a valid HEAD.
+   since step 2 go into the details. Assert `catalog: HEAD stayed unreadable
+   while the clocks passed the protection horizon` only when HEAD still holds
+   this sweep's garbage. With server HEAD PUTs refused that alone does not
+   show a server swept; the SUT's `catalog: delete pass refused on an
+   unreadable HEAD`, which `local-run.sh` requires beside it, does. A HEAD
+   rebuilt during the wait means the sweeps may have read a valid HEAD.
 5. `pass`, then `ravel-cli catalog fold` rebuilds HEAD from the listing, and
    `catalog inspect` reads it.
 

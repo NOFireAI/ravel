@@ -438,6 +438,11 @@ fn requests(
         let key = key_of(&head.target, bucket);
         match rules.admit(&head.method, &key, HOLD_CAP) {
             Admit::Refuse => {
+                // The request body is not drained, so the close can reset the
+                // connection before the client reads the 503. Either way the
+                // PUT fails, which is all the refuse rules' callers (the two
+                // sweep situations) rely on; a caller that reads the store's
+                // answer to a refused PUT must drain the body first.
                 // No pipelining: the previous answer has been read already.
                 // Write the refusal before shutting `up` down: that shutdown
                 // ends the answers thread's copy, which then shuts the client
