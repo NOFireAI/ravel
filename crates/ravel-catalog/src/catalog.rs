@@ -10413,9 +10413,24 @@ mod tests {
     /// from hour 0, generation 1 routes 1 shard from hour 10, and a writer
     /// that had not yet refreshed committed at shard 1 in hour 10. Returns the
     /// enforcing catalog, the commit's token, its data key, and a window and
-    /// `now_ns` covering hour 10.
+    /// `now_ns` in hour 20 whose listing leaves hour 10 out, so only the
+    /// token step can put the commit's data in a snapshot.
     async fn straggler_after_decrease() -> (Catalog, CommitToken, String, TimeRange, i64) {
         let store = Arc::new(MemoryStore::new());
+        let (token, data_key, range, now) = publish_straggler_after_decrease(&store).await;
+        let catalog = Catalog::new(store, config(2))
+            .expect("catalog")
+            .with_provisioning_enforcement();
+        (catalog, token, data_key, range, now)
+    }
+
+    /// The store half of [`straggler_after_decrease`]: provisions the two
+    /// generations and publishes the straggler into `store`, and checks that
+    /// a resolve of the returned window without the token holds none of the
+    /// commit's data.
+    async fn publish_straggler_after_decrease(
+        store: &Arc<MemoryStore>,
+    ) -> (CommitToken, String, TimeRange, i64) {
         crate::provisioning::validate_or_adopt(
             store.as_ref(),
             &tenant(),
@@ -10438,18 +10453,29 @@ mod tests {
         .expect("append the decrease");
         let hour = 10u32;
         let event_ts = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
-        let record = publish_segment(&store, 1, 1, hour, event_ts, event_ts, event_ts).await;
+        let record = publish_segment(store, 1, 1, hour, event_ts, event_ts, event_ts).await;
         let token = record::token_for(&record).expect("token");
         let data_key = keys::reconstruct_data_key(&record).expect("data key");
-        let catalog = Catalog::new(store, config(2))
-            .expect("catalog")
-            .with_provisioning_enforcement();
-        let now = 11 * NS_PER_HOUR;
+        let now = 20 * NS_PER_HOUR + 30 * 60_000_000_000;
         let range = TimeRange {
-            start_ns: i64::from(hour) * NS_PER_HOUR,
+            start_ns: now - NS_PER_HOUR,
             end_ns: now,
         };
-        (catalog, token, data_key, range, now)
+        let listed_only = Catalog::new(store.clone(), config(2))
+            .expect("catalog")
+            .with_provisioning_enforcement()
+            .resolve(&tenant(), Signal::Metrics, range, &[], now)
+            .await
+            .expect("resolve without the token");
+        assert!(
+            listed_only
+                .segments
+                .iter()
+                .all(|s| s.data_object_key != data_key),
+            "the listing alone leaves the commit's data out: {:?}",
+            listed_only.segments
+        );
+        (token, data_key, range, now)
     }
 
     /// TokenResolvesAcrossReshards under its negative config's broken check:
@@ -10461,10 +10487,8 @@ mod tests {
     async fn mutant_token_validated_against_count_breaks_resolution() {
         let (catalog, token, data_key, range, now) = straggler_after_decrease().await;
         let needle = token.encode();
-        {
-            let Some(_mutant) = scoped_mutant("resharding/token-validated-against-count") else {
-                return;
-            };
+        let mut evaluated_under_mutant = 0;
+        if let Some(_mutant) = scoped_mutant("resharding/token-validated-against-count") {
             let err = catalog
                 .resolve(
                     &tenant(),
@@ -10479,14 +10503,14 @@ mod tests {
                 matches!(err, CatalogError::UnsatisfiableToken { shard: 1, .. }),
                 "got: {err}"
             );
-            let Some(found) = captured(TOKEN_RESOLVES_ACROSS_RESHARDS, &needle) else {
-                return;
-            };
-            assert_eq!(found.len(), 1, "one evaluation for the refusal: {found:?}");
-            assert!(
-                !found[0].0,
-                "TokenResolvesAcrossReshards is evaluated false for the refused straggler: {found:?}"
-            );
+            if let Some(found) = captured(TOKEN_RESOLVES_ACROSS_RESHARDS, &needle) {
+                assert_eq!(found.len(), 1, "one evaluation for the refusal: {found:?}");
+                assert!(
+                    !found[0].0,
+                    "TokenResolvesAcrossReshards is evaluated false for the refused straggler: {found:?}"
+                );
+                evaluated_under_mutant = found.len();
+            }
         }
         let snapshot = catalog
             .resolve(
@@ -10506,12 +10530,13 @@ mod tests {
             "the token resolves to its commit's data: {:?}",
             snapshot.segments
         );
-        let found = captured(TOKEN_RESOLVES_ACROSS_RESHARDS, &needle).expect("capturing");
-        assert_eq!(
-            found.len(),
-            1,
-            "the resolving pass evaluates nothing new: {found:?}"
-        );
+        if let Some(found) = captured(TOKEN_RESOLVES_ACROSS_RESHARDS, &needle) {
+            assert_eq!(
+                found.len(),
+                evaluated_under_mutant,
+                "the resolving pass evaluates nothing new: {found:?}"
+            );
+        }
     }
 
     /// The straggler's token, at shard 1 where hour 10's active count is 1,
@@ -10583,6 +10608,70 @@ mod tests {
         };
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].0, "{found:?}");
+    }
+
+    /// A HEAD of the refused token's commit key that fails other than
+    /// NotFound evaluates TokenResolvesAcrossReshards not at all. The mutant
+    /// refuses the straggler before any read of its commit key, so the one
+    /// HEAD on that key is the property's; the first resolve faults it, and
+    /// the second, whose HEAD passes, evaluates the property false.
+    #[tokio::test]
+    async fn token_resolves_across_reshards_failed_head_evaluates_nothing() {
+        let Some(_mutant) = scoped_mutant("resharding/token-validated-against-count") else {
+            return;
+        };
+        let inner = Arc::new(MemoryStore::new());
+        let (token, _data_key, range, now) = publish_straggler_after_decrease(&inner).await;
+        let commit_key =
+            keys::commit_key_for_token(&tenant(), Signal::Metrics, &token).expect("commit key");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Head, ScriptedFault::Permanent("head refused".into()))
+                .with_key_contains(commit_key)
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(2))
+            .expect("catalog")
+            .with_provisioning_enforcement();
+        let needle = token.encode();
+        let tenant = tenant();
+        let resolve = || {
+            catalog.resolve(
+                &tenant,
+                Signal::Metrics,
+                range,
+                std::slice::from_ref(&token),
+                now,
+            )
+        };
+
+        let err = resolve().await.expect_err("the mutant refuses the token");
+        assert!(
+            matches!(err, CatalogError::UnsatisfiableToken { shard: 1, .. }),
+            "got: {err}"
+        );
+        assert_eq!(
+            store.fault_count(Op::Head, FaultKind::Permanent),
+            1,
+            "the property's HEAD of the commit key failed"
+        );
+        let Some(found) = captured(TOKEN_RESOLVES_ACROSS_RESHARDS, &needle) else {
+            return;
+        };
+        assert!(
+            found.is_empty(),
+            "a failed HEAD evaluates nothing: {found:?}"
+        );
+
+        let err = resolve().await.expect_err("the mutant refuses the token");
+        assert!(
+            matches!(err, CatalogError::UnsatisfiableToken { shard: 1, .. }),
+            "got: {err}"
+        );
+        assert_eq!(store.fault_count(Op::Head, FaultKind::Permanent), 1);
+        let found = captured(TOKEN_RESOLVES_ACROSS_RESHARDS, &needle).expect("capturing");
+        assert_eq!(found.len(), 1, "a passing HEAD evaluates: {found:?}");
+        assert!(!found[0].0, "{found:?}");
     }
 
     /// TokenNeverServesStale is evaluated on the served, tombstoned and
