@@ -10251,14 +10251,9 @@ mod tests {
         let _ = needle;
         ravel_invariant::inv_sometimes!(
             {
-                *found.borrow_mut() = Some(
-                    ravel_invariant::capture::evaluations_of(
-                        "commit: a commit token never resolves to a stale answer",
-                    )
-                    .into_iter()
-                    .filter(|e| e.details.contains(needle))
-                    .map(|e| (e.condition, e.details))
-                    .collect(),
+                *found.borrow_mut() = ravel_invariant::test_support::evaluations(
+                    "commit: a commit token never resolves to a stale answer",
+                    needle,
                 );
                 true
             },

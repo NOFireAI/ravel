@@ -3105,9 +3105,11 @@ jobs:
   # ADR-4326 assertion sites and mutant switches (scripts/gates.sh's
   # `invariants` lane): the crates that carry them, tested with every
   # evaluation recorded in process (`ravel-invariant/capture`) and every
-  # mutant compiled in (`ravel-invariant/antithesis-mutants`). No Antithesis
-  # SDK is linked. The workspace jobs build none of these features, so a site
-  # or mutant test that only exists under them runs nowhere else.
+  # mutant compiled in (`ravel-invariant/antithesis-mutants`), with no
+  # Antithesis SDK; a last clippy step compiles them with
+  # `ravel-invariant/antithesis` alone. The workspace jobs build none of these
+  # features, so a site or mutant test that only exists under them runs
+  # nowhere else.
   invariants:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
@@ -3138,6 +3140,10 @@ jobs:
         run: cargo clippy --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --all-targets -- -D warnings
       - name: Test the invariant crates with capture and mutants
         run: cargo test --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants
+      # Every assertion condition compiles under `antithesis`, but neither the
+      # capture nor the mutant module does without its own feature (#4497).
+      - name: Clippy the invariant crates with the antithesis feature alone
+        run: cargo clippy --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis --all-targets -- -D warnings
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
