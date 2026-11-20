@@ -186,10 +186,11 @@ builds them as dependencies and cargo never compiles a dependency's
 `#[cfg(test)]` module, so their own gated tests run in neither.
 An `invariants` lane (clippy and tests of ravel-invariant, ravel-commit,
 ravel-ingest, ravel-catalog, ravel-maintain and ravel-fleet with
-`--features ravel-invariant/capture,ravel-invariant/antithesis-mutants`) runs
+`--features ravel-invariant/capture,ravel-invariant/antithesis-mutants`, then
+a clippy of the six with `--features ravel-invariant/antithesis` alone) runs
 whenever one of those six is in scope, matching CI's `invariants` job. An
-`invariants-services` lane runs the same clippy and tests for ravel-server
-and ravel-cli whenever either is in scope, matching CI's
+`invariants-services` lane runs the capture and mutants clippy and tests for
+ravel-server and ravel-cli whenever either is in scope, matching CI's
 `invariants-services` job. Both depend on each of the six and on
 ravel-query, so a run scoped to any of those runs it too, into the same
 `target/`.
