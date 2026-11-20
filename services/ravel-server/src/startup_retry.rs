@@ -13,6 +13,13 @@
 //! because a process that has just started (after a VM resume or an NTP step,
 //! say) can sign with a clock the store has not caught up with yet, and a
 //! restart only repeats that.
+//! A HEAD response has no body, so a skewed HEAD reaches startup as
+//! `AccessDenied`. The one startup check that reads with HEAD, the
+//! retired-reader gate's marker existence checks, classifies a HEAD refused
+//! with `AccessDenied` by one GET of the same key through the same store
+//! ([`head_refusal_retry_cause`]): a `ClockSkewed` answer retries it as a
+//! clock-skew refusal, and any other answer leaves the HEAD's refusal to
+//! refuse at once.
 //! The wait between attempts is capped exponential backoff with jitter, and
 //! one deadline shared by every site and measured from process start
 //! (`--startup-store-deadline`) bounds the retries and each retry: a retry
@@ -39,10 +46,10 @@ use std::time::Duration;
 
 use ravel_maintain::GcConfigValues;
 use ravel_object_store::s3::S3Store;
-use ravel_object_store::{KmsRoutingStore, ObjectStoreBackend, StoreError};
+use ravel_object_store::{GetRange, KmsRoutingStore, ObjectStoreBackend, StoreError};
 use ravel_types::{ConfiguredScheme, TenantHash};
 
-use crate::compat_gate::{CompatGateError, GateOutcome, RetiredReader};
+use crate::compat_gate::{CompatGateError, GateOutcome, GateRequest, RetiredReader};
 use crate::config::{Mode, StoreKind};
 use crate::tenancy::{ResolvedTenancy, TenancyError};
 use crate::tenant_kms::{TenantKmsConfig, TenantKmsError};
@@ -456,6 +463,23 @@ pub fn chain_retry_cause(err: &(dyn StdError + 'static)) -> Option<RetryCause> {
     None
 }
 
+/// Why startup retries a HEAD (or `pin_of`) of `key` that `store` refused with
+/// `AccessDenied`. A HEAD response has no body, so the S3 adapter cannot tell
+/// a clock-skew refusal from a missing grant there; one GET of the same key
+/// through the same store can, and only its [`StoreError::ClockSkewed`] gives
+/// [`RetryCause::ClockSkew`]. Any other answer, success and `NotFound`
+/// included, gives `None` and the HEAD's refusal stands. The GET's outcome
+/// only classifies: it never stands in for the HEAD's result.
+pub async fn head_refusal_retry_cause(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Option<RetryCause> {
+    match store.get(key, GetRange::Full).await {
+        Err(StoreError::ClockSkewed(_)) => Some(RetryCause::ClockSkew),
+        _ => None,
+    }
+}
+
 /// `TenantKmsError` holds its `KeyEpochError` in a field that is not a
 /// source, so the chain walk starts there.
 fn tenant_kms_retry_cause(err: &TenantKmsError) -> Option<RetryCause> {
@@ -495,6 +519,9 @@ pub async fn enforce_qualification(
 /// gate wraps, in [`CompatGateError::Store`] or through
 /// [`CompatGateError::CompatUnreadable`], retries when it is transient; every
 /// refusal the gate decides from what it read refuses on the first attempt.
+/// A marker HEAD refused with `AccessDenied` is classified by
+/// [`head_refusal_retry_cause`]: retried as a clock-skew refusal when its
+/// probe GET is refused for clock skew, refused at once otherwise.
 /// It sends no request while `retired` is empty. The deployment key comes
 /// from the configured scheme, as `--tenant-hash-key-file` gives it.
 pub async fn enforce_retired_reader_gate(
@@ -511,17 +538,46 @@ pub async fn enforce_retired_reader_gate(
     let outcome = retry
         .run(
             SITE_RETIRED_READER_GATE,
-            || crate::compat_gate::enforce(store, deployment_key, retired, now_ns),
-            |err: &CompatGateError| chain_retry_cause(err),
+            || async {
+                let error =
+                    match crate::compat_gate::enforce(store, deployment_key, retired, now_ns).await
+                    {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(error) => error,
+                    };
+                let retry = match &error {
+                    CompatGateError::Store {
+                        key,
+                        request: GateRequest::Head,
+                        source: StoreError::AccessDenied(_),
+                    } => head_refusal_retry_cause(store, key).await,
+                    _ => chain_retry_cause(&error),
+                };
+                Err(GateAttemptError { error, retry })
+            },
+            |err| err.retry,
         )
         .await
         .map_err(|failure| {
             failure.into_anyhow(|err| {
-                anyhow::Error::new(err).context("retired-reader gate (sys/compat) refused startup")
+                anyhow::Error::new(err.error)
+                    .context("retired-reader gate (sys/compat) refused startup")
             })
         })?;
     tracing::debug!(outcome = ?outcome, "retired-reader gate passed");
     Ok(outcome)
+}
+
+/// One failed retired-reader gate attempt and why startup retries it.
+struct GateAttemptError {
+    error: CompatGateError,
+    retry: Option<RetryCause>,
+}
+
+impl Display for GateAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
 }
 
 /// Tenant-hash scheme resolution and marker bootstrap (ADR-0050 section 3),
