@@ -12717,7 +12717,7 @@ pub(crate) mod tests {
         // HEAD get (absent) + 1 tenant-config read + 1 commit-record load +
         // 1 segment fetch to decode the sole entry's names, besides the
         // folded-HEAD property's re-read where it is evaluated.
-        assert_eq!(first.get_requests - head_rereads(first_folder), 4);
+        assert_eq!(first.get_requests - head_rereads(first_folder, &first), 4);
 
         let now_2 = now_at_seal(12);
         publish_real_segment(
@@ -12743,7 +12743,10 @@ pub(crate) mod tests {
         // load + 1 new commit-record load + 1 new segment fetch = 6: the first
         // fold's "cpu" entry is neither re-loaded from the part nor re-decoded
         // from its segment.
-        assert_eq!(second.get_requests - head_rereads(second_folder), 6);
+        assert_eq!(
+            second.get_requests - head_rereads(second_folder, &second),
+            6
+        );
     }
 
     /// `FoldReport.get_requests` must equal the store's real observed GET count
@@ -12765,8 +12768,8 @@ pub(crate) mod tests {
         // One rebuild fold over a fresh instrumented store holding a single
         // sealed segment. Returns (FoldReport.get_requests, the store's real GET
         // calls issued during the fold only, the HEAD re-reads the folded-HEAD
-        // property issued among them, as counted from its captured
-        // evaluations). Publishing happens on the inner store before it is
+        // property issued among them, as `head_rereads` counts them).
+        // Publishing happens on the inner store before it is
         // wrapped, so only the fold's own requests are measured.
         async fn measured(enforce: bool) -> (u64, u64, u64) {
             let inner = MemoryStore::new();
@@ -12804,7 +12807,7 @@ pub(crate) mod tests {
             (
                 report.get_requests,
                 after.get.calls - before.get.calls,
-                head_rereads(folder_id),
+                head_rereads(folder_id, &report),
             )
         }
 
@@ -13713,10 +13716,24 @@ pub(crate) mod tests {
     const FOLDED_HEAD_HELD: &str = "catalog: a fold reports as folded only a HEAD the store holds";
 
     /// The HEAD re-reads the folded-HEAD property issued for the fold by
-    /// `folder_id`, as counted from its captured evaluations; 0 where
-    /// assertions compile out, which issue no re-read.
-    fn head_rereads(folder_id: Uuid) -> u64 {
-        evaluations(FOLDED_HEAD_HELD, &folder_id.to_string()).len() as u64
+    /// `folder_id`, which returned `report`. The property's condition issues
+    /// one re-read wherever assertions evaluate (`ravel_invariant::EVALUATES`),
+    /// in the HEAD CAS outcome arm, which returns the only report that is not
+    /// a no-op, so a fold that published issued one and a no-op fold none.
+    /// Under `capture` this is the count of captured evaluations, asserted
+    /// equal to that derivation; under `antithesis` alone, which records
+    /// nothing, it is the derivation; in the default build it is 0.
+    fn head_rereads(folder_id: Uuid, report: &FoldReport) -> u64 {
+        let derived = u64::from(ravel_invariant::EVALUATES && !report.no_op);
+        if !capturing() {
+            return derived;
+        }
+        let captured = evaluations(FOLDED_HEAD_HELD, &folder_id.to_string()).len() as u64;
+        assert_eq!(
+            captured, derived,
+            "captured folded-HEAD re-reads of fold {folder_id}: {report:?}"
+        );
+        captured
     }
 
     /// True in the invariants lane, where assertion sites record evaluations
@@ -16774,7 +16791,7 @@ pub(crate) mod tests {
         assert_eq!(parts, 4);
         assert_eq!(covering, 2);
         assert_eq!(
-            next.get_requests - head_rereads(folder_id),
+            next.get_requests - head_rereads(folder_id, &next),
             2 + parts + 2,
             "{next:?}"
         );
@@ -16841,11 +16858,12 @@ pub(crate) mod tests {
         // HEAD and the tenant config, then the covering parts.
         assert_eq!(quiet.get_requests, 2 + covering as u64, "{quiet:?}");
 
+        let requested_folder = Uuid::new_v4();
         let requested = catalog
             .fold_with_seal_through(
                 &tenant(),
                 Signal::Metrics,
-                Uuid::new_v4(),
+                requested_folder,
                 later + 60 * 1_000_000_000,
                 &[],
                 None,
@@ -16867,10 +16885,11 @@ pub(crate) mod tests {
         );
         // HEAD and the tenant config, then every part once. Bucket H - 6
         // holds only a level-0 record, so the targeted pass lists it and
-        // reads nothing.
+        // reads nothing. A no-op fold writes no HEAD, so the folded-HEAD
+        // property issues no re-read in any build.
         assert_eq!(
             requested.get_requests,
-            2 + part_keys.len() as u64,
+            2 + part_keys.len() as u64 + head_rereads(requested_folder, &requested),
             "{requested:?}"
         );
     }
