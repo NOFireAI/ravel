@@ -1644,7 +1644,17 @@ impl<H> GenerationSwitch<H> {
         let mut inner = self.lock();
         let refreshed_at_ns = inner.views.get(&tenant)?.refreshed_at_ns;
         let flush_opens_by_ns = now_ns.saturating_add(self.grace_lead_ns);
-        if hour_of(flush_opens_by_ns) >= trust_horizon(refreshed_at_ns, self.refresh_interval_ns) {
+        if hour_of(flush_opens_by_ns) >= trust_horizon(refreshed_at_ns, self.refresh_interval_ns)
+            && !ravel_invariant::inv_mutant!("resharding/no-writer-fence")
+        {
+            ravel_invariant::inv_reachable!(
+                "resharding: a writer past the lead horizon was fenced",
+                std::collections::BTreeMap::from([
+                    ("tenant", tenant.to_hex()),
+                    ("now_ns", now_ns.to_string()),
+                    ("refreshed_at_ns", refreshed_at_ns.to_string()),
+                ])
+            );
             return None;
         }
         let count = {
@@ -1652,6 +1662,28 @@ impl<H> GenerationSwitch<H> {
             view.last_touched_ns = now_ns;
             active_shard_count(&view.generations, hour_of(now_ns))
         };
+        // This property is the fence's complement: it is judged from the
+        // refresh stamp and route time the fence above used, so passing the
+        // fence makes it true, and only the no-writer-fence mutant makes it
+        // false. It carries that mutant's target and its reachable sites; no
+        // evidence independent of the fence exists inside this function. Its
+        // form is the model's StaleWriterFailsClosed, which has no grace lead.
+        ravel_invariant::inv_always!(
+            u64::from(hour_of(now_ns))
+                < u64::from(hour_of(refreshed_at_ns))
+                    + u64::from(min_lead_hours(self.refresh_interval_ns)),
+            "resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops",
+            std::collections::BTreeMap::from([
+                ("tenant", tenant.to_hex()),
+                ("now_ns", now_ns.to_string()),
+                ("refreshed_at_ns", refreshed_at_ns.to_string()),
+                ("count", count.to_string()),
+            ])
+        );
+        ravel_invariant::inv_reachable!(
+            "resharding: a stale writer routed on a grace-extended view",
+            std::collections::BTreeMap::from([("tenant", tenant.to_hex())])
+        );
         Some(self.ensure_set(&mut inner, count))
     }
 
@@ -2405,6 +2437,66 @@ mod tests {
         assert!(
             sw.try_grace_extend(t, horizon_crossed_ns).is_none(),
             "past the horizon, grace-extension must refuse (fail closed)"
+        );
+    }
+
+    const STALE_WRITER_FAILS_CLOSED: &str = "resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops";
+
+    /// A view refreshed at hour 10 with the default `C`: a grace route at
+    /// hour 11 (inside the horizon), then a route attempt at hour 13 (past
+    /// it). Returns what the hour-13 attempt routed.
+    fn grace_inside_then_past_horizon(t: TenantHash) -> Option<Arc<Vec<u32>>> {
+        let sw = index_switch(4, DEFAULT_REFRESH_INTERVAL_NS);
+        sw.refresh(t, vec![gen0(4)], 10 * NS_PER_HOUR);
+        assert!(sw.try_grace_extend(t, 11 * NS_PER_HOUR).is_some());
+        sw.try_grace_extend(t, 13 * NS_PER_HOUR)
+    }
+
+    /// StaleWriterFailsClosed holds: the inside-horizon grace route is
+    /// evaluated true, and the past-horizon attempt is fenced, routes nothing
+    /// and evaluates nothing.
+    #[test]
+    fn stale_writer_fails_closed_holds_past_the_horizon() {
+        use crate::router::invariant_capture::{capturing, evaluations};
+        let t = tenant(0xD1);
+        assert!(grace_inside_then_past_horizon(t).is_none(), "fenced");
+        if !capturing() {
+            return;
+        }
+        let found = evaluations(STALE_WRITER_FAILS_CLOSED, &t.to_hex());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0, "{found:?}");
+        let fenced = evaluations(
+            "resharding: a writer past the lead horizon was fenced",
+            &t.to_hex(),
+        );
+        assert_eq!(fenced.len(), 1, "{fenced:?}");
+        let routed = evaluations(
+            "resharding: a stale writer routed on a grace-extended view",
+            &t.to_hex(),
+        );
+        assert_eq!(routed.len(), 1, "{routed:?}");
+    }
+
+    /// With the staleness fence off, the hour-13 attempt routes on a view two
+    /// hours past its lead horizon, and StaleWriterFailsClosed is evaluated
+    /// false for it.
+    #[test]
+    fn mutant_no_writer_fence_breaks_stale_writer_fails_closed() {
+        use crate::router::invariant_capture::{capturing, evaluations, scoped_mutant};
+        let Some(_mutant) = scoped_mutant("resharding/no-writer-fence") else {
+            return;
+        };
+        let t = tenant(0xD2);
+        let routed = grace_inside_then_past_horizon(t);
+        assert!(routed.is_some(), "the mutant routes past the horizon");
+        if !capturing() {
+            return;
+        }
+        let found = evaluations(STALE_WRITER_FAILS_CLOSED, &t.to_hex());
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "StaleWriterFailsClosed is evaluated false for the past-horizon route: {found:?}"
         );
     }
 

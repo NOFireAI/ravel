@@ -1921,17 +1921,29 @@ pub async fn append_generation(
         })
         .collect();
 
-    match store
+    let put = store
         .put(
             &key,
             new_record.encode_to_vec().into(),
             PutOptions {
-                mode: PutMode::CasVersion(version),
+                mode: PutMode::CasVersion(version.clone()),
                 checksum: None,
             },
         )
-        .await
-    {
+        .await;
+    if matches!(put, Ok(_) | Err(StoreError::PreconditionFailed)) {
+        assert_append_outcome(
+            store,
+            &key,
+            tenant_hash,
+            signal,
+            &version,
+            &history,
+            put.is_ok(),
+        )
+        .await;
+    }
+    match put {
         Ok(_) => Ok(ReshardOutcome {
             generation: new_generation,
             generations: history,
@@ -1939,6 +1951,81 @@ pub async fn append_generation(
         Err(StoreError::PreconditionFailed) => Err(ProvisioningError::ReshardCasConflict { key }),
         Err(err) => Err(ProvisioningError::store(&key, err)),
     }
+}
+
+/// The resharding CAS properties of one [`append_generation`] outcome, judged
+/// from the record read back after the CAS (ADR-4326 decision 1). `appended`
+/// is the history this append wrote, base generations first; `won` is whether
+/// the store acknowledged the CAS. A read that fails, finds no record, or
+/// returns a history that does not decode or validate cannot tell, and
+/// records nothing. On AWS S3 a 409 ConditionalRequestConflict whose
+/// competing write also failed maps to PreconditionFailed, leaves the record
+/// at the base version, and so records the lost branch false; a false there
+/// on AWS needs that case ruled out first. The outer `inv_sometimes!` keeps
+/// the re-read inside an assertion the default build compiles out.
+async fn assert_append_outcome(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    base_version: &ravel_object_store::Version,
+    appended: &[ShardGeneration],
+    won: bool,
+) {
+    let _ = (store, key, tenant_hash, signal, base_version, appended);
+    if won {
+        ravel_invariant::inv_reachable!(
+            "resharding: generation append CAS won",
+            std::collections::BTreeMap::from([("key", key.to_string())])
+        );
+    } else {
+        ravel_invariant::inv_reachable!(
+            "resharding: generation append CAS lost",
+            std::collections::BTreeMap::from([("key", key.to_string())])
+        );
+    }
+    ravel_invariant::inv_sometimes!(
+        {
+            let stored = match store.get(key, GetRange::Full).await {
+                Ok(got) => sysproto::ProvisioningRecord::decode(got.data.as_ref())
+                    .ok()
+                    .and_then(|record| {
+                        read_generations_checked(&record, key, tenant_hash, signal).ok()
+                    })
+                    .map(|history| (got.version, history)),
+                Err(_) => None,
+            };
+            let base = appended.split_last().map_or(appended, |(_, base)| base);
+            let details = std::collections::BTreeMap::from([
+                ("key", key.to_string()),
+                ("won", won.to_string()),
+                ("appended", format!("{appended:?}")),
+                ("stored", format!("{stored:?}")),
+            ]);
+            // A won append holds this append's whole history as a prefix (a
+            // later append may extend it). A lost one lost to a write that moved
+            // the record off the version the CAS was conditioned on.
+            ravel_invariant::inv_always_if_known!(
+                stored.as_ref().map(|(stored_version, history)| if won {
+                    history.starts_with(appended)
+                } else {
+                    stored_version != base_version
+                }),
+                "resharding: two concurrent reshards on the same base version: exactly one wins, the loser revalidates",
+                details
+            );
+            ravel_invariant::inv_always_if_known!(
+                stored
+                    .as_ref()
+                    .map(|(_, history)| history.starts_with(base)),
+                "resharding: a lost race never drops a committed generation",
+                details
+            );
+            stored.is_some()
+        },
+        "resharding: a generation append's history re-read completes",
+        std::collections::BTreeMap::from([("key", key.to_string())])
+    );
 }
 
 // ---- ADR-0066 format-floor history ----
@@ -4524,6 +4611,182 @@ pub(crate) mod tests {
             1,
             "the injected precondition failure must have fired"
         );
+    }
+
+    /// True in the invariants lane, where assertion sites record evaluations
+    /// (`ravel-invariant/capture`); false under `antithesis` alone and in the
+    /// default build.
+    fn capturing() -> bool {
+        let on = std::cell::Cell::new(false);
+        ravel_invariant::inv_sometimes!(
+            {
+                on.set(ravel_invariant::test_support::capturing());
+                true
+            },
+            "ravel-catalog provisioning test: evaluations are captured",
+            ""
+        );
+        on.get()
+    }
+
+    /// `(condition, details)` of every captured evaluation of `message` whose
+    /// details mention `needle`; empty outside the invariants lane.
+    fn evaluations(message: &'static str, needle: &str) -> Vec<(bool, String)> {
+        let found = std::cell::RefCell::new(Vec::new());
+        let _ = (message, needle);
+        ravel_invariant::inv_sometimes!(
+            {
+                *found.borrow_mut() =
+                    ravel_invariant::test_support::evaluations(message, needle).unwrap_or_default();
+                true
+            },
+            "ravel-catalog provisioning test: evaluations are read",
+            ""
+        );
+        found.into_inner()
+    }
+
+    const ONE_CAS_WINNER: &str = "resharding: two concurrent reshards on the same base version: exactly one wins, the loser revalidates";
+    const NEVER_DISCARDS: &str = "resharding: a lost race never drops a committed generation";
+
+    /// Two appends read the same base version, and both CAS PUTs are held
+    /// until both are in flight; the first is released and completes before
+    /// the second. Returns both outcomes in release order and the store.
+    async fn race_two_appends(
+        th: TenantHash,
+    ) -> (
+        Result<ReshardOutcome, ProvisioningError>,
+        Result<ReshardOutcome, ProvisioningError>,
+        Arc<FaultStore<MemoryStore>>,
+    ) {
+        let inner = MemoryStore::new();
+        seed_record(&inner, &th, Signal::Metrics, 4).await;
+        let store = Arc::new(FaultStore::new(inner, FaultPlan::empty()));
+        let gate = store.hold(Op::Put, Some("/prov".to_string()), Occurrence::Always);
+        let now_ns = 10 * NS_PER_HOUR;
+        let first = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { append_generation(store.as_ref(), &th, Signal::Metrics, 8, 12, now_ns).await }
+        });
+        let second = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { append_generation(store.as_ref(), &th, Signal::Metrics, 6, 13, now_ns).await }
+        });
+        gate.wait_until_held(2).await;
+        let held = gate.held_details();
+        assert_eq!(held.len(), 2, "both CAS PUTs in flight: {held:?}");
+        // Both appends read the record before either CAS: their GETs ran
+        // before their PUTs reached the gate.
+        let mut tasks = [Some(first), Some(second)];
+        let mut outcomes = Vec::new();
+        for (id, _, _) in held {
+            assert!(gate.release(id), "call {id} was held");
+            // The released call is one of the two; wait for whichever ends.
+            loop {
+                let done = tasks
+                    .iter()
+                    .position(|t| t.as_ref().is_some_and(|t| t.is_finished()));
+                if let Some(i) = done {
+                    let task = tasks[i].take().expect("present");
+                    outcomes.push(task.await.expect("append task"));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        let second_outcome = outcomes.pop().expect("two outcomes");
+        let first_outcome = outcomes.pop().expect("two outcomes");
+        (first_outcome, second_outcome, store)
+    }
+
+    /// OneCasWinner: two concurrent appends on one base version. Exactly one
+    /// wins, the other gets the typed conflict and revalidates against the
+    /// winner's history, and the property was evaluated true for both
+    /// outcomes and never false.
+    #[tokio::test]
+    async fn one_cas_winner_holds_under_concurrent_append() {
+        let th = TenantHash([0xC1; 16]);
+        let (won, lost, store) = race_two_appends(th).await;
+        let won = won.expect("the first released CAS wins");
+        assert_eq!(won.generation, 1);
+        let lost = lost.expect_err("the second CAS loses");
+        assert!(
+            matches!(lost, ProvisioningError::ReshardCasConflict { .. }),
+            "got: {lost}"
+        );
+        // The loser revalidates: a re-read sees the winner's history.
+        let record = read_record(store.as_ref(), &provisioning_key(&th, Signal::Metrics))
+            .await
+            .expect("read")
+            .expect("present");
+        let stored = read_generations(&record, "k").expect("valid history");
+        assert_eq!(
+            stored, won.generations,
+            "the store holds the winner's history"
+        );
+        if !capturing() {
+            return;
+        }
+        let found = evaluations(ONE_CAS_WINNER, &th.to_hex());
+        assert_eq!(found.len(), 2, "one evaluation per outcome: {found:?}");
+        assert!(found.iter().all(|(held, _)| *held), "{found:?}");
+        assert!(found.iter().any(|(_, d)| d.contains("\"won\": \"true\"")));
+        assert!(found.iter().any(|(_, d)| d.contains("\"won\": \"false\"")));
+        for message in [
+            "resharding: generation append CAS won",
+            "resharding: generation append CAS lost",
+        ] {
+            assert_eq!(evaluations(message, &th.to_hex()).len(), 1, "{message}");
+        }
+    }
+
+    /// CasAppendNeverDiscards over the same race: the winner's and the
+    /// loser's re-read both hold every generation the base held.
+    #[tokio::test]
+    async fn cas_append_never_discards_holds_under_concurrent_append() {
+        if !capturing() {
+            return;
+        }
+        let th = TenantHash([0xC2; 16]);
+        let (won, lost, _store) = race_two_appends(th).await;
+        won.expect("the first released CAS wins");
+        lost.expect_err("the second CAS loses");
+        let found = evaluations(NEVER_DISCARDS, &th.to_hex());
+        assert_eq!(found.len(), 2, "one evaluation per outcome: {found:?}");
+        assert!(found.iter().all(|(held, _)| *held), "{found:?}");
+    }
+
+    /// A CAS the store refuses while the record still holds the conditioned
+    /// version is a lost append nobody won: OneCasWinner is evaluated false,
+    /// which shows the property reads the store, not the PUT's answer.
+    #[tokio::test]
+    async fn one_cas_winner_is_false_for_a_refusal_nobody_won() {
+        if !capturing() {
+            return;
+        }
+        let th = TenantHash([0xC3; 16]);
+        let inner = MemoryStore::new();
+        seed_record(&inner, &th, Signal::Metrics, 4).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite).with_key_contains("/prov"),
+        );
+        let store = FaultStore::new(inner, plan);
+        append_generation(&store, &th, Signal::Metrics, 8, 12, 10 * NS_PER_HOUR)
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            store.fault_count(
+                Op::Put,
+                ravel_object_store::fault::FaultKind::FailedConditionalWrite
+            ),
+            1
+        );
+        let found = evaluations(ONE_CAS_WINNER, &th.to_hex());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].0, "{found:?}");
+        let kept = evaluations(NEVER_DISCARDS, &th.to_hex());
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].0, "{kept:?}");
     }
 
     // ---- ADR-0066 format-floor tests ----
