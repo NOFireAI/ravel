@@ -13740,8 +13740,8 @@ pub(crate) mod tests {
         let _ = name;
         ravel_invariant::inv_sometimes!(
             {
-                let scoped = ravel_invariant::mutant::scoped(name).expect("a registered mutant");
-                *guard.borrow_mut() = Some(Box::new(scoped));
+                *guard.borrow_mut() = ravel_invariant::test_support::scoped_mutant(name)
+                    .expect("a registered mutant");
                 true
             },
             "ravel-catalog test: a mutant is scoped",
@@ -13757,12 +13757,8 @@ pub(crate) mod tests {
         let _ = (message, needle);
         ravel_invariant::inv_sometimes!(
             {
-                found.borrow_mut().extend(
-                    ravel_invariant::capture::evaluations_of(message)
-                        .into_iter()
-                        .filter(|e| e.details.contains(needle))
-                        .map(|e| (e.condition, e.details)),
-                );
+                *found.borrow_mut() =
+                    ravel_invariant::test_support::evaluations(message, needle).unwrap_or_default();
                 true
             },
             "ravel-catalog test: evaluations are read",
