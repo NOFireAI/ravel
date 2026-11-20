@@ -134,9 +134,9 @@ t/<tenant_hash>/<signal>/del/<request_id>.done    completion record (CreateIfAbs
 
 `ErasureRequest` fields: identity (tenant_hash, signal, request_id,
 created_unix_ns from the injected clock), a **predicate** — a conjunction of
-exact-match label/attribute matchers (`key = value` pairs; metrics match
-series labels, logs match row attributes, spans match span attributes) plus
-an optional event-time range — and an optional free-text reason. v1
+exact-match label/attribute matchers (`key = value` pairs; which attributes
+each signal's matcher tests is stated by the attribute scope amendment below)
+plus an optional event-time range — and an optional free-text reason. v1
 predicates are equality-only: exact semantics by default, no regex (see
 Rejected Alternatives). Matching granularity: for metrics, every sample of
 every series whose labels satisfy the conjunction (intersected with the time
@@ -957,3 +957,38 @@ What follows for erasure:
   filters, and the index cannot surface an erased subject in a result. No
   query reads a leaf yet; the query path ADR-2707 plans (T10, T11) must keep
   this order.
+
+## Amendment (2026-11-20, #4503): the attribute scope of a matcher, per signal
+
+<!-- amendment-applies: sections="1. The erasure request: a durable, immutable predicate record" pointer="attribute scope amendment" -->
+<!-- amendment-supersedes: phrase="logs match row attributes" pointer="attribute scope amendment" -->
+
+Decision 1 said logs match row attributes and did not say whether a subject
+named only in a resource or scope attribute is in scope. The query-time
+exclusion has matched the merged resource, scope and record view since
+`retain_unerased_log_records` became the authoritative exclusion, while the
+rewrite matched record attributes only. A logs request naming a resource or
+scope attribute was therefore hidden while pending, completed with zero
+drops, and served again once its `.dreq` was swept, against decision 2 and
+`DreqRemovalCannotResurrect` (#4503).
+
+The scope is now stated, and it is the same for the query-time exclusion and
+the rewrite: the rewrite drops exactly the records the exclusion hides, never
+more and never fewer.
+
+- Metrics: the series labels. A windowless request drops every sample of a
+  matching series; a windowed one drops the in-window samples.
+- Logs: the record's own attributes, or its merged view, which is the
+  stream's scalar resource and scope attributes overlaid with the record's
+  own, the record's value winning on a key collision. A matcher reads the
+  first string value under its key in each view; a non-string value never
+  matches. The record is dropped when the request's window holds its `ts_ns`
+  and the conjunction matches either view.
+- Spans: the span's merged attributes, into which ingest already folds the
+  resource and scope attributes.
+
+The guarantee covers a bucket whose rewrite for the request ran on a build
+with this rule. A bucket an earlier build already rewrote for the request is
+skipped as already applied and keeps the records that build did not match;
+a new request with a new id for the same subject rewrites it under this
+rule.
