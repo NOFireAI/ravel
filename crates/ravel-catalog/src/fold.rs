@@ -13721,8 +13721,11 @@ pub(crate) mod tests {
     /// in the HEAD CAS outcome arm, which returns the only report that is not
     /// a no-op, so a fold that published issued one and a no-op fold none.
     /// Under `capture` this is the count of captured evaluations, asserted
-    /// equal to that derivation; under `antithesis` alone, which records
-    /// nothing, it is the derivation; in the default build it is 0.
+    /// equal to that derivation, a cross-check that holds where the
+    /// property's verdict is known, since capture records only a known
+    /// verdict and these tests' paths always reach one; under `antithesis`
+    /// alone, which records nothing, it is the derivation; in the default
+    /// build it is 0.
     fn head_rereads(folder_id: Uuid, report: &FoldReport) -> u64 {
         let derived = u64::from(ravel_invariant::EVALUATES && !report.no_op);
         if !capturing() {
