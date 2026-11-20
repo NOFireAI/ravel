@@ -875,12 +875,15 @@ fn rules_ignored_by_mode(mode: Mode, has_rules: bool) -> bool {
 /// rather than taking the signal's default disposition and killing the process
 /// mid-startup (issue #4493).
 struct ShutdownListener {
-    /// `None` when `signal()` failed to install the handler, exactly as the
-    /// previous inline `wait_for_shutdown_signal` mapped a failed `signal(...)`
-    /// to `std::future::pending()`: that signal then never resolves [`recv`],
-    /// and no `unwrap` turns the failure into a panic.
+    /// `None` when the SIGTERM handler failed to install; that branch then never
+    /// resolves [`recv`](Self::recv), as the previous code mapped a failed
+    /// terminate `signal(...)` to `std::future::pending()`.
     #[cfg(unix)]
     sigterm: Option<tokio::signal::unix::Signal>,
+    /// `None` when the SIGINT handler failed to install; that branch then
+    /// resolves [`recv`](Self::recv) at once, as the previous
+    /// `let _ = tokio::signal::ctrl_c().await` returned its install error
+    /// immediately and started the drain.
     #[cfg(unix)]
     sigint: Option<tokio::signal::unix::Signal>,
 }
@@ -889,9 +892,7 @@ impl ShutdownListener {
     /// Install the handlers. On unix these are SIGTERM and SIGINT, the two
     /// signals the previous `wait_for_shutdown_signal` awaited (SIGINT is the
     /// signal `tokio::signal::ctrl_c` listens for). A handler that fails to
-    /// install is dropped to `None` and then to a never-resolving branch in
-    /// [`recv`], as the previous code dropped a failed terminate handler to
-    /// `std::future::pending()`.
+    /// install is kept as `None`, with no `unwrap`.
     fn install() -> Self {
         #[cfg(unix)]
         {
@@ -907,8 +908,8 @@ impl ShutdownListener {
         }
     }
 
-    /// Resolve when either installed signal fires. A handler that failed to
-    /// install never fires.
+    /// Resolve when either signal fires. A failed SIGTERM install never
+    /// resolves; a failed SIGINT install resolves at once.
     async fn recv(&mut self) {
         #[cfg(unix)]
         {
@@ -923,11 +924,8 @@ impl ShutdownListener {
                 }
             };
             let interrupt = async {
-                match sigint {
-                    Some(sig) => {
-                        sig.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
+                if let Some(sig) = sigint {
+                    sig.recv().await;
                 }
             };
             tokio::select! {
