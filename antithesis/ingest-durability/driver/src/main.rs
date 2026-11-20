@@ -830,38 +830,65 @@ impl Workload {
 }
 
 /// The coverage variant's machine: the base rules, plus graceful drains.
+///
+/// Once the eventually starts, every rule returns at once, and the machine
+/// keeps drawing steps while the eventually waits. The coverage eventually
+/// can wait minutes for a drain to settle, and steps drawn that fast grow the
+/// driver's memory until it is killed, so each rule here sleeps first.
 struct CoverageWorkload(Arc<Shared>);
+
+impl CoverageWorkload {
+    fn idle_if_stopping(&self) -> bool {
+        if self.0.stopping.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(200));
+            return true;
+        }
+        false
+    }
+}
 
 #[hegel::concurrent_state_machine]
 impl CoverageWorkload {
     #[rule(groups = ["main"], weight = 6)]
     fn write_logs(&self, tc: TestCase) {
-        self.0.write_logs(&tc);
+        if !self.idle_if_stopping() {
+            self.0.write_logs(&tc);
+        }
     }
 
     #[rule(groups = ["main"], weight = 3)]
     fn write_metrics(&self, tc: TestCase) {
-        self.0.write_metrics(&tc);
+        if !self.idle_if_stopping() {
+            self.0.write_metrics(&tc);
+        }
     }
 
     #[rule(groups = ["main"], weight = 3)]
     fn read_with_tokens(&self, tc: TestCase) {
-        self.0.read_with_tokens(&tc);
+        if !self.idle_if_stopping() {
+            self.0.read_with_tokens(&tc);
+        }
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn scan_without_token(&self, tc: TestCase) {
-        self.0.scan_without_token(&tc);
+        if !self.idle_if_stopping() {
+            self.0.scan_without_token(&tc);
+        }
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn drain(&self, tc: TestCase) {
-        self.0.drain(&tc);
+        if !self.idle_if_stopping() {
+            self.0.drain(&tc);
+        }
     }
 
     #[rule(groups = ["main"])]
     fn eventually(&self, tc: TestCase) {
-        self.0.eventually(&tc);
+        if !self.idle_if_stopping() {
+            self.0.eventually(&tc);
+        }
     }
 }
 
