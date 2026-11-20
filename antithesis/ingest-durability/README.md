@@ -162,9 +162,12 @@ unchanged; three levers do it:
   SIGTERM, writes the exit code to `/control/drained-<host>`, and starts it
   again. At startup it answers a request or an unfinished drain left by a
   killed container as `interrupted`, so every drain it took gets an answer.
-  A stop or kill of the container is passed on to ravel-server, and any exit
-  the supervisor did not ask for ends it with ravel-server's exit code, as in
-  the base config. The driver keeps one drain in flight at a time. When the
+  A stop of the container is passed on to ravel-server; once ravel-server
+  has exited, the supervisor exits 143 when ravel-server ended the way a stop
+  ends it (0, 1 for a drain cut short by the shutdown timeout, or 143), and
+  with ravel-server's own code otherwise, so a crash during a stop still
+  shows. Any other exit the supervisor did not ask for ends it with
+  ravel-server's exit code, as in the base config. The driver keeps one drain in flight at a time. When the
   eventually starts, it withdraws a request the supervisor has not taken and
   waits up to 180 s for the answer to one it has.
 
