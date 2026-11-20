@@ -1540,6 +1540,10 @@ for ((i = 0; i < ${#args[@]}; i++)); do
         rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query samples.0 failed: 422\"}"
       elif [ "${STUB_INGEST_READBACK_422:-}" = "$sys" ]; then
         rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query series failed after 4321 ms: GET /api/v1/series answered 422 Unprocessable Entity: series budget exceeded\"}"
+      elif [ "${STUB_INGEST_READBACK_504:-}" = "$sys" ]; then
+        rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query series failed after 120013 ms: GET /api/v1/series answered 504 Gateway Timeout: query exceeded its deadline of 120s\"}"
+      elif [ "${STUB_INGEST_READBACK_504OTHER:-}" = "$sys" ]; then
+        rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query series failed after 60004 ms: GET /api/v1/series answered 504 Gateway Timeout: upstream request timeout\"}"
       else
         rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback\":{\"series_count\":1000,\"sample_count\":120000,\"matches_expected\":true,\"mismatches\":[]}}"
       fi
@@ -1550,7 +1554,7 @@ stalled=""
 [ -z "${STUB_INGEST_STALL:-}" ] ||
   stalled=",\"stalled\":[{\"system\":\"${STUB_INGEST_STALL}\",\"error\":\"projected 9000 s past the 600 s ceiling\"}]"
 printf '{"profile":{"name":"ci","scrape_interval_secs":15,"run":{"steps":120,"anchor_ms":%s}},"systems":[%s]%s}\n' "$anchor" "$rows" "$stalled"
-if [ -n "${STUB_INGEST_READBACK_FAIL:-}${STUB_INGEST_READBACK_422:-}${STUB_INGEST_STALL:-}${STUB_INGEST_EXIT_AFTER_REPORT:-}" ]; then
+if [ -n "${STUB_INGEST_READBACK_FAIL:-}${STUB_INGEST_READBACK_422:-}${STUB_INGEST_READBACK_504:-}${STUB_INGEST_READBACK_504OTHER:-}${STUB_INGEST_STALL:-}${STUB_INGEST_EXIT_AFTER_REPORT:-}" ]; then
   echo "stub ingest: a row failed its verification" >&2
   exit 1
 fi
@@ -4071,6 +4075,17 @@ expect_no_log "ro3b: no compaction after the miss" "compact-tenant"
 STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_422=ravel STUB_READBACK_ONLY_SEQ="0 422" run_stage1 ro4 history --ravel-only
 expect_rc ro4 0
 check "ro4: refused (budget) at ingest and on L1, matched on L0" 'j("stamps.json")["ravel_only"]["ingest_readback"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l0"]["verdict"] == "matched" and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 4321 and j("stamps.json")["status"] == "passed"'
+# ro4b: a 504 query deadline on the ingest read-back is stamped deadline with
+# its elapsed ms and the run goes on through readback-l0.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_504=ravel STUB_READBACK_ONLY_SEQ="0" run_stage1 ro4b history --ravel-only
+expect_rc ro4b 0
+check "ro4b: deadline at ingest with its listing time and error, the run reached readback-l0 and passed" 'j("stamps.json")["ravel_only"]["ingest_readback"]["verdict"] == "deadline" and j("stamps.json")["ravel_only"]["ingest_readback"]["series_query_ms"] == 120013 and j("stamps.json")["ravel_only"]["ingest_readback"]["error"] == "query series failed after 120013 ms: GET /api/v1/series answered 504 Gateway Timeout: query exceeded its deadline of 120s" and "readback-l0" in j("stamps.json")["steps_completed"] and j("stamps.json")["ravel_only"]["l0"]["verdict"] == "matched" and j("stamps.json")["status"] == "passed"'
+expect_err "ro4b: the deadline is said with its listing time" "ingest: the Ravel read-back's series listing reached the server's query deadline after 120013 ms"
+# ro4c: a 504 on the ingest read-back without the deadline message fails the
+# ingest step.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_504OTHER=ravel STUB_READBACK_ONLY_SEQ="0" run_stage1 ro4c history --ravel-only
+expect_rc ro4c 70
+check "ro4c: a 504 without the deadline message fails ingest" 'j("stamps.json")["ravel_only"]["ingest_readback"].startswith("failed: metricsbench_ingest exited 1: query series failed after 60004 ms") and j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["status"] == "failed"'
 # ro5: a read-back that does not match fails its step.
 STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="mismatch" run_stage1 ro5 ci --ravel-only
 expect_rc ro5 70
