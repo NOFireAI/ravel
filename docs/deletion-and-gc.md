@@ -648,9 +648,11 @@ than deletes, so even a forced pass keeps the recovery window.
   blocker on every pass.
 - Retention is durable and irreversible: raising a tenant's retention
   window after a bucket is tombstoned never resurrects it. A token whose
-  bucket is tombstoned resolves as satisfied with zero segments, not as
-  `unsatisfiable token`; the data was retired on purpose, not lost to a
-  race.
+  bucket is tombstoned never resolves as `unsatisfiable token`; the data was
+  retired on purpose, not lost to a race. What it adds to the snapshot
+  follows step 5 of docs/catalog-and-mvcc.md, "Snapshot resolution by
+  listing": nothing when its commit record is absent, while a present record
+  can still add its own level-0 input.
 - A store NotFound on a segment pinned by a running query surfaces as
   SnapshotInvalidated; the frontend re-resolves and retries once before
   failing the query.
