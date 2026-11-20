@@ -1378,6 +1378,69 @@ mod tests {
         }
     }
 
+    /// A legal hold over the alerts shard written after the pass's snapshot
+    /// is honored by the sweep's delete batch, whose re-read sees it.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_stops_the_alert_retention_batch() {
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let store = MemoryStore::new();
+        let seeded = seed_alert(
+            &store,
+            &tenant,
+            Uuid::from_u128(0xA6),
+            1,
+            now - 200 * NS_PER_DAY,
+        )
+        .await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+        assert!(snapshot.is_empty());
+        let scopes =
+            crate::legal_hold::shard_hold_scopes(&tenant, Signal::Alerts, ALERT_SHARD).unwrap();
+        for (i, scope) in scopes.iter().enumerate() {
+            crate::legal_hold::write_hold_set(
+                &store,
+                &tenant,
+                Uuid::from_u128(0x4501 + i as u128),
+                now,
+                scope,
+                "mid-pass",
+            )
+            .await
+            .expect("hold");
+        }
+
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            ALERT_SHARD,
+            &keep_none_below(now),
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            outcome,
+            AlertRetentionOutcome {
+                records_deleted: 0,
+                data_deleted: 0,
+                kept: 1,
+                kept_current_state: 0,
+                kept_at_or_above_watermark: 0,
+                gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
+            }
+        );
+        assert!(exists(&store, &seeded.commit_key).await);
+        assert!(exists(&store, &seeded.data_key).await);
+    }
+
     /// A [`LeaseCheck`] protecting exactly one key.
     struct HoldOne(String);
 

@@ -791,6 +791,97 @@ mod tests {
         );
     }
 
+    /// The hold over the query-audit shard, written on all three prefixes.
+    async fn hold_query_audit_shard(store: &dyn ObjectStoreBackend, tenant: &TenantHash, ts: i64) {
+        let scopes = shard_hold_scopes(tenant, Signal::Audit, QUERY_AUDIT_SHARD).unwrap();
+        for (i, scope) in scopes.iter().enumerate() {
+            write_hold_set(
+                store,
+                tenant,
+                Uuid::from_u128(0x4501 + i as u128),
+                ts,
+                scope,
+                "mid-pass",
+            )
+            .await
+            .expect("set hold on scope");
+        }
+    }
+
+    /// A hold written after the pass's snapshot is honored by the hour's
+    /// delete batch: both expired records are kept.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_stops_the_audit_retention_batch() {
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let old_ts = now - 200 * NS_PER_DAY;
+        let store = MemoryStore::new();
+        seed_audit(&store, &tenant, old_ts, "first").await;
+        seed_audit(&store, &tenant, old_ts + 1, "second").await;
+        let snapshot = LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+        assert!(snapshot.is_empty());
+        hold_query_audit_shard(&store, &tenant, old_ts).await;
+
+        let outcome = sweep_audit_retention(&store, &clock, &config, &snapshot, &tenant)
+            .await
+            .expect("sweep");
+        assert_eq!(
+            (outcome.records_deleted, outcome.data_deleted, outcome.kept),
+            (0, 0, 2)
+        );
+        assert_eq!(l0_data_count(&store, &tenant).await, 2);
+    }
+
+    /// Two expired hours are two delete batches. A hold written while the
+    /// first hour's first delete is in flight is honored by the second hour,
+    /// whose re-read comes after it; the first hour, which read before it, is
+    /// deleted. A pass that re-read once would delete both hours.
+    #[tokio::test]
+    async fn a_hold_written_between_two_audit_hours_holds_the_second() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let old_ts = now - 200 * NS_PER_DAY;
+        let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+        seed_audit(store.inner(), &tenant, old_ts, "first hour").await;
+        seed_audit(
+            store.inner(),
+            &tenant,
+            old_ts + 2 * NS_PER_HOUR,
+            "second hour",
+        )
+        .await;
+        let snapshot = LegalHoldCheck::refresh(store.inner(), &tenant)
+            .await
+            .expect("refresh");
+        let gate = store.hold(Op::Delete, None, Occurrence::Nth(1));
+
+        let driver = async {
+            gate.wait_until_held(1).await;
+            let held = gate.held_details();
+            hold_query_audit_shard(store.inner(), &tenant, old_ts).await;
+            gate.release(held[0].0);
+        };
+        let (outcome, ()) = tokio::join!(
+            sweep_audit_retention(&store, &clock, &config, &snapshot, &tenant),
+            driver
+        );
+        let outcome = outcome.expect("sweep");
+        assert_eq!(
+            (outcome.records_deleted, outcome.data_deleted, outcome.kept),
+            (1, 1, 1),
+            "the first hour is deleted, the second is held"
+        );
+        assert_eq!(l0_data_count(store.inner(), &tenant).await, 1);
+    }
+
     /// LegalHoldCheck genuinely gates the new sweep. A held
     /// query-audit record past its retention window is NOT deleted; the same
     /// record with no hold IS deleted (the control), so the assertion is not

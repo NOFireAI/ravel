@@ -577,6 +577,43 @@ async fn held_dreq_survives_past_horizon() {
     );
 }
 
+/// A legal hold over the `del/` keyspace written after the pass's snapshot is
+/// honored by the `.dreq` delete batch, which re-reads the hold set before its
+/// first delete (ADR-0042, the delete-batch re-read amendment). Control: the
+/// same request under the same snapshot shape with no hold is removed.
+#[tokio::test]
+async fn a_hold_placed_after_the_snapshot_keeps_the_dreq() {
+    let completed = sealed_now_ns();
+    for hold in [false, true] {
+        let store = MemoryStore::new();
+        let (dreq_key, _) = seed_dreq_done(&store, 4, Some(completed)).await;
+        let snapshot = LegalHoldCheck::refresh(&store, &tenant_hash())
+            .await
+            .expect("refresh");
+        assert!(snapshot.is_empty());
+        if hold {
+            write_hold_set(
+                &store,
+                &tenant_hash(),
+                Uuid::from_u128(0x4501),
+                completed,
+                &keys::del_prefix(&tenant_hash(), Signal::Metrics),
+                "mid-pass",
+            )
+            .await
+            .expect("hold");
+        }
+        let out = sweep_dreq(&store, past_horizon(completed), &snapshot).await;
+        if hold {
+            assert_eq!((out.deleted, out.kept), (0, 1));
+            assert!(present(&store, &dreq_key).await);
+        } else {
+            assert_eq!((out.deleted, out.kept), (1, 0));
+            assert!(!present(&store, &dreq_key).await);
+        }
+    }
+}
+
 /// DreqSweep / DreqSweepRespectsLegalHold (lifecycle traceability row 27): a
 /// `.dreq` past its own horizon, with a valid `.done`, and never itself
 /// protected by any hold, is still kept when the rewrite's own superseded

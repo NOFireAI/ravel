@@ -4825,42 +4825,119 @@ mod tests {
         );
     }
 
-    /// The pass's hold snapshot is taken before a hold is written, and the
-    /// pass then deletes the key the new hold covers: the property evaluates
-    /// false. This pins the gap between the model, which checks the hold at
-    /// the delete's own step, and the once-per-pass hold snapshot the sweep
-    /// honours (see the `legal_hold` module docs).
+    /// The pass's hold snapshot, empty, then a hold over `scope` written after
+    /// it: the state a delete batch meets when a hold lands mid-pass.
+    async fn snapshot_then_hold(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        scope: &str,
+    ) -> crate::legal_hold::LegalHoldCheck {
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(store, tenant)
+            .await
+            .expect("refresh");
+        assert!(snapshot.is_empty(), "the snapshot predates the hold");
+        crate::legal_hold::write_hold_set(
+            store,
+            tenant,
+            Uuid::from_u128(0x4501),
+            1,
+            scope,
+            "mid-pass",
+        )
+        .await
+        .expect("place hold after the snapshot");
+        snapshot
+    }
+
+    /// The pass's hold snapshot is taken before a hold is written: the orphan
+    /// move batch re-reads the hold set before its first move, sees the hold,
+    /// and moves nothing. Under capture, `HeldObjectNeverDeleted` is never
+    /// evaluated, because nothing is deleted. Control: the same pass with no
+    /// hold moves both orphans.
     #[tokio::test]
-    async fn a_hold_placed_after_the_snapshot_trips_held_object_never_deleted() {
-        if !crate::publish::tests::capturing() {
-            return;
-        }
+    async fn a_hold_placed_after_the_snapshot_stops_the_orphan_move_batch() {
         let tenant = TenantHash([0x5c; 16]);
         let signal = Signal::Metrics;
         let shard = 4;
-        let store = MemoryStore::new();
-        put_orphan(&store, &tenant, signal, shard, 0).await;
-        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
-            .await
-            .expect("refresh");
-        let scope = l0_data_prefix(&tenant, signal, shard).unwrap();
-        crate::legal_hold::write_hold_set(&store, &tenant, Uuid::from_u128(1), 0, &scope, "legal")
-            .await
-            .expect("place hold after the snapshot");
-
         let config = CompactorConfig::default();
         let clock = aged_clock(&config);
+        let scope = l0_data_prefix(&tenant, signal, shard).unwrap();
+
+        let control = MemoryStore::new();
+        for seq in 0..2u64 {
+            put_orphan(&control, &tenant, signal, shard, seq).await;
+        }
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&control, &tenant)
+            .await
+            .expect("refresh");
+        let outcome = sweep_orphans(&control, &clock, &config, &snapshot, &tenant, signal, shard)
+            .await
+            .expect("control sweep");
+        assert_eq!((outcome.deleted, outcome.refused), (2, 0));
+
+        let store = MemoryStore::new();
+        for seq in 0..2u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let snapshot = snapshot_then_hold(&store, &tenant, &scope).await;
         let outcome = sweep_orphans(&store, &clock, &config, &snapshot, &tenant, signal, shard)
             .await
             .expect("sweep");
-        assert_eq!(outcome.deleted, 1, "the snapshot allows the delete");
-
-        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &tenant.to_hex());
-        assert_eq!(found.len(), 1, "one evaluation at the delete: {found:?}");
-        assert!(
-            !found[0].0,
-            "a hold placed after the snapshot makes the property false: {found:?}"
+        assert_eq!(
+            (outcome.deleted, outcome.refused),
+            (0, 0),
+            "the batch's re-read sees the hold"
         );
+        assert_eq!(list_all(&store, &scope).await.unwrap().len(), 2);
+        assert!(
+            list_all(&store, QUARANTINE_PREFIX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing was copied to quarantine either"
+        );
+        if crate::publish::tests::capturing() {
+            let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &tenant.to_hex());
+            assert!(
+                found.is_empty(),
+                "nothing deleted, nothing evaluated: {found:?}"
+            );
+        }
+    }
+
+    /// Two orphan passes of one tick share the tick's snapshot. The first
+    /// moves its orphan; a hold over the second shard is then written; the
+    /// second pass's own re-read honors it. A source that re-read once per
+    /// tick would move the second orphan.
+    #[tokio::test]
+    async fn a_hold_written_between_two_orphan_passes_stops_the_second() {
+        let tenant = TenantHash([0x5f; 16]);
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        put_orphan(&store, &tenant, signal, 9, 0).await;
+        put_orphan(&store, &tenant, signal, 10, 1).await;
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+
+        let first = sweep_orphans(&store, &clock, &config, &snapshot, &tenant, signal, 9)
+            .await
+            .expect("first pass");
+        assert_eq!(first.deleted, 1);
+        let scope = l0_data_prefix(&tenant, signal, 10).unwrap();
+        crate::legal_hold::write_hold_set(&store, &tenant, Uuid::from_u128(7), 1, &scope, "")
+            .await
+            .expect("hold");
+        let second = sweep_orphans(&store, &clock, &config, &snapshot, &tenant, signal, 10)
+            .await
+            .expect("second pass");
+        assert_eq!(
+            second.deleted, 0,
+            "the second batch re-reads and sees the hold"
+        );
+        assert_eq!(list_all(&store, &scope).await.unwrap().len(), 1);
     }
 
     /// Seed one quarantine copy of data object `seq` of `shard`, quarantined
@@ -4936,6 +5013,123 @@ mod tests {
             held.is_empty(),
             "the held copy is never evaluated: {held:?}"
         );
+    }
+
+    /// A hold over the original keys written after the pass's snapshot stops
+    /// the purge batch: both copies are retained.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_stops_the_quarantine_purge_batch() {
+        let tenant = TenantHash([0x60; 16]);
+        let store = MemoryStore::new();
+        let copies = [
+            put_quarantined(&store, &tenant, 11, 0).await,
+            put_quarantined(&store, &tenant, 11, 1).await,
+        ];
+        let scope = l0_data_prefix(&tenant, Signal::Metrics, 11).unwrap();
+        let snapshot = snapshot_then_hold(&store, &tenant, &scope).await;
+        let config = CompactorConfig::default();
+        let clock = past_quarantine_horizon(&config);
+
+        let outcome = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            11,
+        )
+        .await
+        .expect("purge");
+        assert_eq!((outcome.reaped, outcome.retained), (0, 2));
+        for copy in &copies {
+            assert!(store.head(copy).await.is_ok(), "{copy} stays");
+        }
+
+        // Control: the same copies under a store with no hold are purged.
+        let control = MemoryStore::new();
+        put_quarantined(&control, &tenant, 11, 0).await;
+        put_quarantined(&control, &tenant, 11, 1).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&control, &tenant)
+            .await
+            .expect("refresh");
+        let outcome = sweep_quarantine(
+            &control,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            11,
+        )
+        .await
+        .expect("control purge");
+        assert_eq!((outcome.reaped, outcome.retained), (2, 0));
+    }
+
+    /// A purge batch whose hold re-read fails purges nothing and is counted
+    /// once; the next shard's purge batch, with a healthy re-read, purges.
+    #[tokio::test]
+    async fn a_failed_re_read_purges_nothing_and_the_next_purge_proceeds() {
+        let tenant = TenantHash([0x61; 16]);
+        let hold_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Audit, crate::legal_hold::AUDIT_HOLD_SHARD)
+                .unwrap();
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Transient("hold shard down".into()))
+                    .with_key_contains(hold_prefix)
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+        let failed_copy = put_quarantined(store.inner(), &tenant, 12, 0).await;
+        let healthy_copy = put_quarantined(store.inner(), &tenant, 13, 0).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(store.inner(), &tenant)
+            .await
+            .expect("the tick's refresh");
+        let source = std::sync::Arc::clone(snapshot.source().expect("bound"));
+        let config = CompactorConfig::default();
+        let clock = past_quarantine_horizon(&config);
+
+        let failed = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            12,
+        )
+        .await
+        .expect("a failed re-read is not a pass error");
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Transient),
+            1,
+            "the purge batch's re-read faulted"
+        );
+        assert_eq!((failed.reaped, failed.retained), (0, 1));
+        assert_eq!(source.reread_failures(), 1);
+        assert!(store.inner().head(&failed_copy).await.is_ok());
+
+        let healthy = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            13,
+        )
+        .await
+        .expect("purge");
+        assert_eq!((healthy.reaped, healthy.retained), (1, 0));
+        assert_eq!(
+            source.reread_failures(),
+            1,
+            "a healthy batch counts nothing"
+        );
+        assert!(store.inner().head(&healthy_copy).await.is_err());
     }
 
     /// The site is not vacuous: a purge under `NoLeases` removes a copy whose
@@ -7288,6 +7482,122 @@ mod tests {
             present(&store, &held).await,
             "a held object must never be swept"
         );
+    }
+
+    /// A hold over the catalog prefix written after the pass's snapshot stops
+    /// the catalog object batch: the old unreferenced part is kept. Control:
+    /// with no hold the same part is deleted.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_stops_the_catalog_object_batch() {
+        async fn seeded(store: &MemoryStore, tenant: &TenantHash) -> String {
+            let signal = Signal::Metrics;
+            let referenced = format!(
+                "{}20260101T00.aaaa.csnap",
+                catalog_snap_prefix(tenant, signal)
+            );
+            let unreferenced = format!(
+                "{}20251231T00.cccc.csnap",
+                catalog_snap_prefix(tenant, signal)
+            );
+            put_catalog_object(store, &referenced).await;
+            put_catalog_object(store, &unreferenced).await;
+            put_head(
+                store,
+                tenant,
+                signal,
+                vec![part_ref(&referenced, [1u8; 32])],
+                None,
+            )
+            .await;
+            unreferenced
+        }
+        let tenant = tenant();
+        let config = CompactorConfig::default();
+        let clock = FixedClock::new(config.protection_horizon_ns.saturating_mul(2));
+
+        let control = MemoryStore::new();
+        seeded(&control, &tenant).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&control, &tenant)
+            .await
+            .expect("refresh");
+        let outcome = sweep_unreferenced_catalog_objects(
+            &control,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+        )
+        .await
+        .expect("control sweep");
+        assert_eq!((outcome.deleted, outcome.kept), (1, 1));
+
+        let store = MemoryStore::new();
+        let unreferenced = seeded(&store, &tenant).await;
+        let snapshot =
+            snapshot_then_hold(&store, &tenant, &format!("t/{}/catalog/", tenant.to_hex())).await;
+        let outcome = sweep_unreferenced_catalog_objects(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!((outcome.deleted, outcome.kept), (0, 2));
+        assert!(present(&store, &unreferenced).await);
+    }
+
+    /// A hold over the idempotency-marker prefix written after the pass's
+    /// snapshot stops the marker batch. Control: with no hold the marker past
+    /// its window is deleted.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_stops_the_idempotency_marker_batch() {
+        let tenant_id = TenantId::new("acme-4501");
+        let tenant = tenant_id.hash();
+        let signal = Signal::Logs;
+        let now_hour = 10_000u32;
+        let config = CompactorConfig {
+            idem_dedup_window_hours: 24,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(i64::from(now_hour) * NS_PER_HOUR);
+        let old_hour = now_hour - 200;
+
+        for hold in [false, true] {
+            let store = MemoryStore::new();
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                b"old-key",
+                old_hour,
+                &idem_receipt(1),
+            )
+            .await
+            .expect("seed marker");
+            let snapshot = if hold {
+                snapshot_then_hold(&store, &tenant, &idem_prefix(&tenant, signal)).await
+            } else {
+                crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
+                    .await
+                    .expect("refresh")
+            };
+            let outcome =
+                sweep_idempotency_markers(&store, &clock, &config, &snapshot, &tenant, signal)
+                    .await
+                    .expect("sweep");
+            let key = marker_key(&tenant_id, signal, b"old-key", old_hour);
+            if hold {
+                assert_eq!((outcome.deleted, outcome.kept), (0, 1));
+                assert!(present(&store, &key).await);
+            } else {
+                assert_eq!((outcome.deleted, outcome.kept), (1, 0));
+                assert!(!present(&store, &key).await);
+            }
+        }
     }
 
     /// Under `dry_run`, the sweep counts what it would delete but calls

@@ -420,3 +420,57 @@ async fn a_failed_re_read_holds_its_retention_bucket_and_the_next_bucket_proceed
         "the healthy batch counts nothing"
     );
 }
+
+// --- unreferenced parts: the pass's part deletes are one batch -------------
+
+/// A stray `l1/` part no compaction record names, past the age gate, is kept
+/// when a hold over the shard is written after the pass's snapshot. Control:
+/// with no hold it is deleted.
+#[tokio::test]
+async fn a_hold_placed_after_the_snapshot_keeps_an_unreferenced_part() {
+    for hold in [false, true] {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(sealed_ns());
+        let bucket = seed_and_compact_at(&store, &clock, HOUR, 0xa1).await;
+        let record = fetch_compaction_record(&store, &bucket).await;
+        let stray_key = keys::l1_part_key(
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+            bucket.ingest_hour_bucket,
+            &hex::encode(&record.input_set_hash[..8]),
+            9,
+            &hex::encode([0xEEu8; 8]),
+        )
+        .unwrap();
+        store
+            .put(
+                &stray_key,
+                bytes::Bytes::from_static(b"stray-l1-part"),
+                ravel_object_store::PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let snapshot = LegalHoldCheck::refresh(&store, &tenant_hash())
+            .await
+            .expect("refresh");
+        if hold {
+            hold_the_shard(&store, 0x4503).await;
+        }
+        let config = cfg();
+        clock.set(config.unreferenced_part_age_gate_ns() + 1);
+        let deleted = ravel_maintain::sweep_unreferenced_parts(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant_hash(),
+            bucket.signal,
+            bucket.shard,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(deleted, usize::from(!hold), "hold={hold}");
+        assert_eq!(store.head(&stray_key).await.is_ok(), hold, "hold={hold}");
+    }
+}
