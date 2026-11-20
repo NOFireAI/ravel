@@ -484,7 +484,166 @@ hedge.
 
 ## 5. #4449: claims-on residual window
 
-(pending)
+### Claims checked against main
+
+- crates/ravel-maintain/src/rewrite.rs: the compaction's last claim checkpoint
+  (`Checkpoint::Publish`) runs, then `relist_changed`, then the record PUT.
+  Holds. Between the re-list and the PUT nothing reads the claim or the bucket.
+- crates/ravel-maintain/src/claim_guard.rs `checkpoint`: no store request
+  within `renew_after_ns` of the last claim write, so a stolen claim is noticed
+  only at a later checkpoint. Holds.
+- ADR-1029, 2026-10-03 amendment, point 7: "An owner that stalls longer than
+  the lease between its re-list and its record PUT is caught by neither: both
+  ran before the steal, so it publishes, and the pass that stole the claim can
+  publish too." Names the window, not the outcome. Holds.
+- CHANGELOG.md 0.34.0 known issue: "With claims on, the default, the two are
+  fenced." Overstated: they are fenced except in that window. Holds.
+- Reader side: `process_bucket` serves an unsuperseded `l1` record's parts and
+  the rewrite's parts together; `erasure_dominated_compaction_records` drops
+  only version 2 records whose predecessor a rewrite supersedes; only the
+  rewrite pass's `select_live_record` fails on two live records. Holds.
+- ADR-1029 amendment point 6: making the two record kinds collide at one
+  `CreateIfAbsent` "would have changed the frozen record key layout". So a
+  shared create-only key is a key-layout change and needs an ADR under the
+  repository's frozen-contract rule. Holds.
+
+### Decision
+
+Yes, correct both texts: the 0.34.0 known-issue note is edited in place to say
+that claims narrow the race to one window and what that window does, and
+ADR-1029 gets a dated amendment stating the outcome beside point 7. Fix
+direction: a reader-side dominance rule, applied identically by snapshot
+resolution, the token fallback, the index fold, the sweep and the erasure
+pass, is the 0.35.0 fix. The shared create-only key is the long-term closure
+and needs its own ADR; a fencing token is rejected.
+
+### Why
+
+The outcome matters more than the window: an operator who read "fenced" ran an
+erasure believing it final, and the window serves the erased series again with
+duplicated rows and then fails every later erasure of that bucket with
+`MultipleLiveRecords`. The ADR has to say that, because point 7 is where the
+next reader looks.
+
+On the fix: a fencing token cannot close the window. The stall lands inside
+the PUT, after every client-side check, and the object store offers no
+condition on a different key than the one being written, so a CAS renewal right
+before the PUT only narrows the window. The shared key closes it at the store,
+but it changes the frozen record key layout, it does not repair a store already
+holding two live sets, and a per-bucket generation key needs a generation the
+publisher derives from a listing, which is the same list-then-act shape. The
+reader rule closes the outcome without a format change: in this race both
+passes planned from the same listing, so the compaction's inputs are exactly
+the rewrite's effective inputs, and a rewrite's parts carry every row of those
+inputs minus the erased ones. A version 1 compaction record not in a live
+rewrite's chain whose every input is among that rewrite's effective inputs is
+dominated by it: readers drop its parts, the sweep reclaims it and its parts in
+the rewrite's chain group, as it already does for a dominated version 2 record,
+and the erasure pass's `select_live_record` treats it as superseded rather than
+failing. A record whose inputs are not all covered is a genuine conflict and
+keeps today's behaviour, which a counter and a WARN line make visible. The
+rule is deterministic, every reader applies it, and it also covers the
+claimless callers, so the `--no-claim` advice becomes about wasted work, not
+correctness.
+
+### Conditions and follow-ups
+
+1. The docs correction (changelog note and ADR-1029 amendment) lands this
+   week as its own documentation pull request; it does not wait for the fix.
+2. The dominance rule lands for 0.35.0 with: the rule in
+   `erasure_dominated_compaction_records` (or a sibling it calls), the sweep's
+   chain-group gathering, `select_live_record`, docs/catalog-and-mvcc.md step
+   3, docs/deletion-and-gc.md's superseded-input row, a counter
+   `ravel_catalog_dominated_compaction_records_total` or the existing sibling
+   counter widened, and the #4507 test un-ignored and asserting that the
+   served set is exactly the rewrite record's parts and the later erasure pass
+   succeeds. The rule needs an ADR-1029 amendment of its own when it lands,
+   since it narrows decision 2's "a claim bug cannot corrupt data" to "a claim
+   bug costs a wasted compaction".
+3. The claim renewal immediately before the PUT (the issue's proposed fix) is
+   still worth adding as a narrowing, in the same change or after, but it is
+   not the fix and must not be described as one.
+4. The shared create-only key is decided by an ADR, held for the human (section
+   7). It is not needed for 0.35.0 once the reader rule is in.
+5. Priority: before 0.35.0, above #4501 and #4428. The 0.34.0 note already
+   promises the fix in 0.35.0, the window is reachable by an ordinary VM or
+   GC pause at the default lease, and Antithesis pause injection reaches it on
+   purpose.
+
+### Confidence
+
+High on the texts. High on rejecting the fencing token. Medium-high on the
+dominance rule: the input-equality argument is exact for the race the test
+reproduces; the implementer must show the sweep side with a test that pins a
+dominated version 1 record's parts and inputs reclaimed in one group.
+
+### Draft corrected 0.34.0 known-issue text (CHANGELOG.md, edited in place)
+
+```markdown
+**Known issue: an erasure that races a compaction or migrate of the same
+bucket can publish beside it (#4449).** When both publish, every reader serves
+the erased series again, rows of that bucket are returned twice, and every
+later erasure of the bucket fails with `MultipleLiveRecords`. With
+`--maintain-claims off`, or with `ravel-cli maintain compact-bucket`,
+`compact-tenant` or `migrate` run with `--no-claim` beside a live fleet,
+nothing fences the two. With claims on, the default, the bucket claim and the
+pre-publish re-list fence every case but one: a pass that stalls for longer
+than the remaining claim lease (about 200 to 300 s at the default 300 s lease,
+from a process freeze, a VM or container pause, or a PUT stalled inside the
+client's timeout) between its re-list and its record PUT publishes anyway, and
+so does the pass that took its claim. Keep claims on, keep the lease above the
+longest pause the platform can impose, and treat `MultipleLiveRecords` from the
+erasure pass as this issue. 0.33.0 has the same race. The fix, a reader-side
+rule under which the rewrite dominates a compaction record over the same
+inputs, is planned for 0.35.0.
+```
+
+### Draft amendment text for ADR-1029
+
+The heading "Amendment (2026-10-03): the claim fences the compaction and
+erasure rewrite publishes (issue #2199)" exists once; its point 7 gains the
+pointer sentence "The outcome of that window is stated by the 2026-11-20
+outcome amendment below." after "the pass that stole the claim can publish too."
+
+```markdown
+## Amendment (2026-11-20, #4449): what the residual publish window does, and how it closes
+
+<!-- amendment-applies: sections="Amendment (2026-10-03): the claim fences the compaction and erasure rewrite publishes (issue #2199)" pointer="2026-11-20 outcome amendment" -->
+
+Point 7 of the 2026-10-03 amendment names the window the claim and the
+re-list leave open: an owner that stalls longer than the lease between its
+re-list and its record PUT publishes, and so does the pass that stole its
+claim. It did not say what that produces. Reproduced with claims on, with
+injected clocks and a store gate parking the compaction inside its record
+PUT: both records land, every reader serves the compaction's parts beside
+the rewrite's, so the erased series is served again and the bucket's
+surviving rows are returned twice, and every later erasure pass over the
+bucket fails with `MultipleLiveRecords`, so the request never completes and
+its `.dreq` is never retired. The window is reached by any stall of about
+200 to 300 s at the default lease (the claim is at most a third of the lease
+old at the publish checkpoint): a process freeze, a VM or container pause,
+or a PUT stalled inside the client's timeout. A claim renewal immediately
+before the PUT narrows it and cannot close it, because the stall can land
+after any client-side check and the store conditions a write on its own key
+only.
+
+The closure is on the read side, applied identically by every bucket
+resolution: a version 1 compaction record that is not in a live rewrite's
+chain and whose every input is among that rewrite's effective inputs is
+dominated by the rewrite. Readers drop its parts, the superseded-input sweep
+reclaims it and its parts in the rewrite's chain group, as for a dominated
+version 2 record, and the erasure pass treats it as superseded. In the race
+above both passes planned from one listing, so the compaction's inputs are
+exactly the rewrite's, and the rewrite's parts hold every row of those inputs
+minus the erased ones; nothing is lost. A compaction record whose inputs are
+not all covered is a genuine conflict and is served as today, counted and
+warned. Decision 2's statement that a claim bug cannot corrupt data is
+restored in this form: between a compaction and an erasure rewrite a lost or
+late claim costs a wasted compaction, never a served erased row. Making the
+two record kinds collide at one create-only key per bucket, which point 6
+rejected as a key-layout change, remains the store-side closure and needs its
+own ADR if it is ever wanted.
+```
 
 ## 6. Order and priority for the next week
 
