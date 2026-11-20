@@ -13,6 +13,9 @@
 #       variant) from config-coverage/ on the same images, as test
 #       ravel-ingest-durability-coverage with attrs.variant=coverage. Not
 #       with a mutant.
+#   CONFIG=config-faults  the fault-switch variant (README.md, Fault-switch
+#       variant), as test ravel-ingest-durability-faults with
+#       attrs.variant=faults. Not with a mutant.
 set -euo pipefail
 HOURS="${1:?max compute hours}"
 DESC="${2:-ravel ingest durability}"
@@ -36,8 +39,17 @@ case "$VARIANT_CONFIG" in
         VARIANT_PARAMS=(--param attrs.variant=coverage)
         DESC="$DESC (coverage variant)"
         ;;
+    config-faults)
+        if [ -n "$MUTANT" ]; then
+            echo "refused: mutant runs use the base config; unset CONFIG or RAVEL_ANTITHESIS_MUTANT" >&2
+            exit 1
+        fi
+        TEST_NAME=ravel-ingest-durability-faults
+        VARIANT_PARAMS=(--param attrs.variant=faults)
+        DESC="$DESC (fault-switch variant)"
+        ;;
     *)
-        echo "refused: CONFIG must be config or config-coverage, not '$VARIANT_CONFIG'" >&2
+        echo "refused: CONFIG must be config, config-coverage or config-faults, not '$VARIANT_CONFIG'" >&2
         exit 1 ;;
 esac
 CONFIG="$WL/$VARIANT_CONFIG"

@@ -10,11 +10,11 @@
 //! `WORKLOAD_COVERAGE=1` turns on the coverage variant (`coverage.rs`).
 
 mod coverage;
+mod stop;
 
 use ravel_antithesis_driver::{model, otlp, ravel};
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +44,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WINDOW_SLACK_NS: u64 = 600 * 1_000_000_000;
 /// Writes verified by one token read in the eventually.
 const TOKEN_BATCH: usize = 20;
+/// How long a forced eventually waits for a rule to start it before the
+/// timer thread runs it itself.
+const FORCED_BACKSTOP: Duration = Duration::from_secs(600);
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -89,8 +92,7 @@ struct Shared {
     /// Every rule holds a read guard while it acts; the eventually takes the
     /// write guard so it checks a quiet system.
     gate: RwLock<()>,
-    stopping: AtomicBool,
-    eventually_lock: Mutex<()>,
+    stop: stop::Stop,
     eventually_on: bool,
     max_writes: usize,
     /// `WORKLOAD_INJECT_MISSING_RECORD=1`: the local loop's self-check.
@@ -177,14 +179,24 @@ fn classify(signal: Signal, mode: Mode, reply: &Reply) -> Attempt {
 }
 
 impl Shared {
-    /// A read guard for one rule, or `None` once the eventually started.
-    fn enter(&self) -> Option<RwLockReadGuard<'_, ()>> {
-        if self.stopping.load(Ordering::SeqCst) {
-            return None;
+    /// The first statement of every rule: runs the forced eventually when the
+    /// timer asked for one, and parks the thread for good once faults stopped
+    /// (#4502).
+    fn halt_if_stopping(&self) {
+        if self.stop.forced() && !self.stop.stopping() {
+            run_eventually(self, "forced by WORKLOAD_EVENTUALLY_AFTER_SECS");
         }
+        self.stop.halt_if_stopping();
+    }
+
+    /// A read guard for one rule. Once the eventually started, the rule
+    /// halts instead, releasing the gate first so the eventually can take it.
+    fn enter(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        self.stop.halt_if_stopping();
         let guard = self.gate.read().unwrap_or_else(|e| e.into_inner());
-        if self.stopping.load(Ordering::SeqCst) {
-            return None;
+        if self.stop.stopping() {
+            drop(guard);
+            stop::halt();
         }
         Some(guard)
     }
@@ -775,7 +787,7 @@ impl Shared {
 
     fn eventually(&self, tc: &TestCase) {
         let s = self;
-        if !s.eventually_on || s.stopping.load(Ordering::SeqCst) {
+        if !s.eventually_on {
             return;
         }
         // The coverage self-check runs its eventually only when forced, so
@@ -801,102 +813,91 @@ impl Shared {
     }
 }
 
+// Every rule's first statement is `self.0.halt_if_stopping();`: once the
+// eventually starts no rule returns, so the engine cannot spin no-op rounds
+// (#4502). stop.rs's tests check the source for it.
 #[hegel::concurrent_state_machine]
 impl Workload {
     #[rule(groups = ["main"], weight = 6)]
     fn write_logs(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         self.0.write_logs(&tc);
     }
 
     #[rule(groups = ["main"], weight = 3)]
     fn write_metrics(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         self.0.write_metrics(&tc);
     }
 
     #[rule(groups = ["main"], weight = 3)]
     fn read_with_tokens(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         self.0.read_with_tokens(&tc);
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn scan_without_token(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         self.0.scan_without_token(&tc);
     }
 
     #[rule(groups = ["main"])]
     fn eventually(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
         self.0.eventually(&tc);
     }
 }
 
 /// The coverage variant's machine: the base rules, plus graceful drains.
-///
-/// Once the eventually starts, every rule returns at once, and the machine
-/// keeps drawing steps while the eventually waits. The coverage eventually
-/// can wait minutes for a drain to settle, and steps drawn that fast grow the
-/// driver's memory until it is killed, so each rule here sleeps first.
 struct CoverageWorkload(Arc<Shared>);
-
-impl CoverageWorkload {
-    fn idle_if_stopping(&self) -> bool {
-        if self.0.stopping.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(200));
-            return true;
-        }
-        false
-    }
-}
 
 #[hegel::concurrent_state_machine]
 impl CoverageWorkload {
     #[rule(groups = ["main"], weight = 6)]
     fn write_logs(&self, tc: TestCase) {
-        if !self.idle_if_stopping() {
-            self.0.write_logs(&tc);
-        }
+        self.0.halt_if_stopping();
+        self.0.write_logs(&tc);
     }
 
     #[rule(groups = ["main"], weight = 3)]
     fn write_metrics(&self, tc: TestCase) {
-        if !self.idle_if_stopping() {
-            self.0.write_metrics(&tc);
-        }
+        self.0.halt_if_stopping();
+        self.0.write_metrics(&tc);
     }
 
     #[rule(groups = ["main"], weight = 3)]
     fn read_with_tokens(&self, tc: TestCase) {
-        if !self.idle_if_stopping() {
-            self.0.read_with_tokens(&tc);
-        }
+        self.0.halt_if_stopping();
+        self.0.read_with_tokens(&tc);
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn scan_without_token(&self, tc: TestCase) {
-        if !self.idle_if_stopping() {
-            self.0.scan_without_token(&tc);
-        }
+        self.0.halt_if_stopping();
+        self.0.scan_without_token(&tc);
     }
 
     #[rule(groups = ["main"], weight = 1)]
     fn drain(&self, tc: TestCase) {
-        if !self.idle_if_stopping() {
-            self.0.drain(&tc);
-        }
+        self.0.halt_if_stopping();
+        self.0.drain(&tc);
     }
 
     #[rule(groups = ["main"])]
     fn eventually(&self, tc: TestCase) {
-        if !self.idle_if_stopping() {
-            self.0.eventually(&tc);
-        }
+        self.0.halt_if_stopping();
+        self.0.eventually(&tc);
     }
 }
 
 /// Stop faults for good, wait for the system to recover, assert every
-/// guarantee that must hold once faults stop, then end the timeline.
+/// guarantee that must hold once faults stop, then end the timeline. Only
+/// the first caller runs it; any other caller halts.
 fn run_eventually(s: &Shared, reason: &str) -> ! {
-    s.stopping.store(true, Ordering::SeqCst);
-    let _only = lock(&s.eventually_lock);
+    if !s.stop.begin_eventually() {
+        stop::halt();
+    }
     let _quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
     println!("eventually ({reason}): stopping faults");
     // The Antithesis platform sets ANTITHESIS_STOP_FAULTS in every container
@@ -912,6 +913,10 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     // No drain may start once the checks below begin.
     if let Some(cov) = &s.cov {
         cov.settle_drains();
+        // ANTITHESIS_STOP_FAULTS stops the platform's faults but not Ravel's
+        // own fault switches, which each server read once at startup: turn
+        // them off for every later start and restart each node.
+        cov.switch_faults_off(&s.ravel.nodes);
     }
 
     let deadline = Instant::now() + Duration::from_secs(300);
@@ -1089,8 +1094,7 @@ fn main(tc: TestCase) {
         ravel,
         model: Mutex::new(Model::default()),
         gate: RwLock::new(()),
-        stopping: AtomicBool::new(false),
-        eventually_lock: Mutex::new(()),
+        stop: stop::Stop::default(),
         eventually_on: cfg.eventually_on,
         max_writes: cfg.max_writes,
         inject_missing: std::env::var("WORKLOAD_INJECT_MISSING_RECORD").is_ok_and(|v| v == "1"),
@@ -1110,11 +1114,21 @@ fn main(tc: TestCase) {
     }
     assert_reachable!("the workload starts", &json!({}));
 
+    // The forced eventually (local loops only) runs inside the next rule, so
+    // no rule returns once it starts (#4502). The backstop runs it here only
+    // if no rule picked the request up, for example every worker stuck in a
+    // long write.
     if let Some(secs) = cfg.eventually_after {
         let s = Arc::clone(&shared);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
-            run_eventually(&s, "forced by WORKLOAD_EVENTUALLY_AFTER_SECS");
+            s.stop.request_forced();
+            if !s
+                .stop
+                .wait_started(FORCED_BACKSTOP, Duration::from_millis(200))
+            {
+                run_eventually(&s, "forced backstop: no rule took the request");
+            }
         });
     }
 

@@ -1,0 +1,18 @@
+# The fault-switch variant's local gate (scripts/local-run.sh with
+# CONFIG=config-faults; README.md, "Fault-switch variant"). Same format as
+# coverage-required.tsv:
+#   required    must be hit with its condition true at least once, or the run fails
+#   reported    listed in the report, not gated (reachability depends on rates and timing)
+required	fault: ingest/encode-cancelled fired
+required	fault: ingest/data-put-refused fired
+required	every node restarted with its fault switches off before the eventually's checks
+required	a strict write was answered with a partial success
+required	a write answered with an error status carries no commit token
+required	a driver-requested drain is answered or reported interrupted
+reported	logs ingest: a write committed on some shards before a sibling shard failed
+reported	metrics ingest: a write committed on some shards before a sibling shard failed
+reported	logs ingest: a write found its shard actor unavailable
+reported	metrics ingest: a write found its shard actor unavailable
+reported	metrics ingest: a write was answered Abandoned
+reported	a log write was answered 503
+reported	a metrics write was answered 503

@@ -19,6 +19,10 @@
 #                                     unless every "required" assertion in
 #                                     local/coverage-required.tsv was hit with
 #                                     its condition true.
+#   CONFIG=config-faults              the fault-switch variant (README.md,
+#                                     "Fault-switch variant"): the coverage
+#                                     variant with Ravel's fault switches on,
+#                                     gated on local/faults-required.tsv.
 #   WORKLOAD_COVERAGE_SELF_CHECK=1    with CONFIG=config-coverage: the
 #                                     variant's self-check, which breaks each
 #                                     of its properties on purpose; the run
@@ -39,8 +43,9 @@ MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
 VARIANT_CONFIG="${CONFIG:-config}"
 case "$VARIANT_CONFIG" in
     config) VARIANT=base ;;
-    config-coverage) VARIANT=coverage ;;
-    *) echo "refused: CONFIG must be config or config-coverage, not '$VARIANT_CONFIG'"; exit 1 ;;
+    config-coverage) VARIANT=coverage; REQUIRED_TSV="$WL/local/coverage-required.tsv" ;;
+    config-faults) VARIANT=coverage; REQUIRED_TSV="$WL/local/faults-required.tsv" ;;
+    *) echo "refused: CONFIG must be config, config-coverage or config-faults, not '$VARIANT_CONFIG'"; exit 1 ;;
 esac
 if [ "$VARIANT" = coverage ] && [ -n "$MUTANT" ]; then
     echo "refused: mutant runs use the base config; unset CONFIG or RAVEL_ANTITHESIS_MUTANT"
@@ -204,13 +209,13 @@ if [ "$VARIANT" = coverage ]; then
         NR == FNR { hits[$4] = $2; passes[$4] = $3; next }
         /^#/ || NF < 2 { next }
         { printf "%s\t%d\t%d\t%s\n", $1, hits[$2], passes[$2], $2 }
-    ' "$OUT/assertions.tsv" "$WL/local/coverage-required.tsv" > "$OUT/coverage.tsv"
+    ' "$OUT/assertions.tsv" "$REQUIRED_TSV" > "$OUT/coverage.tsv"
     echo "coverage variant (class, hits, passes, message):"
     cat "$OUT/coverage.tsv"
     required=$(awk -F'\t' '$1 == "required"' "$OUT/coverage.tsv" | wc -l)
     awk -F'\t' '$1 == "required" && $3 < 1 { print $4 }' "$OUT/coverage.tsv" > "$OUT/coverage-unmet.tsv"
     if [ "$required" -eq 0 ]; then
-        echo "FAIL: no required assertion read from local/coverage-required.tsv"
+        echo "FAIL: no required assertion read from $REQUIRED_TSV"
         exit 1
     fi
     if [ -s "$OUT/coverage-unmet.tsv" ]; then

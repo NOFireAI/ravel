@@ -117,6 +117,17 @@ const METRICS_429: Prop = Prop {
     message: "a metrics write was answered 429",
 };
 
+/// Fault-switch profile only (`WORKLOAD_FAULT_SWITCHES=1`): every node was
+/// restarted after the driver wrote `faults-off`, so none runs with Ravel's
+/// fault switches on while the eventually checks recovery.
+const FAULTS_OFF: Prop = Prop {
+    kind: Kind::Always,
+    message: "every node restarted with its fault switches off before the eventually's checks",
+};
+
+/// How long the eventually waits for each node's switch-off restart.
+const FAULTS_OFF_RESTART: Duration = Duration::from_secs(180);
+
 const PROPS: [&Prop; 10] = [
     &DRAIN_ANSWERED,
     &HEAD_SHED_STORES_NOTHING,
@@ -179,6 +190,9 @@ pub struct Coverage {
     /// Per write: how many poison records or points it carries.
     poison: Mutex<HashMap<u64, u32>>,
     drains: Mutex<Drains>,
+    /// `WORKLOAD_FAULT_SWITCHES=1`: the servers run with
+    /// `RAVEL_ANTITHESIS_FAULTS` set, which the eventually turns off.
+    pub fault_switches: bool,
     /// `WORKLOAD_COVERAGE_SELF_CHECK=1`: the local loop's self-check. Each of
     /// the variant's always-properties is fed an input that breaks it, so
     /// each must fail; the supervisor breaks the drains to match.
@@ -200,8 +214,17 @@ impl Coverage {
             .ok()
             .as_deref()
             == Some("1");
-        println!("coverage variant: on, control directory {control}, self-check {self_check}");
-        Some(Coverage::new(PathBuf::from(control), self_check))
+        let fault_switches = std::env::var("WORKLOAD_FAULT_SWITCHES").ok().as_deref() == Some("1");
+        if fault_switches {
+            emit(&FAULTS_OFF, false, false, &Value::Null);
+        }
+        println!(
+            "coverage variant: on, control directory {control}, self-check {self_check}, \
+             fault switches {fault_switches}"
+        );
+        let mut cov = Coverage::new(PathBuf::from(control), self_check);
+        cov.fault_switches = fault_switches;
+        Some(cov)
     }
 
     fn new(control: PathBuf, self_check: bool) -> Coverage {
@@ -210,8 +233,71 @@ impl Coverage {
             head_shed: Mutex::new(HashMap::new()),
             poison: Mutex::new(HashMap::new()),
             drains: Mutex::new(Drains::default()),
+            fault_switches: false,
             self_check,
         }
+    }
+
+    /// The fault-switch profile's half of stopping faults: write `faults-off`
+    /// to the control volume, which every later supervisor start reads, then
+    /// drain each node in turn and wait for it to come back. Each server read
+    /// `RAVEL_ANTITHESIS_FAULTS` once at startup, so only a restart turns its
+    /// switches off. Call after `settle_drains`, with no drain pending.
+    pub fn switch_faults_off(&self, nodes: &[String]) {
+        if !self.fault_switches {
+            return;
+        }
+        let off = self.control.join("faults-off");
+        if let Err(e) = self.put(&off, "1\n") {
+            println!("fault switches: writing {}: {e}", off.display());
+            check(&FAULTS_OFF, false, json!({ "write_failed": e.to_string() }));
+            return;
+        }
+        let mut d = lock(&self.drains);
+        let mut restarted = Vec::new();
+        let mut failed = Vec::new();
+        for url in nodes {
+            let Some(host) = host_of(url) else {
+                failed.push(format!("no host in {url}"));
+                continue;
+            };
+            d.next_seq += 1;
+            let seq = d.next_seq;
+            let request = self.control.join(format!("drain-{host}"));
+            if let Err(e) = self.put(&request, &format!("{seq}\n")) {
+                failed.push(format!("{host}: writing the request: {e}"));
+                continue;
+            }
+            println!("fault switches: restarting {host} with switches off (seq {seq})");
+            let result = self.control.join(format!("drained-{host}"));
+            let deadline = Instant::now() + FAULTS_OFF_RESTART;
+            let answer = loop {
+                match std::fs::read_to_string(&result) {
+                    Ok(text) if parse_drain_result(&text).seq == Some(seq) => {
+                        let _ = std::fs::remove_file(&result);
+                        break Some(text);
+                    }
+                    Ok(_) | Err(_) if Instant::now() >= deadline => break None,
+                    _ => std::thread::sleep(Duration::from_secs(1)),
+                }
+            };
+            match answer {
+                // An interrupted drain means the container was stopped and
+                // started again; its new supervisor also read `faults-off`.
+                Some(text) => restarted.push(format!("{host}: {}", text.trim())),
+                None => {
+                    let _ = std::fs::remove_file(&request);
+                    failed.push(format!("{host}: no answer in {FAULTS_OFF_RESTART:?}"));
+                }
+            }
+        }
+        d.last_request = Some(Instant::now());
+        println!("fault switches: restarted {restarted:?}, failed {failed:?}");
+        check(
+            &FAULTS_OFF,
+            failed.is_empty(),
+            json!({ "restarted": restarted, "failed": failed }),
+        );
     }
 
     /// Poison records for a log write: only strict and unkeyed ones, since a
