@@ -34,7 +34,9 @@ connection, a pushed-but-broken main).
   follows `ravel-agents-runtime` or `ravel-agents-sim`. The `invariants`
   lane (clippy and tests with
   `--features ravel-invariant/capture,ravel-invariant/antithesis-mutants`,
-  then a clippy with `--features ravel-invariant/antithesis` alone) runs when
+  then a clippy with `--features ravel-invariant/antithesis` alone and tests
+  that way of all but `ravel-catalog`, #4508; the executor tier leaves those
+  tests to CI) runs when
   `ravel-invariant`, `ravel-commit`, `ravel-ingest`, `ravel-catalog`,
   `ravel-maintain` or `ravel-fleet` is in the closure, and the
   `invariants-services` lane, the capture and mutants clippy and tests for

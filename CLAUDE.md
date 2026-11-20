@@ -187,7 +187,9 @@ builds them as dependencies and cargo never compiles a dependency's
 An `invariants` lane (clippy and tests of ravel-invariant, ravel-commit,
 ravel-ingest, ravel-catalog, ravel-maintain and ravel-fleet with
 `--features ravel-invariant/capture,ravel-invariant/antithesis-mutants`, then
-a clippy of the six with `--features ravel-invariant/antithesis` alone) runs
+a clippy of the six with `--features ravel-invariant/antithesis` alone, and
+tests that way of all but ravel-catalog, #4508; the executor tier leaves those
+tests to CI) runs
 whenever one of those six is in scope, matching CI's `invariants` job. An
 `invariants-services` lane runs the capture and mutants clippy and tests for
 ravel-server and ravel-cli whenever either is in scope, matching CI's
