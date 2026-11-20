@@ -127,6 +127,10 @@ const FAULTS_OFF: Prop = Prop {
 
 /// How long the eventually waits for each node's switch-off restart.
 const FAULTS_OFF_RESTART: Duration = Duration::from_secs(180);
+/// How long the eventually waits for a node to answer `readyz` before it
+/// asks for its switch-off restart: the recovery wait the eventually
+/// allows the same nodes.
+const FAULTS_OFF_READY: Duration = Duration::from_secs(300);
 
 const PROPS: [&Prop; 10] = [
     &DRAIN_ANSWERED,
@@ -243,24 +247,58 @@ impl Coverage {
     /// drain each node in turn and wait for it to come back. Each server read
     /// `RAVEL_ANTITHESIS_FAULTS` once at startup, so only a restart turns its
     /// switches off. Call after `settle_drains`, with no drain pending.
-    pub fn switch_faults_off(&self, nodes: &[String]) {
+    ///
+    /// `ready(i)` says whether node `i` answers `readyz`. A node a fault
+    /// stopped just before the eventually is waited for, up to
+    /// [`FAULTS_OFF_READY`], before its drain is requested: a request no
+    /// supervisor is alive to take is not a failed switch-off.
+    pub fn switch_faults_off(&self, nodes: &[String], ready: &dyn Fn(usize) -> bool) {
         if !self.fault_switches {
             return;
         }
-        let off = self.control.join("faults-off");
-        if let Err(e) = self.put(&off, "1\n") {
-            println!("fault switches: writing {}: {e}", off.display());
-            check(&FAULTS_OFF, false, json!({ "write_failed": e.to_string() }));
-            return;
-        }
-        let mut d = lock(&self.drains);
+        let (restarted, failed) =
+            self.switch_faults_off_within(nodes, ready, FAULTS_OFF_READY, FAULTS_OFF_RESTART);
+        println!("fault switches: restarted {restarted:?}, failed {failed:?}");
+        check(
+            &FAULTS_OFF,
+            failed.is_empty(),
+            json!({ "restarted": restarted, "failed": failed }),
+        );
+    }
+
+    /// [`Self::switch_faults_off`] with its two waits given, returning the
+    /// nodes restarted and the failures.
+    fn switch_faults_off_within(
+        &self,
+        nodes: &[String],
+        ready: &dyn Fn(usize) -> bool,
+        ready_wait: Duration,
+        answer_wait: Duration,
+    ) -> (Vec<String>, Vec<String>) {
         let mut restarted = Vec::new();
         let mut failed = Vec::new();
-        for url in nodes {
+        let off = self.control.join("faults-off");
+        if let Err(e) = self.put(&off, "1\n") {
+            failed.push(format!("writing {}: {e}", off.display()));
+            return (restarted, failed);
+        }
+        let mut d = lock(&self.drains);
+        for (i, url) in nodes.iter().enumerate() {
             let Some(host) = host_of(url) else {
                 failed.push(format!("no host in {url}"));
                 continue;
             };
+            let ready_by = Instant::now() + ready_wait;
+            while !ready(i) {
+                if Instant::now() >= ready_by {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            if !ready(i) {
+                failed.push(format!("{host}: not ready within {ready_wait:?}"));
+                continue;
+            }
             d.next_seq += 1;
             let seq = d.next_seq;
             let request = self.control.join(format!("drain-{host}"));
@@ -270,7 +308,7 @@ impl Coverage {
             }
             println!("fault switches: restarting {host} with switches off (seq {seq})");
             let result = self.control.join(format!("drained-{host}"));
-            let deadline = Instant::now() + FAULTS_OFF_RESTART;
+            let deadline = Instant::now() + answer_wait;
             let answer = loop {
                 match std::fs::read_to_string(&result) {
                     Ok(text) if parse_drain_result(&text).seq == Some(seq) => {
@@ -278,7 +316,7 @@ impl Coverage {
                         break Some(text);
                     }
                     Ok(_) | Err(_) if Instant::now() >= deadline => break None,
-                    _ => std::thread::sleep(Duration::from_secs(1)),
+                    _ => std::thread::sleep(Duration::from_millis(200)),
                 }
             };
             match answer {
@@ -287,17 +325,12 @@ impl Coverage {
                 Some(text) => restarted.push(format!("{host}: {}", text.trim())),
                 None => {
                     let _ = std::fs::remove_file(&request);
-                    failed.push(format!("{host}: no answer in {FAULTS_OFF_RESTART:?}"));
+                    failed.push(format!("{host}: no answer in {answer_wait:?}"));
                 }
             }
         }
         d.last_request = Some(Instant::now());
-        println!("fault switches: restarted {restarted:?}, failed {failed:?}");
-        check(
-            &FAULTS_OFF,
-            failed.is_empty(),
-            json!({ "restarted": restarted, "failed": failed }),
-        );
+        (restarted, failed)
     }
 
     /// Poison records for a log write: only strict and unkeyed ones, since a
@@ -1059,6 +1092,99 @@ mod tests {
         cov.settle_drains();
         assert!(lock(&cov.drains).pending.is_none());
         assert!(!dir.join("drained-ravel1").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn switch_off_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("a2cov-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// A stand-in supervisor for `host`, alive from `up_at` on: answers each
+    /// drain request it finds with `code=0`, until `stop` is set.
+    fn answering_supervisor(
+        dir: PathBuf,
+        host: &'static str,
+        up_at: Instant,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let request = dir.join(format!("drain-{host}"));
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if Instant::now() < up_at {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                if let Ok(seq) = std::fs::read_to_string(&request) {
+                    let _ = std::fs::remove_file(&request);
+                    let _ = std::fs::write(
+                        dir.join(format!("drained-{host}")),
+                        format!("seq={} code=0\n", seq.trim()),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    }
+
+    const TWO_NODES: [&str; 2] = ["http://ravel1:4318", "http://ravel2:4318"];
+
+    /// A node that is still down when the switch-off starts is waited for,
+    /// not counted as failed: ravel2 (container and supervisor) comes up
+    /// only after the 1 s answer wait would have run out, and both nodes
+    /// then restart. Requesting its drain before it is ready fails here.
+    #[test]
+    fn switch_off_waits_for_a_node_that_is_not_ready_yet() {
+        let dir = switch_off_dir("switch-wait");
+        let cov = Coverage::new(dir.clone(), false);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let start = Instant::now();
+        let ravel2_up = start + Duration::from_secs(2);
+        let sups = [
+            answering_supervisor(dir.clone(), "ravel1", start, stop.clone()),
+            answering_supervisor(dir.clone(), "ravel2", ravel2_up, stop.clone()),
+        ];
+        let ready = |node: usize| node == 0 || Instant::now() >= ravel2_up;
+        let nodes: Vec<String> = TWO_NODES.iter().map(|s| s.to_string()).collect();
+        let (restarted, failed) = cov.switch_faults_off_within(
+            &nodes,
+            &ready,
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        );
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        for s in sups {
+            let _ = s.join();
+        }
+        assert!(dir.join("faults-off").exists());
+        assert_eq!(failed, Vec::<String>::new());
+        assert_eq!(restarted.len(), 2, "{restarted:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node that never becomes ready fails the switch-off without a drain
+    /// request left behind for it; a ready node that never answers fails
+    /// with its request withdrawn.
+    #[test]
+    fn switch_off_reports_a_node_never_ready_and_one_never_answering() {
+        let dir = switch_off_dir("switch-fail");
+        let cov = Coverage::new(dir.clone(), false);
+        let nodes: Vec<String> = TWO_NODES.iter().map(|s| s.to_string()).collect();
+        let ready = |node: usize| node == 1;
+        let (restarted, failed) = cov.switch_faults_off_within(
+            &nodes,
+            &ready,
+            Duration::from_millis(600),
+            Duration::from_millis(600),
+        );
+        assert!(restarted.is_empty(), "{restarted:?}");
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        assert!(failed[0].starts_with("ravel1: not ready"), "{failed:?}");
+        assert!(failed[1].starts_with("ravel2: no answer"), "{failed:?}");
+        assert!(!dir.join("drain-ravel1").exists());
+        assert!(!dir.join("drain-ravel2").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

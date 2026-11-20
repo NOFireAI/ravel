@@ -916,7 +916,7 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         // ANTITHESIS_STOP_FAULTS stops the platform's faults but not Ravel's
         // own fault switches, which each server read once at startup: turn
         // them off for every later start and restart each node.
-        cov.switch_faults_off(&s.ravel.nodes);
+        cov.switch_faults_off(&s.ravel.nodes, &|node| s.ravel.ready(node).is_ok());
     }
 
     let deadline = Instant::now() + Duration::from_secs(300);
