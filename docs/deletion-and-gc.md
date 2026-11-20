@@ -752,7 +752,7 @@ is dropped by the rewrite and stays erased after the request is swept
 
 That guarantee covers a bucket whose rewrite for the request ran on a build
 with this rule (0.35.0 onward). Builds before it matched log record
-attributes only (#4503). A bucket such a build already rewrote for a request
+attributes only. A bucket such a build already rewrote for a request
 is skipped as already applied, even while the request is still pending, and
 keeps the records that build did not match; they are served again once the
 request is swept. For a logs request whose subject can appear in a resource
