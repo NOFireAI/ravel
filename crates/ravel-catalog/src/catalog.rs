@@ -4885,7 +4885,7 @@ impl Catalog {
         {
             self.assert_token_never_stale(tenant, signal, token, false, "superseded by rewrite")
                 .await;
-            // #4428: unreachable under the shipped sweep, which holds a
+            // Judged unreachable in #4428: the superseded-input sweep holds a
             // rewrite's whole chain group while HEAD names any of it. A set
             // that cannot be judged evaluates nothing.
             ravel_invariant::inv_always_if_known!(
