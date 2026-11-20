@@ -185,10 +185,8 @@ The evidence comes from two fleet tasks plus the pull request's CI:
 - **The R1 executor** (`role=gate`) runs:
   - the discovery sweep above until it is clean;
   - `scripts/gates.sh --tier executor` scoped to every crate it edits;
-  - the MSRV proof for decision 2, `cargo +1.97.0 check --locked
-    --workspace --all-targets` with each feature set the gates' lanes select
-    (`sql`, `flight-sql`, `esql`, `otap`, `agents`, `mcp`, the ravel-bench
-    and ravel-cli sets);
+  - the shipped image's feature set, `-p ravel-server --features
+    sql,flight-sql,otap,agents,mcp`, in the clippy sweep;
   - the `ravel-compat-tests` fmt, clippy and test steps, against its own
     manifest.
 - **A read-only fleet task** runs the unscoped merge gate
@@ -196,6 +194,15 @@ The evidence comes from two fleet tasks plus the pull request's CI:
   on the result ref, on the `role=gate` executor: 484 GB volume, with
   static.rust-lang.org on its egress allowlist. It is a separate task so the
   4 h executor ceiling covers each half.
+- **A second read-only fleet task** runs the MSRV proof for decision 2 on
+  the result ref: `cargo +1.97.0 check --locked --all-targets` for every
+  package and feature selection that `RAVEL_GATES_ALLOW_UNSCOPED=1
+  scripts/gates.sh --dry-run` lists (the workspace, the server's sql,
+  flight-sql, esql, agents and mcp lanes, the bench, stage-timing, ravel-cli
+  and Antithesis `ravel-invariant` lanes), plus the shipped image's
+  `sql,flight-sql,otap,agents,mcp` set. The proof follows the gate's own
+  list, so a lane added later is covered too. It also runs the
+  `incompatible_msrv` probe below.
 - **The pull request's CI** runs every lane, because the toml change forces
   them all, including `docker-build` and `compat-tests`.
 
@@ -221,8 +228,9 @@ passes.
 
 ### 2. MSRV: keep 1.97 through this epic, prove it, raise it later on its own
 
-`rust-version` stays `"1.97"` in both manifests. R1 proves it with the
-`cargo +1.97.0 check --locked` runs above, across the shipped feature sets.
+`rust-version` stays `"1.97"` in both manifests. The second read-only task
+under Gating proves it with `cargo +1.97.0 check --locked` across every
+selection the merge gate lists.
 
 With the floor at 1.97, clippy's `incompatible_msrv` refuses std APIs newer
 than 1.97. That is the std half of keeping a compiler rollback a one-commit
@@ -230,17 +238,16 @@ revert. The lint does not see language features or edition-behaviour
 changes stabilised in 1.98 to 1.100, and no standing check covers that half
 after R1's one-off `+1.97.0 check` (rejected alternatives, MSRV lane). This
 epic accepts that risk for the window until the floor is raised. Before any
-compiler rollback, rerun R1's MSRV proof on the rollback candidate. That
-means `cargo +1.97.0 check --locked --workspace --all-targets` plus the same
-command with each feature set listed under Gating above (`sql`,
-`flight-sql`, `esql`, `otap`, `agents`, `mcp`, and the ravel-bench and
-ravel-cli sets). A default-feature check never compiles the flight-sql, esql
-or bench surfaces. Those runs together list the language-feature uses that
-have to be reverted along with the pin. The lint is in clippy's default-on
+compiler rollback, rerun R1's MSRV proof on the rollback candidate (Gating
+above): a `cargo +1.97.0 check` for each selection the merge gate lists, so
+the Antithesis and stage-timing lanes are covered along with the server's
+feature lanes. A default-feature check never compiles the flight-sql, esql,
+bench or Antithesis surfaces. Those runs together list the language-feature
+uses that have to be reverted along with the pin. The lint is in clippy's default-on
 `suspicious` group. It reads `rust-version` when there is no `clippy.toml`,
-and main has none. R1 confirms this once with a throwaway probe: a call to a
-1.98+ std API in a scratch commit must fail `clippy -D warnings`, and the
-probe is dropped before the result commit. If the probe passes, decision 2
+and main has none. The MSRV task confirms this once with a throwaway probe:
+a call to a 1.98+ std API in a scratch change must fail `clippy -D
+warnings`, and the probe is discarded (that task commits nothing). If the probe passes, decision 2
 still holds, but the guard is the `+1.97.0 check` alone, and the ledger
 says so.
 
@@ -401,8 +408,11 @@ source is found.
 - **R4a, unused dependency removals.** The `cargo::unused_dependencies`
   diagnostics are collected under 1.100 for:
   - default features;
-  - every feature lane CI runs (`sql`, `flight-sql`, `esql`, `otap`,
-    `agents`, `mcp`, the ravel-bench and ravel-cli feature sets);
+  - every package and feature selection the merge gate lists
+    (`RAVEL_GATES_ALLOW_UNSCOPED=1 scripts/gates.sh --dry-run`), so the
+    Antithesis, stage-timing, bench and ravel-cli lanes move with it;
+  - the shipped image's set, `-p ravel-server --features
+    sql,flight-sql,otap,agents,mcp`;
   - `--all-features`;
   - `--all-targets`.
 
