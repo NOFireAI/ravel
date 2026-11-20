@@ -778,8 +778,9 @@ publishes, and neither pass may skip it. Concretely:
    re-list and its record PUT is caught by neither: both ran before the steal,
    so it publishes, and the pass that stole the claim can publish too. The
    outcome of that window is stated by the 2026-11-20 outcome amendment
-   below. That is the same short window the unclaimed callers of point 5 have. Between two
-   compactions the re-list also changes how decision 2's convergence plays
+   below. That is the same short window the unclaimed callers of point 5
+   have. Between two compactions the re-list also changes how decision 2's
+   convergence plays
    out: a losing compaction now usually finds the winner's record at its
    re-list and stops with `AlreadyCompacted`, so it rarely reaches
    `publish.rs`'s `resolve_already_exists`, and that path's re-PUT of a
