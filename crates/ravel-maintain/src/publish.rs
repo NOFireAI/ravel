@@ -522,7 +522,7 @@ async fn resolve_already_exists(
 /// 1): against a winner record, as fetched, whose input-set hash differs from
 /// ours, a HEAD after the attempt resolved finds the record at the version
 /// fetched, so the loser wrote nothing to it. A record gone or a failed HEAD
-/// cannot tell. Nothing here runs in the default build.
+/// cannot tell. Returns at once in the default build.
 async fn assert_loser_resolution(
     store: &dyn ObjectStoreBackend,
     record_key: &str,
@@ -540,6 +540,7 @@ async fn assert_loser_resolution(
         ("our_input_set_hash", hex::encode(our_hash)),
         ("outcome", format!("{outcome:?}")),
     ]);
+    let _ = &details;
     let winner = ravel_commit::record::decode_compaction(&existing.data).ok();
     let diverged = winner
         .as_ref()
@@ -1097,7 +1098,11 @@ pub(crate) mod tests {
             for p in &record.parts {
                 let part_key = keys::reconstruct_l1_part_key(&record, p).expect("part key");
                 store
-                    .put(&part_key, bytes::Bytes::new(), PutOptions::create_if_absent())
+                    .put(
+                        &part_key,
+                        bytes::Bytes::new(),
+                        PutOptions::create_if_absent(),
+                    )
                     .await
                     .expect("put part");
             }
@@ -1144,7 +1149,11 @@ pub(crate) mod tests {
             matches!(lost, Err(MaintainError::InputSetHashDivergence { .. })),
             "{lost:?}"
         );
-        assert_ne!(record_bytes(&store, &key).await, winner, "the mutant overwrote");
+        assert_ne!(
+            record_bytes(&store, &key).await,
+            winner,
+            "the mutant overwrote"
+        );
         if !capturing() {
             return;
         }

@@ -1514,8 +1514,8 @@ impl MaintainMemo {
                     .flatten();
                 self.seed_entry(key, state, clamped_ns);
                 // Judged from the snapshot header the store returned: a seeded
-                // entry is no fresher than its snapshot, unless this process
-                // already held a fresher verdict of its own.
+                // entry is no fresher than its snapshot, unless the memo
+                // already held a fresher verdict for the bucket.
                 let _ = prior_ns;
                 ravel_invariant::inv_always!(
                     self.entries.get(&key).is_some_and(|e| {

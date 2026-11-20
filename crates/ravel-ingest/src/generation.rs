@@ -1665,10 +1665,10 @@ impl<H> GenerationSwitch<H> {
                 view.refreshed_at_ns,
             )
         };
-        // Judged from the cached view's refresh stamp, which only a successful
-        // provisioning read sets, against the route hour, in the model's own
-        // form (no grace lead): a grace route lands inside `min_lead_hours` of
-        // the last refresh.
+        // Judged from the cached view's refresh stamp, which only installing a
+        // provisioning read's history sets (a grace route never does), against
+        // the route hour, in the model's own form (no grace lead): a grace
+        // route lands inside `min_lead_hours` of the last refresh.
         let _ = view_refreshed_at_ns;
         ravel_invariant::inv_always!(
             u64::from(hour_of(now_ns))

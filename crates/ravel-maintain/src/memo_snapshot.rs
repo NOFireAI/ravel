@@ -99,10 +99,7 @@ pub async fn write_memo_snapshot(
             Err(StoreError::PreconditionFailed | StoreError::AlreadyExists)
         ),
         "maintenance: a memo snapshot write is an overwrite, never refused as a CAS",
-        std::collections::BTreeMap::from([
-            ("key", key.clone()),
-            ("result", format!("{put:?}")),
-        ])
+        std::collections::BTreeMap::from([("key", key.clone()), ("result", format!("{put:?}")),])
     );
     put?;
     ravel_invariant::inv_reachable!(

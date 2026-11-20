@@ -4663,15 +4663,11 @@ pub(crate) mod tests {
         let now_ns = 10 * NS_PER_HOUR;
         let first = tokio::spawn({
             let store = Arc::clone(&store);
-            async move {
-                append_generation(store.as_ref(), &th, Signal::Metrics, 8, 12, now_ns).await
-            }
+            async move { append_generation(store.as_ref(), &th, Signal::Metrics, 8, 12, now_ns).await }
         });
         let second = tokio::spawn({
             let store = Arc::clone(&store);
-            async move {
-                append_generation(store.as_ref(), &th, Signal::Metrics, 6, 13, now_ns).await
-            }
+            async move { append_generation(store.as_ref(), &th, Signal::Metrics, 6, 13, now_ns).await }
         });
         gate.wait_until_held(2).await;
         let held = gate.held_details();
@@ -4721,7 +4717,10 @@ pub(crate) mod tests {
             .expect("read")
             .expect("present");
         let stored = read_generations(&record, "k").expect("valid history");
-        assert_eq!(stored, won.generations, "the store holds the winner's history");
+        assert_eq!(
+            stored, won.generations,
+            "the store holds the winner's history"
+        );
         if !capturing() {
             return;
         }
