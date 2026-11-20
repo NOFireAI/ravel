@@ -613,6 +613,12 @@ pub mod mutant {
 /// needs `capture`. These wrappers exist wherever the condition compiles and return
 /// the empty value when their backing module is absent. `capturing` tells a
 /// test whether `capture` records, which a condition that runs cannot.
+///
+/// `evaluations` returns `None` when nothing is recorded (`capture` off) and
+/// `Some` of an empty list when `capture` recorded no matching evaluation. A
+/// test that reads it after `scoped_mutant` checks `capturing` first:
+/// `antithesis-mutants` compiles mutants in without `capture`, so the mutant
+/// runs and nothing records its evaluation.
 #[cfg(any(feature = "antithesis", feature = "capture"))]
 #[doc(hidden)]
 pub mod test_support {
@@ -644,7 +650,8 @@ pub mod test_support {
     }
 
     /// `(condition, details)` of every captured evaluation of `message` whose
-    /// details contain `needle`, in order; `None` without `capture`.
+    /// details contain `needle`, in order; `None` without `capture`, and
+    /// `Some` of an empty list when `capture` recorded no match.
     #[cfg(feature = "capture")]
     pub fn evaluations(message: &str, needle: &str) -> Option<Vec<(bool, String)>> {
         Some(
@@ -657,7 +664,8 @@ pub mod test_support {
     }
 
     /// `(condition, details)` of every captured evaluation of `message` whose
-    /// details contain `needle`, in order; `None` without `capture`.
+    /// details contain `needle`, in order; `None` without `capture`, and
+    /// `Some` of an empty list when `capture` recorded no match.
     #[cfg(not(feature = "capture"))]
     pub fn evaluations(message: &str, needle: &str) -> Option<Vec<(bool, String)>> {
         let _ = (message, needle);
@@ -1555,6 +1563,11 @@ mod tests {
         assert!(
             !found[1].0 && found[1].1.contains("needle-a again"),
             "{found:?}"
+        );
+        assert_eq!(
+            crate::test_support::evaluations(MESSAGE, "no-such-needle"),
+            Some(Vec::new()),
+            "capture on with no match is an empty list, not None"
         );
     }
 

@@ -134,6 +134,7 @@ cli_explain_test='==> cargo nextest run --locked -p ravel-cli --features sql-exp
 invariants_clippy='==> cargo clippy --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --all-targets -- -D warnings'
 invariants_test='==> cargo nextest run --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants'
 invariants_antithesis_clippy='==> cargo clippy --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis --all-targets -- -D warnings'
+invariants_antithesis_test='==> cargo nextest run --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis'
 invariants_services_clippy='==> cargo clippy --locked -p ravel-server -p ravel-cli --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --all-targets -- -D warnings'
 invariants_services_test='==> cargo nextest run --locked -p ravel-server -p ravel-cli --features ravel-invariant/capture,ravel-invariant/antithesis-mutants'
 ingest_shipping_clippy='==> cargo clippy --locked -p ravel-ingest --all-targets -- -D warnings'
@@ -234,12 +235,20 @@ check_eq "gates -p ravel-commit: invariants lane antithesis-alone clippy" "1" \
   "$(count "${out}" "${invariants_antithesis_clippy}")"
 check_eq "gates -p ravel-commit: antithesis-alone clippy directly after the lane tests" "1" \
   "$(grep -A1 -xF -- "${invariants_test}" "${out}" | grep -cxF -- "${invariants_antithesis_clippy}")"
+# Then the tests with the antithesis feature alone, ravel-catalog left out
+# (#4508).
+check_eq "gates -p ravel-commit: invariants lane antithesis-alone tests" "1" \
+  "$(count "${out}" "${invariants_antithesis_test}")"
+check_eq "gates -p ravel-commit: antithesis-alone tests directly after its clippy" "1" \
+  "$(grep -A1 -xF -- "${invariants_antithesis_clippy}" "${out}" | grep -cxF -- "${invariants_antithesis_test}")"
 check_eq "gates -p ravel-logseg: invariants lane (ravel-ingest in the closure)" "1" \
   "$(count "${tmp}/logseg.out" "${invariants_clippy}")"
 check_eq "gates -p ravel-logseg: invariants lane directly after stage-timing" "1" \
   "$(grep -A2 -xF -- "${stage_clippy}" "${tmp}/logseg.out" | grep -cxF -- "${invariants_clippy}")"
 check_eq "gates -p ravel-logseg: invariants lane antithesis-alone clippy" "1" \
   "$(count "${tmp}/logseg.out" "${invariants_antithesis_clippy}")"
+check_eq "gates -p ravel-logseg: invariants lane antithesis-alone tests" "1" \
+  "$(count "${tmp}/logseg.out" "${invariants_antithesis_test}")"
 # ravel-server and ravel-cli depend on ravel-commit, so their lane runs too,
 # directly after the six-crate one.
 check_eq "gates -p ravel-commit: invariants-services lane clippy" "1" \
@@ -247,7 +256,7 @@ check_eq "gates -p ravel-commit: invariants-services lane clippy" "1" \
 check_eq "gates -p ravel-commit: invariants-services lane tests" "1" \
   "$(count "${out}" "${invariants_services_test}")"
 check_eq "gates -p ravel-commit: invariants-services lane directly after the invariants lane" "1" \
-  "$(grep -A1 -xF -- "${invariants_antithesis_clippy}" "${out}" | grep -cxF -- "${invariants_services_clippy}")"
+  "$(grep -A1 -xF -- "${invariants_antithesis_test}" "${out}" | grep -cxF -- "${invariants_services_clippy}")"
 
 # -p ravel-server: the services lane, and not the six-crate lane, whose crates
 # ravel-server's closure does not reach.
@@ -261,6 +270,8 @@ check_eq "gates -p ravel-server: invariants-services lane tests" "1" \
 check_eq "gates -p ravel-server: no invariants lane" "0" "$(count "${out}" "${invariants_clippy}")"
 check_eq "gates -p ravel-server: no antithesis-alone clippy" "0" \
   "$(count "${out}" "${invariants_antithesis_clippy}")"
+check_eq "gates -p ravel-server: no antithesis-alone tests" "0" \
+  "$(count "${out}" "${invariants_antithesis_test}")"
 
 # Each of the six crates selects the invariants lane by itself. In the graph
 # above most of them reach another through the closure, so these runs use a
@@ -290,6 +301,8 @@ for c in ravel-invariant ravel-commit ravel-ingest ravel-catalog ravel-maintain 
     "$(count "${tmp}/leaf_${c}.out" "${invariants_test}")"
   check_eq "gates -p ${c} (a leaf): invariants lane antithesis-alone clippy" "${want}" \
     "$(count "${tmp}/leaf_${c}.out" "${invariants_antithesis_clippy}")"
+  check_eq "gates -p ${c} (a leaf): invariants lane antithesis-alone tests" "${want}" \
+    "$(count "${tmp}/leaf_${c}.out" "${invariants_antithesis_test}")"
   check_eq "gates -p ${c} (a leaf): invariants-services lane clippy" "${want_services}" \
     "$(count "${tmp}/leaf_${c}.out" "${invariants_services_clippy}")"
   check_eq "gates -p ${c} (a leaf): invariants-services lane tests" "${want_services}" \
@@ -413,11 +426,13 @@ check_eq "gates --dry-run: invariants lane clippy" "1" "$(count "${out}" "${inva
 check_eq "gates --dry-run: invariants lane tests" "1" "$(count "${out}" "${invariants_test}")"
 check_eq "gates --dry-run: invariants lane antithesis-alone clippy" "1" \
   "$(count "${out}" "${invariants_antithesis_clippy}")"
+check_eq "gates --dry-run: invariants lane antithesis-alone tests" "1" \
+  "$(count "${out}" "${invariants_antithesis_test}")"
 check_eq "gates --dry-run: invariants-services lane clippy" "1" "$(count "${out}" "${invariants_services_clippy}")"
 check_eq "gates --dry-run: invariants-services lane tests" "1" "$(count "${out}" "${invariants_services_test}")"
 check_eq "gates --dry-run: feature lane clippy runs" "14" \
   "$(count_matching "${out}" '^==> cargo clippy --locked .*--features ')"
-check_eq "gates --dry-run: feature lane nextest runs" "15" \
+check_eq "gates --dry-run: feature lane nextest runs" "16" \
   "$(count_matching "${out}" '^==> cargo nextest run --locked .*--features ')"
 
 # RAVEL_GATES_SKIP_SDK=1: the SDK step becomes one skip line, and nothing else
@@ -519,6 +534,10 @@ check_eq "tier executor -p ravel-commit: invariants lane tests restricted to it"
   "$(count "${out}" '==> cargo nextest run --locked -p ravel-commit --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --cargo-profile ci')"
 check_eq "tier executor -p ravel-commit: antithesis-alone clippy restricted to it" "1" \
   "$(count "${out}" '==> cargo clippy --locked -p ravel-commit --features ravel-invariant/antithesis --all-targets -- -D warnings')"
+# The antithesis-alone tests are left to the merge tier and CI: neither run on
+# their own nor unified into the lane test run above.
+check_eq "tier executor -p ravel-commit: no antithesis-alone test run" "0" \
+  "$(count_matching "${out}" '^==> cargo (nextest run|test) .*ravel-invariant/antithesis( |,|$)')"
 check_eq "tier executor -p ravel-commit: no feature prefixed twice" "0" \
   "$(count_matching "${out}" '[a-z-]+/ravel-invariant/')"
 
