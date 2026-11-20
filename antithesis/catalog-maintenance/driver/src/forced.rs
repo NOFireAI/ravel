@@ -139,10 +139,12 @@ pub fn unfolded_reached(
     head_after == Some(head_before) && record_present && inputs_before > 0
 }
 
-/// Whether the unreadable-HEAD sweep reached what it exists for: after the
-/// jump past the protection horizon and the wait for the servers' sweeps,
-/// HEAD still held the garbage the driver wrote, so every pass in the wait
-/// read an undecodable HEAD.
+/// Whether HEAD stayed unreadable through the unreadable-HEAD sweep: after
+/// the jump past the protection horizon and the wait for the servers' sweeps,
+/// HEAD still held the garbage the driver wrote. With server HEAD PUTs
+/// refused this holds whether or not a server swept; that a server's sweep
+/// read the undecodable HEAD is the SUT's own "delete pass refused on an
+/// unreadable HEAD", which local-run.sh requires beside this one.
 pub fn unreadable_head_reached(head_after: Option<&[u8]>, garbage: &[u8]) -> bool {
     head_after == Some(garbage)
 }

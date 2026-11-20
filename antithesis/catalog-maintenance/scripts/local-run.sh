@@ -98,9 +98,12 @@ UPPER="catalog: no scan shows a phantom or an excess copy"
 # situation it forces: a server fold losing its HEAD CAS, a server's
 # compaction record PUT losing to a concurrent compaction, the clocks
 # passing a record's protection horizon and pinned-query window while HEAD
-# had not folded it, and the servers' sweeps passing the protection horizon
-# while HEAD was unreadable. Each is the situation one silent mutant needs; a run
-# that never reaches it cannot tell that mutant from clean code.
+# had not folded it, and HEAD staying unreadable while the clocks passed the
+# protection horizon. Each is the situation one silent mutant needs; a run
+# that never reaches it cannot tell that mutant from clean code. The driver
+# cannot see a server's sweep pass, so the SUT's own "delete pass refused on
+# an unreadable HEAD" (both delete paths in ravel-maintain) is required too:
+# it proves a server sweep read the undecodable HEAD and stopped.
 REQUIRED=(
     "catalog: the workload starts"
     "clock: the driver's clock jumped forward"
@@ -114,7 +117,8 @@ REQUIRED=(
     "catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead"
     "catalog: a server's compaction record PUT lost to a concurrent compaction"
     "catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it"
-    "catalog: the servers' sweeps ran past the protection horizon while HEAD was unreadable"
+    "catalog: HEAD stayed unreadable while the clocks passed the protection horizon"
+    "catalog: delete pass refused on an unreadable HEAD"
 )
 mkdir -p "$OUT"
 export COMPOSE_FILE="$COMPOSE_BASE:$WL/local/docker-compose.local.yaml"

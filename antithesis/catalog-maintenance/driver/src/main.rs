@@ -1622,7 +1622,7 @@ impl Shared {
         println!("unreadable-HEAD sweep: {details}");
         assert_sometimes!(
             reached,
-            "catalog: the servers' sweeps ran past the protection horizon while HEAD was unreadable",
+            "catalog: HEAD stayed unreadable while the clocks passed the protection horizon",
             &details
         );
         reached
