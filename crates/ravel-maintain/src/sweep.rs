@@ -4863,16 +4863,27 @@ mod tests {
         let clock = aged_clock(&config);
         let scope = l0_data_prefix(&tenant, signal, shard).unwrap();
 
+        // The control runs as another tenant, so its deletes' evaluations are
+        // not counted below.
+        let control_tenant = TenantHash([0x63; 16]);
         let control = MemoryStore::new();
         for seq in 0..2u64 {
-            put_orphan(&control, &tenant, signal, shard, seq).await;
+            put_orphan(&control, &control_tenant, signal, shard, seq).await;
         }
-        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&control, &tenant)
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&control, &control_tenant)
             .await
             .expect("refresh");
-        let outcome = sweep_orphans(&control, &clock, &config, &snapshot, &tenant, signal, shard)
-            .await
-            .expect("control sweep");
+        let outcome = sweep_orphans(
+            &control,
+            &clock,
+            &config,
+            &snapshot,
+            &control_tenant,
+            signal,
+            shard,
+        )
+        .await
+        .expect("control sweep");
         assert_eq!((outcome.deleted, outcome.refused), (2, 0));
 
         let store = MemoryStore::new();
@@ -5130,6 +5141,60 @@ mod tests {
             "a healthy batch counts nothing"
         );
         assert!(store.inner().head(&healthy_copy).await.is_err());
+    }
+
+    /// RefreshFailureNeverSweeps per batch, mutant arm: with
+    /// `lifecycle/refresh-failure-is-no-hold` selected a purge batch whose
+    /// re-read failed proceeds as if nothing were held, purges, and the
+    /// property evaluates false at the purge. The shipped arm is
+    /// `a_failed_re_read_purges_nothing_and_the_next_purge_proceeds`.
+    #[tokio::test]
+    async fn refresh_failure_is_no_hold_mutant_purges_under_a_failed_batch_re_read() {
+        let Some(_mutant) =
+            crate::publish::tests::scoped_mutant("lifecycle/refresh-failure-is-no-hold")
+        else {
+            return;
+        };
+        let tenant = TenantHash([0x62; 16]);
+        let hold_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Audit, crate::legal_hold::AUDIT_HOLD_SHARD)
+                .unwrap();
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Transient("hold shard down".into()))
+                    .with_key_contains(hold_prefix),
+            ),
+        );
+        let copy = put_quarantined(store.inner(), &tenant, 14, 0).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(store.inner(), &tenant)
+            .await
+            .expect("the tick's refresh");
+        let config = CompactorConfig::default();
+        let clock = past_quarantine_horizon(&config);
+
+        let outcome = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            14,
+        )
+        .await
+        .expect("purge");
+        assert!(store.fault_count(Op::List, FaultKind::Transient) >= 1);
+        assert_eq!(
+            outcome.reaped, 1,
+            "the mutant purges under the failed re-read"
+        );
+        let found =
+            crate::publish::tests::evaluations("gc: a failed hold refresh sweeps nothing", &copy);
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "RefreshFailureNeverSweeps must evaluate false under the mutant: {found:?}"
+        );
     }
 
     /// The site is not vacuous: a purge under `NoLeases` removes a copy whose

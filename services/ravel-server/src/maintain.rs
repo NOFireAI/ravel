@@ -10927,6 +10927,19 @@ mod tests {
     async fn tick_with_deletable_work_under_a_failed_refresh(
         tenant_name: &str,
     ) -> FailedRefreshTick {
+        tick_with_deletable_work_under_hold_list_faults(
+            tenant_name,
+            ravel_object_store::fault::Occurrence::Always,
+        )
+        .await
+    }
+
+    /// [`tick_with_deletable_work_under_a_failed_refresh`] with the hold
+    /// shard's LIST faulting on `occurrence` only.
+    async fn tick_with_deletable_work_under_hold_list_faults(
+        tenant_name: &str,
+        occurrence: ravel_object_store::fault::Occurrence,
+    ) -> FailedRefreshTick {
         let tenant_id = TenantId::new(tenant_name);
         let tenant = tenant_id.hash();
         let written_ns: i64 = 1_700_000_000 * 1_000_000_000;
@@ -10999,7 +11012,8 @@ mod tests {
                     Op::List,
                     ScriptedFault::Transient("hold shard unavailable".into()),
                 )
-                .with_key_contains(hold_prefix),
+                .with_key_contains(hold_prefix)
+                .with_occurrence(occurrence),
             ),
         );
         run_tick_with_clock(
@@ -11050,6 +11064,39 @@ mod tests {
             assert!(
                 observed.evaluations.iter().all(|(held, _)| *held),
                 "RefreshFailureNeverSweeps never evaluates false on the shipped skip: {:?}",
+                observed.evaluations
+            );
+        }
+    }
+
+    /// A tick whose snapshot refresh succeeds but whose first delete batch's
+    /// hold re-read fails (the hold shard's second LIST): that batch, one of
+    /// the two superseded inputs' chain groups, deletes nothing and moves the
+    /// refresh-failure counter by exactly one, and the next batch, whose
+    /// re-read is healthy, deletes its input.
+    #[tokio::test]
+    async fn a_failed_batch_re_read_deletes_nothing_and_the_tick_goes_on() {
+        let observed = tick_with_deletable_work_under_hold_list_faults(
+            "batch-reread-fails",
+            ravel_object_store::fault::Occurrence::Nth(2),
+        )
+        .await;
+        assert_eq!(
+            observed.refresh_faults, 1,
+            "the first batch's re-read LIST really faulted"
+        );
+        assert_eq!(
+            observed.refresh_failures, 1,
+            "one failed batch, one refresh failure"
+        );
+        assert_eq!(
+            observed.superseded_data_deleted, 1,
+            "the failed batch keeps its input, the healthy one deletes its own"
+        );
+        if ravel_invariant::EVALUATES {
+            assert!(
+                observed.evaluations.iter().all(|(held, _)| *held),
+                "RefreshFailureNeverSweeps holds per batch: {:?}",
                 observed.evaluations
             );
         }
