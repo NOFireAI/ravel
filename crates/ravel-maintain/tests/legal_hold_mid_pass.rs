@@ -74,6 +74,16 @@ async fn l0_data_count(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize
     list_all(store, &prefix).await.unwrap().len()
 }
 
+/// Objects under the shard's commit prefix: the L0 commit records the
+/// superseded-input sweep deletes beside the data objects, which the shard
+/// hold's scopes also cover.
+async fn commit_record_count(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize {
+    let prefix =
+        ravel_commit::keys::commit_shard_prefix(&bucket.tenant_hash, bucket.signal, bucket.shard)
+            .expect("commit prefix");
+    list_all(store, &prefix).await.unwrap().len()
+}
+
 #[tokio::test]
 #[ignore = "contract decision pending #4501: a hold acknowledged after the pass's hold refresh does not stop that pass's deletes"]
 async fn a_hold_acknowledged_after_the_pass_refresh_stops_the_pass_deletes() {
@@ -87,6 +97,7 @@ async fn a_hold_acknowledged_after_the_pass_refresh_stops_the_pass_deletes() {
     let control = MemoryStore::new();
     let control_clock = FixedClock::new(created);
     let control_bucket = seed_and_compact(&control, &control_clock).await;
+    let control_records_before = commit_record_count(&control, &control_bucket).await;
     let control_snapshot = LegalHoldCheck::refresh(&control, &control_bucket.tenant_hash)
         .await
         .expect("refresh");
@@ -103,12 +114,15 @@ async fn a_hold_acknowledged_after_the_pass_refresh_stops_the_pass_deletes() {
     .await
     .expect("control sweep");
     assert!(control_report.superseded_data_deleted > 0);
+    assert!(control_report.superseded_records_deleted > 0);
     assert_eq!(l0_data_count(&control, &control_bucket).await, 0);
+    assert!(commit_record_count(&control, &control_bucket).await < control_records_before);
 
     let store = MemoryStore::new();
     let clock = FixedClock::new(created);
     let bucket = seed_and_compact(&store, &clock).await;
     let data_before = l0_data_count(&store, &bucket).await;
+    let records_before = commit_record_count(&store, &bucket).await;
     assert!(data_before > 0);
 
     // The pass starts: its hold refresh sees no hold.
@@ -159,9 +173,13 @@ async fn a_hold_acknowledged_after_the_pass_refresh_stops_the_pass_deletes() {
     .expect("sweep");
 
     assert_eq!(
-        l0_data_count(&store, &bucket).await,
-        data_before,
-        "an object under a hold acknowledged before its delete is not deleted \
-         (ADR-0042 decision 2, HeldObjectNeverDeleted); sweep report: {report:?}"
+        (
+            l0_data_count(&store, &bucket).await,
+            commit_record_count(&store, &bucket).await
+        ),
+        (data_before, records_before),
+        "no object under a hold acknowledged before its delete is deleted, data objects \
+         or commit records (ADR-0042 decision 2, HeldObjectNeverDeleted); sweep report: \
+         {report:?}"
     );
 }
