@@ -93,8 +93,9 @@ From the 1.100.0 announcement and the release notes for 1.98.0 to 1.100.0:
 The #4232 perfmap readouts on main 90e7643c9 (rustc 1.97.1, c6a.4xlarge,
 loopback s3s-fs, 8 GB decoded cache; comments 6900075592 and 6900206618)
 are the reference. Q33 hot runs at 15.0 of 16 vCPU, so it is CPU-bound and is
-where a compiler or PGO effect would show. Peak RSS (VmHWM) is 25.1 GB. Q46 of
-that issue no longer applies after #4255. c6a.4xlarge exposes no PMU, so no
+where a compiler or PGO effect would show. Peak RSS (VmHWM) is 25.1 GB. The row-path
+`SELECT *` by UserID figure in comment 6900075592 no longer applies after
+#4255. c6a.4xlarge exposes no PMU, so no
 virtualised c6a size can collect branch samples. R2's arm A re-measures the
 baseline under this ADR's protocol rather than reusing those numbers, because
 the host differs.
@@ -223,9 +224,16 @@ passes.
 `rust-version` stays `"1.97"` in both manifests. R1 proves it with the
 `cargo +1.97.0 check --locked` runs above, across the shipped feature sets.
 
-With the floor at 1.97, clippy's `incompatible_msrv` keeps newer std APIs out
-of the tree, so rolling back the compiler stays a one-commit revert for as
-long as a rollback is plausible. The lint is in clippy's default-on
+With the floor at 1.97, clippy's `incompatible_msrv` refuses std APIs newer
+than 1.97. That is the std half of keeping a compiler rollback a one-commit
+revert. The lint does not see language features or edition-behaviour
+changes stabilised in 1.98 to 1.100, and no standing check covers that half
+after R1's one-off `+1.97.0 check` (rejected alternatives, MSRV lane). This
+epic accepts that risk for the window until the floor is raised. Before any
+compiler rollback, run `cargo +1.97.0 check --locked --workspace
+--all-targets` on the rollback candidate. That one command lists every
+language-feature use that has to be reverted along with the pin. The lint is
+in clippy's default-on
 `suspicious` group. It reads `rust-version` when there is no `clippy.toml`,
 and main has none. R1 confirms this once with a throwaway probe: a call to a
 1.98+ std API in a scratch commit must fail `clippy -D warnings`, and the
@@ -261,9 +269,15 @@ epic (decisions 6 and 7).
   and server flags.
 - **Cache arms.** The shipping cache configuration is decoded cache 0. The
   ClickBench arm is 8 GB. Each is reported on its own.
-- **CPU and memory.** The server is pinned with `taskset` to 16 logical
-  CPUs on one socket. Clients and the loader run on the remaining CPUs. The
-  server runs with the same process memory budget and query limits in every
+- **CPU and memory.** c6a.metal has several NUMA nodes, where the
+  c6a.4xlarge reference host has one memory domain. A page placed on a
+  remote node would move the memory-bound Q33 by more than the 5% band. So
+  the server runs under `numactl --cpunodebind=<n> --membind=<n>` on the
+  same node in every arm, pinned to 16 logical CPUs of that node (SMT
+  siblings included). The report stamps the node, the CPU list and the box's
+  NPS setting from `lscpu` and `numactl --hardware`. Clients and the loader
+  run on other nodes. The server runs with the same process memory budget and
+  query limits in every
   arm, and those flags are stamped into the report.
 - **Workloads:**
   - cold control `q01_count_all`;
@@ -305,7 +319,7 @@ the pre-registration starts from:
 
 | Figure | Band | Miss | Basis |
 |---|---|---|---|
-| CPU-s per correct query, warm Q29/Q33/q20 (B/A median over 5 rounds) | 0.95 to 1.05 | B/A above 1.05 in at least 3 of 5 rounds: investigate, upgrade blocked until explained | predicted |
+| CPU-s per correct query, warm Q29/Q33/q20 (B/A median over 5 rounds) | at most 1.05 (a ratio below 0.95 is reported as a gain, not a miss) | B/A above 1.05 in at least 3 of 5 rounds: investigate, upgrade blocked until explained | predicted |
 | p99, 4-client mix (B/A) | at most 1.05 | above 1.05 in at least 3 of 5 rounds | predicted |
 | Ingest lines/s under the mix (B/A) | at least 0.95 | below 0.95 in at least 3 of 5 rounds | predicted |
 | Peak RSS (B/A) | at most 1.05 | above 1.05 in at least 3 of 5 rounds | predicted |
@@ -501,14 +515,16 @@ rollback.
 
 - **Raise `rust-version` to 1.100 in R1.** No consumer builds from source
   with an older compiler, so the floor protects nobody. It lost because the
-  1.97 floor is the only mechanical guard (`incompatible_msrv`) keeping the
-  compiler rollback a one-commit revert while the upgrade is new. It would
+  1.97 floor is the only mechanical guard (`incompatible_msrv`, std APIs
+  only) keeping the compiler rollback a one-commit revert while the upgrade
+  is new. It would
   also force R2's arm A to build with `--ignore-rust-version`.
 - **Add a standing MSRV CI lane on 1.97.0.** It would keep the floor honest
   permanently. It lost because no published crate or source consumer needs
   it, and it adds a cold workspace build per pull request to a CI whose
   runtime budget is already the bottleneck. The one-off `+1.97.0 check` in R1
-  covers the window this epic cares about.
+  proves the floor at landing. After that, the language-feature half of the
+  floor is unguarded until it is raised, which decision 2 accepts as a risk.
 - **Arm A from main's pre-R1 source.** It lost because the lint fixes would
   differ between arms and confound a compiler-only comparison. The same
   source builds on both compilers, so nothing needs labelling.
@@ -545,9 +561,9 @@ rollback.
 - Rust 1.100 becomes the build compiler for CI, images, prebuilt binaries,
   Brig, fleet executors (through the toml) and the Antithesis images. The
   first CI runs after the bump build cold until main saves new caches.
-- The source keeps compiling on 1.97 until the separate floor raise. During
-  that window, contributors cannot use std APIs from 1.98 to 1.100;
-  `incompatible_msrv` refuses them.
+- Until the separate floor raise, `incompatible_msrv` refuses std APIs from
+  1.98 to 1.100. Nothing refuses a 1.98+ language feature in that window.
+  A rollback finds such uses with `cargo +1.97.0 check` (decision 2).
 - R2 produces a compiler-only readout with binary hashes and
   reproduction commands. A repeated material regression blocks R1 from
   landing until it is explained or accepted by the owner.
