@@ -238,7 +238,11 @@ before a delete batch re-read the hold set is honored by that batch. The
 residual is the batch's own in-flight deletes: a hold written after the
 re-read and before the batch's delete requests return is not honored by
 that batch, and nothing short of a store-side transaction could make it
-so. The cost is one listing of the hold shard per delete batch (one LIST
+so. The Antithesis invariant for HeldObjectNeverDeleted is judged at each
+delete from the hold set that batch observed, so it catches a delete of a
+key the batch's own read holds, not a hold that landed after that read.
+The lifecycle model's RefreshFailureNeverSweeps keeps one refresh state; in
+the shipped code a failed re-read stops its own batch only. The cost is one listing of the hold shard per delete batch (one LIST
 request per page, so a large hold set takes several); hold commit
 records and audit objects are immutable and cached by key within the
 process. ravel-cli hold set states the guarantee in its output, and
