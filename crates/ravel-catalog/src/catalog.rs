@@ -4885,6 +4885,17 @@ impl Catalog {
         {
             self.assert_token_never_stale(tenant, signal, token, false, "superseded by rewrite")
                 .await;
+            // #4428: unreachable under the shipped sweep, which holds a
+            // rewrite's whole chain group while HEAD names any of it. A set
+            // that cannot be judged evaluates nothing.
+            ravel_invariant::inv_always_if_known!(
+                bucket
+                    .set_holds_a_replaced_object(rkey, record, token, out)
+                    .ok()
+                    .map(|held| !held),
+                "commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced",
+                rewrite_fallback_details(tenant, signal, token)
+            );
             for part in &record.parts {
                 let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
                 if !out.contains_key(&segment_ref.data_object_key) {
@@ -5451,6 +5462,23 @@ fn token_answer_details(
         ),
         ("token", token.encode()),
         ("answer", answer.to_owned()),
+    ])
+}
+
+/// Details of a swept-token rewrite-fallback evaluation; only an invariant
+/// assertion reads them.
+#[allow(dead_code)]
+fn rewrite_fallback_details(
+    tenant: &TenantHash,
+    signal: Signal,
+    token: &CommitToken,
+) -> std::collections::BTreeMap<&'static str, String> {
+    std::collections::BTreeMap::from([
+        ("tenant", tenant.to_hex()),
+        ("signal", format!("{signal:?}")),
+        ("shard", token.shard.to_string()),
+        ("ingest_hour", token.ingest_hour_bucket.to_string()),
+        ("token", token.encode()),
     ])
 }
 
