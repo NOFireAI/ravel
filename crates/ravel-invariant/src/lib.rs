@@ -606,6 +606,58 @@ pub mod mutant {
     const _: fn() = || <ScopedMutant as AmbiguousIfSend<_>>::check();
 }
 
+/// Crate-test helpers that are called inside an `inv_*` assertion condition.
+///
+/// Such a condition compiles whenever `antithesis` or `capture` is on, while
+/// [`mutant`] needs `antithesis-mutants` and [`capture`](mod@capture) needs
+/// `capture`. These wrappers exist wherever the condition compiles and return
+/// the empty value when their backing module is absent.
+#[cfg(any(feature = "antithesis", feature = "capture"))]
+#[doc(hidden)]
+pub mod test_support {
+    use std::any::Any;
+
+    #[cfg(feature = "antithesis-mutants")]
+    use crate::InitError;
+
+    /// Selects mutant `name` on this thread until the returned guard drops,
+    /// as `mutant::scoped`; `Ok(None)` without `antithesis-mutants`.
+    #[cfg(feature = "antithesis-mutants")]
+    pub fn scoped_mutant(name: &str) -> Result<Option<Box<dyn Any>>, InitError> {
+        let scoped: Box<dyn Any> = Box::new(crate::mutant::scoped(name)?);
+        Ok(Some(scoped))
+    }
+
+    /// Selects mutant `name` on this thread until the returned guard drops,
+    /// as `mutant::scoped`; `Ok(None)` without `antithesis-mutants`.
+    #[cfg(not(feature = "antithesis-mutants"))]
+    pub fn scoped_mutant(name: &str) -> Result<Option<Box<dyn Any>>, crate::InitError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// `(condition, details)` of every captured evaluation of `message` whose
+    /// details contain `needle`, in order; `None` without `capture`.
+    #[cfg(feature = "capture")]
+    pub fn evaluations(message: &str, needle: &str) -> Option<Vec<(bool, String)>> {
+        Some(
+            crate::capture::evaluations_of(message)
+                .into_iter()
+                .filter(|e| e.details.contains(needle))
+                .map(|e| (e.condition, e.details))
+                .collect(),
+        )
+    }
+
+    /// `(condition, details)` of every captured evaluation of `message` whose
+    /// details contain `needle`, in order; `None` without `capture`.
+    #[cfg(not(feature = "capture"))]
+    pub fn evaluations(message: &str, needle: &str) -> Option<Vec<(bool, String)>> {
+        let _ = (message, needle);
+        None
+    }
+}
+
 /// The fault switches: the registered names, the process rates, the per-test
 /// scope and the draw.
 #[cfg(any(feature = "antithesis", feature = "capture"))]
@@ -1440,5 +1492,68 @@ mod tests {
             !inv_mutant!("commit/commit-before-data") && !inv_mutant!("catalog/lost-cas-proceeds"),
             "a thread that opened no scope sees no mutant"
         );
+    }
+
+    #[cfg(all(
+        any(feature = "antithesis", feature = "capture"),
+        feature = "antithesis-mutants"
+    ))]
+    #[test]
+    fn test_support_scoped_mutant_selects_until_dropped() {
+        use crate::test_support::scoped_mutant;
+
+        let guard = scoped_mutant("commit/commit-before-data").expect("registered");
+        assert!(guard.is_some(), "a guard where mutants are compiled in");
+        assert!(crate::mutant::is_selected("commit/commit-before-data"));
+        drop(guard);
+        assert!(!crate::mutant::is_selected("commit/commit-before-data"));
+        assert!(
+            scoped_mutant("commit/no-such-mutant").is_err(),
+            "an unregistered name is refused"
+        );
+    }
+
+    #[cfg(all(
+        any(feature = "antithesis", feature = "capture"),
+        not(feature = "antithesis-mutants")
+    ))]
+    #[test]
+    fn test_support_scoped_mutant_is_none_without_mutants() {
+        let guard = crate::test_support::scoped_mutant("commit/commit-before-data");
+        assert!(matches!(guard, Ok(None)));
+    }
+
+    #[cfg(feature = "capture")]
+    #[test]
+    fn test_support_evaluations_filters_by_needle() {
+        const MESSAGE: &str = "ravel-invariant test: test_support evaluations";
+        inv_sometimes!(
+            true,
+            "ravel-invariant test: test_support evaluations",
+            serde_json::json!("needle-a")
+        );
+        inv_sometimes!(
+            false,
+            "ravel-invariant test: test_support evaluations",
+            serde_json::json!("needle-b")
+        );
+        inv_sometimes!(
+            false,
+            "ravel-invariant test: test_support evaluations",
+            serde_json::json!("needle-a again")
+        );
+        let found = crate::test_support::evaluations(MESSAGE, "needle-a").expect("capture is on");
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].0 && found[0].1.contains("needle-a"), "{found:?}");
+        assert!(
+            !found[1].0 && found[1].1.contains("needle-a again"),
+            "{found:?}"
+        );
+    }
+
+    #[cfg(all(feature = "antithesis", not(feature = "capture")))]
+    #[test]
+    fn test_support_evaluations_is_none_without_capture() {
+        assert_eq!(crate::test_support::evaluations("any", ""), None);
     }
 }
