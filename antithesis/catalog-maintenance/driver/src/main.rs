@@ -1519,8 +1519,9 @@ impl Shared {
     /// sweep passes, which read the undecodable HEAD and must delete nothing
     /// on its account. Then lift the refusal and rebuild HEAD with a
     /// `ravel-cli` fold. The caller holds the gate's write guard. Returns
-    /// whether the servers' sweeps ran past the horizon while HEAD was
-    /// unreadable.
+    /// whether HEAD stayed unreadable while the clocks passed the horizon;
+    /// that a server's sweep read it is the SUT's own "delete pass refused on
+    /// an unreadable HEAD", which local-run.sh requires.
     fn unreadable_head_sweep(&self, reason: &str) -> bool {
         let (Some(prefix), Some(head_key)) = (self.known_prefix(), lock(&self.head_key).clone())
         else {
