@@ -953,7 +953,9 @@ pub struct MaintainMemo {
     /// hold re-reads (ADR-0042, the delete-batch re-read amendment) pay one
     /// LIST and no GET for a record this process already read. Hold records
     /// are immutable, so an entry never goes stale. In memory only; shared,
-    /// not split, by [`Self::split_unit`].
+    /// not split, by [`Self::split_unit`]. Deliberately not pruned by
+    /// `retain_present`: hold records are few and immutable, so the map keeps
+    /// every record this process has read for its lifetime.
     hold_records: crate::legal_hold::HoldRecordCache,
 }
 

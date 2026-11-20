@@ -1556,8 +1556,10 @@ NoDeleteInsideProtectionWindow ==
 HeldObjectNeverDeleted ==
     ~lastGc.held
 
-\* A failed hold refresh skips the whole tick: no deletion happens while the
-\* refresh failed (the refresh state the delete observed at its own step).
+\* A failed hold read deletes nothing: no deletion happens while the refresh
+\* state the delete observed at its own step is failed. In the shipped code that
+\* step is a delete batch's re-read (ADR-0042, delete-batch re-read amendment):
+\* a failed re-read stops that batch only, and the pass goes on.
 RefreshFailureNeverSweeps ==
     (lastGc.deleted # {}) => (lastGc.refreshWasFailed = FALSE)
 

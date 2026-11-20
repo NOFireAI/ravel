@@ -313,7 +313,9 @@ TRUE`, `SPECIFICATION FairSpec`, every switch at its shipped value. Both fail:
   state clears it; `superseded = {"raw1"}` and `RawInputs \cap head = {}` hold
   from state 9 on (the antecedent is true), `raw1` stays present, and
   `SupersededSweep` is fail-closed on `refreshFailed` (`RefreshFailureNeverSweeps`),
-  so it stays disabled forever. `SetRefresh(FALSE)` is enabled at state 9 (it
+  so it stays disabled forever (the model has one refresh state; the shipped
+  code fails closed per delete batch and goes on with the next batch, ADR-0042
+  delete-batch re-read amendment). `SetRefresh(FALSE)` is enabled at state 9 (it
   would clear the failure) but `FairSpec` grants it no fairness, so the
   environment is free to never call it again. Exact line:
   `Error: Temporal properties were violated.` with the counter-example above
