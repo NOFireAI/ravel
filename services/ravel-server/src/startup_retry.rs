@@ -733,9 +733,8 @@ pub(crate) mod test_support {
     use bytes::Bytes;
     use ravel_object_store::fault::{FaultPlan, Occurrence, Op, Rule, ScriptedFault, Sequence};
     use ravel_object_store::{
-        Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload,
-        ObjectMeta, ObjectStoreBackend, PageToken, Pin, PinnedRead, PutOptions, PutOutcome,
-        StoreError,
+        Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+        ObjectStoreBackend, PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
     };
 
     use super::{StartupClock, StartupRetry};
@@ -818,11 +817,7 @@ pub(crate) mod test_support {
             self.inner.get_pinned(key, range, pin).await
         }
 
-        async fn get_with_pin(
-            &self,
-            key: &str,
-            range: GetRange,
-        ) -> Result<PinnedRead, StoreError> {
+        async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
             self.inner.get_with_pin(key, range).await
         }
 
@@ -1508,10 +1503,7 @@ mod tests {
             },
         };
         assert_eq!(tenant_kms_retry_cause(&kms), transient);
-        assert_eq!(
-            tenant_kms_retry_cause(&TenantKmsError::EmptyTenantId),
-            None
-        );
+        assert_eq!(tenant_kms_retry_cause(&TenantKmsError::EmptyTenantId), None);
     }
 
     // --- qualification ---
@@ -1632,11 +1624,8 @@ mod tests {
     #[tokio::test]
     async fn qualification_clock_skew_past_the_deadline_refuses_naming_clock_skew() {
         let clock = Arc::new(ManualClock::default());
-        let store = ScriptedRefusals::always(
-            qualified_memory().await,
-            QUALIFICATION_KEY,
-            clock_skewed,
-        );
+        let store =
+            ScriptedRefusals::always(qualified_memory().await, QUALIFICATION_KEY, clock_skewed);
         let err = enforce_qualification(&retry_on(clock.clone()), &store, StoreKind::S3, None)
             .await
             .expect_err("refuses once the deadline passes");

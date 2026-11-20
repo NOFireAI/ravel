@@ -1568,10 +1568,7 @@ pub(crate) const CLOCK_SKEW_CODE: &str = "RequestTimeTooSkewed";
 
 /// A 401 or 403: [`StoreError::ClockSkewed`] when its S3 error code is
 /// [`CLOCK_SKEW_CODE`], else [`StoreError::AccessDenied`].
-fn refused(
-    detail: String,
-    source: &(dyn std::error::Error + Send + Sync + 'static),
-) -> StoreError {
+fn refused(detail: String, source: &(dyn std::error::Error + Send + Sync + 'static)) -> StoreError {
     if s3_error_code(source).as_deref() == Some(CLOCK_SKEW_CODE) {
         StoreError::ClockSkewed(detail)
     } else {

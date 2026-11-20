@@ -22,7 +22,9 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{TenantHash, TenantId};
 
 use crate::config::Mode;
-use crate::startup_retry::{RetryCause, SITE_IPCRYPT_MARKER, StartupRetry, store_error_retry_cause};
+use crate::startup_retry::{
+    RetryCause, SITE_IPCRYPT_MARKER, StartupRetry, store_error_retry_cause,
+};
 
 /// The metric label sanitizer rule keys are matched through on metric
 /// surfaces (ADR-2993 decision 1): the one the OTLP metric normalizer applies

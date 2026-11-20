@@ -2008,10 +2008,7 @@ async fn a_clock_skew_403_is_clock_skewed_and_other_403s_stay_access_denied() {
     fake.script(Op::Get, [Fault::Forbidden("RequestTimeTooSkewed")]);
     skewed(
         "GET",
-        store
-            .get("skew/k", GetRange::Full)
-            .await
-            .expect_err("get"),
+        store.get("skew/k", GetRange::Full).await.expect_err("get"),
     );
     fake.script(Op::Put, [Fault::Forbidden("RequestTimeTooSkewed")]);
     skewed(
@@ -2027,9 +2024,21 @@ async fn a_clock_skew_403_is_clock_skewed_and_other_403s_stay_access_denied() {
     );
     fake.script(Op::List, [Fault::Forbidden("RequestTimeTooSkewed")]);
     skewed("LIST", store.list("skew/", None).await.expect_err("list"));
-    assert_eq!(fake.count(Op::Get), 1, "a clock-skew 403 GET is not retried");
-    assert_eq!(fake.count(Op::Put), 1, "a clock-skew 403 PUT is not retried");
-    assert_eq!(fake.count(Op::List), 1, "a clock-skew 403 LIST is not retried");
+    assert_eq!(
+        fake.count(Op::Get),
+        1,
+        "a clock-skew 403 GET is not retried"
+    );
+    assert_eq!(
+        fake.count(Op::Put),
+        1,
+        "a clock-skew 403 PUT is not retried"
+    );
+    assert_eq!(
+        fake.count(Op::List),
+        1,
+        "a clock-skew 403 LIST is not retried"
+    );
 
     fake.script(Op::Head, [Fault::Forbidden("RequestTimeTooSkewed")]);
     let head = store.head("skew/k").await.expect_err("head");
@@ -2040,10 +2049,7 @@ async fn a_clock_skew_403_is_clock_skewed_and_other_403s_stay_access_denied() {
 
     for code in ["AccessDenied", "SignatureDoesNotMatch"] {
         fake.script(Op::Get, [Fault::Forbidden(code)]);
-        let get = store
-            .get("skew/k", GetRange::Full)
-            .await
-            .expect_err("get");
+        let get = store.get("skew/k", GetRange::Full).await.expect_err("get");
         assert!(
             matches!(get, StoreError::AccessDenied(_)),
             "a GET 403 {code} must stay AccessDenied, got {get:?}"

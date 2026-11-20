@@ -79,7 +79,8 @@ coincide on S3 and Azure and differ on GCS; commit-protocol code uses only
 
 `StoreError` variants (exhaustive for callers' retry logic):
 `NotFound`, `AlreadyExists`, `PreconditionFailed`, `AccessDenied`,
-`Throttled { retry_after_ms }`, `Timeout`, `Corrupted(msg)` (checksum or
+`ClockSkewed(msg)` (the store refused the request's signing time as too far
+from its own clock), `Throttled { retry_after_ms }`, `Timeout`, `Corrupted(msg)` (checksum or
 range mismatch), `InvalidRange(msg)`, `Transient(msg)`, `Permanent(msg)`,
 `Unsupported { operation }` (the backend does not implement the operation at
 all, so no argument and no retry can make it succeed, unlike `Permanent`,
@@ -97,6 +98,22 @@ Retry classification: `Throttled`, `Timeout`, `Transient` are retryable with
 jittered exponential backoff. `AlreadyExists` on `CreateIfAbsent` is a
 *protocol signal*, not an error to retry. `AccessDenied` is permanent and
 alerts differently (misconfigured credentials or prefix policy).
+`ClockSkewed` is the S3 adapter's 403 (or, outside its listing, 401) whose
+error body names the code
+`RequestTimeTooSkewed`, read from the body by the adapter's own S3 error-code
+parsing; an `AccessDenied` whose message merely mentions that code stays
+`AccessDenied`. It is not retryable at runtime (`is_retryable` is false),
+every caller whose control flow singles out `AccessDenied` takes the same path
+for it (a caller that only words a grant hint for `AccessDenied` reports it
+with its generic error text instead), and
+`InstrumentedStore` counts it in the `AccessDenied` class. The one exception
+is the server's startup store checks (`--startup-store-deadline`): there it retries under the same deadline, backoff and per-attempt
+bound as a transient error, because a host whose clock is still being stepped
+by time sync is rejected by the store for the first seconds after boot, and
+the refusal after the deadline names clock skew and time sync, not a missing
+grant. A HEAD response has no body, so a skewed `head` or `pin_of` cannot be
+told apart and stays `AccessDenied`; a startup check that issues a HEAD still
+refuses on it at once.
 A 404 is not always `NotFound`. On the S3 adapter a 404 whose error body
 names `NoSuchBucket` is `Permanent` on get, list, put, delete and multipart,
 because a missing bucket is not a missing object and a delete must never
@@ -680,7 +697,9 @@ ListObjectsV2 requests (ADR-2637 decision 1) and retries each one with the
 figures of `object_store`'s default `RetryConfig`: at most 10 retries within
 180 seconds, with decorrelated-jitter backoff starting at 100 ms and capped at
 15 s. It retries a 5xx, 429 or 408 status and a connect, request, timeout or
-interrupted transport failure, and never a 403, a 3xx or another 4xx. A
+interrupted transport failure, and never a 403 (a 403 `RequestTimeTooSkewed`
+included: it is `ClockSkewed`, and only a startup check retries that, as a whole
+call), a 3xx or another 4xx. A
 `put_part` that still fails *poisons the
 handle*: the first failure surfaces the classified `StoreError` a `put` would
 (so the original cause stays visible), but the handle is now dead, and every
@@ -1712,7 +1731,9 @@ adapter contract:
    `object_store` retries the whole request on a per-key `SlowDown` or
    `InternalError`, and any other code takes the generic classification
    (`Transient` unless its text reads as a throttle or a timeout), which is
-   retryable and fails the pass. A whole-request 403 is `AccessDenied` too.
+   retryable and fails the pass. A whole-request 403 is `AccessDenied` too,
+   or `ClockSkewed` when its code is `RequestTimeTooSkewed`, which the sweep
+   tolerates the same way.
    A whole-request 404 is not a missing key: `DeleteObjects` addresses the
    bucket and S3 reports a missing key per key, so S3 answers a request-level
    404 when the bucket itself is gone (`NoSuchBucket`). Only a `NoSuchKey`
