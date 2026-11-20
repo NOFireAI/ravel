@@ -1657,28 +1657,26 @@ impl<H> GenerationSwitch<H> {
             );
             return None;
         }
-        let (count, view_refreshed_at_ns) = {
+        let count = {
             let view = inner.views.get_mut(&tenant)?;
             view.last_touched_ns = now_ns;
-            (
-                active_shard_count(&view.generations, hour_of(now_ns)),
-                view.refreshed_at_ns,
-            )
+            active_shard_count(&view.generations, hour_of(now_ns))
         };
-        // Judged from the cached view's refresh stamp, which only installing a
-        // provisioning read's history sets (a grace route never does), against
-        // the route hour, in the model's own form (no grace lead): a grace
-        // route lands inside `min_lead_hours` of the last refresh.
-        let _ = view_refreshed_at_ns;
+        // This property is the fence's complement: it is judged from the
+        // refresh stamp and route time the fence above used, so passing the
+        // fence makes it true, and only the no-writer-fence mutant makes it
+        // false. It carries that mutant's target and its reachable sites; no
+        // evidence independent of the fence exists inside this function. Its
+        // form is the model's StaleWriterFailsClosed, which has no grace lead.
         ravel_invariant::inv_always!(
             u64::from(hour_of(now_ns))
-                < u64::from(hour_of(view_refreshed_at_ns))
+                < u64::from(hour_of(refreshed_at_ns))
                     + u64::from(min_lead_hours(self.refresh_interval_ns)),
             "resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops",
             std::collections::BTreeMap::from([
                 ("tenant", tenant.to_hex()),
                 ("now_ns", now_ns.to_string()),
-                ("refreshed_at_ns", view_refreshed_at_ns.to_string()),
+                ("refreshed_at_ns", refreshed_at_ns.to_string()),
                 ("count", count.to_string()),
             ])
         );

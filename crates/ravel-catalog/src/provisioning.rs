@@ -1958,8 +1958,11 @@ pub async fn append_generation(
 /// is the history this append wrote, base generations first; `won` is whether
 /// the store acknowledged the CAS. A read that fails, finds no record, or
 /// returns a history that does not decode or validate cannot tell, and
-/// records nothing. The outer `inv_sometimes!` keeps the re-read inside an
-/// assertion the default build compiles out.
+/// records nothing. On AWS S3 a 409 ConditionalRequestConflict whose
+/// competing write also failed maps to PreconditionFailed, leaves the record
+/// at the base version, and so records the lost branch false; a false there
+/// on AWS needs that case ruled out first. The outer `inv_sometimes!` keeps
+/// the re-read inside an assertion the default build compiles out.
 async fn assert_append_outcome(
     store: &dyn ObjectStoreBackend,
     key: &str,

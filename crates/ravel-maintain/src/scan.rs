@@ -1536,13 +1536,15 @@ impl MaintainMemo {
                 stats.seeded_buckets += 1;
             }
         }
-        ravel_invariant::inv_reachable!(
-            "maintenance: a memo was seeded from a snapshot",
-            std::collections::BTreeMap::from([
-                ("writer", snapshot.process_id().to_string()),
-                ("seeded_buckets", stats.seeded_buckets.to_string()),
-            ])
-        );
+        if stats.seeded_buckets > 0 {
+            ravel_invariant::inv_reachable!(
+                "maintenance: a memo was seeded from a snapshot",
+                std::collections::BTreeMap::from([
+                    ("writer", snapshot.process_id().to_string()),
+                    ("seeded_buckets", stats.seeded_buckets.to_string()),
+                ])
+            );
+        }
         Ok(stats)
     }
 }
@@ -2902,16 +2904,30 @@ mod memo_snapshot_tests {
             TerminalState::Compacted,
             snapshot_unix_ns - NS_PER_HOUR,
         );
-        let bytes = frame(&source.snapshot_body(), snapshot_unix_ns);
-        let mut seeded = MaintainMemo::with_default_interval();
-        let stats = seed(
-            &mut seeded,
-            &bytes,
-            snapshot_unix_ns,
-            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-            |_, _, _| true,
+        // A writer id no other test uses, so the reachable evaluation read
+        // below is this test's own.
+        let writer = Uuid::from_u128(0x5eed_4339);
+        let snapshot = VerifiedSnapshot::verify(
+            writer,
+            MaintainMemo::snapshot_bytes_from_body(
+                &source.snapshot_body(),
+                snapshot_unix_ns,
+                &writer,
+                &keys(),
+            ),
+            &keys(),
         )
-        .expect("decode");
+        .expect("honest frame verifies");
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seeded
+            .seed_from_snapshot(
+                &snapshot,
+                MemoSnapshotLimits::DEFAULT,
+                snapshot_unix_ns,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("decode");
         assert_eq!(stats.seeded_buckets, 2);
         let found = evaluations(
             "maintenance: a seeded memo entry is never fresher than its snapshot",
@@ -2919,7 +2935,57 @@ mod memo_snapshot_tests {
         );
         assert_eq!(found.len(), 2, "{found:?}");
         assert!(found.iter().all(|(held, _)| *held), "{found:?}");
-        assert!(!evaluations("maintenance: a memo was seeded from a snapshot", "").is_empty());
+        let reached = evaluations(
+            "maintenance: a memo was seeded from a snapshot",
+            &writer.to_string(),
+        );
+        assert_eq!(reached.len(), 1, "{reached:?}");
+    }
+
+    /// A snapshot that seeds no bucket (this process owns none of its units)
+    /// does not fire "maintenance: a memo was seeded from a snapshot".
+    #[test]
+    fn a_snapshot_that_seeds_nothing_is_not_reported_seeded() {
+        use crate::publish::tests::{capturing, evaluations};
+        if !capturing() {
+            return;
+        }
+        let t = TenantId::new("seed-nothing-reachable").hash();
+        let snapshot_unix_ns = 5 * NS_PER_HOUR;
+        let mut source = MaintainMemo::with_default_interval();
+        source.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalState::Compacted,
+            snapshot_unix_ns - NS_PER_HOUR,
+        );
+        let writer = Uuid::from_u128(0x5eed_4340);
+        let snapshot = VerifiedSnapshot::verify(
+            writer,
+            MaintainMemo::snapshot_bytes_from_body(
+                &source.snapshot_body(),
+                snapshot_unix_ns,
+                &writer,
+                &keys(),
+            ),
+            &keys(),
+        )
+        .expect("honest frame verifies");
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seeded
+            .seed_from_snapshot(
+                &snapshot,
+                MemoSnapshotLimits::DEFAULT,
+                snapshot_unix_ns,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| false,
+            )
+            .expect("decode");
+        assert_eq!(stats.seeded_buckets, 0);
+        let reached = evaluations(
+            "maintenance: a memo was seeded from a snapshot",
+            &writer.to_string(),
+        );
+        assert!(reached.is_empty(), "{reached:?}");
     }
 
     /// One hand-built snapshot unit: an optional `(start, end)` frontier and

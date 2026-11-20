@@ -533,7 +533,9 @@ impl WorkerSet {
             )
             .await;
         // Judged from the store's answer: only a conditional write can be
-        // refused for a precondition or an existing object.
+        // refused for a precondition or an existing object. A store-contract
+        // and reachability probe: false only if the store refuses an
+        // unconditional PUT.
         ravel_invariant::inv_always!(
             !matches!(
                 put,
@@ -1246,6 +1248,40 @@ mod tests {
         assert!(found.iter().all(|(held, _)| *held), "{found:?}");
         let written = evaluations("maintenance: a worker heartbeat was written", &id);
         assert_eq!(written.len(), 2, "{written:?}");
+    }
+
+    /// HeartbeatAndMemoNeverCas, heartbeat half: a store that refuses the
+    /// unconditional PUT as a failed conditional write breaks the store
+    /// contract, and the property records false.
+    #[tokio::test]
+    async fn heartbeat_never_cas_is_false_when_the_store_refuses_an_overwrite() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite)
+                .with_key_contains(WORKERS_PREFIX),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        let w = worker(0);
+        let err = w
+            .write_heartbeat(&store, &membership(), 1_000)
+            .await
+            .expect_err("the refused PUT surfaces");
+        assert!(matches!(err, StoreError::PreconditionFailed), "{err:?}");
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+            1
+        );
+        if !capturing() {
+            return;
+        }
+        let id = w.process_id().to_string();
+        let found = evaluations(
+            "maintenance: a heartbeat write is an overwrite, never refused as a CAS",
+            &id,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].0, "{found:?}");
+        let written = evaluations("maintenance: a worker heartbeat was written", &id);
+        assert!(written.is_empty(), "{written:?}");
     }
 
     /// The reaper deletes exactly the keys past the reap horizon (issue #1679):
