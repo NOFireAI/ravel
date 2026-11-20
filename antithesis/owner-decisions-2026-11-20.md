@@ -392,7 +392,95 @@ docs/deletion-and-gc.md carry the normative wording.
 
 ## 4. #4428: swept-token fallback beside a stale HEAD
 
-(pending)
+### Claims checked against main
+
+- `resolve_min_token_fallback` (crates/ravel-catalog/src/catalog.rs) serves a
+  live rewrite's parts for a swept token through `live_rewrite_naming` and
+  never calls `set_holds_a_replaced_object`. Holds. The present-record path
+  does call it (the #4418 fix), and on a hit it adds the token's own input
+  instead of the rewrite's parts. Holds.
+- docs/deletion-and-gc.md "HEAD-referenced snapshot delete blocker": the
+  superseded-input sweep asks the HEAD gate "over the entire chain at once,
+  down to the raw inputs the oldest generation superseded: a HEAD naming
+  anything in the chain holds all of it", and the chain group is "one
+  indivisible delete unit". Holds. So while HEAD names M, raw or through a
+  compaction part in R's chain, the group entered from R holds P too, and P's
+  commit record is not deleted by that sweep.
+- The other deleters cannot produce the state either: retention removes P only
+  under a tombstone, and a tombstoned bucket resolves to zero segments on every
+  path; orphan GC removes record-less objects, and P has a record; the catalog
+  sweep removes catalog objects only.
+- A HEAD that names M but not P: the fold lists an hour only once it is
+  sealed, and a commit of a sealed hour landed before the seal, so a fold that
+  names M lists P too. The one exception is an hour held open by an
+  operator-asserted seal (ADR-2677), which every fold re-lists until the margin
+  passes, so the gap between a fold naming M and one naming P is one fold
+  interval, far inside the protection horizon the sweep waits on R.
+- A pinned reader on an older HEAD naming M while the current HEAD names
+  neither: the unnamed-since marker gate (ADR-1133) delays the delete past
+  every validated query deadline. The readers outside that gate (`ravel-cli
+  export`, the bench harness) are already documented as outside it in
+  docs/consistency-model.md.
+- The pmoust correction of 2026-11-19 ("the fold that names M also names P,
+  and the superseded-input sweep holds an object HEAD names") is right, and
+  the chain-group rule makes it stronger than stated: the sweep holds P because
+  it holds the whole group, not only because HEAD names P.
+- docs/deletion-and-gc.md line 651 says without condition that a token whose
+  bucket is tombstoned "resolves as satisfied with zero segments". The brief's
+  item 2 reads that as the present-record case adding an L0 input in a
+  tombstoned bucket; `resolve_min_token` was not re-read line by line here, and
+  docs/catalog-and-mvcc.md step 5 is the normative text the brief says is
+  already right. The sentence should defer to it.
+
+### Decision
+
+Close item 1 as unreachable under the shipped sweep and resolver, with the
+reasoning above recorded on the issue, and do not change the resolver now.
+Land two small things instead: an invariant at the swept fallback that fires
+if the state is ever reached, and the doc sentence fix. The fix of record, if
+the invariant ever fires, is option two: serve the rewrite's parts and remove
+from the set exactly the objects the rewrite replaced when every one of them
+is fully covered by its effective inputs, and return a typed refusal otherwise.
+
+### Why
+
+The brief's own test builds the state by deleting P directly; no sweep path
+reaches it, and the chain-group HEAD gate is the reason, which is a stronger
+argument than "not found yet". A resolver change with no reachable trigger is
+dead weight on the token path and a review and gate cost before 0.35 for no
+observable behaviour. An `inv_always` at the fallback ("a swept-token fallback
+never adds a rewrite's parts beside an object the rewrite replaced"), judged
+with `set_holds_a_replaced_object` and compiled out of the default build, turns
+the question into something the Antithesis lifecycle profile (T9, #4338) can
+answer by reading with old tokens across erasure, rewrite and sweep, which is
+the campaign's purpose. Typed refusal as the fix of record was rejected because
+a stale HEAD is a steady state between folds and the refusal would re-resolve
+into the same answer; removal of fully covered replaced objects is exact,
+because a rewrite's parts carry every row of its effective inputs minus the
+erased ones, and the erasure filter still applies while the `.dreq` is pending.
+
+### Conditions and follow-ups
+
+1. The issue gets the reasoning above and item 1 is closed as unreachable, with
+   the invariant and the fix of record named so a later executor does not
+   re-decide.
+2. PR #4504's test is not merged in its current shape. It stays on its branch
+   as reference material; the issue comment points at it. If the invariant
+   fires, the test's "serves every surviving row once" arm becomes the fix's
+   test.
+3. The doc sentence at docs/deletion-and-gc.md line 651 is changed to state
+   the rule by reference: a token whose bucket is tombstoned resolves as
+   docs/catalog-and-mvcc.md step 5 describes, satisfied without the bucket's
+   data, never as `unsatisfiable token`. Same pull request as the invariant.
+4. `check_rewrite_siblings` already alarms on sibling rewrites; the new
+   invariant uses the same details shape (tenant, signal, shard, hour, token).
+
+### Confidence
+
+Medium-high on unreachability: it rests on the chain-group rule and the
+fold-after-seal rule, both normative and both implemented, and on the ADR-1133
+window for pinned readers. Medium on "not worth a fix now"; the invariant is the
+hedge.
 
 ## 5. #4449: claims-on residual window
 
