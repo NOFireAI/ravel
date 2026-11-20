@@ -2068,20 +2068,22 @@ mod tests {
 /// This crate has no feature of its own that forwards
 /// `ravel-invariant/capture` or `ravel-invariant/antithesis-mutants`, so the
 /// gate is an assertion macro: its condition is compiled and run only when
-/// ravel-invariant records evaluations, and the default build expands it to
-/// nothing.
+/// ravel-invariant evaluates assertions (`antithesis` or `capture`), and the
+/// default build expands it to nothing.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) mod invariant_capture {
     use std::any::Any;
     use std::cell::{Cell, RefCell};
 
-    /// True in the invariants lane, where evaluations are recorded.
+    /// True in the invariants lane, where evaluations are recorded
+    /// (`ravel-invariant/capture`); false under `antithesis` alone, which
+    /// evaluates the assertions and records nothing.
     pub(crate) fn capturing() -> bool {
         let on = Cell::new(false);
         ravel_invariant::inv_sometimes!(
             {
-                on.set(true);
+                on.set(ravel_invariant::test_support::capturing());
                 true
             },
             "ravel-ingest test: evaluations are captured",
