@@ -45,7 +45,10 @@ purges, a signal's erasure-request (`.dreq`) deletes, a signal's catalog
 object deletes, a signal's idempotency-marker deletes, a shard's unreferenced
 `l1/` part deletes, an alert retention pass's deletes and one hour of
 query-audit retention deletes. Planning earlier in the pass reads the tick's
-hold snapshot; the delete itself is judged from the batch's own read. A hold
+hold snapshot, except the erasure-request sweep's chain-hold observation,
+which joins the snapshot with one re-read of its own ("The hold is read off
+the superseded-input sweep" below); the
+delete itself is judged from the batch's own read. A hold
 written after a batch's re-read and before its delete requests return is not
 honored by that batch. A failed re-read is counted on
 `ravel_maintain_legal_hold_refresh_failures_total` and the pass goes on to
@@ -1012,9 +1015,9 @@ marker (ADR-2993, erasure amendment):
   observation is therefore always whole-signal: one listing of the commit
   keyspace enumerates the signal's shards, and every shard is observed across
   every hour. A shard with no commit key holds nothing, so that scope costs
-  listing, never correctness. The rule issues no GET of its own beyond the
-  sweep's and the completions it must read anyway; it reads a verdict that
-  sweep produced while doing its own work.
+  listing, never correctness. Beyond the sweep's requests and the completions
+  it must read anyway, the rule issues only its one hold re-read (below); it
+  reads a verdict that sweep produced while doing its own work.
 
 - **An erasure request's `.dreq` outlives every input any rewrite in its
   supersession chain superseded.** The hold does not look only for the record
@@ -1032,7 +1035,16 @@ marker (ADR-2993, erasure amendment):
   applied no request, so a walk that ends at one cuts nothing. A chain group
   the legal-hold gate skipped holds its requests' `.dreq`s the same way a
   HEAD-held one does, which is what keeps a data-prefix-only hold from
-  retiring a filter over data it is preserving.
+  retiring a filter over data it is preserving. The observation judges that
+  gate from the tick's hold snapshot joined with a hold re-read it takes
+  itself, once per pass before walking the shards (ADR-0042, the delete-batch
+  re-read amendment): a chain group is held when either covers one of its
+  keys, so a hold written after the snapshot, which the deleting pass's batch
+  re-read honors, keeps the `.dreq` too. If that re-read fails, every
+  candidate `.dreq` of the pass is kept and the failure is counted on
+  `ravel_maintain_legal_hold_refresh_failures_total`. A hold written after the
+  snapshot and cleared before this re-read is not seen by the observation,
+  even if the deleting pass held a chain group for it earlier in the tick.
 
 - **The pinned-query window lengthens the `.dreq`'s life.** The observing
   pass holds a chain whose unnamed-since marker is missing or younger than

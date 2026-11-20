@@ -242,7 +242,23 @@ so. The Antithesis invariant for HeldObjectNeverDeleted is judged at each
 delete from the hold set that batch observed, so it catches a delete of a
 key the batch's own read holds, not a hold that landed after that read.
 The lifecycle model's RefreshFailureNeverSweeps keeps one refresh state; in
-the shipped code a failed re-read stops its own batch only. The cost is one listing of the hold shard per delete batch (one LIST
+the shipped code a failed re-read stops its own batch only.
+
+One planning decision does not keep the snapshot alone: the erasure-request
+sweep's (rule 6) observation of which superseded chains the superseded-input
+sweep (rule 2) holds. Rule 2 now judges each chain group from its batch's
+re-read, and the `.dreq` that rule 6 deletes lies outside every shard hold
+scope, so a snapshot-only observation could release the erasure filter over a
+chain rule 2 kept for a hold written after the snapshot. Rule 6 therefore
+re-reads the hold set once per pass, before walking the shards, and judges a
+chain group held when the snapshot or that re-read covers any of its keys. A
+failed re-read keeps every candidate `.dreq` of the pass and is counted like a
+failed batch re-read. The residual: a hold written after the snapshot and
+cleared before rule 6's re-read is not seen by rule 6, even if rule 2 held a
+chain group for it earlier in the tick.
+
+The cost is one listing of the hold shard per delete batch, plus one per
+erasure-request pass that has a candidate `.dreq` (one LIST
 request per page, so a large hold set takes several); hold commit
 records and audit objects are immutable and cached by key within the
 process. ravel-cli hold set states the guarantee in its output, and
