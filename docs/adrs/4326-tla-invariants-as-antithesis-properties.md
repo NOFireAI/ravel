@@ -484,7 +484,8 @@ partial-shard commit that answer leaves when a sibling shard committed, and
 the metrics and logs `Abandoned` answer of a data PUT that ended without
 landing. A store outage retries inside `object_store` for up to 180 s, so the
 10 s strict-ack timeout answers the write first. This amendment adds a switch
-that takes each of those paths on demand.
+that takes each of those paths on demand (two switches, per the two-switches
+correction below).
 
 - `inv_fault!("<area>/<name>")`, in `ravel-invariant`, is a `bool`. It is
   compiled in under the `antithesis` feature (the workload images) and under
@@ -535,3 +536,13 @@ faults these switches stand in for. `check-release-profile.sh` refuses
 Dockerfile and `publish-images.yml`) and in every workspace manifest, except
 `antithesis` forwarded by a feature of the same name, so a published binary
 compiles neither switch in.
+
+## Correction (2026-11-20): the fault-switch amendment defines two switches (#4499)
+
+<!-- amendment-supersedes: phrase="This amendment adds a switch that takes each of those paths on demand" pointer="two-switches correction" -->
+
+This is the two-switches correction. The #4496 amendment says it "adds a
+switch that takes each of those paths on demand", but it defines two
+switches, as its own marker says: `ingest/encode-cancelled` and
+`ingest/data-put-refused`. The amendment adds two switches that between them
+take those three paths on demand. Nothing else in it changes.

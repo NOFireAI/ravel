@@ -552,10 +552,14 @@ pub mod mutant {
 
     /// Whether `name` is the selected mutant on this thread: the test scope
     /// when one is open here, the process selection otherwise. Before
-    /// [`crate::init`] the process selects none.
+    /// [`crate::init`] the process selects none. A thread whose thread-local
+    /// storage is already destroyed (a destructor running at thread exit)
+    /// has no scope open and sees the process selection.
     pub fn is_selected(name: &str) -> bool {
         let selected = SCOPED
-            .with(Cell::get)
+            .try_with(Cell::get)
+            .ok()
+            .flatten()
             .unwrap_or_else(|| PROCESS.get().copied().flatten());
         selected == Some(name)
     }
@@ -591,7 +595,8 @@ pub mod mutant {
 
     impl Drop for ScopedMutant {
         fn drop(&mut self) {
-            SCOPED.with(|s| s.set(self.previous));
+            // Destroyed storage has no scope left to restore.
+            let _ = SCOPED.try_with(|s| s.set(self.previous));
         }
     }
 
@@ -783,13 +788,34 @@ pub mod fault {
             .map_or(0.0, |(_, rate)| *rate)
     }
 
+    fn process_rate(name: &str) -> f64 {
+        PROCESS.get().map_or(0.0, |r| rate_of(r, name))
+    }
+
     /// The rate in force for `name` on this thread: the test scope's when one
     /// is open here, the process rates otherwise. A fault with no rate, and
-    /// any fault before [`crate::init`], has rate 0.
+    /// any fault before [`crate::init`], has rate 0. A thread whose
+    /// thread-local scope storage is already destroyed (a destructor running
+    /// at thread exit) has no scope open: the process rates from
+    /// `RAVEL_ANTITHESIS_FAULTS` apply, as on any thread with no scope.
     pub fn rate(name: &str) -> f64 {
         SCOPED
-            .with(|scoped| scoped.borrow().as_deref().map(|r| rate_of(r, name)))
-            .unwrap_or_else(|| PROCESS.get().map_or(0.0, |r| rate_of(r, name)))
+            .try_with(|scoped| scoped.borrow().as_deref().map(|r| rate_of(r, name)))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| process_rate(name))
+    }
+
+    /// Whether this thread's scope storage is destroyed, so [`rate`] reads
+    /// the process rates.
+    #[cfg(test)]
+    pub(crate) fn scope_storage_destroyed() -> bool {
+        SCOPED.try_with(|_| ()).is_err()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_rate_for_test(name: &str) -> f64 {
+        process_rate(name)
     }
 
     /// One evaluation of `inv_fault!(name)`. Rate 0 returns false and rate 1
@@ -836,24 +862,31 @@ pub mod fault {
         antithesis_sdk::random::get_random()
     }
 
-    // splitmix64 over a per-thread seed from std's randomly keyed hasher.
+    // splitmix64 over a per-thread seed from std's randomly keyed hasher. A
+    // thread whose state storage is destroyed draws from a fresh seed.
     #[cfg(not(feature = "antithesis"))]
     fn random_u64() -> u64 {
         use std::cell::Cell;
         use std::hash::{BuildHasher, RandomState};
 
-        thread_local! {
-            static STATE: Cell<u64> =
-                Cell::new(RandomState::new().hash_one(std::thread::current().id()));
+        fn seed() -> u64 {
+            RandomState::new().hash_one(std::thread::current().id())
         }
-        STATE.with(|state| {
-            let next = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
-            state.set(next);
-            let mut z = next;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        })
+
+        thread_local! {
+            static STATE: Cell<u64> = Cell::new(seed());
+        }
+        let next = STATE
+            .try_with(|state| {
+                let next = state.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+                state.set(next);
+                next
+            })
+            .unwrap_or_else(|_| seed().wrapping_add(0x9E37_79B9_7F4A_7C15));
+        let mut z = next;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 
     /// Sets `name`'s rate on the calling thread until the guard drops, for a
@@ -897,7 +930,8 @@ pub mod fault {
     impl Drop for ScopedFault {
         fn drop(&mut self) {
             let previous = self.previous.take();
-            SCOPED.with(|scoped| *scoped.borrow_mut() = previous);
+            // Destroyed storage has no scope left to restore.
+            let _ = SCOPED.try_with(|scoped| *scoped.borrow_mut() = previous);
         }
     }
 
@@ -1225,6 +1259,65 @@ mod tests {
         assert!(
             !inv_fault!("ingest/encode-cancelled") && !inv_fault!("ingest/data-put-refused"),
             "a thread that opened no scope sees no fault"
+        );
+    }
+
+    // A thread-local destructor that reads a fault rate after the fault
+    // scope's own storage is destroyed. The thread touches PROBE before it
+    // opens a scope, so PROBE's destructor is registered before SCOPED's.
+    // std on Linux runs thread-local destructors in reverse registration
+    // order, so SCOPED is destroyed first; the probe records whether it saw
+    // the storage destroyed and the test asserts it did, so a platform that
+    // runs them in another order fails here instead of passing without
+    // reaching the destroyed state. The scope is leaked open at rate 1, so a
+    // read of live storage gives 1 and the process rate differs from it.
+    #[cfg(any(feature = "antithesis", feature = "capture"))]
+    #[test]
+    fn fault_rate_after_scope_storage_is_destroyed_is_the_process_rate() {
+        use std::cell::RefCell;
+        use std::sync::{Arc, Mutex};
+
+        use crate::fault::{process_rate_for_test, rate, scope_storage_destroyed, scoped};
+
+        const NAME: &str = "ingest/encode-cancelled";
+        type Seen = Arc<Mutex<Option<(bool, f64, bool)>>>;
+
+        struct Probe(Seen);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let seen = (
+                    scope_storage_destroyed(),
+                    rate(NAME),
+                    inv_fault!("ingest/encode-cancelled"),
+                );
+                *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(seen);
+            }
+        }
+        thread_local! {
+            static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+        }
+
+        let _firing = fault_firing_lock();
+        let seen: Seen = Arc::default();
+        let probe_seen = Arc::clone(&seen);
+        let joined = std::thread::spawn(move || {
+            PROBE.with(|p| *p.borrow_mut() = Some(Probe(probe_seen)));
+            std::mem::forget(scoped(NAME, 1.0).expect("registered"));
+            assert_eq!(rate(NAME).to_bits(), 1.0_f64.to_bits());
+        })
+        .join();
+        assert!(joined.is_ok(), "the thread exits without a panic");
+        let (destroyed, seen_rate, fired) = seen
+            .lock()
+            .expect("probe lock")
+            .take()
+            .expect("the probe's destructor ran");
+        assert!(destroyed, "the probe ran after SCOPED was destroyed");
+        assert_eq!(seen_rate.to_bits(), process_rate_for_test(NAME).to_bits());
+        assert_ne!(seen_rate.to_bits(), 1.0_f64.to_bits());
+        assert!(
+            !fired,
+            "no test in this binary calls init, so the process rate is 0"
         );
     }
 
