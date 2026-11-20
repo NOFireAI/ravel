@@ -87,6 +87,7 @@ use prost::Message;
 use crate::clock::Clock;
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
+use crate::legal_hold::{Admit, DeleteBatch};
 use crate::query_audit::QUERY_AUDIT_SHARD;
 use crate::read::verify_commit_key;
 use crate::retention::held_out_of_window_rlog;
@@ -259,11 +260,23 @@ pub async fn sweep_audit_retention(
             outcome.kept += hour_candidates.len();
             continue;
         }
+        // Each hour's deletes are one delete batch (#4501): it re-reads the
+        // hold set before its first delete and judges each record and the
+        // objects it names from that read.
+        let mut batch = DeleteBatch::new(lease, tenant, "audit retention hour");
         for candidate in hour_candidates {
+            let judged: Vec<&str> = std::iter::once(candidate.record_key.as_str())
+                .chain(candidate.objects.iter().map(String::as_str))
+                .collect();
+            if batch.admit(store, &judged).await != Admit::Delete {
+                outcome.kept += 1;
+                continue;
+            }
             // Record before its objects (mirrors the superseded sweep): a crash
             // between the two leaves record-less data for orphan GC, never a
             // record pointing at a deleted object.
             if !config.dry_run {
+                batch.assert_delete(&judged);
                 store.delete(&candidate.record_key).await?;
                 for key in &candidate.objects {
                     store.delete(key).await?;

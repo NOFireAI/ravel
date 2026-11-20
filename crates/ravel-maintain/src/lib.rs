@@ -134,8 +134,8 @@ pub use gc_config::{
 };
 pub use late_writes::{LateWrite, LateWriteReport, late_write_pass};
 pub use legal_hold::{
-    AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear,
-    write_hold_clear_with_compat, write_hold_set, write_hold_set_with_compat,
+    AUDIT_HOLD_SHARD, HoldRecordCache, HoldSource, LegalHoldCheck, shard_hold_scopes,
+    write_hold_clear, write_hold_clear_with_compat, write_hold_set, write_hold_set_with_compat,
 };
 pub use memo_snapshot::{
     MEMO_PREFIX, MEMO_SNAPSHOT_MTIME_SKIP_NS, MemoSnapshotRead, memo_key, read_all_memo_snapshots,

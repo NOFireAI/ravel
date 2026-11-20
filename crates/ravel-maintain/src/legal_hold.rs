@@ -10,11 +10,22 @@
 //!
 //! [`LeaseCheck::is_protected`] is synchronous and called once per candidate
 //! key inside a sweep pass, but deciding whether a key is under a hold requires
-//! reading hold records from object storage, which is async. This module
-//! resolves that exactly the way [`crate::config::RetentionConfig`] resolves
-//! it: state is loaded once, before the pass, into an in-memory snapshot, and
-//! the per-key check reads only that snapshot. [`LegalHoldCheck::refresh`] is
-//! the async load; [`LegalHoldCheck::is_protected`] never touches I/O.
+//! reading hold records from object storage, which is async. Holds are read
+//! at two points. [`LegalHoldCheck::refresh`] loads the per-tick snapshot that
+//! planning decisions read. Every delete batch then re-reads the hold set from
+//! the store, through the snapshot's [`HoldSource`], immediately before its
+//! first delete, and judges its deletes from that read (ADR-0042, the
+//! delete-batch re-read amendment, #4501). A batch whose re-read fails deletes
+//! nothing and is counted on [`HoldSource::reread_failures`].
+//! [`LegalHoldCheck::is_protected`] itself never touches I/O.
+//!
+//! The guarantee: a legal hold whose set record was durable before a delete
+//! batch re-read the hold set is honored by that batch. A hold written after
+//! the re-read and before the batch's delete requests return is not.
+//!
+//! A re-read is one LIST of the hold shard. Hold records are immutable, so the
+//! commit-record and audit-object GETs behind each listed record are served
+//! from a [`HoldRecordCache`] after the first read; the LIST is never cached.
 //!
 //! # Hold records (ADR-0040, ADR-0042 decision 2)
 //!
@@ -60,6 +71,8 @@
 //! [`crate::NoLeases`].
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ravel_commit::keys::{self, BucketEntry, KeyError};
 use ravel_commit::record;
@@ -165,10 +178,113 @@ struct HoldRecord {
     ts_ns: i64,
 }
 
+/// Decoded hold records per hold commit-record key, shared by every re-read
+/// that goes through it. A hold record and the audit object it names are
+/// immutable, so an entry never goes stale; a record deleted from the store
+/// stops being listed and so stops being read, whatever the cache holds.
+///
+/// Cloning shares the map. The server keeps one per process in its
+/// [`crate::MaintainMemo`], so the GETs behind a record are paid once per
+/// process; each entry is keyed by the full commit key, which names the
+/// tenant.
+#[derive(Debug, Clone, Default)]
+pub struct HoldRecordCache {
+    records: Arc<Mutex<HashMap<String, Arc<[HoldRecord]>>>>,
+}
+
+impl HoldRecordCache {
+    fn get(&self, key: &str) -> Option<Arc<[HoldRecord]>> {
+        self.records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
+    fn insert(&self, key: String, records: Arc<[HoldRecord]>) {
+        self.records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, records);
+    }
+
+    /// The number of commit records cached (introspection and tests).
+    pub fn len(&self) -> usize {
+        self.records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether nothing is cached.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Where a delete batch re-reads one tenant's hold set (ADR-0042, the
+/// delete-batch re-read amendment). Every [`LegalHoldCheck`] built by
+/// [`LegalHoldCheck::refresh`] or [`LegalHoldCheck::refresh_from`] carries
+/// one, and the sweeps reach it through [`LeaseCheck::hold_source`].
+///
+/// The store is not held here: a batch re-reads from the store it is about to
+/// delete from, which is the store the caller passed the sweep.
+#[derive(Debug)]
+pub struct HoldSource {
+    tenant: TenantHash,
+    cache: HoldRecordCache,
+    reread_failures: AtomicU64,
+}
+
+impl HoldSource {
+    /// A source for `tenant` with a cache of its own.
+    pub fn new(tenant: TenantHash) -> Self {
+        Self::with_cache(tenant, HoldRecordCache::default())
+    }
+
+    /// A source for `tenant` reading through `cache`, which may be shared with
+    /// other sources (the server shares one per process).
+    pub fn with_cache(tenant: TenantHash, cache: HoldRecordCache) -> Self {
+        HoldSource {
+            tenant,
+            cache,
+            reread_failures: AtomicU64::new(0),
+        }
+    }
+
+    /// The tenant whose holds this source reads.
+    pub fn tenant(&self) -> &TenantHash {
+        &self.tenant
+    }
+
+    /// The tenant's hold set as the store holds it now: one LIST of the hold
+    /// shard, with each listed record's GETs served from the cache when it
+    /// has them. The returned snapshot carries no source of its own.
+    pub async fn current(&self, store: &dyn ObjectStoreBackend) -> Result<LegalHoldCheck> {
+        let records = load_hold_records(store, &self.tenant, Some(&self.cache)).await?;
+        Ok(LegalHoldCheck {
+            held_prefixes: fold_active_holds(records),
+            source: None,
+        })
+    }
+
+    /// Delete batches whose hold re-read failed, so that deleted nothing,
+    /// since this source was made. The server adds these to its legal-hold
+    /// refresh-failure counter.
+    pub fn reread_failures(&self) -> u64 {
+        self.reread_failures.load(Ordering::Relaxed)
+    }
+
+    fn note_reread_failure(&self) {
+        self.reread_failures.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A pre-resolved, in-memory snapshot of a tenant's active legal holds,
-/// implementing [`LeaseCheck`]. Built once per sweep pass by
+/// implementing [`LeaseCheck`]. Built once per maintain tick by
 /// [`LegalHoldCheck::refresh`]; [`LegalHoldCheck::is_protected`] consults only
-/// this snapshot and never blocks on I/O.
+/// this snapshot and never blocks on I/O. Planning decisions read the
+/// snapshot; each delete batch re-reads through [`Self::source`].
 ///
 /// An empty snapshot protects nothing and is byte-for-byte equivalent to
 /// [`crate::NoLeases`] as a sweep gate, which is exactly what a tenant with no
@@ -178,28 +294,56 @@ pub struct LegalHoldCheck {
     /// Active held key-prefixes (each scope whose latest record is a set),
     /// sorted and deduplicated for a deterministic snapshot.
     held_prefixes: Vec<String>,
+    /// Where each delete batch re-reads the hold set. `None` on
+    /// [`Self::empty`] and on a snapshot [`HoldSource::current`] returned.
+    source: Option<Arc<HoldSource>>,
 }
 
 impl LegalHoldCheck {
     /// An empty snapshot: nothing is held. Identical in effect to
-    /// [`crate::NoLeases`]. Useful as a default before the first refresh.
+    /// [`crate::NoLeases`], and with no [`HoldSource`], so a sweep under it
+    /// re-reads nothing. Useful as a default before the first refresh.
     pub fn empty() -> Self {
         LegalHoldCheck::default()
     }
 
+    /// An empty snapshot bound to `source`: planning sees no hold, and every
+    /// delete batch still re-reads through `source`.
+    pub fn empty_with_source(source: Arc<HoldSource>) -> Self {
+        LegalHoldCheck {
+            held_prefixes: Vec::new(),
+            source: Some(source),
+        }
+    }
+
     /// Load and fold a tenant's legal-hold records from
-    /// [`Signal::Audit`] shard [`AUDIT_HOLD_SHARD`] into a fresh snapshot.
+    /// [`Signal::Audit`] shard [`AUDIT_HOLD_SHARD`] into a fresh snapshot,
+    /// bound to a new [`HoldSource`] for the tenant so the sweeps it is
+    /// passed to re-read holds before each delete batch.
     ///
-    /// This is the async load point, called once before a sweep pass begins
-    /// (mirroring how [`crate::config::RetentionConfig`] is loaded once and
-    /// passed in, never re-fetched per key). Lists the shard's commit records,
-    /// reads each referenced audit object, decodes its RLOG records, keeps the
-    /// legal-hold ones, and folds them to the set of currently-active scopes.
+    /// Lists the shard's commit records, reads each referenced audit object,
+    /// decodes its RLOG records, keeps the legal-hold ones, and folds them to
+    /// the set of currently-active scopes.
     pub async fn refresh(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> Result<Self> {
-        let records = load_hold_records(store, tenant).await?;
+        Self::refresh_from(store, Arc::new(HoldSource::new(*tenant))).await
+    }
+
+    /// [`Self::refresh`] through an existing `source`, whose cache the load
+    /// fills and whose failure counter the sweeps' re-reads move.
+    pub async fn refresh_from(
+        store: &dyn ObjectStoreBackend,
+        source: Arc<HoldSource>,
+    ) -> Result<Self> {
+        let current = source.current(store).await?;
         Ok(LegalHoldCheck {
-            held_prefixes: fold_active_holds(records),
+            held_prefixes: current.held_prefixes,
+            source: Some(source),
         })
+    }
+
+    /// The source each delete batch re-reads through, if any.
+    pub fn source(&self) -> Option<&Arc<HoldSource>> {
+        self.source.as_ref()
     }
 
     /// The currently-active held key-prefixes (introspection and tests).
@@ -221,6 +365,189 @@ impl LeaseCheck for LegalHoldCheck {
         self.held_prefixes
             .iter()
             .any(|prefix| key.starts_with(prefix.as_str()))
+    }
+
+    fn hold_source(&self) -> Option<&HoldSource> {
+        self.source.as_deref()
+    }
+}
+
+/// What a [`DeleteBatch`] says about deleting a set of keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admit {
+    /// No hold the batch observed covers any of the keys.
+    Delete,
+    /// A hold the batch observed covers at least one of the keys.
+    Held,
+    /// The batch's hold re-read failed: the batch deletes nothing.
+    ReadFailed,
+}
+
+/// One delete batch's hold set (ADR-0042, the delete-batch re-read
+/// amendment). The first [`Self::admit`] re-reads the hold set through the
+/// pass lease's [`HoldSource`], and every later one in the batch judges from
+/// that same read, not from the pass snapshot. A failed re-read is counted
+/// once on the source and makes every later [`Self::admit`] of the batch
+/// answer [`Admit::ReadFailed`].
+///
+/// A lease with no source ([`crate::NoLeases`], a test lease) is judged as
+/// itself, with no re-read.
+pub(crate) struct DeleteBatch<'a> {
+    lease: &'a dyn LeaseCheck,
+    tenant: TenantHash,
+    batch: &'static str,
+    observe_unsourced: bool,
+    state: BatchState,
+}
+
+enum BatchState {
+    Unread,
+    Read {
+        /// The batch's own re-read; `None` for a lease with no source.
+        fresh: Option<LegalHoldCheck>,
+        /// For a lease with no source, the hold set re-read only for the
+        /// HeldObjectNeverDeleted assertion; never consulted to decide.
+        observed: Option<LegalHoldCheck>,
+        /// Whether the re-read succeeded. `false` here only under the
+        /// `lifecycle/refresh-failure-is-no-hold` mutant.
+        read_ok: bool,
+    },
+    Failed,
+}
+
+impl<'a> DeleteBatch<'a> {
+    /// A batch of deletes of `tenant`'s objects, judged against `lease`'s
+    /// hold source. `batch` names the delete site in logs and assertions.
+    pub(crate) fn new(lease: &'a dyn LeaseCheck, tenant: &TenantHash, batch: &'static str) -> Self {
+        DeleteBatch {
+            lease,
+            tenant: *tenant,
+            batch,
+            observe_unsourced: false,
+            state: BatchState::Unread,
+        }
+    }
+
+    /// Under a lease with no source, still re-read the store's holds for the
+    /// HeldObjectNeverDeleted assertion where assertions evaluate, so the
+    /// assertion can catch a caller that passed no hold at all.
+    pub(crate) fn observing(mut self) -> Self {
+        self.observe_unsourced = true;
+        self
+    }
+
+    async fn read(&mut self, store: &dyn ObjectStoreBackend) {
+        if !matches!(self.state, BatchState::Unread) {
+            return;
+        }
+        let Some(source) = self.lease.hold_source() else {
+            let observed = if ravel_invariant::EVALUATES && self.observe_unsourced {
+                LegalHoldCheck::refresh(store, &self.tenant).await.ok()
+            } else {
+                None
+            };
+            self.state = BatchState::Read {
+                fresh: None,
+                observed,
+                read_ok: true,
+            };
+            return;
+        };
+        self.state = match source.current(store).await {
+            Ok(fresh) => BatchState::Read {
+                fresh: Some(fresh),
+                observed: None,
+                read_ok: true,
+            },
+            // Mutant lifecycle/refresh-failure-is-no-hold (ADR-4326): treat a
+            // failed re-read as an empty hold set and delete.
+            Err(_) if ravel_invariant::inv_mutant!("lifecycle/refresh-failure-is-no-hold") => {
+                BatchState::Read {
+                    fresh: Some(LegalHoldCheck::empty()),
+                    observed: None,
+                    read_ok: false,
+                }
+            }
+            Err(err) => {
+                source.note_reread_failure();
+                tracing::error!(
+                    tenant = %self.tenant.to_hex(),
+                    batch = self.batch,
+                    error = %err,
+                    "maintenance: legal hold re-read failed before a delete batch; the batch \
+                     deletes nothing and is retried on a later pass"
+                );
+                ravel_invariant::inv_reachable!(
+                    "gc: a failed hold re-read skips a delete batch",
+                    std::collections::BTreeMap::from([
+                        ("tenant", self.tenant.to_hex()),
+                        ("batch", self.batch.to_string()),
+                    ])
+                );
+                BatchState::Failed
+            }
+        };
+    }
+
+    /// Re-read the hold set if this batch has not yet, then judge `keys`
+    /// from the batch's read.
+    pub(crate) async fn admit(&mut self, store: &dyn ObjectStoreBackend, keys: &[&str]) -> Admit {
+        self.read(store).await;
+        match &self.state {
+            BatchState::Unread | BatchState::Failed => Admit::ReadFailed,
+            BatchState::Read { fresh, .. } => {
+                let held = match fresh {
+                    Some(fresh) => keys.iter().any(|k| fresh.is_protected(k)),
+                    None => keys.iter().any(|k| self.lease.is_protected(k)),
+                };
+                if held { Admit::Held } else { Admit::Delete }
+            }
+        }
+    }
+
+    /// The batch's own judgement of `key`, after an [`Self::admit`]; a batch
+    /// that has not read, or whose read failed, holds everything.
+    pub(crate) fn is_held(&self, key: &str) -> bool {
+        match &self.state {
+            BatchState::Unread | BatchState::Failed => true,
+            BatchState::Read { fresh: Some(f), .. } => f.is_protected(key),
+            BatchState::Read { fresh: None, .. } => self.lease.is_protected(key),
+        }
+    }
+
+    /// HeldObjectNeverDeleted and RefreshFailureNeverSweeps at a delete's own
+    /// step, judged from the hold set this batch observed. Call immediately
+    /// before deleting `keys`, the keys the delete removes or that protect it.
+    pub(crate) fn assert_delete(&self, keys: &[&str]) {
+        let (observed, _read_ok) = match &self.state {
+            BatchState::Read {
+                fresh,
+                observed,
+                read_ok,
+            } => (fresh.as_ref().or(observed.as_ref()), *read_ok),
+            BatchState::Unread | BatchState::Failed => (None, false),
+        };
+        let _verdict = observed.map(|holds| !keys.iter().any(|k| holds.is_protected(k)));
+        let _key = keys.first().map(|k| (*k).to_string()).unwrap_or_default();
+        ravel_invariant::inv_always_if_known!(
+            _verdict,
+            "gc: a held object is never deleted",
+            std::collections::BTreeMap::from([
+                ("key", _key.clone()),
+                ("tenant", self.tenant.to_hex()),
+                ("batch", self.batch.to_string()),
+            ])
+        );
+        ravel_invariant::inv_always!(
+            _read_ok,
+            "gc: a failed hold refresh sweeps nothing",
+            std::collections::BTreeMap::from([
+                ("tenant", self.tenant.to_hex()),
+                ("batch", self.batch.to_string()),
+                ("batch_reread_ok", _read_ok.to_string()),
+                ("key", _key),
+            ])
+        );
     }
 }
 
@@ -255,9 +582,13 @@ fn fold_active_holds(records: Vec<HoldRecord>) -> Vec<String> {
 /// [`Signal::Audit`] shard [`AUDIT_HOLD_SHARD`]. Non-legal-hold audit records
 /// are skipped; a record marked `legal_hold` but missing a required attr is a
 /// typed [`MaintainError::Invariant`] (fail loud, never a silent skip).
+///
+/// With a `cache`, a listed record whose decoded hold records the cache has is
+/// not read again; the LIST always runs.
 async fn load_hold_records(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
+    cache: Option<&HoldRecordCache>,
 ) -> Result<Vec<HoldRecord>> {
     let prefix = keys::commit_shard_prefix(tenant, Signal::Audit, AUDIT_HOLD_SHARD)?;
     let metas = list_all(store, &prefix).await?;
@@ -282,16 +613,25 @@ async fn load_hold_records(
             }
             Err(e) => return Err(MaintainError::Key(e)),
         }
+        if let Some(cached) = cache.and_then(|c| c.get(&meta.key)) {
+            out.extend(cached.iter().cloned());
+            continue;
+        }
         let got = store.get(&meta.key, GetRange::Full).await?;
         let commit = record::decode(&got.data)?;
         let data_key = keys::reconstruct_data_key(&commit)?;
         let object = store.get(&data_key, GetRange::Full).await?;
         let reader = RlogReader::new(object.data.as_ref(), &cfg)?;
         let (rows, _stats) = reader.scan(&Predicate::And(Vec::new()))?;
+        let mut holds = Vec::new();
         for row in &rows {
             if let Some(hold) = parse_hold_record(row)? {
-                out.push(hold);
+                holds.push(hold);
             }
+        }
+        out.extend(holds.iter().cloned());
+        if let Some(cache) = cache {
+            cache.insert(meta.key, holds.into());
         }
     }
     Ok(out)
@@ -607,6 +947,7 @@ mod tests {
     fn prefix_match_is_scope_containment() {
         let snapshot = LegalHoldCheck {
             held_prefixes: vec!["t/acme/m/l0/0007/".to_string()],
+            source: None,
         };
         assert!(snapshot.is_protected("t/acme/m/l0/0007/w.10.0000000000000000001.h"));
         assert!(!snapshot.is_protected("t/acme/m/l0/0008/other"));

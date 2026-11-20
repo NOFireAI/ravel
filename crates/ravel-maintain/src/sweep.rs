@@ -132,6 +132,7 @@ use uuid::Uuid;
 use crate::clock::Clock;
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
+use crate::legal_hold::{Admit, DeleteBatch};
 use crate::reachability::{
     MarkerContext, MarkerPolicy, MarkerStats, SnapshotBlock, SnapshotGate, SnapshotObject,
     SnapshotReachability, catalog_head_key,
@@ -156,6 +157,13 @@ pub trait LeaseCheck: Send + Sync {
     /// Return `true` if `key` is protected by an active reader lease and must
     /// not be deleted this pass.
     fn is_protected(&self, key: &str) -> bool;
+
+    /// Where each delete batch re-reads the hold set before its first delete
+    /// (ADR-0042, the delete-batch re-read amendment). `None`, the default,
+    /// judges every delete from [`Self::is_protected`] alone.
+    fn hold_source(&self) -> Option<&crate::legal_hold::HoldSource> {
+        None
+    }
 }
 
 /// The shipped [`LeaseCheck`]: nothing is ever protected, so the
@@ -795,17 +803,10 @@ pub async fn sweep_orphans(
         });
     }
 
-    // The tenant's holds re-read from the store, not the pass's lease: the
-    // HeldObjectNeverDeleted assertion below is false for a deleted key this
-    // re-read protects. A failed re-read leaves `None`, the assertion records
-    // nothing, and the pass goes on.
-    let holds_now = if ravel_invariant::EVALUATES && !candidates.is_empty() {
-        crate::legal_hold::LegalHoldCheck::refresh(store, tenant)
-            .await
-            .ok()
-    } else {
-        None
-    };
+    // The pass's moves are one delete batch: it re-reads the hold set before
+    // its first move and judges every move from that read. A failed re-read
+    // moves nothing.
+    let mut batch = DeleteBatch::new(lease, tenant, "orphan quarantine move").observing();
 
     // Phase (d): quarantine. The breaker (phase (c)) already returned if the
     // pass should collect zero; here every surviving candidate is moved to the
@@ -817,6 +818,11 @@ pub async fn sweep_orphans(
     let mut quarantined = 0usize;
     let mut refused = 0usize;
     for (meta, _) in &candidates {
+        match batch.admit(store, &[meta.key.as_str()]).await {
+            Admit::Delete => {}
+            Admit::Held => continue,
+            Admit::ReadFailed => break,
+        }
         if config.dry_run {
             quarantined += 1;
             continue;
@@ -824,17 +830,7 @@ pub async fn sweep_orphans(
         let dest = quarantine_key(&meta.key, quarantined_at_ns);
         match quarantine_object(store, &meta.key, &dest).await {
             Ok(QuarantineMove::Copied) => {
-                let _verdict = holds_now
-                    .as_ref()
-                    .map(|fresh| !fresh.is_protected(&meta.key));
-                ravel_invariant::inv_always_if_known!(
-                    _verdict,
-                    "gc: a held object is never deleted",
-                    std::collections::BTreeMap::from([
-                        ("key", meta.key.clone()),
-                        ("tenant", tenant.to_hex()),
-                    ])
-                );
+                batch.assert_delete(&[meta.key.as_str()]);
                 store.delete(&meta.key).await?;
                 ravel_invariant::inv_reachable!(
                     "gc: orphan sweep delete",
@@ -1059,11 +1055,10 @@ pub async fn sweep_quarantine(
     let mut reaped = 0usize;
     let mut reaped_bytes = 0u64;
     let mut retained = 0usize;
-    // The tenant's holds re-read from the store once, before the pass's first
-    // delete, not the pass's lease: the HeldObjectNeverDeleted assertion below
-    // is false for a purge whose copy or original key this re-read protects.
-    // The inner `None` is a failed re-read, which records nothing.
-    let mut holds_now: Option<Option<crate::legal_hold::LegalHoldCheck>> = None;
+    // The pass's purges are one delete batch: it re-reads the hold set before
+    // its first purge and judges every purge, the copy's key and its original
+    // key, from that read. A failed re-read purges nothing.
+    let mut batch = DeleteBatch::new(lease, tenant, "quarantine purge").observing();
     for meta in objects {
         let Some(quarantined_at_ns) = parse_quarantine_timestamp(&meta.key) else {
             retained += 1;
@@ -1079,30 +1074,13 @@ pub async fn sweep_quarantine(
             retained += 1;
             continue;
         }
+        let judged: Vec<&str> = std::iter::once(meta.key.as_str()).chain(original).collect();
+        if batch.admit(store, &judged).await != Admit::Delete {
+            retained += 1;
+            continue;
+        }
         if !config.dry_run {
-            let _verdict = if ravel_invariant::EVALUATES {
-                if holds_now.is_none() {
-                    holds_now = Some(
-                        crate::legal_hold::LegalHoldCheck::refresh(store, tenant)
-                            .await
-                            .ok(),
-                    );
-                }
-                holds_now.as_ref().and_then(Option::as_ref).map(|fresh| {
-                    !(fresh.is_protected(&meta.key)
-                        || original.is_some_and(|k| fresh.is_protected(k)))
-                })
-            } else {
-                None
-            };
-            ravel_invariant::inv_always_if_known!(
-                _verdict,
-                "gc: a held object is never deleted",
-                std::collections::BTreeMap::from([
-                    ("key", meta.key.clone()),
-                    ("tenant", tenant.to_hex()),
-                ])
-            );
+            batch.assert_delete(&judged);
             store.delete(&meta.key).await?;
         }
         reaped += 1;
@@ -1876,6 +1854,15 @@ async fn sweep_superseded_impl(
     // below. Only that assertion fills or reads it, so where assertions
     // compile out it stays empty and never allocates.
     let _head_names_group: RefCell<HashMap<usize, bool>> = RefCell::default();
+    // Each cleared chain group is one delete batch (#4501): before its first
+    // delete it re-reads the hold set and checks every key of the group
+    // against that read. A group a hold now covers, or whose re-read failed,
+    // deletes nothing and stops, so it is reported held below.
+    let mut batches: Vec<DeleteBatch> = cleared
+        .iter()
+        .map(|_| DeleteBatch::new(lease, tenant, "superseded chain group"))
+        .collect();
+    let mut admitted: Vec<bool> = vec![false; cleared.len()];
     for delete_loop in [
         DeleteLoop::InputRecords,
         DeleteLoop::Data,
@@ -1890,7 +1877,39 @@ async fn sweep_superseded_impl(
                 if deleted.contains(k.as_str()) {
                     continue;
                 }
+                if !admitted[index] {
+                    let group_keys: Vec<&str> = group.keys().map(String::as_str).collect();
+                    match batches[index].admit(store, &group_keys).await {
+                        Admit::Delete => admitted[index] = true,
+                        Admit::Held => {
+                            let protected = group_keys
+                                .iter()
+                                .find(|k| batches[index].is_held(k))
+                                .copied()
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                tenant_hash = %tenant.to_hex(),
+                                signal = signal.key_prefix(),
+                                shard,
+                                ingest_hour_bucket = group.ingest_hour_bucket,
+                                protected_key = %protected,
+                                group_objects = group.object_count(),
+                                "superseded-input sweep: a legal hold read before this chain's \
+                                 first delete protects a key in it, so the whole chain is \
+                                 skipped this pass"
+                            );
+                            outcome.chain_groups_held_by_legal_hold += 1;
+                            stopped[index] = true;
+                            break;
+                        }
+                        Admit::ReadFailed => {
+                            stopped[index] = true;
+                            break;
+                        }
+                    }
+                }
                 if !config.dry_run {
+                    batches[index].assert_delete(&[k.as_str()]);
                     // The HEAD as it stands at the group's first delete, read
                     // afresh, not the one the gate above planned from. A HEAD
                     // that cannot be read then proves nothing either way.
@@ -3419,6 +3438,8 @@ async fn sweep_unreferenced_parts_impl(
     let objects = list_l1_scoped(store, tenant, signal, shard, hours).await?;
     let mut deleted = 0usize;
     let mut deleted_bytes = 0u64;
+    // The pass's part deletes are one delete batch (#4501).
+    let mut batch = DeleteBatch::new(lease, tenant, "unreferenced part sweep");
     for meta in objects {
         let parsed = keys::parse_l1_part_key(&meta.key)?;
         let bucket = parsed.ingest_hour_bucket;
@@ -3443,7 +3464,13 @@ async fn sweep_unreferenced_parts_impl(
         if classify_part(&meta.key, bucket, &fresh_ref, &fresh_tomb) != Some(branch) {
             continue;
         }
+        match batch.admit(store, &[meta.key.as_str()]).await {
+            Admit::Delete => {}
+            Admit::Held => continue,
+            Admit::ReadFailed => break,
+        }
         if !config.dry_run {
+            batch.assert_delete(&[meta.key.as_str()]);
             store.delete(&meta.key).await?;
         }
         deleted += 1;
@@ -3591,6 +3618,8 @@ pub async fn sweep_idempotency_markers(
     let mut deleted = 0usize;
     let mut kept = 0usize;
     let mut skipped_malformed = 0usize;
+    // The pass's marker deletes are one delete batch (#4501).
+    let mut batch = DeleteBatch::new(lease, tenant, "idempotency marker sweep");
     for meta in objects {
         let Some(hour) = parse_marker_hour(&meta.key, &prefix) else {
             tracing::warn!(
@@ -3609,7 +3638,12 @@ pub async fn sweep_idempotency_markers(
             kept += 1;
             continue;
         }
+        if batch.admit(store, &[meta.key.as_str()]).await != Admit::Delete {
+            kept += 1;
+            continue;
+        }
         if !config.dry_run {
+            batch.assert_delete(&[meta.key.as_str()]);
             store.delete(&meta.key).await?;
         }
         deleted += 1;
@@ -3930,8 +3964,15 @@ pub async fn sweep_unreferenced_catalog_objects(
         kept,
         ..CatalogSweepOutcome::default()
     };
+    // The pass's catalog object deletes are one delete batch (#4501).
+    let mut batch = DeleteBatch::new(lease, tenant, "catalog object sweep");
     for meta in &candidates {
+        if batch.admit(store, &[meta.key.as_str()]).await != Admit::Delete {
+            outcome.kept += 1;
+            continue;
+        }
         if !config.dry_run {
+            batch.assert_delete(&[meta.key.as_str()]);
             // Judged from the bytes of the HEAD reads the pass decided from,
             // decoded here, not from the reference set built from them. A
             // HEAD corrupted after those reads does not bear on this delete.
@@ -4222,6 +4263,9 @@ pub async fn sweep_erasure_requests(
 
     let mut deleted = 0usize;
     let mut held_by_superseded_inputs = 0usize;
+    // The pass's `.dreq` deletes are one delete batch (#4501). The rule 2
+    // observation above is planning and keeps the pass snapshot.
+    let mut batch = DeleteBatch::new(lease, tenant, "erasure request sweep");
     for (request_id, dreq_key) in candidates {
         // The horizon has elapsed, but rule 2 may have held an object one of
         // this request's rewrites superseded: an input the live HEAD still
@@ -4252,7 +4296,12 @@ pub async fn sweep_erasure_requests(
             held_by_superseded_inputs += 1;
             continue;
         }
+        if batch.admit(store, &[dreq_key.as_str()]).await != Admit::Delete {
+            kept += 1;
+            continue;
+        }
         if !config.dry_run {
+            batch.assert_delete(&[dreq_key.as_str()]);
             store.delete(dreq_key).await?;
         }
         deleted += 1;
