@@ -4894,7 +4894,7 @@ impl Catalog {
                     .ok()
                     .map(|held| !held),
                 "commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced",
-                rewrite_fallback_details(tenant, signal, token)
+                rewrite_fallback_details(tenant, signal, token, out.len())
             );
             for part in &record.parts {
                 let segment_ref = build_rewrite_l1_segment_ref(record, part, rkey)?;
@@ -5465,13 +5465,15 @@ fn token_answer_details(
     ])
 }
 
-/// Details of a swept-token rewrite-fallback evaluation; only an invariant
-/// assertion reads them.
+/// Details of a swept-token rewrite-fallback evaluation, `set_len` being the
+/// number of objects in the set judged; only an invariant assertion reads
+/// them.
 #[allow(dead_code)]
 fn rewrite_fallback_details(
     tenant: &TenantHash,
     signal: Signal,
     token: &CommitToken,
+    set_len: usize,
 ) -> std::collections::BTreeMap<&'static str, String> {
     std::collections::BTreeMap::from([
         ("tenant", tenant.to_hex()),
@@ -5479,6 +5481,7 @@ fn rewrite_fallback_details(
         ("shard", token.shard.to_string()),
         ("ingest_hour", token.ingest_hour_bucket.to_string()),
         ("token", token.encode()),
+        ("set_len", set_len.to_string()),
     ])
 }
 

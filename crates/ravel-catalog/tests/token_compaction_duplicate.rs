@@ -1494,8 +1494,14 @@ fn replaced_object_evaluations(token: &CommitToken) -> Option<Vec<(bool, String)
 }
 
 /// Asserts `evaluations` are exactly one evaluation, judged `expected`,
-/// whose details name the token's tenant, signal, shard and ingest hour.
-fn assert_one_replaced_object_evaluation(evaluations: &[(bool, String)], expected: bool) {
+/// whose details name the token's tenant, signal, shard and ingest hour and
+/// a judged set of `set_len` objects: the set as it stood before the
+/// rewrite's parts were added.
+fn assert_one_replaced_object_evaluation(
+    evaluations: &[(bool, String)],
+    expected: bool,
+    set_len: usize,
+) {
     assert_eq!(evaluations.len(), 1, "{evaluations:?}");
     let (condition, details) = &evaluations[0];
     assert_eq!(*condition, expected, "{details}");
@@ -1504,6 +1510,7 @@ fn assert_one_replaced_object_evaluation(evaluations: &[(bool, String)], expecte
         "\"signal\": \"Logs\"".to_string(),
         "\"shard\": \"0\"".to_string(),
         format!("\"ingest_hour\": \"{HOUR}\""),
+        format!("\"set_len\": \"{set_len}\""),
     ] {
         assert!(details.contains(&field), "{field} in {details}");
     }
@@ -1515,7 +1522,9 @@ fn assert_one_replaced_object_evaluation(evaluations: &[(bool, String)], expecte
 /// compaction of M), the live rewrite R over P and M landed after the fold,
 /// and P's commit record and data object are deleted directly. Resolving
 /// P's token reaches the swept-token fallback's live-rewrite branch with the
-/// set holding an object R replaced.
+/// set holding `held` alone, an object R replaced. The property is judged on
+/// that one-object set, before R's part joins it; a raw-input-only judge
+/// misses the compacted variant's `held`.
 async fn swept_token_beside_a_replaced_object_is_evaluated_false(compacted_m: bool, p_seq: u64) {
     let store = Arc::new(MemoryStore::new());
     let start = hour_start(HOUR);
@@ -1569,7 +1578,7 @@ async fn swept_token_beside_a_replaced_object_is_evaluated_false(compacted_m: bo
     );
 
     let evaluations = replaced_object_evaluations(&token(&p)).expect("capturing");
-    assert_one_replaced_object_evaluation(&evaluations, false);
+    assert_one_replaced_object_evaluation(&evaluations, false, 1);
 }
 
 #[tokio::test]
@@ -1630,5 +1639,5 @@ async fn swept_token_with_its_rewrite_part_in_head_is_evaluated_true() {
     );
 
     let evaluations = replaced_object_evaluations(&token(&p)).expect("capturing");
-    assert_one_replaced_object_evaluation(&evaluations, true);
+    assert_one_replaced_object_evaluation(&evaluations, true, 1);
 }
