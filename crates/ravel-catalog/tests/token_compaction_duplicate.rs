@@ -1468,3 +1468,176 @@ async fn swept_token_beside_a_raw_input_its_live_rewrite_replaced() {
 async fn swept_token_beside_a_compaction_its_live_rewrite_replaced() {
     swept_token_beside_an_input_its_live_rewrite_replaced(true).await;
 }
+
+/// `(condition, details)` of every captured evaluation of the swept-token
+/// replaced-object property whose details mention `token`, or `None`
+/// outside the invariants lane. This crate forwards no
+/// `ravel-invariant/capture` feature, so the read sits inside an assertion
+/// macro, whose condition runs only when ravel-invariant records
+/// evaluations.
+fn replaced_object_evaluations(token: &CommitToken) -> Option<Vec<(bool, String)>> {
+    let found = std::cell::RefCell::new(None);
+    let needle = token.encode();
+    let _ = &needle;
+    ravel_invariant::inv_sometimes!(
+        {
+            *found.borrow_mut() = ravel_invariant::test_support::evaluations(
+                "commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced",
+                &needle,
+            );
+            true
+        },
+        "ravel-catalog test: evaluations are read",
+        ""
+    );
+    found.into_inner()
+}
+
+/// Asserts `evaluations` are exactly one evaluation, judged `expected`,
+/// whose details name the token's tenant, signal, shard and ingest hour and
+/// a judged set of `set_len` objects: the set as it stood before the
+/// rewrite's parts were added.
+fn assert_one_replaced_object_evaluation(
+    evaluations: &[(bool, String)],
+    expected: bool,
+    set_len: usize,
+) {
+    assert_eq!(evaluations.len(), 1, "{evaluations:?}");
+    let (condition, details) = &evaluations[0];
+    assert_eq!(*condition, expected, "{details}");
+    for field in [
+        format!("\"tenant\": \"{}\"", tenant().to_hex()),
+        "\"signal\": \"Logs\"".to_string(),
+        "\"shard\": \"0\"".to_string(),
+        format!("\"ingest_hour\": \"{HOUR}\""),
+        format!("\"set_len\": \"{set_len}\""),
+    ] {
+        assert!(details.contains(&field), "{field} in {details}");
+    }
+}
+
+/// The state the ignored `swept_token_beside_*` tests build, on writer
+/// sequences `p_seq` and `p_seq + 1` so each test reads only its own
+/// evaluations: HEAD names `held` (M's raw object, or the part of a
+/// compaction of M), the live rewrite R over P and M landed after the fold,
+/// and P's commit record and data object are deleted directly. Resolving
+/// P's token reaches the swept-token fallback's live-rewrite branch with the
+/// set holding `held` alone, an object R replaced. The property is judged on
+/// that one-object set, before R's part joins it; a raw-input-only judge
+/// misses the compacted variant's `held`.
+async fn swept_token_beside_a_replaced_object_is_evaluated_false(compacted_m: bool, p_seq: u64) {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let p = l0(Signal::Logs, p_seq, HOUR, start, L_ROWS);
+    if replaced_object_evaluations(&token(&p)).is_none() {
+        return;
+    }
+    let m = l0(Signal::Logs, p_seq + 1, HOUR, start + 2_000_000, M_ROWS);
+    put_l0(store.as_ref(), &p).await;
+    put_l0(store.as_ref(), &m).await;
+    let held = if compacted_m {
+        let mut c = compaction(Signal::Logs, &[&m], 0x11, 0xc1, M_ROWS);
+        c.parts[0].min_event_ts_ns = m.min_event_ts_ns;
+        c.parts[0].max_event_ts_ns = m.max_event_ts_ns;
+        put_compaction(store.as_ref(), &c).await;
+        part_key(&c)
+    } else {
+        l0_key(&m)
+    };
+    fold_hour(&store, Signal::Logs).await;
+    let request_id = Uuid::from_u128(0xd4428);
+    put_dreq(store.as_ref(), Signal::Logs, request_id).await;
+    let rw = put_rewrite(
+        store.as_ref(),
+        Signal::Logs,
+        &[&p, &m],
+        request_id,
+        start,
+        L_ROWS + M_ROWS - 1,
+    )
+    .await;
+    store
+        .delete(&keys::commit_key_for_record(&p).expect("commit key"))
+        .await
+        .expect("delete P's commit record");
+    store
+        .delete(&l0_key(&p))
+        .await
+        .expect("delete P's data object");
+
+    let window = (late_window().0, sealed_window().1);
+    let (plain, _) = resolve_counted(&store, Signal::Logs, window, &[]).await;
+    assert_eq!(sorted_keys(&plain), vec![held.clone()], "HEAD is stale");
+    let (snapshot, _) = resolve_counted(&store, Signal::Logs, window, &[token(&p)]).await;
+    let mut expected = vec![held, rewrite_part_key(&rw)];
+    expected.sort();
+    assert_eq!(
+        sorted_keys(&snapshot),
+        expected,
+        "the branch adds R's parts whatever the verdict"
+    );
+
+    let evaluations = replaced_object_evaluations(&token(&p)).expect("capturing");
+    assert_one_replaced_object_evaluation(&evaluations, false, 1);
+}
+
+#[tokio::test]
+async fn swept_token_beside_a_raw_input_its_live_rewrite_replaced_is_evaluated_false() {
+    swept_token_beside_a_replaced_object_is_evaluated_false(false, 41).await;
+}
+
+#[tokio::test]
+async fn swept_token_beside_a_compaction_its_live_rewrite_replaced_is_evaluated_false() {
+    swept_token_beside_a_replaced_object_is_evaluated_false(true, 43).await;
+}
+
+/// HEAD folded after the rewrite R over P and M landed, so it names R's own
+/// part and no object R replaced. P's commit record and data object are
+/// deleted, and resolving P's token reaches the swept-token fallback's
+/// live-rewrite branch with R's part already in the set: the property holds
+/// and the snapshot serves R's part once.
+#[tokio::test]
+async fn swept_token_with_its_rewrite_part_in_head_is_evaluated_true() {
+    let store = Arc::new(MemoryStore::new());
+    let start = hour_start(HOUR);
+    let p = l0(Signal::Logs, 45, HOUR, start, L_ROWS);
+    if replaced_object_evaluations(&token(&p)).is_none() {
+        return;
+    }
+    let m = l0(Signal::Logs, 46, HOUR, start + 2_000_000, M_ROWS);
+    put_l0(store.as_ref(), &p).await;
+    put_l0(store.as_ref(), &m).await;
+    let request_id = Uuid::from_u128(0xd4428);
+    put_dreq(store.as_ref(), Signal::Logs, request_id).await;
+    let rw = put_rewrite(
+        store.as_ref(),
+        Signal::Logs,
+        &[&p, &m],
+        request_id,
+        start,
+        L_ROWS + M_ROWS - 1,
+    )
+    .await;
+    fold_hour(&store, Signal::Logs).await;
+    store
+        .delete(&keys::commit_key_for_record(&p).expect("commit key"))
+        .await
+        .expect("delete P's commit record");
+    store
+        .delete(&l0_key(&p))
+        .await
+        .expect("delete P's data object");
+
+    let (plain, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[]).await;
+    assert_eq!(sorted_keys(&plain), vec![rewrite_part_key(&rw)]);
+    let (snapshot, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[token(&p)]).await;
+    assert_eq!(sorted_keys(&snapshot), vec![rewrite_part_key(&rw)]);
+    assert_eq!(
+        rows(&snapshot),
+        L_ROWS + M_ROWS - 1,
+        "each row counted once"
+    );
+
+    let evaluations = replaced_object_evaluations(&token(&p)).expect("capturing");
+    assert_one_replaced_object_evaluation(&evaluations, true, 1);
+}
