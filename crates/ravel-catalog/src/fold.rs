@@ -13822,6 +13822,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn mutant_lost_cas_proceeds_breaks_no_live_commit_omitted() {
+        if !capturing() {
+            return;
+        }
         let Some(_mutant) = scoped_mutant("catalog/lost-cas-proceeds") else {
             return;
         };

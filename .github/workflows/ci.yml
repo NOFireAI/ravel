@@ -3106,10 +3106,11 @@ jobs:
   # `invariants` lane): the crates that carry them, tested with every
   # evaluation recorded in process (`ravel-invariant/capture`) and every
   # mutant compiled in (`ravel-invariant/antithesis-mutants`), with no
-  # Antithesis SDK; a last clippy step compiles them with
-  # `ravel-invariant/antithesis` alone. The workspace jobs build none of these
-  # features, so a site or mutant test that only exists under them runs
-  # nowhere else.
+  # Antithesis SDK; a clippy step then compiles them with
+  # `ravel-invariant/antithesis` alone, and a last step tests them that way,
+  # all but ravel-catalog, whose tests fail there (#4508). The workspace jobs
+  # build none of these features, so a site or mutant test that only exists
+  # under them runs nowhere else.
   invariants:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
@@ -3144,6 +3145,10 @@ jobs:
       # capture nor the mutant module does without its own feature (#4497).
       - name: Clippy the invariant crates with the antithesis feature alone
         run: cargo clippy --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis --all-targets -- -D warnings
+      # Runs ravel-invariant's test_support fallbacks, which no other step
+      # compiles. ravel-catalog's tests fail under this feature alone (#4508).
+      - name: Test the invariant crates with the antithesis feature alone
+        run: cargo test --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
