@@ -13,10 +13,12 @@
 #
 # Every exit the supervisor did not ask for ends the supervisor with the
 # child's exit code. A SIGTERM or SIGINT it receives is passed on to the
-# child, and once the child is gone the supervisor exits 143, whatever the
-# child's own drain status was: a stop that lands mid-drain while the store
-# is down makes ravel-server exit 1 (drain exceeded --shutdown-timeout), and
-# that is the stop fault's outcome, not an unexpected container exit.
+# child, and once the child is gone the supervisor exits 143 when the child
+# ended the way a stop ends it: 0 (drained), 1 (a stop that lands mid-drain
+# while the store is down makes ravel-server exit 1, drain exceeded
+# --shutdown-timeout) or 143 (killed by the SIGTERM). Any other child code,
+# such as a panic (101) or a crash (139), is the supervisor's exit code even
+# during a stop, so a crash that coincides with a stop still shows.
 #
 # RAVEL_SUPERVISE_SELF_CHECK=1 is the local loop's self-check: the first drain
 # kills the child with SIGKILL instead, and every later one is taken and never
@@ -85,6 +87,15 @@ reap() {
     done
 }
 
+# Exit once a stop has ended the child: 143 for the codes a stop produces,
+# the child's own code for anything else.
+exit_stopped() {
+    case "$code" in
+        0 | 1 | 143) exit 143 ;;
+        *) exit "$code" ;;
+    esac
+}
+
 mkdir -p "$CONTROL"
 for left in "$DRAINING" "$REQUEST"; do
     if [ -e "$left" ]; then
@@ -140,9 +151,7 @@ while :; do
                 reap
                 if [ "$stopping" = 1 ]; then
                     report "seq=$seq interrupted"
-                    # A container stop ends the supervisor as a stopped
-                    # container: 143, not the child's own drain status.
-                    exit 143
+                    exit_stopped
                 fi
                 report "seq=$seq code=$code"
                 drained=1
@@ -155,7 +164,7 @@ while :; do
         reap
         echo "supervise: ravel-server exited with status $code"
         if [ "$stopping" = 1 ]; then
-            exit 143
+            exit_stopped
         fi
         exit "$code"
     fi
