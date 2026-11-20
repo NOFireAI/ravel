@@ -145,6 +145,11 @@ enum Fault {
     OkWithSlowDownBody,
     /// 403 `AccessDenied`: permanent, must not be retried at all.
     AccessDenied,
+    /// 403 with this `<Error><Code>`: `RequestTimeTooSkewed` from a request
+    /// whose signing time is too far from the store's clock,
+    /// `SignatureDoesNotMatch` from a bad secret. A HEAD response carries no
+    /// body, so on a HEAD the code never reaches the client.
+    Forbidden(&'static str),
     /// 301 with no `Location`, the redirect S3 answers a request sent to the
     /// wrong region with: permanent, never retried.
     MovedPermanently,
@@ -949,6 +954,9 @@ async fn handle(
             "AccessDenied",
             "Access Denied by the fake endpoint.",
         ),
+        Some(Fault::Forbidden(code)) => {
+            error_response(StatusCode::FORBIDDEN, code, "Refused by the fake endpoint.")
+        }
         Some(Fault::MovedPermanently) => {
             build(StatusCode::MOVED_PERMANENTLY, vec![], Body::empty())
         }
@@ -1973,6 +1981,86 @@ async fn access_denied_is_never_retried() {
         1,
         "a permanent error must not be retried at all"
     );
+}
+
+/// A 403 whose S3 error code is `RequestTimeTooSkewed` is `ClockSkewed` on
+/// the GET, PUT and LIST paths startup reads take, sent once and not
+/// retryable, while a 403 `AccessDenied` or `SignatureDoesNotMatch` stays
+/// `AccessDenied`. A HEAD 403 has no body, so its code is unknown and it stays
+/// `AccessDenied` whatever the store meant.
+#[tokio::test]
+async fn a_clock_skew_403_is_clock_skewed_and_other_403s_stay_access_denied() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("skew/k", b"present");
+
+    let skewed = |op: &str, error: StoreError| {
+        assert!(
+            matches!(error, StoreError::ClockSkewed(_)),
+            "{op}: a 403 RequestTimeTooSkewed must map to ClockSkewed, got {error:?}"
+        );
+        assert!(
+            !error.is_retryable(),
+            "{op}: ClockSkewed is not retryable at runtime: {error:?}"
+        );
+    };
+
+    fake.script(Op::Get, [Fault::Forbidden("RequestTimeTooSkewed")]);
+    skewed(
+        "GET",
+        store.get("skew/k", GetRange::Full).await.expect_err("get"),
+    );
+    fake.script(Op::Put, [Fault::Forbidden("RequestTimeTooSkewed")]);
+    skewed(
+        "PUT",
+        store
+            .put(
+                "skew/new",
+                Bytes::from_static(b"payload"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect_err("put"),
+    );
+    fake.script(Op::List, [Fault::Forbidden("RequestTimeTooSkewed")]);
+    skewed("LIST", store.list("skew/", None).await.expect_err("list"));
+    assert_eq!(
+        fake.count(Op::Get),
+        1,
+        "a clock-skew 403 GET is not retried"
+    );
+    assert_eq!(
+        fake.count(Op::Put),
+        1,
+        "a clock-skew 403 PUT is not retried"
+    );
+    assert_eq!(
+        fake.count(Op::List),
+        1,
+        "a clock-skew 403 LIST is not retried"
+    );
+
+    fake.script(Op::Head, [Fault::Forbidden("RequestTimeTooSkewed")]);
+    let head = store.head("skew/k").await.expect_err("head");
+    assert!(
+        matches!(head, StoreError::AccessDenied(_)),
+        "a HEAD 403 carries no code, so it stays AccessDenied, got {head:?}"
+    );
+
+    for code in ["AccessDenied", "SignatureDoesNotMatch"] {
+        fake.script(Op::Get, [Fault::Forbidden(code)]);
+        let get = store.get("skew/k", GetRange::Full).await.expect_err("get");
+        assert!(
+            matches!(get, StoreError::AccessDenied(_)),
+            "a GET 403 {code} must stay AccessDenied, got {get:?}"
+        );
+        fake.script(Op::List, [Fault::Forbidden(code)]);
+        let list = store.list("skew/", None).await.expect_err("list");
+        assert!(
+            matches!(list, StoreError::AccessDenied(_)),
+            "a LIST 403 {code} must stay AccessDenied, got {list:?}"
+        );
+    }
 }
 
 /// `S3Store::delete` is one `DeleteObjects` POST naming only the key: never a

@@ -709,6 +709,13 @@ pub enum StoreError {
     PreconditionFailed,
     #[error("access denied: {0}")]
     AccessDenied(String),
+    /// The backend refused the request because the request's signing time is
+    /// too far from its own clock (S3 error code `RequestTimeTooSkewed`, sent
+    /// with a 403). Never retryable, like [`StoreError::AccessDenied`]; a
+    /// caller whose own clock may just have stepped, such as a process
+    /// running its startup checks, may choose to retry it.
+    #[error("request clock rejected by the store (clock skew): {0}")]
+    ClockSkewed(String),
     #[error("throttled, retry after {retry_after_ms} ms")]
     Throttled { retry_after_ms: u64 },
     #[error("timeout")]
@@ -1919,5 +1926,18 @@ mod observed_store_time_tests {
 
         let erased_twice: Arc<dyn ObjectStoreBackend> = Arc::new(Arc::clone(&shared));
         assert_eq!(erased_twice.observed_store_time_ns(), Some(42));
+    }
+}
+
+#[cfg(test)]
+mod store_error_tests {
+    use super::StoreError;
+
+    /// A clock-skew refusal is not retryable, as the `AccessDenied` that every
+    /// other 403 maps to is not.
+    #[test]
+    fn a_clock_skew_refusal_is_not_retryable() {
+        assert!(!StoreError::ClockSkewed("403 RequestTimeTooSkewed".into()).is_retryable());
+        assert!(!StoreError::AccessDenied("403 AccessDenied".into()).is_retryable());
     }
 }
