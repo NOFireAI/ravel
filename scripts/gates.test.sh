@@ -134,7 +134,7 @@ cli_explain_test='==> cargo nextest run --locked -p ravel-cli --features sql-exp
 invariants_clippy='==> cargo clippy --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --all-targets -- -D warnings'
 invariants_test='==> cargo nextest run --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants'
 invariants_antithesis_clippy='==> cargo clippy --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis --all-targets -- -D warnings'
-invariants_antithesis_test='==> cargo nextest run --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis'
+invariants_antithesis_test='==> cargo nextest run --locked -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis'
 invariants_services_clippy='==> cargo clippy --locked -p ravel-server -p ravel-cli --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --all-targets -- -D warnings'
 invariants_services_test='==> cargo nextest run --locked -p ravel-server -p ravel-cli --features ravel-invariant/capture,ravel-invariant/antithesis-mutants'
 ingest_shipping_clippy='==> cargo clippy --locked -p ravel-ingest --all-targets -- -D warnings'
@@ -235,8 +235,7 @@ check_eq "gates -p ravel-commit: invariants lane antithesis-alone clippy" "1" \
   "$(count "${out}" "${invariants_antithesis_clippy}")"
 check_eq "gates -p ravel-commit: antithesis-alone clippy directly after the lane tests" "1" \
   "$(grep -A1 -xF -- "${invariants_test}" "${out}" | grep -cxF -- "${invariants_antithesis_clippy}")"
-# Then the tests with the antithesis feature alone, ravel-catalog left out
-# (#4508).
+# Then the tests of the same six crates with the antithesis feature alone.
 check_eq "gates -p ravel-commit: invariants lane antithesis-alone tests" "1" \
   "$(count "${out}" "${invariants_antithesis_test}")"
 check_eq "gates -p ravel-commit: antithesis-alone tests directly after its clippy" "1" \

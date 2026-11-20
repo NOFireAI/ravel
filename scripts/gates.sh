@@ -523,9 +523,7 @@ run_feature_lanes() {
     run cargo clippy --locked \
       -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet \
       --features ravel-invariant/antithesis --all-targets -- -D warnings
-    # ravel-catalog is linted above but not tested here: its tests fail
-    # under `antithesis` alone (#4508).
-    run_lane_tests -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-maintain -p ravel-fleet \
+    run_lane_tests -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet \
       --features ravel-invariant/antithesis
   fi
 
