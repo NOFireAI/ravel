@@ -102,7 +102,8 @@ compaction record is seen the workload jumps the clock twice more.
 | `sweep_unreadable_head` | Rarely, once HEAD is known and at most once per timeline: the unreadable-HEAD sweep ("The forced races"). |
 | `audit` | The store audit below. |
 | `check_bounds` | The upper-bound check below, on one node. |
-| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs up to six fold races until a server fold lost its CAS, up to five record races until a server's record PUT lost, the unfolded-record sweep unless one already reached its situation, and the unreadable-HEAD sweep, then folds, compacts, audits, takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, runs the full multiset check and ends the timeline. |
+| `token_lifecycle_read` | While faults may run: reads one acked write back with its commit tokens on a drawn node, drawing the write from all of them, from those with a compacted input, or from those whose input commit record the sweep check confirmed deleted, and drawing whether to read it twice on that node ("Token reads across the lifecycle"). |
+| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs up to six fold races until a server fold lost its CAS, up to five record races until a server's record PUT lost, the unfolded-record sweep unless one already reached its situation, and the unreadable-HEAD sweep, then folds, compacts, audits, folds and audits again and token-reads up to six writes with a compacted input, takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, in the local loop has `local-run.sh` restart a node, token-reads up to six writes whose input commit record was swept, runs the full multiset check and ends the timeline. |
 
 The forced eventually runs inside the state machine, like a drawn one: once
 `WORKLOAD_EVENTUALLY_AFTER_SECS` passes, the timer only sets a flag, and the
@@ -130,6 +131,74 @@ records, must hold every seeded record exactly once, and a read of every
 acked live write with its commit tokens must find each at least once. A read
 that fails for two minutes counts as a violation, not as a pass.
 
+### Token reads across the lifecycle
+
+A commit token promises read-your-write: a read with the token returns the
+write's records whatever happened to the objects holding them since. The
+catalog resolves a token by an exact GET of its commit record, and once that
+record is gone, through the compaction record that names it
+(docs/catalog-and-mvcc.md, steps 4 and 5). Each of those branches is a place
+where a stale answer could come back: the obsolete input beside its
+compacted replacement, or nothing. `token_lifecycle_read` and the
+`eventually` read single writes back at each state of their input's
+lifecycle and judge every answer exactly.
+
+Which writes: acked live writes whose model allows one stored copy at most
+(`Write::max_copies() == 1`, a single attempt, acknowledged). For those the
+model's bounds are exact, so every record must come back exactly once. A
+retried write may hold two copies and is never read here.
+
+The read: `POST /api/v1/sql` on one node, counting `(wl.write, wl.rec)` rows of
+that write only, over its event time plus and minus 10 minutes, with every
+token of its acknowledgement as `min_commit_token`. The verdict comes from
+the ingest-durability model (`judge_logs` with the write expected): no
+phantom, no record more than once, none missing. A 200 with no rows is a
+verdict and fails. A 503 carrying the stable message `requested commit token
+is not yet visible; retry` (an unsatisfiable token) is retried once after
+2 s, as the message asks; refused again, it is a verdict and fails, since an
+acknowledged token always resolves while no retention is configured. Every
+other failure (no response, another 503, 504, 500, 422, 400, an unparsable
+body) gives no verdict: it is counted by class in the details
+(`tally`) and in the driver log (`token reads by outcome:`), never passed.
+
+The state of each token's input, decided from what the store shows, never
+from a Ravel resolver of the read itself. A token decodes (base64url of
+`v2:<shard>:<writer>:<epoch>:<seq>:<hour>`, `CommitToken::encode`) to its
+commit record key, the same `<writer>.<epoch>.<seq:020>.cmt` key a compaction
+record's decoded input names. Before the read the driver LISTs the token's
+bucket (`l/c/<shard>/<hour>/`), decodes every compaction record there it has
+not decoded (`commit decode-compaction`), and checks the commit record (in
+that LIST, else a GET). After the read it GETs the commit record again.
+
+| State | Evidence |
+|---|---|
+| before compaction | No decoded compaction record names the input. |
+| compacted, commit record present | A compaction record listed before the read names the input, and the commit record was still in the store after the read, so throughout it: deleted keys never come back. |
+| HEAD named the compaction output | The last audit whose HEAD held still (its `created_unix_ns` the same before and after) has a watermark at or above the input's hour, so HEAD alone serves that hour, and its `rlog footprint` resolved an output part of the covering record (`l/l1/<shard>/<hour>/<input_set_hash16>.`) and no data object of the input. This is the one state whose evidence goes through `ravel-cli`'s catalog resolve: no command prints a part's entries ("Missing decoder" below). The claim is that HEAD had named the output before the read; `corrupt_head` takes only the read gate too, so HEAD may be garbage during the read itself. |
+| input commit record swept | A compaction record names the input, and the commit record was absent before the read (absent from the LIST and a GET found nothing). On a node that never cached the record, the read takes the catalog's fallback, where the SUT evaluates `commit: a commit token never resolves to a stale answer` with the answer `superseded by compaction`. A node that read the record before (every node lists every unsealed hour's records) serves the token from its cache, so only a restarted node gets there: in the local loop, the eventually reads its swept writes on the node it had `local-run.sh` restart. |
+| node restarted since the write | The read's node acknowledged one write after this one was acknowledged (or acknowledged this one), and a later write, sent after that answer arrived, under another writer identity. A ravel-server process draws its log writer identity once, when it starts (the log router builds its shard set once per shard count, and this workload never reshards), so a new identity is a new process. One counter orders every attempt's send and answer in real time. |
+
+With `twice` the same tokens are read again at once on the same node: the
+second read finds whatever the first one cached there (a present commit
+record, the bucket's compaction records). A swept commit record is not
+cached, so the second read of a swept input on a restarted node takes the
+fallback again.
+
+How this closes #4490: the ingest-durability driver reads at "now", so the
+listing path caches every commit record before the token loop and the
+fallback never runs; nothing there compacts or sweeps. Here the same
+caching holds: a ravel-server keeps every commit record it read, and both
+nodes read every live record while its hour was unsealed, so a read of a
+swept input on a node that has run since then is served from that cache and
+never GETs the record. The fallback, and with it `assert_token_never_stale`
+and the SUT's `commit: a commit token's stale-answer evidence read
+evaluated`, runs only for a read of a swept input on a node with a cold
+cache: a node restarted after the hour was folded (by a fault in
+Antithesis, by the eventually's requested restart in the local loop). Reads
+after HEAD named the compaction output run `include_token_l0` past its
+early return on any node. `local-run.sh` requires the SUT assertion in a
+plain run.
+
 ### The store audit
 
 1. `catalog inspect --json` gives the HEAD key and its `created_unix_ns`.
@@ -155,7 +224,10 @@ that fails for two minutes counts as a violation, not as a pass.
    not is requested again, and a listing that still fails gives no verdict,
    never an empty bucket.
 5. `catalog inspect --json` again. If HEAD changed during steps 1 to 5, or
-   is corrupt or absent, the audit skips steps 6 and 7.
+   is corrupt or absent, the audit skips steps 6 and 7. Otherwise, when
+   `rlog footprint` succeeded, its keys and HEAD's watermark become the HEAD
+   evidence a later token read decides "HEAD named the compaction output"
+   from.
 6. Cross-check the text parse against the JSON form of the same HEAD: the
    same part keys in the same order and the same number of key-index leaves.
    A parse that found nothing or a different set fails the audit, since it
@@ -197,6 +269,12 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: every data object the catalog resolves exists` | always | `audit` | Every data object `rlog footprint` reports is in that LIST. |
 | `catalog: the system recovers once faults stop` | always | `eventually` | Every node is ready and answers SQL, and every maintenance node is ready, within 300 s of faults stopping. |
 | `catalog: compaction preserves the acked multiset` | always | `eventually` | After faults stop, a fold and a compaction: each seeded record is stored exactly once, each acked live record at least once (read with its commit tokens), no live record more often than its attempts allow, no row names a record that was never written, and every read answered. |
+| `catalog: a token read returns each acked record of its write exactly once` | always | `token_lifecycle_read`, `eventually` | Every token read that gave a verdict returned each record of the write exactly once and nothing else, and was not refused as unsatisfiable twice ("Token reads across the lifecycle"). Reads without a verdict are counted, not judged. |
+| `catalog: a token read ran after its input was compacted` | sometimes | `token_lifecycle_read`, `eventually` | A read gave a verdict while a compaction record named one of the write's inputs and that input's commit record was still in the store. |
+| `catalog: a token read ran after HEAD named the compaction output` | sometimes | `token_lifecycle_read`, `eventually` | A read gave a verdict after a stable HEAD served one of the write's inputs from the covering record's output. |
+| `catalog: a token read ran after its input commit record was swept` | sometimes | `token_lifecycle_read`, `eventually` | A read gave a verdict while a compaction record named one of the write's inputs and that input's commit record was gone. |
+| `catalog: a token read ran twice on one node` | sometimes | `token_lifecycle_read`, `eventually` | Both reads of a `twice` pair gave a verdict. |
+| `catalog: a token read ran on a node restarted since the write` | sometimes | `token_lifecycle_read`, `eventually` | A read gave a verdict on a node that acknowledged under a new writer identity after the write. A fault restarts nodes in Antithesis; the local loop restarts `ravel2` once (see `local-run.sh` below). |
 | `catalog: a sealed seeded hour was folded into HEAD` | sometimes | every `catalog inspect --json` | A part of HEAD with entries covers some seeded hour (inside its `min_hour..=watermark_hour`, not retired). |
 | `clock: an hour ingested live was sealed by a fold` | sometimes | every `catalog inspect --json` | A part of HEAD with entries covers the hour of some acked live write. |
 | `catalog: a compaction record was published` | sometimes | `audit` | A listed `l1.*.cmt` record decoded through `commit decode-compaction`. |
@@ -616,6 +694,19 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   run's compose file, runs the workload for `seconds` (default 240) before
   the driver's forced `eventually`, and exits 0 only if all of these hold:
   - `faketime` and `init` exited 0, and setup completed within 900 s;
+  - `ravel2` was restarted once (`docker restart`, `node-restart.txt`) when
+    the eventually asked for it. The local compose sets
+    `WORKLOAD_LOCAL_RESTART_NODE=ravel2`; with it, the eventually prints
+    `eventually: local loop: restart http://ravel2:4318 now` before its
+    token reads after the sweep, waits up to 300 s for `local-run.sh` to
+    restart the node and create `/tmp/local-restart-done` in the driver
+    container, waits for every node to serve, writes once to `ravel2` (its
+    new writer identity is the restart evidence), and then reads every
+    swept write on `ravel2`. A ravel-server keeps every commit record it
+    read in memory, and both nodes read every live write's record while its
+    hour was unsealed, so without a restart no read GETs a swept record and
+    the token fallback never runs. In Antithesis the variable is unset and
+    the faults restart nodes;
   - the driver was still running after setup, then exited 0 having logged
     `eventually: ending the timeline`;
   - every other container (`s3proxy` included) is running or exited 0;
@@ -641,7 +732,15 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     window while HEAD had not folded it` and `catalog: HEAD stayed
     unreadable while the clocks passed the protection horizon`, together with
     the SUT's `catalog: delete pass refused on an unreadable HEAD`, which
-    shows a server's sweep read that HEAD and stopped.
+    shows a server's sweep read that HEAD and stopped;
+  - the token reads reached every state: `catalog: a token read ran after
+    its input was compacted`, `catalog: a token read ran after HEAD named
+    the compaction output`, `catalog: a token read ran after its input
+    commit record was swept`, `catalog: a token read ran twice on one node`
+    and `catalog: a token read ran on a node restarted since the write`, and
+    the SUT's `commit: a commit token's stale-answer evidence read
+    evaluated`, which holds only when a token read took the catalog's
+    fallback.
 - The local loop's bound on the driver's run after setup is `seconds` plus
   4800 s: the `eventually` runs the forced races before its fold.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
@@ -649,6 +748,13 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   `catalog: compaction preserves the acked multiset` must appear in
   `violated.tsv`, and no assertion other than it and `catalog: no scan shows
   a phantom or an excess copy` may. The other gates still apply.
+- `WORKLOAD_INJECT_STALE_TOKEN_RESULT=1 scripts/local-run.sh <out-dir>` is
+  the token-read self-check. Every token read that answers rows has its
+  smallest returned record counted twice before the model judges it, as an
+  obsolete input served beside its replacement would be, so `catalog: a
+  token read returns each acked record of its write exactly once` must
+  appear in `violated.tsv`, and no other assertion may. The other gates still
+  apply. The two self-checks and a mutant run are separate runs.
 - `RAVEL_ANTITHESIS_MUTANT=catalog/<stem> scripts/local-run.sh <out-dir>
   [seconds]` is a mutant control run over the `-mutants` images (see
   "Mutants"); it exits 0 only when that mutant's property was violated.

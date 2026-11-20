@@ -13,8 +13,10 @@
 //! alone rarely reaches: a fold losing its HEAD CAS, a compaction record PUT
 //! losing to a concurrent compaction, a sweep past a compaction record that
 //! HEAD has not folded, and a sweep past the protection horizon while HEAD
-//! is unreadable. The eventually stops faults,
-//! sweeps every shard and checks the whole multiset. See
+//! is unreadable. Token reads read an acked write back with its commit
+//! tokens before and after its input is compacted, folded and swept, and
+//! judge every answer exactly against the model. The eventually stops
+//! faults, sweeps every shard and checks the whole multiset. See
 //! antithesis/catalog-maintenance/README.md for the properties.
 
 mod audit;
@@ -26,6 +28,7 @@ mod race;
 mod s3;
 mod seed;
 mod stop;
+mod token;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -102,6 +105,16 @@ const FORCED_REASON: &str = "forced by WORKLOAD_EVENTUALLY_AFTER_SECS";
 /// rule to start it before running it itself. Longer than any rule takes, so
 /// it only fires when no rule runs any more.
 const FORCED_BACKSTOP: Duration = Duration::from_secs(600);
+/// Writes the eventually reads with their tokens at each lifecycle point.
+const EVENTUALLY_TOKEN_READS: usize = 6;
+/// How long a token read refused as unsatisfiable waits before its one
+/// retry; the refusal's own message asks for a retry.
+const UNSATISFIABLE_RETRY: Duration = Duration::from_secs(2);
+/// The file `local-run.sh` creates in the driver container once it restarted
+/// the node the driver asked it to (`WORKLOAD_LOCAL_RESTART_NODE`).
+const LOCAL_RESTART_DONE: &str = "/tmp/local-restart-done";
+/// How long the eventually waits for that restart, and then for every node.
+const LOCAL_RESTART_WAIT: Duration = Duration::from_secs(300);
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -159,6 +172,10 @@ struct Config {
     seed_per_hour: u32,
     max_writes: usize,
     inject_swap: bool,
+    inject_stale_token: bool,
+    /// The local loop only: the host name of the node the eventually asks
+    /// `local-run.sh` to restart before its reads after the sweep.
+    local_restart: Option<String>,
     eventually_on: bool,
     eventually_after: Option<u64>,
     clock: ClockPlan,
@@ -184,6 +201,11 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3000),
             inject_swap: std::env::var("WORKLOAD_INJECT_SWAPPED_RECORD").is_ok_and(|v| v == "1"),
+            inject_stale_token: std::env::var("WORKLOAD_INJECT_STALE_TOKEN_RESULT")
+                .is_ok_and(|v| v == "1"),
+            local_restart: std::env::var("WORKLOAD_LOCAL_RESTART_NODE")
+                .ok()
+                .filter(|v| !v.is_empty()),
             eventually_on: std::env::var("WORKLOAD_EVENTUALLY").map_or(true, |v| v != "off"),
             eventually_after: std::env::var("WORKLOAD_EVENTUALLY_AFTER_SECS")
                 .ok()
@@ -282,6 +304,20 @@ struct Shared {
     /// The inputs of each compaction record decoded so far; records are
     /// immutable, so each is decoded once.
     inputs_of: Mutex<BTreeMap<String, Vec<InputKeys>>>,
+    /// Every acknowledgement, by node and by write, for the restart
+    /// evidence of a token read.
+    acks: Mutex<token::AckLedger>,
+    /// Orders attempts and their answers in real time.
+    ticks: AtomicU64,
+    /// The last HEAD an audit saw hold still, with what the catalog
+    /// resolved under it.
+    head_evidence: Mutex<Option<token::HeadEvidence>>,
+    /// The token-read self-check: one returned record counted twice.
+    inject_stale_token: bool,
+    /// Token reads by outcome class.
+    token_tally: Mutex<BTreeMap<&'static str, u64>>,
+    /// The local loop only: the index of the node to restart.
+    restart_node: Option<usize>,
     /// Every rule holds a read guard while it acts, except for the audit
     /// rule's sweep check; the clock jump and the eventually take the write
     /// guard.
@@ -416,8 +452,10 @@ impl Shared {
         let body = otlp::logs_request(w.id, records, streams, w.ts_ns);
         for attempt_no in 0..=MAX_RETRIES {
             let k = self.begin_attempt(w.id);
+            let n = node();
+            let sent = self.ticks.fetch_add(1, Ordering::SeqCst);
             let reply = self.ravel.export(
-                node(),
+                n,
                 "/v1/logs",
                 &body,
                 w.mode.header(),
@@ -426,6 +464,7 @@ impl Shared {
                 WRITE_TIMEOUT,
             );
             let attempt = classify(&reply);
+            self.record_ack(w.id, n, sent, &attempt);
             self.finish_attempt(w.id, k, attempt.clone());
             let retryable = match attempt {
                 Attempt::NoResponse => true,
@@ -448,6 +487,28 @@ impl Shared {
                 w.attempts.len() - 1
             }
             None => 0,
+        }
+    }
+
+    /// Record which node acknowledged an attempt, under which writer
+    /// identity, and when, for a token read's restart evidence.
+    fn record_ack(&self, id: u64, node: usize, sent: u64, attempt: &Attempt) {
+        let Attempt::Acked { header } = attempt else {
+            return;
+        };
+        let answered = self.ticks.fetch_add(1, Ordering::SeqCst);
+        match token::decode_header(header).map(|t| t.into_iter().next()) {
+            Ok(Some((_, first))) => lock(&self.acks).record(
+                id,
+                token::Ack {
+                    node,
+                    writer: first.writer,
+                    sent,
+                    answered,
+                },
+            ),
+            Ok(None) => {}
+            Err(e) => println!("write {id}: the commit-token header does not decode: {e}"),
         }
     }
 
@@ -1712,6 +1773,20 @@ impl Shared {
             println!("audit: HEAD moved while listing; skipped");
             return Some((prefix, listed));
         }
+        // Only a footprint that resolved everything lists HEAD's objects in
+        // full; a failed one names just the object it could not fetch.
+        if let (true, Some(resolved), Some(created), Some(wm)) = (
+            footprint.ok(),
+            &resolved,
+            before.created_unix_ns,
+            before.watermark_hour,
+        ) {
+            *lock(&self.head_evidence) = Some(token::HeadEvidence {
+                created_unix_ns: created,
+                watermark_hour: wm,
+                resolved: resolved.iter().cloned().collect(),
+            });
+        }
         // A text parse that found nothing, or other parts than the JSON
         // form lists, would check nothing and pass.
         let parse = match (&before.parts, text.ok()) {
@@ -1807,6 +1882,337 @@ impl Shared {
                 _ => std::thread::sleep(Duration::from_secs(2)),
             }
         }
+    }
+
+    /// The acked live writes a token read can judge exactly: one attempt's
+    /// worth of copies at most (`max_copies() == 1`), so every acked record
+    /// must come back exactly once. `pool` 0 is all of them, 1 those with an
+    /// input a decoded compaction record names, 2 those with an input
+    /// commit record the sweep check confirmed deleted.
+    fn token_candidates(&self, prefix: &str, pool: u64) -> Vec<Write> {
+        let writes: Vec<Write> = {
+            let m = lock(&self.model);
+            m.acked_logs
+                .iter()
+                .filter_map(|id| m.writes.get(id))
+                .filter(|w| w.max_copies() == 1)
+                .cloned()
+                .collect()
+        };
+        if pool == 0 {
+            return writes;
+        }
+        let compacted: BTreeSet<String> = lock(&self.inputs_of)
+            .values()
+            .flatten()
+            .map(|i| i.commit.clone())
+            .collect();
+        let sweeps = lock(&self.sweeps);
+        writes
+            .into_iter()
+            .filter(|w| {
+                let Some(Ok(tokens)) = w.acked_header().map(token::decode_header) else {
+                    return false;
+                };
+                tokens.iter().any(|(_, t)| {
+                    let key = t.commit_key(prefix);
+                    if pool == 1 {
+                        compacted.contains(&key)
+                    } else {
+                        sweeps.is_confirmed(&key)
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Whether `key` is in the store: from `listed` when it holds the key,
+    /// else from a GET. `None` when the GET failed.
+    fn present(&self, key: &str, listed: Option<&BTreeSet<String>>) -> Option<bool> {
+        if listed.is_some_and(|l| l.contains(key)) {
+            return Some(true);
+        }
+        match self.store.get(key) {
+            Ok(found) => Some(found.is_some()),
+            Err(e) => {
+                println!("token read: GET {key}: {e}");
+                None
+            }
+        }
+    }
+
+    /// LIST each token's bucket, decode its compaction records not decoded
+    /// yet, and return every bucket's listing and the decoded records.
+    #[allow(clippy::type_complexity)]
+    fn token_buckets(
+        &self,
+        prefix: &str,
+        tokens: &[(String, token::Token)],
+    ) -> (
+        BTreeMap<String, BTreeSet<String>>,
+        BTreeMap<String, Vec<InputKeys>>,
+    ) {
+        let mut listings = BTreeMap::new();
+        for (_, t) in tokens {
+            let bucket = keys::bucket_prefix(prefix, t.shard, u64::from(t.hour));
+            if listings.contains_key(&bucket) {
+                continue;
+            }
+            match self.store.list(&bucket) {
+                Ok(listed) => {
+                    let listed: BTreeSet<String> = listed.into_iter().collect();
+                    for record in keys::bucket(&bucket, &listed).records {
+                        if lock(&self.inputs_of).contains_key(&record) {
+                            continue;
+                        }
+                        let out = self
+                            .cli
+                            .run(&["commit", "decode-compaction", &record], CLI_TIMEOUT_S);
+                        match audit::compaction_inputs(prefix, &record, &out.stdout) {
+                            Some(inputs) if out.ok() => {
+                                lock(&self.inputs_of).insert(record, inputs);
+                            }
+                            _ => println!(
+                                "token read: commit decode-compaction {record}: {}",
+                                out.summary()
+                            ),
+                        }
+                    }
+                    listings.insert(bucket, listed);
+                }
+                Err(e) => println!("token read: listing {bucket}: {e}"),
+            }
+        }
+        (listings, lock(&self.inputs_of).clone())
+    }
+
+    /// One token read of write `w` on `node`, retried once if refused as
+    /// unsatisfiable.
+    fn token_read_once(&self, node: usize, w: &Write, tokens: &[String]) -> token::Outcome {
+        let start = w.ts_ns.saturating_sub(WINDOW_SLACK_NS) as f64 / 1e9;
+        let end = w.ts_ns.saturating_add(WINDOW_SLACK_NS) as f64 / 1e9;
+        let read = || {
+            let value = self.ravel.sql(
+                node,
+                &writes_query(&[w.id]),
+                start,
+                end,
+                tokens,
+                READ_TIMEOUT,
+            )?;
+            model::log_counts(ravel::rows(&value)).map_err(SqlFailure::BadBody)
+        };
+        let mut result = read();
+        if let Err(e) = &result
+            && token::failure_class(e) == "unsatisfiable"
+        {
+            std::thread::sleep(UNSATISFIABLE_RETRY);
+            result = read();
+        }
+        match result {
+            Ok(counts) => {
+                let m = lock(&self.model);
+                token::Outcome::Conclusive(token::judge(&m, counts, w.id, self.inject_stale_token))
+            }
+            Err(e) => match token::failure_class(&e) {
+                "unsatisfiable" => token::Outcome::Unsatisfiable(e.to_string()),
+                class => token::Outcome::Inconclusive {
+                    class,
+                    detail: e.to_string(),
+                },
+            },
+        }
+    }
+
+    /// Read write `w` back with its commit tokens on `node` (twice, the
+    /// second on a warm cache, with `twice`), judge each answer against the
+    /// model, and record which lifecycle state each token's input was in:
+    /// decided before the read from the bucket's LIST, the decoded
+    /// compaction records, a GET of the commit record and the last stable
+    /// HEAD the audit saw, and after the read from the commit record's
+    /// presence. Returns whether every read that gave a verdict held.
+    fn lifecycle_read(&self, w: &Write, node: usize, twice: bool, reason: &str) -> bool {
+        let Some(prefix) = self.tenant_prefix() else {
+            println!("token read: no HEAD key known yet");
+            return true;
+        };
+        let Some(header) = w.acked_header() else {
+            return true;
+        };
+        let tokens = match token::decode_header(header) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("token read: write {}: {e}", w.id);
+                return true;
+            }
+        };
+        let (listings, records) = self.token_buckets(&prefix, &tokens);
+        let head = lock(&self.head_evidence).clone();
+        let restart = lock(&self.acks).restarted_since(w.id, node);
+        let mut states: Vec<token::InputState> = tokens
+            .iter()
+            .map(|(_, t)| {
+                let key = t.commit_key(&prefix);
+                let bucket = keys::bucket_prefix(&prefix, t.shard, u64::from(t.hour));
+                let cover = token::covering(&key, &records);
+                token::InputState {
+                    commit_before: self.present(&key, listings.get(&bucket)),
+                    head_named_output: match (cover, &head) {
+                        (Some((record, input)), Some(h)) => h.names_output(t.hour, record, input),
+                        _ => false,
+                    },
+                    covering_record: cover.map(|(r, _)| r.to_string()),
+                    commit_key: key,
+                    commit_after: None,
+                }
+            })
+            .collect();
+        let qualified: Vec<String> = w.tokens("logs");
+        let mut outcomes = vec![self.token_read_once(node, w, &qualified)];
+        if twice {
+            outcomes.push(self.token_read_once(node, w, &qualified));
+        }
+        for s in &mut states {
+            if s.covering_record.is_some() {
+                s.commit_after = self.present(&s.commit_key, None);
+            }
+        }
+        let tally: BTreeMap<&'static str, u64> = {
+            let mut t = lock(&self.token_tally);
+            for o in &outcomes {
+                *t.entry(o.class()).or_insert(0) += 1;
+            }
+            t.clone()
+        };
+        let state_json: Vec<serde_json::Value> = states.iter().map(|s| s.to_json()).collect();
+        let restart_json = restart.as_ref().map(|(x, y)| {
+            json!({
+                "write_acked_by_node": lock(&self.acks).of_write(w.id).map(|a| a.node),
+                "writer_before": x.writer,
+                "writer_after": y.writer,
+                "ticks": [x.sent, x.answered, y.sent, y.answered],
+            })
+        });
+        let base = json!({
+            "reason": reason,
+            "write": w.id,
+            "records": w.records,
+            "node": self.ravel.nodes[node],
+            "tokens": tokens.len(),
+            "inputs": state_json,
+            "head": head.as_ref().map(|h| json!({
+                "created_unix_ns": h.created_unix_ns,
+                "watermark_hour": h.watermark_hour,
+                "resolved": h.resolved.len(),
+            })),
+            "restart": restart_json,
+            "tally": tally,
+        });
+        let mut all_hold = true;
+        for (i, o) in outcomes.iter().enumerate() {
+            let mut details = base.clone();
+            details["read"] = json!(i);
+            details["outcome"] = json!(o.class());
+            match o {
+                token::Outcome::Conclusive(j) => {
+                    details["rows"] = json!(j.rows);
+                    details["injected"] = json!(j.injected);
+                    details["phantoms"] = first(&j.phantoms);
+                    details["over"] = first(&j.over);
+                    details["missing"] = first(&j.missing);
+                }
+                token::Outcome::Unsatisfiable(e) => details["refusal"] = json!(e),
+                token::Outcome::Inconclusive { detail, .. } => details["detail"] = json!(detail),
+            }
+            println!("token read: {details}");
+            if o.conclusive() {
+                assert_always!(
+                    o.holds(),
+                    "catalog: a token read returns each acked record of its write exactly once",
+                    &details
+                );
+                all_hold &= o.holds();
+            }
+        }
+        let first_verdict = outcomes[0].conclusive();
+        assert_sometimes!(
+            first_verdict
+                && states
+                    .iter()
+                    .any(token::InputState::compacted_record_present),
+            "catalog: a token read ran after its input was compacted",
+            &base
+        );
+        assert_sometimes!(
+            first_verdict && states.iter().any(|s| s.head_named_output),
+            "catalog: a token read ran after HEAD named the compaction output",
+            &base
+        );
+        assert_sometimes!(
+            first_verdict && states.iter().any(token::InputState::swept),
+            "catalog: a token read ran after its input commit record was swept",
+            &base
+        );
+        assert_sometimes!(
+            outcomes.len() == 2 && outcomes.iter().all(token::Outcome::conclusive),
+            "catalog: a token read ran twice on one node",
+            &base
+        );
+        assert_sometimes!(
+            first_verdict && restart.is_some(),
+            "catalog: a token read ran on a node restarted since the write",
+            &base
+        );
+        all_hold
+    }
+
+    /// The eventually's token reads: up to [`EVENTUALLY_TOKEN_READS`] writes
+    /// of `pool` (of pool 1 when `pool` is empty), spread over the acked
+    /// writes, each read twice on one node.
+    /// With `on`, every read goes to that node; otherwise they alternate.
+    fn eventually_token_reads(&self, pool: u64, reason: &str, on: Option<usize>) {
+        let Some(prefix) = self.tenant_prefix() else {
+            println!("{reason}: no HEAD key known, so no token reads");
+            return;
+        };
+        let mut writes = self.token_candidates(&prefix, pool);
+        if writes.is_empty() && pool > 1 {
+            writes = self.token_candidates(&prefix, 1);
+        }
+        let step = (writes.len() / EVENTUALLY_TOKEN_READS).max(1);
+        let n = self.ravel.nodes.len().max(1);
+        for (i, w) in writes
+            .iter()
+            .step_by(step)
+            .take(EVENTUALLY_TOKEN_READS)
+            .enumerate()
+        {
+            self.lifecycle_read(w, on.unwrap_or(i % n), true, reason);
+        }
+    }
+
+    /// The local loop's stand-in for a node-restart fault (README.md, "Token
+    /// reads across the lifecycle"): ask `local-run.sh` to restart `node`,
+    /// wait for its confirmation and for every node to serve, then write once
+    /// to the restarted node so its new writer identity is on record. Returns
+    /// whether the restart was confirmed.
+    fn local_restart(&self, node: usize) -> bool {
+        let url = &self.ravel.nodes[node];
+        println!("eventually: local loop: restart {url} now");
+        let deadline = Instant::now() + LOCAL_RESTART_WAIT;
+        while !Path::new(LOCAL_RESTART_DONE).exists() {
+            if Instant::now() >= deadline {
+                println!("eventually: local loop: no restart of {url} confirmed");
+                return false;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        if let Err(e) = self.wait_serving(LOCAL_RESTART_WAIT, "local restart") {
+            println!("eventually: local loop: not every node serves after the restart: {e}");
+        }
+        let acked = (0..3).any(|_| self.write(1, 1, &mut || node));
+        println!("eventually: local loop: {url} restarted; a write to it acked: {acked}");
+        true
     }
 }
 
@@ -2005,6 +2411,32 @@ impl Workload {
         s.check_bounds(node, "scan");
     }
 
+    /// Read one acked write back with its commit tokens on a drawn node,
+    /// while faults may run, drawing the write from all of them, from those
+    /// with a compacted input, or from those with a swept input commit
+    /// record, and drawing whether to read it twice on that node.
+    #[rule(groups = ["main"], weight = 2)]
+    fn token_lifecycle_read(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
+        let s = &self.0;
+        let _g = s.enter();
+        let Some(prefix) = s.tenant_prefix() else {
+            return;
+        };
+        let pool = tc.draw(gs::integers::<u64>().min_value(0).max_value(2));
+        let mut writes = s.token_candidates(&prefix, pool);
+        if writes.is_empty() {
+            writes = s.token_candidates(&prefix, 0);
+        }
+        if writes.is_empty() {
+            return;
+        }
+        let w = &writes[draw_node(&tc, writes.len())];
+        let node = draw_node(&tc, s.ravel.nodes.len());
+        let twice = tc.draw(gs::weighted_booleans(0.5));
+        s.lifecycle_read(w, node, twice, "drawn");
+    }
+
     #[rule(groups = ["main"])]
     fn eventually(&self, tc: TestCase) {
         // The helper runs no eventually of its own unless one was forced, so
@@ -2095,6 +2527,14 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         }
     }
     s.audit(&|_| 0);
+    // A fold after the compaction lets HEAD name its output, and the audit
+    // records what that HEAD resolves; the token reads then run while the
+    // compacted inputs' commit records are still there.
+    if !s.fold() {
+        println!("eventually: the fold after the compaction failed");
+    }
+    s.audit(&|_| 0);
+    s.eventually_token_reads(1, "eventually: compacted", None);
     if s.compacted.load(Ordering::SeqCst) {
         s.sweep_jump("eventually");
     } else {
@@ -2109,6 +2549,11 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         println!("eventually: the fold after the sweep failed");
     }
     s.audit(&|_| 0);
+    // Every node read every live record while its hour was unsealed and
+    // keeps it cached, so only a restarted node takes the token fallback.
+    let restarted = s.restart_node.filter(|&node| s.local_restart(node));
+    s.eventually_token_reads(2, "eventually: swept", restarted);
+    println!("token reads by outcome: {:?}", lock(&s.token_tally));
 
     let acked: Vec<Write> = {
         let m = lock(&s.model);
@@ -2370,8 +2815,20 @@ fn main(tc: TestCase) {
         nodes,
         maint_nodes,
         proxy,
+        inject_stale_token,
+        local_restart,
         ..
     } = cfg;
+    // A name that matches no node is a broken local config: refuse it rather
+    // than run a loop that never restarts anything.
+    let restart_node = local_restart.map(|name| {
+        let host = format!("//{name}:");
+        ravel
+            .nodes
+            .iter()
+            .position(|url| url.contains(&host))
+            .unwrap_or_else(|| die(&format!("WORKLOAD_LOCAL_RESTART_NODE={name} names no node")))
+    });
     let shared = Arc::new(Shared {
         ravel,
         maint,
@@ -2403,6 +2860,12 @@ fn main(tc: TestCase) {
         unreadable_sweeps: AtomicU64::new(0),
         sweeps: Mutex::new(audit::SweepLedger::default()),
         inputs_of: Mutex::new(BTreeMap::new()),
+        acks: Mutex::new(token::AckLedger::default()),
+        ticks: AtomicU64::new(0),
+        head_evidence: Mutex::new(None),
+        inject_stale_token,
+        token_tally: Mutex::new(BTreeMap::new()),
+        restart_node,
         gate: RwLock::new(()),
         stop: Stop::default(),
         eventually_on,

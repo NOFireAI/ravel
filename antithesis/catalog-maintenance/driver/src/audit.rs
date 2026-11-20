@@ -297,6 +297,11 @@ impl SweepLedger {
     pub fn confirmed(&self) -> usize {
         self.confirmed.len()
     }
+
+    /// Whether a GET confirmed `key` swept.
+    pub fn is_confirmed(&self, key: &str) -> bool {
+        self.confirmed.contains(key)
+    }
 }
 
 /// The keys HEAD names that the listing does not hold.
