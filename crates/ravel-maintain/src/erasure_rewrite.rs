@@ -237,12 +237,16 @@ impl ErasureMatcher {
     }
 }
 
-/// A minimal, semantically-faithful duplicate of
-/// `ravel_query::erasure::ErasurePredicate::matches_log_attrs`, reimplemented
-/// here for the same dependency-direction reason as [`ErasureMatcher`]. A log
-/// record's own `attrs` field is matched (never `stream_attrs`/resource, matching the query path), and only [`LogAttrValue::Str`] values can satisfy a matcher --
-/// any other attribute-value variant never matches, mirroring
-/// `ravel-query`'s `logs_non_string_attr_never_matches` test.
+/// A minimal, semantically-faithful duplicate of the query path's logs
+/// erasure rule (`ravel_query::erasure::is_erased_log_row`), reimplemented
+/// here for the same dependency-direction reason as [`ErasureMatcher`]. A
+/// record is matched against its own `attrs` and against the merged
+/// resource + scope + record view (`ravel_query::erasure::merged_log_attrs`),
+/// so a subject named only in a resource or scope attribute is dropped by the
+/// rewrite exactly as queries hide it (issue #4503). Only
+/// [`LogAttrValue::Str`] values can satisfy a matcher -- any other
+/// attribute-value variant never matches, mirroring `ravel-query`'s
+/// `logs_non_string_attr_never_matches` test.
 #[derive(Debug, Clone)]
 pub struct LogErasureMatcher {
     matchers: Vec<(String, String)>,
@@ -285,9 +289,90 @@ impl LogErasureMatcher {
     }
 
     /// Whether this predicate drops a log record with `attrs` recorded at
-    /// `ts_ns`.
+    /// `ts_ns`, judged on the record's own attributes alone.
     pub fn drops_record(&self, attrs: &[(String, LogAttrValue)], ts_ns: i64) -> bool {
         self.matches_attrs(attrs) && self.ts_in_window(ts_ns)
+    }
+
+    /// Conjunction of exact-match matchers against the merged view of a
+    /// record whose own attributes are `record` and whose stream's scalar
+    /// resource-then-scope attributes are `stream` ([`stream_view`]).
+    pub fn matches_merged(
+        &self,
+        record: &[(String, LogAttrValue)],
+        stream: &[(String, LogAttrValue)],
+    ) -> bool {
+        self.all_matchers(|k| merged_str_value(record, stream, k))
+    }
+
+    /// Whether this predicate drops a log record at `ts_ns`: the window holds
+    /// and the conjunction matches either the record's own attributes or its
+    /// merged view, the same union the query path hides. Each view is read
+    /// as the query path reads it: the first string value under a key.
+    pub fn drops_log_record(
+        &self,
+        record: &[(String, LogAttrValue)],
+        stream: &[(String, LogAttrValue)],
+        ts_ns: i64,
+    ) -> bool {
+        self.ts_in_window(ts_ns)
+            && (self.all_matchers(|k| first_str_value(record, k))
+                || self.matches_merged(record, stream))
+    }
+
+    fn all_matchers<'a>(&self, mut lookup: impl FnMut(&str) -> Option<&'a str>) -> bool {
+        !self.matchers.is_empty()
+            && self
+                .matchers
+                .iter()
+                .all(|(k, v)| lookup(k) == Some(v.as_str()))
+    }
+}
+
+fn first_str_value<'a>(attrs: &'a [(String, LogAttrValue)], key: &str) -> Option<&'a str> {
+    attrs.iter().find_map(|(k, v)| match v {
+        LogAttrValue::Str(s) if k == key => Some(s.as_str()),
+        _ => None,
+    })
+}
+
+/// A stream's scalar resource attributes followed by its scalar scope
+/// attributes, the base `ravel_query::erasure::merged_log_attrs` overlays a
+/// record's attributes onto. Nested `Map`/`List` values are left out, as
+/// there.
+pub fn stream_view(stream_attrs: &[u8]) -> Result<Vec<(String, LogAttrValue)>> {
+    let attrs = ravel_logseg::record::decode_stream_attrs(stream_attrs)?;
+    Ok(attrs
+        .resource
+        .into_iter()
+        .chain(attrs.scope_attrs)
+        .filter(|(_, v)| !matches!(v, LogAttrValue::Map(_) | LogAttrValue::List(_)))
+        .collect())
+}
+
+/// The first string value under `key` in the merged view of `stream`
+/// overlaid with `record`, without building that view. The overlay replaces
+/// the first `stream` slot holding `key` with the record's last value for it
+/// (or appends one slot when `stream` has none); a lookup then takes the
+/// first slot under `key` whose value is a string.
+fn merged_str_value<'a>(
+    record: &'a [(String, LogAttrValue)],
+    stream: &'a [(String, LogAttrValue)],
+    key: &str,
+) -> Option<&'a str> {
+    let as_str = |v: &'a LogAttrValue| match v {
+        LogAttrValue::Str(s) => Some(s.as_str()),
+        _ => None,
+    };
+    let record_value = record.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v);
+    let mut stream_slots = stream.iter().filter(|(k, _)| k == key).map(|(_, v)| v);
+    match record_value {
+        None => stream_slots.find_map(as_str),
+        Some(rv) => {
+            // The first stream slot under `key` (if any) now holds `rv`.
+            let _replaced = stream_slots.next();
+            as_str(rv).or_else(|| stream_slots.find_map(as_str))
+        }
     }
 }
 
@@ -1518,15 +1603,25 @@ fn build_rewrite_part(
 
 /// The first request in `requests` (fixed order, first-match-wins, same
 /// tie-break rationale as [`first_dropping_request`]) whose matcher drops a
-/// log record with `attrs` at `ts_ns`, if any.
+/// log record, if any. `stream_views` caches each stream's decoded
+/// [`stream_view`] by its `stream_attrs` bytes.
 fn first_dropping_log_request(
     requests: &[ApplicableLogRequest],
-    attrs: &[(String, LogAttrValue)],
-    ts_ns: i64,
-) -> Option<usize> {
-    requests
-        .iter()
-        .position(|r| r.matcher.drops_record(attrs, ts_ns))
+    record: &ravel_logseg::LogRecord,
+    stream_views: &mut HashMap<Vec<u8>, Vec<(String, LogAttrValue)>>,
+) -> Result<Option<usize>> {
+    if !stream_views.contains_key(&record.stream_attrs) {
+        let view = stream_view(&record.stream_attrs)?;
+        stream_views.insert(record.stream_attrs.clone(), view);
+    }
+    let stream = stream_views
+        .get(&record.stream_attrs)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    Ok(requests.iter().position(|r| {
+        r.matcher
+            .drops_log_record(&record.attrs, stream, record.ts_ns)
+    }))
 }
 
 /// Decode-filter-reencode one LOGS bucket's live record set against every
@@ -1627,6 +1722,7 @@ pub async fn build_rewrite_logs(
     let footer_record_count = checked_sample_sum(catalogs.iter().map(|c| c.record_count))?;
 
     let mut dropped_counts = vec![0u64; requests.len()];
+    let mut stream_views = HashMap::new();
     // dry_run: true -- `publish_rewrite_record` PUTs `build.parts` itself, only
     // after its conservation gate passes, mirroring how `build_rewrite_part`
     // (metrics) also defers the PUT to that shared publish path.
@@ -1648,7 +1744,7 @@ pub async fn build_rewrite_logs(
         // after the conservation gate passes (ADR-0979 decision 3).
         true,
         rlog::RangeCut::Off,
-        &mut |record| match first_dropping_log_request(requests, &record.attrs, record.ts_ns) {
+        &mut |record| match first_dropping_log_request(requests, record, &mut stream_views)? {
             Some(i) => {
                 dropped_counts[i] += 1;
                 Ok(false)
@@ -4527,7 +4623,7 @@ mod tests {
     /// Drops exactly the log record matched by the erasure predicate and
     /// leaves every other record in the bucket byte-for-byte (via
     /// `LogRecord`'s own `PartialEq`) intact. Flip-line proof:
-    /// `LogErasureMatcher::matches_attrs` returning `false`
+    /// `LogErasureMatcher::drops_log_record` returning `false`
     /// unconditionally makes the "checkout" record survive, growing the
     /// survivor set to two records and failing the `assert_eq!(survivors,
     /// vec![kept])` below.
