@@ -594,10 +594,16 @@ async fn resolve_against_winner(
 
     // Same input set: repair any missing winner part we can reproduce.
     let mut repaired = 0usize;
+    // Winner parts the store answered absent to this attempt's HEAD and that
+    // no acknowledged re-PUT restored.
+    let mut absent: Vec<String> = Vec::new();
     for part in &winner.parts {
         let part_key = keys::reconstruct_l1_part_key(&winner, part)?;
         let head = store.head(&part_key).await;
         note_metadata(ledger, RequestPhase::Publish);
+        if matches!(head, Err(StoreError::NotFound)) {
+            absent.push(part_key.clone());
+        }
         match head {
             Ok(_) => {}
             Err(StoreError::NotFound) => {
@@ -616,6 +622,7 @@ async fn resolve_against_winner(
                         // other L1 part write, not to the phase that noticed
                         // the hole.
                         crate::build::put_part_with_ledger(store, ours, ledger, compat).await?;
+                        absent.retain(|k| k != &part_key);
                         repaired += 1;
                     }
                     // Cannot repair (bytes released at PUT, or a part this run
@@ -639,33 +646,15 @@ async fn resolve_against_winner(
             Err(e) => return Err(MaintainError::Store(e)),
         }
     }
-    // Judged from one fresh HEAD of every winner part, taken after the HEADs
-    // and re-PUTs that chose this branch and not charged to the request
-    // ledger: any part answered NotFound is false, and a HEAD error of
-    // another kind, or a key that does not rebuild, cannot tell.
-    ravel_invariant::inv_always_if_known!(
-        {
-            let mut verdict = Some(true);
-            for part in &winner.parts {
-                let Ok(part_key) = keys::reconstruct_l1_part_key(&winner, part) else {
-                    verdict = None;
-                    continue;
-                };
-                match store.head(&part_key).await {
-                    Ok(_) => {}
-                    Err(StoreError::NotFound) => {
-                        verdict = Some(false);
-                        break;
-                    }
-                    Err(_) => verdict = None,
-                }
-            }
-            verdict
-        },
+    // Judged from the store's answers to this attempt's part HEADs and
+    // re-PUTs: every winner part was answered present or re-PUT.
+    ravel_invariant::inv_always!(
+        absent.is_empty(),
         "maintenance: a loser reports Converged only when the winner part is observed present in the store",
         std::collections::BTreeMap::from([
             ("record_key", record_key.to_string()),
             ("our_input_set_hash", hex::encode(our_hash)),
+            ("absent_parts", format!("{absent:?}")),
         ])
     );
     ravel_invariant::inv_reachable!(
