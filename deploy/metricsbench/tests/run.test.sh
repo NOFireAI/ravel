@@ -457,7 +457,13 @@
 #                                       Mimir, objects and read-backs naming
 #                                       PREFIX-ravel, ravel_only.store and
 #                                       object_store stamped; ro1's portable
-#                                       ravel_only.store.
+#                                       ravel_only.store; ro8: a 504 query
+#                                       deadline on L0 stamped deadline with
+#                                       its elapsed ms, L1 matched, exit 0;
+#                                       ro8b: the same on L1, the deadline
+#                                       as the ms; ro8c: a 504 without the
+#                                       deadline message and ro8d: the
+#                                       message on a 500 exit 70.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -484,6 +490,10 @@
 #                                       141 holders, 4 tokens, 145 opened),
 #                                       the prune mismatch out of band on
 #                                       si3, missing on si8.
+#                                       The Ravel-only history file (#3941):
+#                                       every figure in band on ro8 with
+#                                       history's object counts, the L1
+#                                       listing at 40000 ms out of band.
 #                                       box-run.sh, sourced: the band file
 #                                       per profile (refused for cardinality
 #                                       without MB_STAGE1_BANDS) and

@@ -468,13 +468,15 @@
 #               name (ravel_only.l1.readback)
 #
 # Each ravel_only.STATE.readback carries verdict (matched, mismatch, error,
-# or refused (budget) when the series listing answered 422), series_query_ms
-# (from the error's "query series failed after N ms" on a 422), and Ravel's
+# refused (budget) when the series listing answered 422, or deadline when it
+# answered 504 with the server's "query exceeded its deadline of D"),
+# series_query_ms (from the error's "query series failed after N ms" on a 422
+# or a deadline, else the deadline D it names), and Ravel's
 # ravel_store_calls_total and ravel_store_bytes_total for op="get" before and
 # after the read-back with their deltas; ravel_only.l0.series_query_ms,
 # .verdict and the same under l1 repeat the two headline figures. A mismatch
 # or error fails the read-back step, and so does any of those figures missing
-# (a miss). The sampler, mimir-readiness, objects, query, capture,
+# (a miss); refused (budget) and deadline go on to the next step. The sampler, mimir-readiness, objects, query, capture,
 # provenance, validate, memory, object-spans and folded steps do not run, so
 # no report.json, memory.jsonl or memory-summary.json is written; the query,
 # query_scrapes, mimir_readiness, ravel_objects, object_spans and
@@ -1287,10 +1289,23 @@ elif op == "ravel-only-readback":
     elif isinstance(doc, dict) and isinstance(doc.get("readback_error"), str):
         err = doc["readback_error"]
         stamp["error"] = err
-        stamp["verdict"] = "refused (budget)" if re.search(r"\banswered 422\b", err) else "error"
+        # The series listing past the server's query deadline: a 504 whose
+        # body carries QueryError::DeadlineExceeded's message, the deadline in
+        # Duration's Debug form ("120s", "2.5s", "500ms").
+        deadline = re.search(r"\bquery series failed\b.*\banswered 504\b.*\bquery exceeded its deadline of "
+                             r"(\d+(?:\.\d+)?)" "(ns|\N{MICRO SIGN}s|us|ms|s)" r"\b", err, re.S)
+        if re.search(r"\banswered 422\b", err):
+            stamp["verdict"] = "refused (budget)"
+        elif deadline:
+            stamp["verdict"] = "deadline"
+        else:
+            stamp["verdict"] = "error"
         m = re.search(r"\bquery series failed after (\d+) ms\b", err)
         if m:
             stamp["series_query_ms"] = int(m.group(1))
+        elif deadline:
+            scale = {"ns": 1e-6, "\N{MICRO SIGN}s": 1e-3, "us": 1e-3, "ms": 1, "s": 1000}[deadline.group(2)]
+            stamp["series_query_ms"] = round(float(deadline.group(1)) * scale)
     elif stamp["verdict"] is None:
         stamp["verdict"] = "error"
         stamp["error"] = f"{os.path.basename(out_path)} carries neither readback nor readback_error"
@@ -4967,7 +4982,8 @@ ravel_only_ingest() {
 # ravel_only_readback STATE: step readback-STATE (l0 or l1), the Ravel row
 # read back alone between two scrapes of Ravel's /metrics, stamped as
 # ravel_only.STATE.readback with its verdict and series_query_ms repeated
-# beside it. Fails on a mismatch, an error, or a figure it did not produce.
+# beside it. Fails on a mismatch, an error, or a figure it did not produce;
+# a listing refused (budget) or past the server's query deadline goes on.
 ravel_only_readback() {
   local state="$1" step="readback-$1" code=0 stamp_code=0 stamp verdict ms
   local before="${out_dir}/ravel-metrics-before-readback-${1}.txt" before_arg
@@ -4999,6 +5015,7 @@ ravel_only_readback() {
         fail_step "$step" "metricsbench_ingest --readback-only exited $code with a matching read-back"
       ;;
     "refused (budget)") say "${step}: the series listing was refused (budget) after ${ms} ms" ;;
+    deadline) say "${step}: the series listing reached the server's query deadline after ${ms} ms" ;;
     *)
       show_log "${out_dir}/readback-${state}.log"
       fail_step "$step" "metricsbench_ingest --readback-only exited $code, verdict ${verdict}: $(py get "$STAMPS" "ravel_only.${state}.readback.error")"
