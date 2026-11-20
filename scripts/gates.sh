@@ -512,11 +512,16 @@ run_feature_lanes() {
 
   # ADR-4326 assertion sites and mutant switches: each crate's tests with every
   # evaluation recorded in process and every mutant compiled in, so a test can
-  # show a site holding and its mutant breaking it. No SDK. Mirrors CI's
-  # `invariants` job.
+  # show a site holding and its mutant breaking it. No SDK. Then a clippy with
+  # `antithesis` alone, which compiles every assertion condition but neither
+  # the capture nor the mutant module (#4497).
+  # Mirrors CI's `invariants` job.
   if [[ ${want_invariants} -eq 1 ]]; then
     run_feature_lane ravel-invariant/capture,ravel-invariant/antithesis-mutants \
       -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet
+    run cargo clippy --locked \
+      -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet \
+      --features ravel-invariant/antithesis --all-targets -- -D warnings
   fi
 
   # The same features for ravel-server and ravel-cli, a lane of its own as CI's
