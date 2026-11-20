@@ -647,8 +647,77 @@ own ADR if it is ever wanted.
 
 ## 6. Order and priority for the next week
 
-(pending)
+### Decision
+
+Order, with the reason each item sits where it does:
+
+1. **#4503 fix (PR #4511) with the ADR-0064 amendment, days 1 to 2.** Live
+   data loss of an erasure guarantee in two released versions; the advisory
+   cannot go out until the fix has a release to point at. Fix the two review
+   findings per section 1, add the amendment, merge.
+2. **#4503 changelog fragment and advisory, same day as the merge.** Text is
+   drafted in section 2; the human posts the advisory.
+3. **#4449 docs correction (0.34.0 note, ADR-1029 amendment), day 1, in
+   parallel with item 1.** Docs only, no gate cost beyond the doc scripts;
+   operators reading "fenced" today are misinformed.
+4. **#4449 reader-side dominance rule, days 2 to 5, targeted at 0.35.0.** The
+   one remaining way an erased series is served with default settings; the
+   0.34.0 note already promises 0.35.0.
+5. **#4501 contract 1 (re-read before each delete batch), ADR-0042 amendment,
+   guide rewrite, #4505 test un-ignored, days 3 to 5.** A compliance contract
+   the code does not meet, but the exposure needs a hold placed during a pass
+   and no erased data is involved. Merge #4337 after it.
+6. **#4428 invariant and doc sentence, end of the week or first idle
+   executor.** No reachable trigger found; the invariant is cheap.
+
+### Antithesis budget (about 888 compute hours left of 1200)
+
+- Do not spend lifecycle hours on main before items 1 and 4 are on the branch
+  under test: a run now re-finds #4503 and the #4449 window, both already
+  reproduced deterministically, and burns budget on known findings.
+- Reserve the larger share, about 600 hours, for the lifecycle profile (T9,
+  #4338) after items 1, 4 and 5 land, with pause injection on and reads with
+  old tokens across erasure, rewrite and sweep, which is what the #4428
+  invariant and the #4449 rule need to be exercised against.
+- Spend at most about 100 hours this week: one run on a build carrying items
+  1, 3 and 4 as soon as item 4 is gate-green, pause injection on, to check the
+  dominance rule under the race it closes.
+- Keep the remainder, about 180 hours, unallocated for re-runs on a finding.
+- Triage rule until the fixes land: `HeldObjectNeverDeleted` false before item
+  5 is the #4501 window; two live record sets in one bucket before item 4 is
+  #4449; a logs subject served after its `.dreq` is gone before item 1 is
+  #4503. None of those is a new bug.
+
+### Confidence
+
+Medium. The day estimates assume one executor per item and the usual review
+rounds; the ordering does not depend on them.
 
 ## 7. Lines for the human to type
 
-(pending)
+Decisions above that only the human can authorize, each as the line to type or
+the action to take:
+
+1. **Post the #4503 advisory.** It is outward facing. The text is in section 2;
+   confirm the first affected release before posting:
+   `git log --oneline -1 1f33d5eeb` and the release tag that first contains it.
+2. **Approve editing the released 0.34.0 changelog section in place.** The
+   known-issue note is a note, not a change entry, so in-place correction is
+   what this document recommends; a release-notes policy that forbids editing a
+   released section would instead put the corrected text under 0.35.0 with a
+   pointer. Type `edit in place` or `0.35.0 only`.
+3. **Sign the ADR-0042 amendment.** It changes the stated behaviour of a
+   compliance feature. The decision here is contract 1; the ADR owner signs
+   the amendment text in section 3 or amends it.
+4. **Open, or decline to open, an ADR for a shared create-only record key per
+   bucket (#4449 long-term closure).** It changes the frozen record key layout
+   and is not needed for 0.35.0 once the reader rule lands. Type `open ADR` or
+   `not now`.
+5. **Confirm the Antithesis allocation in section 6** (about 100 hours this
+   week, about 600 reserved for the post-fix lifecycle runs, about 180
+   unallocated), or give different figures.
+
+Nothing else in this document is held: the #4503 fix direction and amendment,
+the #4503 changelog-only remediation, the #4501 contract, the #4428 closure
+with an invariant, the #4449 text corrections and fix direction, and the work
+order are decided here, subject to override.
