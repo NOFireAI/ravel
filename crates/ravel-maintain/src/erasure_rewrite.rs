@@ -1623,20 +1623,21 @@ fn build_rewrite_part(
 
 /// The first request in `requests` (fixed order, first-match-wins, same
 /// tie-break rationale as [`first_dropping_request`]) whose matcher drops a
-/// log record, if any. `stream_views` caches each stream's decoded
-/// [`stream_view`] by its `stream_attrs` bytes.
+/// log record, if any. `last_view` holds the decoded [`stream_view`] of the
+/// last stream seen, keyed by its stream id (derived from the same bytes), so
+/// the merge's runs of one stream decode it once and the rewrite holds one
+/// stream's attributes at a time.
 fn first_dropping_log_request(
     requests: &[ApplicableLogRequest],
     record: &ravel_logseg::LogRecord,
-    stream_views: &mut HashMap<Vec<u8>, Vec<(String, LogAttrValue)>>,
+    last_view: &mut Option<(ravel_logseg::LogStreamId, Vec<(String, LogAttrValue)>)>,
 ) -> Result<Option<usize>> {
-    if !stream_views.contains_key(&record.stream_attrs) {
-        let view = stream_view(&record.stream_attrs)?;
-        stream_views.insert(record.stream_attrs.clone(), view);
+    if last_view.as_ref().map(|(id, _)| *id) != Some(record.stream_id) {
+        *last_view = Some((record.stream_id, stream_view(&record.stream_attrs)?));
     }
-    let stream = stream_views
-        .get(&record.stream_attrs)
-        .map(Vec::as_slice)
+    let stream = last_view
+        .as_ref()
+        .map(|(_, view)| view.as_slice())
         .unwrap_or_default();
     Ok(requests.iter().position(|r| {
         r.matcher
@@ -1742,7 +1743,7 @@ pub async fn build_rewrite_logs(
     let footer_record_count = checked_sample_sum(catalogs.iter().map(|c| c.record_count))?;
 
     let mut dropped_counts = vec![0u64; requests.len()];
-    let mut stream_views = HashMap::new();
+    let mut last_view = None;
     // dry_run: true -- `publish_rewrite_record` PUTs `build.parts` itself, only
     // after its conservation gate passes, mirroring how `build_rewrite_part`
     // (metrics) also defers the PUT to that shared publish path.
@@ -1764,7 +1765,7 @@ pub async fn build_rewrite_logs(
         // after the conservation gate passes (ADR-0979 decision 3).
         true,
         rlog::RangeCut::Off,
-        &mut |record| match first_dropping_log_request(requests, record, &mut stream_views)? {
+        &mut |record| match first_dropping_log_request(requests, record, &mut last_view)? {
             Some(i) => {
                 dropped_counts[i] += 1;
                 Ok(false)

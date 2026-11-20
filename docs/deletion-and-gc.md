@@ -749,7 +749,11 @@ attributes (a record attribute wins on a key collision); for spans, the
 span's attributes, which already merge resource and scope at ingest. Only a
 string value matches. Query-time exclusion and the rewrite apply the same
 rule, so a subject named only in a log record's resource or scope attributes
-is dropped by the rewrite and stays erased after the request is swept.
+is dropped by the rewrite and stays erased after the request is swept. One
+exception carries over from versions before this rule (#4503): a bucket such
+a version already rewrote for a request is not rewritten again for that same
+request, so records it kept come back once that request is swept. Submitting
+a new request for the same subject rewrites the bucket under this rule.
 
 ### Erasure under IPCrypt
 
