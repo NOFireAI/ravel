@@ -4887,6 +4887,7 @@ pub(crate) fn clone_store_error(err: &StoreError) -> StoreError {
         StoreError::AlreadyExists => StoreError::AlreadyExists,
         StoreError::PreconditionFailed => StoreError::PreconditionFailed,
         StoreError::AccessDenied(msg) => StoreError::AccessDenied(msg.clone()),
+        StoreError::ClockSkewed(msg) => StoreError::ClockSkewed(msg.clone()),
         StoreError::Throttled { retry_after_ms } => StoreError::Throttled {
             retry_after_ms: *retry_after_ms,
         },

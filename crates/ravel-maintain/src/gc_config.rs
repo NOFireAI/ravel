@@ -512,10 +512,12 @@ pub async fn read_gc_config(
             Ok(Some((values, outcome.version)))
         }
         Err(StoreError::NotFound) => Ok(None),
-        Err(StoreError::AccessDenied(detail)) => Err(GcConfigError::AccessDenied {
-            op: GcAccessOp::Read,
-            detail,
-        }),
+        Err(StoreError::AccessDenied(detail) | StoreError::ClockSkewed(detail)) => {
+            Err(GcConfigError::AccessDenied {
+                op: GcAccessOp::Read,
+                detail,
+            })
+        }
         Err(err) => Err(GcConfigError::Store(err.to_string())),
     }
 }
@@ -579,10 +581,12 @@ pub async fn bootstrap_gc_config(
                 .ok_or(GcConfigError::ObjectVanished)?;
             Ok(values)
         }
-        Err(StoreError::AccessDenied(detail)) => Err(GcConfigError::AccessDenied {
-            op: GcAccessOp::Create,
-            detail,
-        }),
+        Err(StoreError::AccessDenied(detail) | StoreError::ClockSkewed(detail)) => {
+            Err(GcConfigError::AccessDenied {
+                op: GcAccessOp::Create,
+                detail,
+            })
+        }
         Err(err) => Err(GcConfigError::Store(err.to_string())),
     }
 }

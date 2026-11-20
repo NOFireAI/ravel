@@ -576,7 +576,7 @@ pub async fn reap_keys(store: &dyn ObjectStoreBackend, keys: &[String]) -> ReapP
     for (index, key) in keys.iter().enumerate() {
         match store.delete(key).await {
             Ok(()) => pass.reaped += 1,
-            Err(StoreError::AccessDenied(reason)) => {
+            Err(StoreError::AccessDenied(reason) | StoreError::ClockSkewed(reason)) => {
                 tracing::error!(
                     prefix = QUERY_WORKERS_PREFIX,
                     undeleted = keys.len().saturating_sub(index),

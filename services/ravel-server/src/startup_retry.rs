@@ -6,9 +6,13 @@
 //! the first store error, even one the store contract marks retryable.
 //!
 //! [`StartupRetry::run`] runs one such read and retries it only while it fails
-//! with a transient store error: a [`StoreError`] that
-//! [`StoreError::is_retryable`] accepts (`Transient`, `Timeout` or
-//! `Throttled`), found by type in the error's source chain, never by its text.
+//! with a [`StoreError`] found by type in the error's source chain, never by
+//! its text, that is either transient ([`StoreError::is_retryable`] accepts it:
+//! `Transient`, `Timeout` or `Throttled`) or a [`StoreError::ClockSkewed`]
+//! refusal. Runtime callers never retry a clock-skew refusal; startup does,
+//! because a process that has just started (after a VM resume or an NTP step,
+//! say) can sign with a clock the store has not caught up with yet, and a
+//! restart only repeats that.
 //! The wait between attempts is capped exponential backoff with jitter, and
 //! one deadline shared by every site and measured from process start
 //! (`--startup-store-deadline`) bounds the retries and each retry: a retry
@@ -120,23 +124,50 @@ impl StartupClock for TokioStartupClock {
 pub enum StartupReadFailure<E> {
     /// A non-transient error: refused on the attempt that returned it.
     Refused(E),
-    /// Every attempt failed transiently, and the deadline has passed or the
-    /// next wait would reach it.
+    /// Every attempt failed with an error startup retries, and the deadline
+    /// has passed or the next wait would reach it. `cause` is why `last` was
+    /// retried.
     DeadlinePassed {
         site: &'static str,
         attempts: u32,
         deadline: Duration,
+        cause: RetryCause,
         last: E,
     },
     /// Retry `attempts` was still running when its bound, `bound`, ran out.
-    /// `last` is the transient error of the attempt before it.
+    /// `last` is the retried error of the attempt before it, and `cause` why
+    /// it was retried.
     CutOff {
         site: &'static str,
         attempts: u32,
         deadline: Duration,
         bound: Duration,
+        cause: RetryCause,
         last: E,
     },
+}
+
+/// Why startup retries a failed store read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryCause {
+    /// A store error [`StoreError::is_retryable`] accepts.
+    Transient,
+    /// A [`StoreError::ClockSkewed`] refusal: the store rejected the request's
+    /// signing time.
+    ClockSkew,
+}
+
+impl RetryCause {
+    /// The failure as the refusal message names it.
+    fn failure_text(self) -> &'static str {
+        match self {
+            RetryCause::Transient => "a transient store error",
+            RetryCause::ClockSkew => {
+                "a clock-skew refusal (the store rejected the request clock, S3 \
+                 RequestTimeTooSkewed; check time sync between this host and the store)"
+            }
+        }
+    }
 }
 
 fn attempts_text(attempts: u32) -> String {
@@ -159,11 +190,13 @@ impl<E> StartupReadFailure<E> {
                 site,
                 attempts,
                 deadline,
+                cause,
                 last,
             } => refuse(last).context(format!(
-                "startup store read of {site} still failed with a transient store error after \
-                 {}, and the startup deadline of {} (--startup-store-deadline) has passed or \
-                 would pass before another attempt; refusing to start",
+                "startup store read of {site} still failed with {} after {}, and the startup \
+                 deadline of {} (--startup-store-deadline) has passed or would pass before \
+                 another attempt; refusing to start",
+                cause.failure_text(),
                 attempts_text(attempts),
                 humantime::format_duration(deadline)
             )),
@@ -172,14 +205,17 @@ impl<E> StartupReadFailure<E> {
                 attempts,
                 deadline,
                 bound,
+                cause,
                 last,
             } => refuse(last).context(format!(
                 "startup store read of {site} was cut off after attempt {attempts} ran for {}, \
                  its bound under the startup deadline of {} (--startup-store-deadline): the time \
-                 left before the deadline, and never less than {}; refusing to start",
+                 left before the deadline, and never less than {}; the attempt before it failed \
+                 with {}; refusing to start",
                 humantime::format_duration(bound),
                 humantime::format_duration(deadline),
-                humantime::format_duration(MIN_STARTUP_ATTEMPT)
+                humantime::format_duration(MIN_STARTUP_ATTEMPT),
+                cause.failure_text()
             )),
         }
     }
@@ -236,9 +272,9 @@ impl StartupRetry {
             .max(MIN_STARTUP_ATTEMPT)
     }
 
-    /// Run `op` until it succeeds, fails with an error `is_transient` rejects,
-    /// or the deadline ends it. Each retry logs one warning naming `site`, the
-    /// attempt number and the error.
+    /// Run `op` until it succeeds, fails with an error `retry_cause` gives no
+    /// [`RetryCause`] for, or the deadline ends it. Each retry logs one
+    /// warning naming `site`, the attempt number and the error.
     ///
     /// The first attempt is not bounded here; only the store's own request
     /// timeout and retries end it. Each retry is bounded by the time left
@@ -247,13 +283,13 @@ impl StartupRetry {
     /// one attempt. A retry starts only when its wait ends before the
     /// deadline, so once an attempt has failed transiently the read ends at
     /// that failure or by the deadline plus [`MIN_STARTUP_ATTEMPT`], whichever
-    /// is later. A site whose first attempt fails transiently after the
-    /// deadline has passed gets no retry and refuses.
+    /// is later. A site whose first attempt fails with a retried error after
+    /// the deadline has passed gets no retry and refuses.
     pub async fn run<T, E, F, Fut>(
         &self,
         site: &'static str,
         mut op: F,
-        is_transient: impl Fn(&E) -> bool,
+        retry_cause: impl Fn(&E) -> Option<RetryCause>,
     ) -> Result<T, StartupReadFailure<E>>
     where
         F: FnMut() -> Fut,
@@ -261,12 +297,12 @@ impl StartupRetry {
         E: Display,
     {
         let mut attempt: u32 = 0;
-        let mut last: Option<E> = None;
+        let mut last: Option<(RetryCause, E)> = None;
         loop {
             attempt = attempt.saturating_add(1);
             let outcome = match last.take() {
                 None => op().await,
-                Some(previous) => {
+                Some((cause, previous)) => {
                     // A wait that overran the deadline: the retry does not
                     // start.
                     if self.remaining().is_none() {
@@ -274,6 +310,7 @@ impl StartupRetry {
                             site,
                             attempts: attempt.saturating_sub(1),
                             deadline: self.deadline,
+                            cause,
                             last: previous,
                         });
                     }
@@ -298,6 +335,7 @@ impl StartupRetry {
                                 attempts: attempt,
                                 deadline: self.deadline,
                                 bound,
+                                cause,
                                 last: previous,
                             });
                         }
@@ -310,16 +348,17 @@ impl StartupRetry {
                         tracing::info!(
                             site,
                             attempts = attempt,
-                            "startup store read succeeded after transient failures"
+                            "startup store read succeeded after retried failures"
                         );
                     }
                     return Ok(value);
                 }
                 Err(err) => err,
             };
-            if self.deadline.is_zero() || !is_transient(&err) {
-                return Err(StartupReadFailure::Refused(err));
-            }
+            let cause = match retry_cause(&err) {
+                Some(cause) if !self.deadline.is_zero() => cause,
+                _ => return Err(StartupReadFailure::Refused(err)),
+            };
             let elapsed = self.clock.elapsed();
             let delay = self.backoff(attempt);
             match self.remaining() {
@@ -329,20 +368,36 @@ impl StartupRetry {
                         site,
                         attempts: attempt,
                         deadline: self.deadline,
+                        cause,
                         last: err,
                     });
                 }
             }
-            tracing::warn!(
-                site,
-                attempt,
-                error = %err,
-                retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                deadline_ms = u64::try_from(self.deadline.as_millis()).unwrap_or(u64::MAX),
-                "startup store read failed with a transient store error; retrying"
-            );
-            last = Some(err);
+            let retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+            let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+            let deadline_ms = u64::try_from(self.deadline.as_millis()).unwrap_or(u64::MAX);
+            match cause {
+                RetryCause::Transient => tracing::warn!(
+                    site,
+                    attempt,
+                    error = %err,
+                    retry_in_ms,
+                    elapsed_ms,
+                    deadline_ms,
+                    "startup store read failed with a transient store error; retrying"
+                ),
+                RetryCause::ClockSkew => tracing::warn!(
+                    site,
+                    attempt,
+                    error = %err,
+                    retry_in_ms,
+                    elapsed_ms,
+                    deadline_ms,
+                    "startup store read was refused for clock skew (the store rejected the \
+                     request clock); retrying until the startup deadline, check time sync"
+                ),
+            }
+            last = Some((cause, err));
             self.clock.sleep(delay).await;
         }
     }
@@ -373,35 +428,42 @@ impl StartupRetry {
     }
 }
 
-/// Whether a store error is one startup retries: the kinds
-/// [`StoreError::is_retryable`] accepts, `Transient`, `Timeout` and
-/// `Throttled`.
-pub fn store_error_is_transient(err: &StoreError) -> bool {
-    err.is_retryable()
+/// Why startup retries a store error, `None` when it does not: the kinds
+/// [`StoreError::is_retryable`] accepts (`Transient`, `Timeout` and
+/// `Throttled`) are [`RetryCause::Transient`], and
+/// [`StoreError::ClockSkewed`] is [`RetryCause::ClockSkew`].
+pub fn store_error_retry_cause(err: &StoreError) -> Option<RetryCause> {
+    if err.is_retryable() {
+        Some(RetryCause::Transient)
+    } else if matches!(err, StoreError::ClockSkewed(_)) {
+        Some(RetryCause::ClockSkew)
+    } else {
+        None
+    }
 }
 
-/// Whether the first [`StoreError`] in `err`'s source chain, `err` included,
-/// is one startup retries ([`store_error_is_transient`]). An error with no
-/// store error in its chain is not transient.
-pub fn chain_is_transient(err: &(dyn StdError + 'static)) -> bool {
+/// Why startup retries the first [`StoreError`] in `err`'s source chain, `err`
+/// included ([`store_error_retry_cause`]). An error with no store error in its
+/// chain is not retried.
+pub fn chain_retry_cause(err: &(dyn StdError + 'static)) -> Option<RetryCause> {
     let mut current = Some(err);
     while let Some(e) = current {
         if let Some(store) = e.downcast_ref::<StoreError>() {
-            return store_error_is_transient(store);
+            return store_error_retry_cause(store);
         }
         current = e.source();
     }
-    false
+    None
 }
 
 /// `TenantKmsError` holds its `KeyEpochError` in a field that is not a
 /// source, so the chain walk starts there.
-fn tenant_kms_is_transient(err: &TenantKmsError) -> bool {
+fn tenant_kms_retry_cause(err: &TenantKmsError) -> Option<RetryCause> {
     match err {
         TenantKmsError::ReadEpochs { error, .. } | TenantKmsError::RecordEpoch { error, .. } => {
-            chain_is_transient(error)
+            chain_retry_cause(error)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -416,7 +478,7 @@ pub async fn enforce_qualification(
         .run(
             SITE_QUALIFICATION,
             || crate::qualification::enforce(store, store_kind, configured_identity),
-            |err| chain_is_transient(err),
+            |err| chain_retry_cause(err),
         )
         .await
         .map_err(|failure| {
@@ -450,7 +512,7 @@ pub async fn enforce_retired_reader_gate(
         .run(
             SITE_RETIRED_READER_GATE,
             || crate::compat_gate::enforce(store, deployment_key, retired, now_ns),
-            |err: &CompatGateError| chain_is_transient(err),
+            |err: &CompatGateError| chain_retry_cause(err),
         )
         .await
         .map_err(|failure| {
@@ -482,7 +544,7 @@ pub async fn resolve_tenancy(
         .run(
             SITE_TENANCY,
             || crate::tenancy::resolve_and_pin(store, configured.clone(), now_ns),
-            |err: &TenancyError| chain_is_transient(err),
+            |err: &TenancyError| chain_retry_cause(err),
         )
         .await
         .map_err(|failure| {
@@ -510,7 +572,7 @@ pub async fn configure_tenant_kms(
         .run(
             SITE_TENANT_KMS,
             || crate::tenant_kms::configure_tenant_kms(kms, store, config, now_ns),
-            tenant_kms_is_transient,
+            tenant_kms_retry_cause,
         )
         .await
         .map_err(|failure| {
@@ -546,7 +608,7 @@ pub async fn validate_static_provisioning(
                     now_ns,
                 )
             },
-            |err| chain_is_transient(err),
+            |err| chain_retry_cause(err),
         )
         .await
         .map_err(|failure| {
@@ -664,12 +726,164 @@ pub async fn run_startup_store_checks(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) mod test_support {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use bytes::Bytes;
     use ravel_object_store::fault::{FaultPlan, Occurrence, Op, Rule, ScriptedFault, Sequence};
+    use ravel_object_store::{
+        Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+        ObjectStoreBackend, PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
+    };
 
     use super::{StartupClock, StartupRetry};
+
+    /// Answers the `get`s of `key` with scripted store errors, in order, then
+    /// passes them through; every other call passes through. `FaultStore` has
+    /// no scripted `AccessDenied` or `ClockSkewed`, which this exists for.
+    pub(crate) struct ScriptedRefusals {
+        inner: Arc<dyn ObjectStoreBackend>,
+        key: String,
+        refusals: Mutex<VecDeque<StoreError>>,
+        always: Option<fn() -> StoreError>,
+        gets: Mutex<u64>,
+    }
+
+    impl ScriptedRefusals {
+        /// `refusals` in order, then the real answer.
+        pub(crate) fn then_ok(
+            inner: Arc<dyn ObjectStoreBackend>,
+            key: &str,
+            refusals: impl IntoIterator<Item = StoreError>,
+        ) -> Self {
+            ScriptedRefusals {
+                inner,
+                key: key.to_string(),
+                refusals: Mutex::new(refusals.into_iter().collect()),
+                always: None,
+                gets: Mutex::new(0),
+            }
+        }
+
+        /// `refusal()` on every `get` of `key`.
+        pub(crate) fn always(
+            inner: Arc<dyn ObjectStoreBackend>,
+            key: &str,
+            refusal: fn() -> StoreError,
+        ) -> Self {
+            ScriptedRefusals {
+                always: Some(refusal),
+                ..ScriptedRefusals::then_ok(inner, key, [])
+            }
+        }
+
+        /// The `get`s of `key` so far, refused or not.
+        pub(crate) fn gets(&self) -> u64 {
+            *self.gets.lock().expect("gets lock")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for ScriptedRefusals {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            if key == self.key {
+                *self.gets.lock().expect("gets lock") += 1;
+                if let Some(refusal) = self.always {
+                    return Err(refusal());
+                }
+                if let Some(refusal) = self.refusals.lock().expect("refusals lock").pop_front() {
+                    return Err(refusal);
+                }
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn get_pinned(
+            &self,
+            key: &str,
+            range: GetRange,
+            pin: &Pin,
+        ) -> Result<PinnedRead, StoreError> {
+            self.inner.get_pinned(key, range, pin).await
+        }
+
+        async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+            self.inner.get_with_pin(key, range).await
+        }
+
+        async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+            self.inner.pin_of(key).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A 403 `RequestTimeTooSkewed`, as the S3 adapter reports it.
+    pub(crate) fn clock_skewed() -> StoreError {
+        StoreError::ClockSkewed(
+            "k: Server returned non-2xx status code: 403 Forbidden: \
+             <Error><Code>RequestTimeTooSkewed</Code></Error>"
+                .into(),
+        )
+    }
+
+    /// A 403 `AccessDenied` whose text names the clock-skew code, so only a
+    /// classification by text could take it for a clock-skew refusal.
+    pub(crate) fn denied_naming_clock_skew() -> StoreError {
+        StoreError::AccessDenied(
+            "k: Server returned non-2xx status code: 403 Forbidden: \
+             <Error><Code>AccessDenied</Code><Message>RequestTimeTooSkewed</Message></Error>"
+                .into(),
+        )
+    }
 
     /// Virtual time: `sleep` advances it at once and records the request.
     /// `attempt_timer` yields once, so an attempt that is ready when first
@@ -787,6 +1001,26 @@ pub(crate) mod test_support {
         FaultPlan::empty().with_sequence(sequence.then_passthrough())
     }
 
+    /// The text `into_anyhow` gives a deadline refusal for a clock-skew
+    /// refusal, for `site` after `attempts`.
+    pub(crate) fn assert_clock_skew_deadline_refusal(
+        err: &anyhow::Error,
+        site: &str,
+        attempts: u64,
+    ) {
+        assert!(attempts > 1, "retried before giving up: {attempts}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "startup store read of {site} still failed with a clock-skew refusal (the \
+                 store rejected the request clock, S3 RequestTimeTooSkewed; check time sync \
+                 between this host and the store) after {attempts} attempts, and the startup \
+                 deadline of 15s (--startup-store-deadline) has passed or would pass before \
+                 another attempt; refusing to start"
+            )
+        );
+    }
+
     /// The text `into_anyhow` gives a deadline refusal, for `site` after
     /// `attempts`.
     pub(crate) fn assert_deadline_refusal(err: &anyhow::Error, site: &str, attempts: u64) {
@@ -814,7 +1048,8 @@ pub(crate) mod test_support {
             format!(
                 "startup store read of {site} was cut off after attempt {attempts} ran for {}, \
                  its bound under the startup deadline of 15s (--startup-store-deadline): the \
-                 time left before the deadline, and never less than 5s; refusing to start",
+                 time left before the deadline, and never less than 5s; the attempt before it \
+                 failed with a transient store error; refusing to start",
                 humantime::format_duration(bound)
             )
         );
@@ -868,7 +1103,7 @@ mod tests {
                     calls += 1;
                     async { Err(StoreError::Transient("down".into())) }
                 },
-                store_error_is_transient,
+                store_error_retry_cause,
             )
             .await;
         assert!(matches!(
@@ -968,7 +1203,7 @@ mod tests {
                     calls += 1;
                     async { Err(StoreError::Transient("down".into())) }
                 },
-                store_error_is_transient,
+                store_error_retry_cause,
             )
             .await;
         assert!(
@@ -1133,7 +1368,7 @@ mod tests {
                     calls += 1;
                     async { Err(StoreError::Transient("down".into())) }
                 },
-                store_error_is_transient,
+                store_error_retry_cause,
             )
             .await;
         assert!(matches!(result, Err(StartupReadFailure::Refused(_))));
@@ -1183,7 +1418,7 @@ mod tests {
                         }
                     }
                 },
-                store_error_is_transient,
+                store_error_retry_cause,
             )
             .await
             .expect("succeeds on the third attempt");
@@ -1221,27 +1456,45 @@ mod tests {
 
     #[test]
     fn classification_is_by_type_through_sources() {
+        let transient = Some(RetryCause::Transient);
         let tenancy = TenancyError::Store(StoreError::Transient("x".into()));
-        assert!(chain_is_transient(&tenancy));
-        assert!(!chain_is_transient(&TenancyError::CorruptMarker));
+        assert_eq!(chain_retry_cause(&tenancy), transient);
+        assert_eq!(chain_retry_cause(&TenancyError::CorruptMarker), None);
         // Every kind `StoreError::is_retryable` accepts retries.
         let throttled = TenancyError::Store(StoreError::Throttled { retry_after_ms: 1 });
-        assert!(chain_is_transient(&throttled));
-        assert!(chain_is_transient(&TenancyError::Store(
-            StoreError::Timeout
-        )));
+        assert_eq!(chain_retry_cause(&throttled), transient);
+        assert_eq!(
+            chain_retry_cause(&TenancyError::Store(StoreError::Timeout)),
+            transient
+        );
         let wrapped =
             anyhow::Error::new(TenancyError::Store(StoreError::Timeout)).context("outer context");
-        assert!(chain_is_transient(wrapped.as_ref()));
-        assert!(!chain_is_transient(&TenancyError::Store(
-            StoreError::AccessDenied("no".into())
-        )));
-        assert!(!chain_is_transient(&TenancyError::Store(
-            StoreError::NotFound
-        )));
-        // The text names the variant; only the type counts.
+        assert_eq!(chain_retry_cause(wrapped.as_ref()), transient);
+        assert_eq!(
+            chain_retry_cause(&TenancyError::Store(StoreError::AccessDenied("no".into()))),
+            None
+        );
+        assert_eq!(
+            chain_retry_cause(&TenancyError::Store(StoreError::NotFound)),
+            None
+        );
+        // A clock-skew refusal retries at startup only: at runtime it is not
+        // retryable.
+        assert!(!clock_skewed().is_retryable());
+        let skewed = anyhow::Error::new(TenancyError::Store(clock_skewed())).context("outer");
+        assert_eq!(
+            chain_retry_cause(skewed.as_ref()),
+            Some(RetryCause::ClockSkew)
+        );
+        // The text names the variant or the code; only the type counts.
         let text = std::io::Error::other("transient error: x");
-        assert!(!chain_is_transient(&text));
+        assert_eq!(chain_retry_cause(&text), None);
+        let text = std::io::Error::other("403 RequestTimeTooSkewed (clock skew)");
+        assert_eq!(chain_retry_cause(&text), None);
+        assert_eq!(
+            chain_retry_cause(&TenancyError::Store(denied_naming_clock_skew())),
+            None
+        );
         let kms = TenantKmsError::ReadEpochs {
             tenant: "acme".into(),
             error: ravel_catalog::KeyEpochError::Store {
@@ -1249,8 +1502,8 @@ mod tests {
                 source: StoreError::Transient("x".into()),
             },
         };
-        assert!(tenant_kms_is_transient(&kms));
-        assert!(!tenant_kms_is_transient(&TenantKmsError::EmptyTenantId));
+        assert_eq!(tenant_kms_retry_cause(&kms), transient);
+        assert_eq!(tenant_kms_retry_cause(&TenantKmsError::EmptyTenantId), None);
     }
 
     // --- qualification ---
@@ -1340,6 +1593,68 @@ mod tests {
             "store backend is not qualified (sys/qualification); refusing to start"
         );
         assert!(clock.sleeps().is_empty());
+    }
+
+    /// A store holding a qualification record.
+    async fn qualified_memory() -> Arc<dyn ObjectStoreBackend> {
+        let store = MemoryStore::new();
+        seed_qualification(&store).await;
+        Arc::new(store)
+    }
+
+    #[tokio::test]
+    async fn qualification_retries_a_clock_skew_refusal_then_starts() {
+        let clock = Arc::new(ManualClock::default());
+        let store = ScriptedRefusals::then_ok(
+            qualified_memory().await,
+            QUALIFICATION_KEY,
+            [clock_skewed(), clock_skewed()],
+        );
+        enforce_qualification(&retry_on(clock.clone()), &store, StoreKind::S3, None)
+            .await
+            .expect("starts once the store accepts the request clock");
+        // Two refusals plus the read that passed: three attempts, two waits.
+        assert_eq!(store.gets(), 3);
+        assert_eq!(clock.sleeps().len(), 2);
+        assert!(clock.virtual_now() < DEADLINE);
+        // Startup retries it; runtime does not.
+        assert!(!clock_skewed().is_retryable());
+    }
+
+    #[tokio::test]
+    async fn qualification_clock_skew_past_the_deadline_refuses_naming_clock_skew() {
+        let clock = Arc::new(ManualClock::default());
+        let store =
+            ScriptedRefusals::always(qualified_memory().await, QUALIFICATION_KEY, clock_skewed);
+        let err = enforce_qualification(&retry_on(clock.clone()), &store, StoreKind::S3, None)
+            .await
+            .expect_err("refuses once the deadline passes");
+        assert_clock_skew_deadline_refusal(&err, SITE_QUALIFICATION, store.gets());
+        assert_eq!(clock.sleeps().len() as u64, store.gets() - 1);
+        assert!(clock.virtual_now() < DEADLINE);
+        assert!(DEADLINE - clock.virtual_now() <= MAX_BACKOFF);
+        let chain = format!("{err:#}");
+        assert!(chain.contains("store backend is not qualified"), "{chain}");
+        assert!(chain.contains("RequestTimeTooSkewed"), "{chain}");
+    }
+
+    #[tokio::test]
+    async fn qualification_access_denied_naming_the_clock_skew_code_refuses_at_once() {
+        let clock = Arc::new(ManualClock::default());
+        let store = ScriptedRefusals::always(
+            qualified_memory().await,
+            QUALIFICATION_KEY,
+            denied_naming_clock_skew,
+        );
+        let err = enforce_qualification(&retry_on(clock.clone()), &store, StoreKind::S3, None)
+            .await
+            .expect_err("refuses at once");
+        assert_eq!(store.gets(), 1);
+        assert!(clock.sleeps().is_empty());
+        assert_eq!(
+            err.to_string(),
+            "store backend is not qualified (sys/qualification); refusing to start"
+        );
     }
 
     #[tokio::test]

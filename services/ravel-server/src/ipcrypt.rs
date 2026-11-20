@@ -22,7 +22,9 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{TenantHash, TenantId};
 
 use crate::config::Mode;
-use crate::startup_retry::{SITE_IPCRYPT_MARKER, StartupRetry, store_error_is_transient};
+use crate::startup_retry::{
+    RetryCause, SITE_IPCRYPT_MARKER, StartupRetry, store_error_retry_cause,
+};
 
 /// The metric label sanitizer rule keys are matched through on metric
 /// surfaces (ADR-2993 decision 1): the one the OTLP metric normalizer applies
@@ -219,10 +221,11 @@ fn rule_key_of(err: &ResolveError) -> String {
 /// modes that read it are the ones that build the ingest routers,
 /// [`Mode::holds_ingest_buffer`].
 ///
-/// A check that fails with a transient store error is retried under `retry`
-/// (issue #4325). The marker create is create-if-absent and a retry starts
-/// from the read, so a create that landed before an ambiguous failure reads
-/// back as this policy's own marker and matches.
+/// A check that fails with a transient store error or a clock-skew refusal is
+/// retried under `retry` (issues #4325, #4521). The marker create is
+/// create-if-absent and a retry starts from the read, so a create that landed
+/// before an ambiguous failure reads back as this policy's own marker and
+/// matches.
 pub async fn check_startup_marker(
     store: &dyn ObjectStoreBackend,
     mode: Mode,
@@ -237,7 +240,7 @@ pub async fn check_startup_marker(
         .run(
             SITE_IPCRYPT_MARKER,
             || check_marker(store, policy.fingerprint()),
-            check_error_is_transient,
+            check_error_retry_cause,
         )
         .await
         .map_err(|failure| {
@@ -258,12 +261,12 @@ pub async fn check_startup_marker(
 
 /// `CheckError::Create` holds its store error in a field that is not a
 /// source, so each variant is matched by type.
-fn check_error_is_transient(err: &CheckError) -> bool {
+fn check_error_retry_cause(err: &CheckError) -> Option<RetryCause> {
     match err {
         CheckError::Create(store) | CheckError::Marker(MarkerError::Store(store)) => {
-            store_error_is_transient(store)
+            store_error_retry_cause(store)
         }
-        CheckError::Mismatch { .. } | CheckError::Marker(_) => false,
+        CheckError::Mismatch { .. } | CheckError::Marker(_) => None,
     }
 }
 

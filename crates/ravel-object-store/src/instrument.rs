@@ -224,6 +224,8 @@ impl StoreErrorClass {
             StoreError::AlreadyExists => StoreErrorClass::AlreadyExists,
             StoreError::PreconditionFailed => StoreErrorClass::PreconditionFailed,
             StoreError::AccessDenied(_) => StoreErrorClass::AccessDenied,
+            // A 403 the store sent; it counts where every other 403 does.
+            StoreError::ClockSkewed(_) => StoreErrorClass::AccessDenied,
             StoreError::Throttled { .. } => StoreErrorClass::Throttled,
             StoreError::Timeout => StoreErrorClass::Timeout,
             StoreError::Corrupted(_) => StoreErrorClass::Corrupted,

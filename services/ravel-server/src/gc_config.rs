@@ -21,11 +21,12 @@
 //! credential lacks the read grant. Only under bucket policies that predate
 //! those list grants is a GET of an absent key refused, so a fresh bucket can
 //! surface as a refused read; that context names both readings, the missing
-//! read grant first. Every other refusal names the missing grant.
+//! read grant first. Every other refusal names the missing grant, except a
+//! clock-skew refusal (S3 `RequestTimeTooSkewed`), which names time sync.
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -36,7 +37,7 @@ use ravel_object_store::{
 };
 
 use crate::Mode;
-use crate::startup_retry::{SITE_GC_CONFIG, StartupRetry, store_error_is_transient};
+use crate::startup_retry::{RetryCause, SITE_GC_CONFIG, StartupRetry, store_error_retry_cause};
 
 /// A `Duration` as saturating `i64` nanoseconds, matching how every ns knob in
 /// this workspace is compared. An absurd duration saturates to `i64::MAX`
@@ -56,12 +57,15 @@ pub async fn bootstrap(
 }
 
 /// [`bootstrap`] as startup runs it: retried while it fails with a transient
-/// store error (issue #4325), and refused with [`bootstrap_failure_context`]
-/// otherwise. The create is create-if-absent and a retry starts from the read,
-/// so an object that landed before an ambiguous failure reads back as present.
+/// store error (issue #4325) or a clock-skew refusal (issue #4521), and
+/// refused otherwise, with [`CLOCK_SKEW_CONTEXT`] for a clock-skew refusal and
+/// [`bootstrap_failure_context`] for anything else. The create is
+/// create-if-absent and a retry starts from the read, so an object that landed
+/// before an ambiguous failure reads back as present.
 ///
-/// `GcConfigError::Store` carries the store error as text, so the store is
-/// wrapped in [`LastErrorStore`] to learn the failing call's error by type.
+/// `GcConfigError` carries the store error as text, and reports a clock-skew
+/// refusal as `AccessDenied`, so the store is wrapped in [`LastErrorStore`] to
+/// learn the failing call's error by type.
 pub async fn bootstrap_at_startup(
     store: Arc<dyn ObjectStoreBackend>,
     now_ns: i64,
@@ -77,27 +81,46 @@ pub async fn bootstrap_at_startup(
                 bootstrap(&recording, now_ns)
                     .await
                     .map_err(|error| GcAttemptError {
-                        transient: matches!(error, GcConfigError::Store(_))
-                            && recording.last_failure_was_transient(),
+                        retry: match (&error, recording.last_failure_retry_cause()) {
+                            (GcConfigError::Store(_), Some(RetryCause::Transient)) => {
+                                Some(RetryCause::Transient)
+                            }
+                            (GcConfigError::AccessDenied { .. }, Some(RetryCause::ClockSkew)) => {
+                                Some(RetryCause::ClockSkew)
+                            }
+                            _ => None,
+                        },
                         error,
                     })
             },
-            |err| err.transient,
+            |err| err.retry,
         )
         .await
         .map_err(|failure| {
             failure.into_anyhow(|err| {
-                let context = bootstrap_failure_context(&err.error, mode);
+                let context = if err.retry == Some(RetryCause::ClockSkew) {
+                    CLOCK_SKEW_CONTEXT.to_string()
+                } else {
+                    bootstrap_failure_context(&err.error, mode)
+                };
                 anyhow::Error::new(err.error).context(context)
             })
         })
 }
 
-/// One failed [`bootstrap`] attempt and whether the store call behind it
-/// failed with a transient store error ([`store_error_is_transient`]).
+/// The context startup attaches to a `sys/gc` read or create the store refused
+/// for clock skew, in place of [`bootstrap_failure_context`]'s missing-grant
+/// advice.
+pub const CLOCK_SKEW_CONTEXT: &str = "the object store rejected this process's request clock \
+     on sys/gc (S3 RequestTimeTooSkewed: the request's signing time is too far from the \
+     store's clock), which is not a missing grant; check time sync (NTP) between this host \
+     and the store. Startup retries this refusal until --startup-store-deadline";
+
+/// One failed [`bootstrap`] attempt and why startup retries the store call
+/// behind it ([`store_error_retry_cause`]), `None` when it does not.
 struct GcAttemptError {
     error: GcConfigError,
-    transient: bool,
+    retry: Option<RetryCause>,
 }
 
 impl fmt::Display for GcAttemptError {
@@ -106,33 +129,45 @@ impl fmt::Display for GcAttemptError {
     }
 }
 
-/// Delegates every call and remembers whether the most recent failing one
-/// returned a transient store error ([`store_error_is_transient`]).
+/// Delegates every call and remembers why startup would retry the most recent
+/// failing one ([`store_error_retry_cause`]).
 struct LastErrorStore {
     inner: Arc<dyn ObjectStoreBackend>,
-    last_failure_transient: AtomicBool,
+    last_failure: AtomicU8,
 }
+
+const NOT_RETRIED: u8 = 0;
+const TRANSIENT: u8 = 1;
+const CLOCK_SKEW: u8 = 2;
 
 impl LastErrorStore {
     fn new(inner: Arc<dyn ObjectStoreBackend>) -> Self {
         LastErrorStore {
             inner,
-            last_failure_transient: AtomicBool::new(false),
+            last_failure: AtomicU8::new(NOT_RETRIED),
         }
     }
 
     fn forget(&self) {
-        self.last_failure_transient.store(false, Ordering::SeqCst);
+        self.last_failure.store(NOT_RETRIED, Ordering::SeqCst);
     }
 
-    fn last_failure_was_transient(&self) -> bool {
-        self.last_failure_transient.load(Ordering::SeqCst)
+    fn last_failure_retry_cause(&self) -> Option<RetryCause> {
+        match self.last_failure.load(Ordering::SeqCst) {
+            TRANSIENT => Some(RetryCause::Transient),
+            CLOCK_SKEW => Some(RetryCause::ClockSkew),
+            _ => None,
+        }
     }
 
     fn note<T>(&self, result: Result<T, StoreError>) -> Result<T, StoreError> {
         if let Err(err) = &result {
-            self.last_failure_transient
-                .store(store_error_is_transient(err), Ordering::SeqCst);
+            let code = match store_error_retry_cause(err) {
+                Some(RetryCause::Transient) => TRANSIENT,
+                Some(RetryCause::ClockSkew) => CLOCK_SKEW,
+                None => NOT_RETRIED,
+            };
+            self.last_failure.store(code, Ordering::SeqCst);
         }
         result
     }
@@ -540,6 +575,58 @@ mod tests {
                 "failed to bootstrap or read the durable GC config (sys/gc)"
             );
             assert!(clock.sleeps().is_empty());
+        }
+
+        #[tokio::test]
+        async fn retries_a_clock_skew_refusal_then_starts() {
+            let clock = Arc::new(ManualClock::default());
+            let store = Arc::new(ScriptedRefusals::then_ok(
+                Arc::new(MemoryStore::new()),
+                GC_KEY,
+                [clock_skewed(), clock_skewed()],
+            ));
+            bootstrap_at_startup(store.clone(), 1, Mode::All, &retry_on(clock.clone()))
+                .await
+                .expect("starts once the store accepts the request clock");
+            assert_eq!(store.gets(), 3);
+            assert_eq!(clock.sleeps().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn clock_skew_past_the_deadline_refuses_naming_time_sync() {
+            let clock = Arc::new(ManualClock::default());
+            let store = Arc::new(ScriptedRefusals::always(
+                Arc::new(MemoryStore::new()),
+                GC_KEY,
+                clock_skewed,
+            ));
+            let err = bootstrap_at_startup(store.clone(), 1, Mode::All, &retry_on(clock.clone()))
+                .await
+                .expect_err("refuses once the deadline passes");
+            assert_clock_skew_deadline_refusal(&err, SITE_GC_CONFIG, store.gets());
+            let chain = format!("{err:#}");
+            assert!(chain.contains(CLOCK_SKEW_CONTEXT), "{chain}");
+            assert!(!chain.contains("lacks GetObject"), "{chain}");
+            assert!(!chain.contains("restarting will not help"), "{chain}");
+        }
+
+        /// An `AccessDenied` is a missing grant whatever its text says.
+        #[tokio::test]
+        async fn access_denied_naming_the_clock_skew_code_refuses_at_once() {
+            let clock = Arc::new(ManualClock::default());
+            let store = Arc::new(ScriptedRefusals::always(
+                Arc::new(MemoryStore::new()),
+                GC_KEY,
+                denied_naming_clock_skew,
+            ));
+            let err = bootstrap_at_startup(store.clone(), 1, Mode::All, &retry_on(clock.clone()))
+                .await
+                .expect_err("refuses at once");
+            assert_eq!(store.gets(), 1);
+            assert!(clock.sleeps().is_empty());
+            let chain = format!("{err:#}");
+            assert!(!chain.contains(CLOCK_SKEW_CONTEXT), "{chain}");
+            assert!(chain.contains("lacks GetObject on sys/gc"), "{chain}");
         }
 
         /// A transient failure on an earlier call does not make a later
