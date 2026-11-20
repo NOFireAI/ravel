@@ -55,6 +55,15 @@ fn init_sets_the_process_rates_from_the_variable() {
 }
 
 #[test]
+fn init_rates_apply_after_scope_storage_is_destroyed() {
+    run_child(
+        "child_rate_after_scope_storage_is_destroyed_is_the_process_rate",
+        "ingest/encode-cancelled=1",
+        None,
+    );
+}
+
+#[test]
 fn init_refuses_an_invalid_variable() {
     run_child(
         "child_init_refuses_an_unknown_fault",
@@ -83,6 +92,52 @@ fn child_init_fires_the_named_fault() {
         let want = if name == expected { 100 } else { 0 };
         assert_eq!(fired, want, "{name} with {FAULT_ENV}={value:?}");
     }
+}
+
+// The thread touches PROBE before it opens a scope, so PROBE's destructor is
+// registered before the scope storage's and runs after it is destroyed. The
+// scope is leaked open at rate 0 and the process rate is 1, so a read of the
+// live scope and a destroyed-storage answer of 0 both give 0.
+#[test]
+#[ignore = "a child of init_rates_apply_after_scope_storage_is_destroyed"]
+fn child_rate_after_scope_storage_is_destroyed_is_the_process_rate() {
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
+
+    const NAME: &str = "ingest/encode-cancelled";
+    type Seen = Arc<Mutex<Option<(f64, bool)>>>;
+
+    struct Probe(Seen);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let seen = (fault::rate(NAME), fault::fires(NAME));
+            *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(seen);
+        }
+    }
+    thread_local! {
+        static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+    }
+
+    assert_eq!(variable(), "ingest/encode-cancelled=1");
+    ravel_invariant::init().expect("a valid value starts");
+    assert_eq!(fault::rate(NAME).to_bits(), 1.0_f64.to_bits());
+
+    let seen: Seen = Arc::default();
+    let probe_seen = Arc::clone(&seen);
+    let joined = std::thread::spawn(move || {
+        PROBE.with(|p| *p.borrow_mut() = Some(Probe(probe_seen)));
+        std::mem::forget(fault::scoped(NAME, 0.0).expect("registered"));
+        assert_eq!(fault::rate(NAME).to_bits(), 0.0_f64.to_bits());
+    })
+    .join();
+    assert!(joined.is_ok(), "the thread exits without a panic");
+    let (seen_rate, fired) = seen
+        .lock()
+        .expect("probe lock")
+        .take()
+        .expect("the probe's destructor ran");
+    assert_eq!(seen_rate.to_bits(), 1.0_f64.to_bits(), "the process rate");
+    assert!(fired, "the fault fires at the process rate 1");
 }
 
 #[test]

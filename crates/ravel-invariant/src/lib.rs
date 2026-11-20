@@ -552,9 +552,8 @@ pub mod mutant {
 
     /// Whether `name` is the selected mutant on this thread: the test scope
     /// when one is open here, the process selection otherwise. Before
-    /// [`crate::init`] the process selects none. A thread whose thread-local
-    /// storage is already destroyed (a destructor running at thread exit)
-    /// has no scope open and sees the process selection.
+    /// [`crate::init`] the process selects none. A thread whose scope
+    /// storage has been destroyed sees the process selection.
     pub fn is_selected(name: &str) -> bool {
         let selected = SCOPED
             .try_with(Cell::get)
