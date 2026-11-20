@@ -253,7 +253,142 @@ How to find affected requests: run `ravel-cli erase status --tenant <tenant>
 
 ## 3. #4501: legal hold written mid-pass
 
-(pending)
+### Claims checked against main
+
+- ADR-0042 decision 2: `LegalHoldCheck` "consults a per-tenant (or
+  per-time-range) hold record before any physical delete in both the sweeper
+  and the retention path; a hold present means the delete is skipped". Holds.
+- crates/ravel-maintain/src/legal_hold.rs: `refresh` loads the hold set once;
+  `is_protected` reads only the snapshot and does no I/O. Holds.
+  services/ravel-server/src/maintain.rs refreshes once per tenant per tick and
+  threads that snapshot through retention, every sweep rule, the erasure rewrite
+  and the alert and audit retention passes. Holds.
+- `LifecycleGC.tla`: `PlaceHold` changes `heldBuckets` at once, `RetentionSweep`
+  and `SupersededSweep` guard on `~HeldObject(o, heldBuckets)`, and
+  `HeldObjectNeverDeleted` reads the true hold set the delete observed at its
+  own step. Holds. The model has no notion of a per-pass snapshot.
+- The brief says the #4337 work puts `HeldObjectNeverDeleted` at three Rust
+  sites and that `a_hold_placed_after_the_snapshot_trips_held_object_never_deleted`
+  is in sweep.rs. Neither is on main at b9303ba: sweep.rs asserts the HEAD-gate
+  and unreadable-HEAD invariants only, and no symbol or string of that name
+  exists in crates/ravel-maintain. Both are on an unmerged branch. The decision
+  below does not depend on them, but the #4337 merge must follow it.
+- Not in the brief: the operator guides already state contract 2.
+  docs/guides/operations/maintenance.md "Legal hold" says the hold "is not
+  effective the instant the command returns", that a hold set after a tick's
+  refresh "is not honored until the next one", and that the exposure window is
+  one maintain interval, five minutes by default; troubleshooting.md "Data
+  deleted despite hold" says the same. That window figure is wrong under
+  either contract: the exposure is the remainder of the running pass, which on
+  a large tenant is longer than the interval. So the repository already
+  contradicts ADR-0042 and the model in its operator docs, independent of this
+  decision.
+
+### Decision
+
+Contract 1: the hold set is re-read from the store immediately before each
+delete batch, and a batch whose re-read fails deletes nothing. The guarantee
+sentence, for ADR-0042, docs/deletion-and-gc.md and the `hold set` output:
+
+> A legal hold whose set record was durable before a delete batch re-read the
+> hold set is honored by that batch; every delete batch re-reads the hold set
+> immediately before its first delete, and a batch that cannot read it deletes
+> nothing.
+
+The residual is the batch's own in-flight deletes: a hold written after the
+re-read and before the batch's delete requests return is not honored by that
+batch. That residual is stated, not hidden.
+
+### Why
+
+ADR-0042 is a compliance contract and its words are "before any physical
+delete". A litigation hold whose effect waits for a running pass to end has no
+bound an operator can state: a tick's destructive passes on a large tenant run
+for as long as the sweep takes, and the guide's "one maintain interval" is the
+scheduling gap, not the pass length. Contract 2 would therefore need a new
+bound that does not exist today, and it would narrow the one property the
+Antithesis lifecycle campaign already checks. Contract 1 matches the ADR, the
+model and the Rust assertion the #4337 branch adds, and its cost is small and
+proportional to deletes rather than to data: one LIST of the hold shard per
+delete batch, with the GET of each commit record and audit object cacheable
+within the process by key, since hold records are immutable. Deletes are rare
+relative to planning work, and a tick that deletes nothing pays nothing new.
+Fencing hold writes against running passes was the other contract-1 shape; it
+adds a mutable coordination object to a path that today has none, and the
+re-read gives the same guarantee without it.
+
+### Conditions and follow-ups
+
+1. Minimal change set, in one pull request on the #4505 branch or beside it:
+   - ravel-maintain gains a hold source the delete sites call (an async
+     `current()` returning a fresh `LegalHoldCheck`, over the store the pass
+     already has), used at the superseded-input delete per chain group, the
+     retention `delete_all` per bucket, the orphan quarantine move and purge,
+     the `.dreq` sweep, the catalog sweep and the alert and audit retention
+     deletes. Planning keeps the per-tick snapshot; only the delete decision
+     re-reads.
+   - A failed re-read skips that batch, counts on the existing refresh-failure
+     counter, and the pass continues to the next batch (fail closed per batch,
+     not per tick, so one transient fault does not stop every delete).
+   - The commit-record and audit-object reads inside `load_hold_records` are
+     cached per key for the process lifetime; the LIST is not.
+   - ADR-0042 gets a dated amendment carrying the guarantee sentence and the
+     residual (draft below). `LifecycleGC.tla` is unchanged.
+   - maintenance.md "Legal hold" and troubleshooting.md "Data deleted despite
+     hold" are rewritten to the sentence above; the five-minute figure goes.
+     `hold set` prints "hold set: <scope>; honored by every delete batch that
+     re-reads holds after now" or equivalent.
+   - The #4505 test loses its `#[ignore]` and asserts `superseded_records_deleted`
+     and `superseded_data_deleted` of 0 with `superseded_groups_held_by_legal_hold`
+     of 1 for the group, so it pins the claim in the commit's own words.
+2. #4337's Rust `HeldObjectNeverDeleted` sites judge from a hold set re-read at
+   the delete, which is what this contract makes true; merge #4337 after this
+   change, or rebase it onto it.
+3. Until this lands, an Antithesis `HeldObjectNeverDeleted` failure is triaged
+   against this window first, as the issue already says.
+
+### Confidence
+
+High on the contract. Medium on the list of delete sites being complete; the
+implementer greps every `is_protected` call under a delete and treats a site
+missing from the list above as in scope.
+
+### Draft amendment text for ADR-0042
+
+The heading "Decision" exists once in the file; decision 2's prose gains the
+pointer "(the re-read before each delete batch is stated by the delete-batch
+re-read amendment below)" after "a hold present means the delete is skipped".
+
+```markdown
+## Amendment (2026-11-20, #4501): the hold set is re-read before each delete batch
+
+<!-- amendment-applies: sections="Decision" pointer="delete-batch re-read amendment" -->
+
+Decision 2 says the hold record is consulted before any physical delete. The
+shipped `LegalHoldCheck` loaded the hold set once per tenant per maintenance
+tick and judged every delete of that tick from that snapshot, so a hold whose
+record landed after the snapshot was not honored until the next tick, for as
+long as the running pass took. ADR-0042, the lifecycle model's
+`HeldObjectNeverDeleted` and the operator guides disagreed about this; the
+guides said next tick, the ADR and the model said before the delete.
+
+The ADR and the model stand. Every delete batch (a superseded chain group, a
+retention bucket, an orphan quarantine move or purge, an erasure request
+record, a catalog object batch, an alert or audit retention batch) re-reads
+the hold set from the store immediately before its first delete and judges
+its deletes from that read; planning decisions earlier in the pass keep the
+per-tick snapshot. A batch whose re-read fails deletes nothing, is counted on
+the refresh-failure counter, and the pass continues. The guarantee is: a legal
+hold whose set record was durable before a delete batch re-read the hold set
+is honored by that batch. The residual is the batch's own in-flight deletes:
+a hold written after the re-read and before the batch's delete requests
+return is not honored by that batch, and nothing short of a store-side
+transaction could make it so. The cost is one LIST of the hold shard per
+delete batch; hold commit records and audit objects are immutable and cached
+by key within the process. `ravel-cli hold set` states the guarantee in its
+output, and docs/guides/operations/maintenance.md "Legal hold" and
+docs/deletion-and-gc.md carry the normative wording.
+```
 
 ## 4. #4428: swept-token fallback beside a stale HEAD
 
