@@ -2,9 +2,9 @@
 //! decision 2).
 //!
 //! The sweeper consults a [`LeaseCheck`] before every physical delete. Legal
-//! hold is the first non-trivial implementation of that seam: a held object is
-//! never deleted, in any of the three sweep rules or the retention physical
-//! sweep, until the hold that covers it is cleared.
+//! hold is the first non-trivial implementation of that seam: an object a hold
+//! covers is not deleted by any sweep rule or retention batch whose hold
+//! re-read saw the hold, until the hold that covers it is cleared.
 //!
 //! # The sync/async tension
 //!

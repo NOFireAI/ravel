@@ -142,10 +142,11 @@ use crate::unnamed_marker::{MarkerAnchor, MarkerKind, MarkerReapOutcome};
 
 use ravel_ingest::{IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, MARKER_SUFFIX};
 
-/// A hook the sweeper consults before every delete, in all five rules. The
-/// only implementation today is [`NoLeases`] (nothing is ever protected); this
-/// is a seam for future reader-lease / slow-consumer work, never
-/// a correctness dependency of the current design. In-flight readers are
+/// A hook the sweeper consults before every delete, in all five rules.
+/// [`NoLeases`] protects nothing; [`crate::LegalHoldCheck`] protects what a
+/// legal hold covers and, through [`Self::hold_source`], is re-read before
+/// each delete batch. As a reader lease it is a seam for future
+/// slow-consumer work, never a correctness dependency of the current design. In-flight readers are
 /// protected by the protection horizon, the age gates, the ADR-0020 HEAD
 /// delete blocker and, for the retention and superseded-input rules, the
 /// unnamed-since marker gate (ADR-1133): a candidate HEAD no longer names is
