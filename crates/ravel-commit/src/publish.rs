@@ -514,14 +514,15 @@ mod tests {
 
     /// True in a build where ravel-invariant records evaluations: the
     /// invariants lane (`ravel-invariant/capture`). This crate has no feature
-    /// of its own that forwards `capture`, so the gate is an assertion macro,
-    /// which evaluates its condition only when `capture` (or `antithesis`) is
-    /// on and expands to nothing otherwise.
+    /// of its own that forwards `capture`, so the gate is an assertion macro
+    /// whose condition asks `test_support::capturing`. The condition runs only
+    /// when `capture` or `antithesis` is on, and the default build expands it
+    /// to nothing.
     fn capturing() -> bool {
         let on = std::cell::Cell::new(false);
         ravel_invariant::inv_sometimes!(
             {
-                on.set(true);
+                on.set(ravel_invariant::test_support::capturing());
                 true
             },
             "ravel-commit test: evaluations are captured",
