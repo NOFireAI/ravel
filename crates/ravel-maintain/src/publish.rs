@@ -488,6 +488,14 @@ async fn resolve_already_exists(
         compat,
     )
     .await;
+    if matches!(outcome, Err(MaintainError::InputSetHashDivergence { .. }))
+        && ravel_invariant::inv_mutant!("maintenance/mo-diverge-overwrites-record")
+    {
+        store
+            .put(record_key, our_payload.clone(), PutOptions::default())
+            .await?;
+    }
+    assert_loser_resolution(store, record_key, &existing, our_hash, &outcome, ledger).await;
     // The record the store holds after this attempt, not the one it fetched,
     // unless the fetched record is byte-equal to ours: nothing this attempt
     // writes can then change it. A record a later sweep removed was not
@@ -508,6 +516,52 @@ async fn resolve_already_exists(
         ])
     );
     outcome
+}
+
+/// DivergentInputSetNeverMutates for one losing publish (ADR-4326 decision
+/// 1): against a winner record, as fetched, whose input-set hash differs from
+/// ours, a HEAD after the attempt resolved finds the record at the version
+/// fetched, so the loser wrote nothing to it. A record gone or a failed HEAD
+/// cannot tell. Nothing here runs in the default build.
+async fn assert_loser_resolution(
+    store: &dyn ObjectStoreBackend,
+    record_key: &str,
+    existing: &ravel_object_store::GetOutcome,
+    our_hash: &[u8; 32],
+    outcome: &Result<PublishOutcome>,
+    ledger: Option<&RequestLedger>,
+) {
+    let _ = (store, existing, ledger);
+    if !ravel_invariant::EVALUATES {
+        return;
+    }
+    let details = std::collections::BTreeMap::from([
+        ("record_key", record_key.to_string()),
+        ("our_input_set_hash", hex::encode(our_hash)),
+        ("outcome", format!("{outcome:?}")),
+    ]);
+    let winner = ravel_commit::record::decode_compaction(&existing.data).ok();
+    let diverged = winner
+        .as_ref()
+        .is_some_and(|w| w.input_set_hash.as_slice() != our_hash.as_slice());
+    if diverged {
+        ravel_invariant::inv_reachable!(
+            "maintenance: a loser observed a divergent input set and alarmed",
+            details
+        );
+        ravel_invariant::inv_always_if_known!(
+            {
+                let after = store.head(record_key).await;
+                note_metadata(ledger, RequestPhase::Publish);
+                match after {
+                    Ok(after) => Some(after.version == existing.version),
+                    Err(_) => None,
+                }
+            },
+            "maintenance: a loser observing a divergent input-set hash fails closed and never overwrites the record",
+            details
+        );
+    }
 }
 
 /// [`resolve_already_exists`] against the winner's record bytes `existing`.
@@ -535,10 +589,16 @@ async fn resolve_against_winner(
 
     // Same input set: repair any missing winner part we can reproduce.
     let mut repaired = 0usize;
+    // Winner parts the store answered absent to this attempt's HEAD and that
+    // no acknowledged re-PUT restored.
+    let mut absent: Vec<String> = Vec::new();
     for part in &winner.parts {
         let part_key = keys::reconstruct_l1_part_key(&winner, part)?;
         let head = store.head(&part_key).await;
         note_metadata(ledger, RequestPhase::Publish);
+        if matches!(head, Err(StoreError::NotFound)) {
+            absent.push(part_key.clone());
+        }
         match head {
             Ok(_) => {}
             Err(StoreError::NotFound) => {
@@ -557,6 +617,7 @@ async fn resolve_against_winner(
                         // other L1 part write, not to the phase that noticed
                         // the hole.
                         crate::build::put_part_with_ledger(store, ours, ledger, compat).await?;
+                        absent.retain(|k| k != &part_key);
                         repaired += 1;
                     }
                     // Cannot repair (bytes released at PUT, or a part this run
@@ -568,6 +629,11 @@ async fn resolve_against_winner(
                     // matching the fresh-record arm's
                     // AlreadyExistsPartVanished loudness.
                     Some(_) | None => {
+                        if ravel_invariant::inv_mutant!(
+                            "maintenance/mo-missing-part-reports-converged"
+                        ) {
+                            continue;
+                        }
                         return Err(MaintainError::ConvergedWinnerPartMissing { part_key });
                     }
                 }
@@ -575,6 +641,24 @@ async fn resolve_against_winner(
             Err(e) => return Err(MaintainError::Store(e)),
         }
     }
+    // Judged from the store's answers to this attempt's part HEADs and
+    // re-PUTs: every winner part was answered present or re-PUT.
+    ravel_invariant::inv_always!(
+        absent.is_empty(),
+        "maintenance: a loser reports Converged only when the winner part is observed present in the store",
+        std::collections::BTreeMap::from([
+            ("record_key", record_key.to_string()),
+            ("our_input_set_hash", hex::encode(our_hash)),
+            ("absent_parts", format!("{absent:?}")),
+        ])
+    );
+    ravel_invariant::inv_reachable!(
+        "maintenance: a loser converged on the winner record",
+        std::collections::BTreeMap::from([
+            ("record_key", record_key.to_string()),
+            ("our_input_set_hash", hex::encode(our_hash)),
+        ])
+    );
     tracing::info!(
         parts_repaired = repaired,
         "converged on prior compaction record"
@@ -976,6 +1060,185 @@ pub(crate) mod tests {
         assert!(found[0].0, "{found:?}");
         let published = evaluations("catalog: compaction record published", "");
         assert!(!published.is_empty());
+    }
+
+    const NEVER_MUTATES: &str = "maintenance: a loser observing a divergent input-set hash fails closed and never overwrites the record";
+    const CONVERGES: &str = "maintenance: a loser reports Converged only when the winner part is observed present in the store";
+
+    /// Publishes 17 input records as parts of 12 and 5 under `hash` and, when
+    /// `put_parts`, puts the parts the record names. Returns the record key
+    /// and bytes.
+    async fn publish_winner(
+        store: &MemoryStore,
+        hash: &[u8; 32],
+        put_parts: bool,
+    ) -> (String, bytes::Bytes) {
+        let bucket = bucket(Signal::Metrics);
+        let inputs = vec![input(1, 10, &bucket), input(2, 7, &bucket)];
+        let outcome = publish_record(
+            store,
+            &CompactorConfig::default(),
+            &FixedClock::new(1),
+            &bucket,
+            &inputs,
+            hash,
+            &[part(0, 12), part(1, 5)],
+            1,
+        )
+        .await
+        .expect("winner publish");
+        assert_eq!(outcome, PublishOutcome::Published);
+        let listed = list_all(store, "").await.expect("list");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let key = listed[0].key.clone();
+        let bytes = record_bytes(store, &key).await;
+        if put_parts {
+            let record = ravel_commit::record::decode_compaction(&bytes).expect("decode");
+            for p in &record.parts {
+                let part_key = keys::reconstruct_l1_part_key(&record, p).expect("part key");
+                store
+                    .put(&part_key, bytes::Bytes::new(), PutOptions::create_if_absent())
+                    .await
+                    .expect("put part");
+            }
+        }
+        (key, bytes)
+    }
+
+    /// Publishes the same inputs as one part of 17 under `hash`: a loser to
+    /// any record at the same key.
+    async fn publish_loser(store: &MemoryStore, hash: &[u8; 32]) -> Result<PublishOutcome> {
+        let bucket = bucket(Signal::Metrics);
+        let inputs = vec![input(1, 10, &bucket), input(2, 7, &bucket)];
+        publish_record(
+            store,
+            &CompactorConfig::default(),
+            &FixedClock::new(1),
+            &bucket,
+            &inputs,
+            hash,
+            &[part(0, 17)],
+            1,
+        )
+        .await
+    }
+
+    /// A hash that shares `hash`'s first 8 bytes, so its record key is the
+    /// same, and differs after them.
+    fn diverging(hash: [u8; 32]) -> [u8; 32] {
+        let mut other = hash;
+        other[31] ^= 0xFF;
+        other
+    }
+
+    #[tokio::test]
+    async fn mutant_diverge_overwrites_record_breaks_never_mutates() {
+        let Some(_mutant) = scoped_mutant("maintenance/mo-diverge-overwrites-record") else {
+            return;
+        };
+        let ours = [0x51; 32];
+        let store = MemoryStore::new();
+        let (key, winner) = publish_winner(&store, &diverging(ours), true).await;
+        let lost = publish_loser(&store, &ours).await;
+        assert!(
+            matches!(lost, Err(MaintainError::InputSetHashDivergence { .. })),
+            "{lost:?}"
+        );
+        assert_ne!(record_bytes(&store, &key).await, winner, "the mutant overwrote");
+        if !capturing() {
+            return;
+        }
+        let found = evaluations(NEVER_MUTATES, &hex::encode(ours));
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "DivergentInputSetNeverMutates is evaluated false for the overwrite: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_divergent_loser_never_mutates_the_record() {
+        if !capturing() {
+            return;
+        }
+        let ours = [0x52; 32];
+        let store = MemoryStore::new();
+        let (key, winner) = publish_winner(&store, &diverging(ours), true).await;
+        let lost = publish_loser(&store, &ours).await;
+        assert!(
+            matches!(lost, Err(MaintainError::InputSetHashDivergence { .. })),
+            "{lost:?}"
+        );
+        assert_eq!(record_bytes(&store, &key).await, winner);
+        let found = evaluations(NEVER_MUTATES, &hex::encode(ours));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0, "{found:?}");
+        let alarmed = evaluations(
+            "maintenance: a loser observed a divergent input set and alarmed",
+            &hex::encode(ours),
+        );
+        assert_eq!(alarmed.len(), 1, "{alarmed:?}");
+        assert!(evaluations(CONVERGES, &hex::encode(ours)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mutant_missing_part_reports_converged_breaks_convergence() {
+        let Some(_mutant) = scoped_mutant("maintenance/mo-missing-part-reports-converged") else {
+            return;
+        };
+        let hash = [0x53; 32];
+        let store = MemoryStore::new();
+        // The winner's parts are absent and the loser never built them, so
+        // it cannot re-PUT them.
+        publish_winner(&store, &hash, false).await;
+        let outcome = publish_loser(&store, &hash).await;
+        assert_eq!(
+            outcome.expect("the mutant reports convergence"),
+            PublishOutcome::Converged { parts_repaired: 0 }
+        );
+        if !capturing() {
+            return;
+        }
+        let found = evaluations(CONVERGES, &hex::encode(hash));
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "MergeAttemptsConverge is evaluated false for the missing part: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_loser_converges_only_over_present_winner_parts() {
+        if !capturing() {
+            return;
+        }
+        let present = [0x54; 32];
+        let store = MemoryStore::new();
+        publish_winner(&store, &present, true).await;
+        assert_eq!(
+            publish_loser(&store, &present).await.expect("converges"),
+            PublishOutcome::Converged { parts_repaired: 0 }
+        );
+        let found = evaluations(CONVERGES, &hex::encode(present));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0, "{found:?}");
+        let converged = evaluations(
+            "maintenance: a loser converged on the winner record",
+            &hex::encode(present),
+        );
+        assert_eq!(converged.len(), 1, "{converged:?}");
+
+        // A missing, non-re-PUTtable winner part fails closed: no
+        // convergence is reported, so nothing is evaluated.
+        let missing = [0x55; 32];
+        let store = MemoryStore::new();
+        publish_winner(&store, &missing, false).await;
+        let err = publish_loser(&store, &missing)
+            .await
+            .expect_err("fails closed");
+        assert!(
+            matches!(err, MaintainError::ConvergedWinnerPartMissing { .. }),
+            "{err:?}"
+        );
+        assert!(evaluations(CONVERGES, &hex::encode(missing)).is_empty());
     }
 
     /// Publishes inputs of 10 and 7 records as parts of 12 and 5 and returns

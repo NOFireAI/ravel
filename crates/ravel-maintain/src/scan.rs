@@ -1507,15 +1507,42 @@ impl MaintainMemo {
                 // makes it structurally impossible for a decoded entry to be
                 // fresher than the snapshot it came from, which the header-level
                 // too_future guard has already bounded against `now_ns`.
-                let verified_ns = verified_ns.min(decoded.snapshot_unix_ns);
-                self.seed_entry(
-                    (unit.tenant, unit.signal, unit.shard, hour),
-                    state,
-                    verified_ns,
+                let clamped_ns = verified_ns.min(decoded.snapshot_unix_ns);
+                let key = (unit.tenant, unit.signal, unit.shard, hour);
+                let prior_ns = ravel_invariant::EVALUATES
+                    .then(|| self.entries.get(&key).map(|e| e.verified_at_ns))
+                    .flatten();
+                self.seed_entry(key, state, clamped_ns);
+                // Judged from the snapshot header the store returned: a seeded
+                // entry is no fresher than its snapshot, unless this process
+                // already held a fresher verdict of its own.
+                let _ = prior_ns;
+                ravel_invariant::inv_always!(
+                    self.entries.get(&key).is_some_and(|e| {
+                        e.verified_at_ns
+                            <= snapshot
+                                .snapshot_unix_ns()
+                                .max(prior_ns.unwrap_or(i64::MIN))
+                    }),
+                    "maintenance: a seeded memo entry is never fresher than its snapshot",
+                    std::collections::BTreeMap::from([
+                        ("writer", snapshot.process_id().to_string()),
+                        ("tenant", unit.tenant.to_hex()),
+                        ("shard", unit.shard.to_string()),
+                        ("hour", hour.to_string()),
+                        ("entry_verified_ns", verified_ns.to_string()),
+                    ])
                 );
                 stats.seeded_buckets += 1;
             }
         }
+        ravel_invariant::inv_reachable!(
+            "maintenance: a memo was seeded from a snapshot",
+            std::collections::BTreeMap::from([
+                ("writer", snapshot.process_id().to_string()),
+                ("seeded_buckets", stats.seeded_buckets.to_string()),
+            ])
+        );
         Ok(stats)
     }
 }
@@ -2851,6 +2878,48 @@ mod memo_snapshot_tests {
             ),
             "clamped entry expires on schedule instead of suppressing reads forever"
         );
+    }
+
+    /// MemoNeverExtendsFreshnessPastSnapshot holds for a future-dated entry
+    /// and an honest one: both seeded entries are evaluated true and never
+    /// false.
+    #[test]
+    fn memo_never_extends_freshness_past_snapshot_holds() {
+        use crate::publish::tests::{capturing, evaluations};
+        if !capturing() {
+            return;
+        }
+        let t = TenantId::new("seed-clamp-property").hash();
+        let snapshot_unix_ns = 5 * NS_PER_HOUR;
+        let mut source = MaintainMemo::with_default_interval();
+        source.mark_terminal(
+            (t, Signal::Metrics, 0, 1),
+            TerminalState::Compacted,
+            snapshot_unix_ns + 100 * NS_PER_HOUR,
+        );
+        source.mark_terminal(
+            (t, Signal::Metrics, 0, 3),
+            TerminalState::Compacted,
+            snapshot_unix_ns - NS_PER_HOUR,
+        );
+        let bytes = frame(&source.snapshot_body(), snapshot_unix_ns);
+        let mut seeded = MaintainMemo::with_default_interval();
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            snapshot_unix_ns,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
+        assert_eq!(stats.seeded_buckets, 2);
+        let found = evaluations(
+            "maintenance: a seeded memo entry is never fresher than its snapshot",
+            &t.to_hex(),
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|(held, _)| *held), "{found:?}");
+        assert!(!evaluations("maintenance: a memo was seeded from a snapshot", "").is_empty());
     }
 
     /// One hand-built snapshot unit: an optional `(start, end)` frontier and

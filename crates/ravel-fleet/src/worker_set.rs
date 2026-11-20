@@ -522,7 +522,7 @@ impl WorkerSet {
             .as_bytes()
             .to_vec();
         let key = heartbeat_key(&self.process_id);
-        store
+        let put = store
             .put(
                 &key,
                 heartbeat.encode_to_vec().into(),
@@ -531,7 +531,25 @@ impl WorkerSet {
                     checksum: None,
                 },
             )
-            .await?;
+            .await;
+        // Judged from the store's answer: only a conditional write can be
+        // refused for a precondition or an existing object.
+        ravel_invariant::inv_always!(
+            !matches!(
+                put,
+                Err(StoreError::PreconditionFailed | StoreError::AlreadyExists)
+            ),
+            "maintenance: a heartbeat write is an overwrite, never refused as a CAS",
+            std::collections::BTreeMap::from([
+                ("key", key.clone()),
+                ("result", format!("{put:?}")),
+            ])
+        );
+        put?;
+        ravel_invariant::inv_reachable!(
+            "maintenance: a worker heartbeat was written",
+            std::collections::BTreeMap::from([("key", key)])
+        );
         Ok(())
     }
 
@@ -1169,6 +1187,65 @@ mod tests {
             heartbeat.heartbeat_unix_ns, 2_000,
             "the second write's content wins: no CAS precondition blocked it"
         );
+    }
+
+    /// True in the invariants lane, where assertion sites record evaluations
+    /// (`ravel-invariant/capture`); false otherwise.
+    fn capturing() -> bool {
+        let on = std::cell::Cell::new(false);
+        ravel_invariant::inv_sometimes!(
+            {
+                on.set(ravel_invariant::test_support::capturing());
+                true
+            },
+            "ravel-fleet test: evaluations are captured",
+            ""
+        );
+        on.get()
+    }
+
+    /// `(condition, details)` of every captured evaluation of `message` whose
+    /// details mention `needle`; empty outside the invariants lane.
+    fn evaluations(message: &'static str, needle: &str) -> Vec<(bool, String)> {
+        let found = std::cell::RefCell::new(Vec::new());
+        let _ = (message, needle);
+        ravel_invariant::inv_sometimes!(
+            {
+                *found.borrow_mut() =
+                    ravel_invariant::test_support::evaluations(message, needle).unwrap_or_default();
+                true
+            },
+            "ravel-fleet test: evaluations are read",
+            ""
+        );
+        found.into_inner()
+    }
+
+    /// HeartbeatAndMemoNeverCas, heartbeat half: a first write and an
+    /// overwrite of the same key are both evaluated true from the store's
+    /// answer, and never false.
+    #[tokio::test]
+    async fn heartbeat_never_cas_holds_over_an_overwrite() {
+        if !capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let w = worker(0);
+        w.write_heartbeat(&store, &membership(), 1_000)
+            .await
+            .expect("first write");
+        w.write_heartbeat(&store, &membership(), 2_000)
+            .await
+            .expect("overwrite");
+        let id = w.process_id().to_string();
+        let found = evaluations(
+            "maintenance: a heartbeat write is an overwrite, never refused as a CAS",
+            &id,
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|(held, _)| *held), "{found:?}");
+        let written = evaluations("maintenance: a worker heartbeat was written", &id);
+        assert_eq!(written.len(), 2, "{written:?}");
     }
 
     /// The reaper deletes exactly the keys past the reap horizon (issue #1679):
