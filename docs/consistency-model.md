@@ -147,7 +147,12 @@ Buffered mode (opt-in per request, named "buffered"):
   server fault, not bad input: no store call is made, any strict waiter is
   acked with the retryable `ShardUnavailable` (503), the shard actor keeps
   running, and the flush is logged at ERROR and counted in no `abandoned_*`
-  counter. Six: the flush's lifetime, re-derived when its permit is granted,
+  counter. In a build with the Antithesis fault switches compiled in (the
+  `antithesis` or `ravel-invariant/capture` feature, never a published
+  build), the `ingest/encode-cancelled` switch (ADR-4326) produces this same
+  case: the encode call returns the gate's `Cancelled` error without running
+  the encode job, with or without a gate attached.
+  Six: the flush's lifetime, re-derived when its permit is granted,
   elapses before its encode on the write gate returns, most likely because
   the encode is still queued for a gate permit. The flush is abandoned with
   no store call, any strict waiter is acked with the retryable `Abandoned`
