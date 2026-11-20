@@ -97,6 +97,7 @@ use crate::audit_retention::{expired_and_past_horizon, hour_certainly_not_expire
 use crate::clock::Clock;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
+use crate::legal_hold::{Admit, DeleteBatch};
 use crate::read::verify_commit_key;
 use crate::retention::held_out_of_window_rlog;
 use crate::sweep::LeaseCheck;
@@ -260,6 +261,10 @@ pub async fn sweep_alert_retention(
     let metas = list_all(store, &prefix).await?;
 
     let mut outcome = AlertRetentionOutcome::default();
+    // The pass's record deletes are one delete batch (#4501): it re-reads the
+    // hold set before its first delete and judges each record and its data
+    // object from that read.
+    let mut batch = DeleteBatch::new(lease, tenant, "alert retention");
     for meta in metas {
         match keys::partition_bucket_entry(&meta.key) {
             Ok(BucketEntry::CommitRecord(parsed)) => {
@@ -336,7 +341,13 @@ pub async fn sweep_alert_retention(
                     outcome.kept += 1;
                     continue;
                 }
+                let pair = [meta.key.as_str(), data_key.as_str()];
+                if batch.admit(store, &pair).await != Admit::Delete {
+                    outcome.kept += 1;
+                    continue;
+                }
                 if !config.dry_run {
+                    batch.assert_delete(&pair);
                     store.delete(&meta.key).await?;
                     store.delete(&data_key).await?;
                 }
@@ -1365,6 +1376,69 @@ mod tests {
             assert!(exists(&store, &seeded.commit_key).await);
             assert!(exists(&store, &seeded.data_key).await);
         }
+    }
+
+    /// A legal hold over the alerts shard written after the pass's snapshot
+    /// is honored by the sweep's delete batch, whose re-read sees it.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_stops_the_alert_retention_batch() {
+        let tenant = tenant();
+        let now = 400 * NS_PER_DAY;
+        let clock = FixedClock::new(now);
+        let config = CompactorConfig::default();
+        let store = MemoryStore::new();
+        let seeded = seed_alert(
+            &store,
+            &tenant,
+            Uuid::from_u128(0xA6),
+            1,
+            now - 200 * NS_PER_DAY,
+        )
+        .await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+        assert!(snapshot.is_empty());
+        let scopes =
+            crate::legal_hold::shard_hold_scopes(&tenant, Signal::Alerts, ALERT_SHARD).unwrap();
+        for (i, scope) in scopes.iter().enumerate() {
+            crate::legal_hold::write_hold_set(
+                &store,
+                &tenant,
+                Uuid::from_u128(0x4501 + i as u128),
+                now,
+                scope,
+                "mid-pass",
+            )
+            .await
+            .expect("hold");
+        }
+
+        let outcome = sweep_alert_retention(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            ALERT_SHARD,
+            &keep_none_below(now),
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(
+            outcome,
+            AlertRetentionOutcome {
+                records_deleted: 0,
+                data_deleted: 0,
+                kept: 1,
+                kept_current_state: 0,
+                kept_at_or_above_watermark: 0,
+                gets_skipped_by_hour_prefilter: 0,
+                held_out_of_window: 0,
+            }
+        );
+        assert!(exists(&store, &seeded.commit_key).await);
+        assert!(exists(&store, &seeded.data_key).await);
     }
 
     /// A [`LeaseCheck`] protecting exactly one key.

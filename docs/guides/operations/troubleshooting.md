@@ -1065,8 +1065,9 @@ two-level merge that cannot run is refused instead, and counted under
 **Symptom.**
 `increase(ravel_maintain_legal_hold_refresh_failures_total[15m]) > 0`
 
-**Cause.** The maintenance loop could not read the hold records, so it skipped
-the whole tick of that tenant.
+**Cause.** The maintenance loop could not read the hold records. A failed
+per-tick refresh skips the whole tick of that tenant; a failed re-read before a
+delete batch skips that batch, which deletes nothing, and the pass goes on.
 
 **Confirm.** The counter on `/metrics`. `ravel-cli hold list --tenant <id>`
 reads the same records from the CLI.
@@ -1077,17 +1078,23 @@ maintenance at all.
 
 ### Data deleted despite hold
 
-**Symptom.** A legal hold was set but data was still deleted.
+**Symptom.** A legal hold was set but data under its scope was still deleted.
 
-**Cause.** The hold was set after the snapshot refresh of the current tick.
-Each tick refreshes its hold snapshot once, before its destructive pass.
+**Cause.** A legal hold whose set record was durable before a delete batch
+re-read the hold set is honored by that batch; every delete batch re-reads the
+hold set immediately before its first delete, and a batch that cannot read it
+deletes nothing. So a delete under the scope came from a batch that re-read
+before the hold's record was durable and was still deleting when it landed,
+or the scope does not cover the key: one shard spans three prefixes, and a
+hold on one of them leaves the others deletable.
 
 **Confirm.** `ravel-cli hold list --tenant <id>` shows whether the scope is
-recorded.
+recorded and which prefixes it covers. Compare the hold's set time with the
+time of the delete.
 
-**Action.** Confirm with `hold list` after every urgent `hold set`. A
-successful `hold set` means that the record was written, not that a pass
-picked it up. The exposure window is one maintenance interval.
+**Action.** Hold a shard with the `--signal` and `--shard` form, which writes
+all three prefixes. A batch that started before the hold finishes its own
+deletes; every later batch honors the hold.
 
 ### Catalog fold stalled
 

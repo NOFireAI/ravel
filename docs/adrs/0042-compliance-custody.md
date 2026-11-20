@@ -62,7 +62,8 @@ and one real gap the pinned `object_store` version cannot close:
    `LegalHoldCheck` implementation consults a per-tenant (or
    per-time-range) hold record before any physical delete in both the
    sweeper and the retention path; a hold present means the delete is
-   skipped, not queued or soft-failed, so re-evaluation is naturally
+   skipped (the re-read before each delete batch is stated by the
+   delete-batch re-read amendment below), not queued or soft-failed, so re-evaluation is naturally
    idempotent on the next pass once the hold clears. Hold records are
    themselves immutable objects (set/cleared as new records, folded to
    derive current hold state - the same pattern ADR-0040 uses for
@@ -211,3 +212,35 @@ prior version"). `docs/object-store-contract.md`, "Required bucket
 configuration", states the same model normatively. The two-layer framing,
 the out-of-band bucket step, and decision 2's Ravel-enforced legal hold are
 unchanged.
+
+## Amendment (2026-11-20, #4501): the hold set is re-read before each delete batch
+
+<!-- amendment-applies: sections="Decision" pointer="delete-batch re-read amendment" -->
+
+Decision 2 says the hold record is consulted before any physical delete.
+The shipped LegalHoldCheck loaded the hold set once per tenant per
+maintenance tick and judged every delete of that tick from that snapshot,
+so a hold whose record landed after the snapshot was not honored until the
+next tick, for as long as the running pass took. ADR-0042, the lifecycle
+model's HeldObjectNeverDeleted and the operator guides disagreed about
+this; the guides said next tick, the ADR and the model said before the
+delete.
+
+The ADR and the model stand. Every delete batch (a superseded chain group,
+a retention bucket, an orphan quarantine move or purge, an erasure request
+record, a catalog object batch, an unreferenced part batch, an idempotency
+marker batch, an alert or audit retention batch) re-reads the hold set from the store immediately before its first delete
+and judges its deletes from that read; planning decisions earlier in the
+pass keep the per-tick snapshot. A batch whose re-read fails deletes
+nothing, is counted on the refresh-failure counter, and the pass
+continues. The guarantee is: a legal hold whose set record was durable
+before a delete batch re-read the hold set is honored by that batch. The
+residual is the batch's own in-flight deletes: a hold written after the
+re-read and before the batch's delete requests return is not honored by
+that batch, and nothing short of a store-side transaction could make it
+so. The cost is one listing of the hold shard per delete batch (one LIST
+request per page, so a large hold set takes several); hold commit
+records and audit objects are immutable and cached by key within the
+process. ravel-cli hold set states the guarantee in its output, and
+docs/guides/operations/maintenance.md "Legal hold" and
+docs/deletion-and-gc.md carry the normative wording.
