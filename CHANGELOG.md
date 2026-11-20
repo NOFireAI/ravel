@@ -20,7 +20,9 @@ the erased series again, rows of that bucket are returned twice, and every
 later erasure of the bucket fails with `MultipleLiveRecords`. With
 `--maintain-claims off`, or with `ravel-cli maintain compact-bucket`,
 `compact-tenant` or `migrate` run with `--no-claim` beside a live fleet,
-nothing fences the two. With claims on, the default, the bucket claim and the
+only the pre-publish re-list fences the two: one pass's record PUT landing
+between the other's re-list and its PUT is enough, with no stall needed.
+With claims on, the default, the bucket claim and the
 pre-publish re-list fence every case but one: a pass that stalls for longer
 than the remaining claim lease (about 200 to 300 s at the default 300 s lease,
 from a process freeze, a VM or container pause, or a PUT stalled inside the
