@@ -80,8 +80,8 @@ coincide on S3 and Azure and differ on GCS; commit-protocol code uses only
 `StoreError` variants (exhaustive for callers' retry logic):
 `NotFound`, `AlreadyExists`, `PreconditionFailed`, `AccessDenied`,
 `ClockSkewed(msg)` (the store refused the request's signing time as too far
-from its own clock), `Throttled { retry_after_ms }`, `Timeout`, `Corrupted(msg)` (checksum or
-range mismatch), `InvalidRange(msg)`, `Transient(msg)`, `Permanent(msg)`,
+from its own clock), `Throttled { retry_after_ms }`, `Timeout`,
+`Corrupted(msg)` (checksum or range mismatch), `InvalidRange(msg)`, `Transient(msg)`, `Permanent(msg)`,
 `Unsupported { operation }` (the backend does not implement the operation at
 all, so no argument and no retry can make it succeed, unlike `Permanent`,
 which reports a request the backend understood and rejected), `ReadOnly {
@@ -99,16 +99,16 @@ jittered exponential backoff. `AlreadyExists` on `CreateIfAbsent` is a
 *protocol signal*, not an error to retry. `AccessDenied` is permanent and
 alerts differently (misconfigured credentials or prefix policy).
 `ClockSkewed` is the S3 adapter's 403 (or, outside its listing, 401) whose
-error body names the code
-`RequestTimeTooSkewed`, read from the body by the adapter's own S3 error-code
-parsing; an `AccessDenied` whose message merely mentions that code stays
-`AccessDenied`. It is not retryable at runtime (`is_retryable` is false),
-every caller whose control flow singles out `AccessDenied` takes the same path
-for it (a caller that only words a grant hint for `AccessDenied` reports it
-with its generic error text instead), and
+error body names the code `RequestTimeTooSkewed`, read from the body by the
+adapter's own S3 error-code parsing; an `AccessDenied` whose message merely
+mentions that code stays `AccessDenied`. It is not retryable at runtime
+(`is_retryable` is false), every caller whose control flow singles out
+`AccessDenied` takes the same path for it (a caller that only words a grant
+hint for `AccessDenied` reports it with its generic error text instead), and
 `InstrumentedStore` counts it in the `AccessDenied` class. The one exception
-is the server's startup store checks (`--startup-store-deadline`): there it retries under the same deadline, backoff and per-attempt
-bound as a transient error, because a host whose clock is still being stepped
+is the server's startup store checks (`--startup-store-deadline`): there it
+retries under the same deadline, backoff and per-attempt bound as a transient
+error, because a host whose clock is still being stepped
 by time sync is rejected by the store for the first seconds after boot, and
 the refusal after the deadline names clock skew and time sync, not a missing
 grant. A HEAD response has no body, so a skewed `head` or `pin_of` cannot be

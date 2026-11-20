@@ -273,8 +273,8 @@ impl StartupRetry {
     }
 
     /// Run `op` until it succeeds, fails with an error `retry_cause` gives no
-    /// [`RetryCause`] for, or the deadline ends it. Each retry logs one warning naming `site`, the
-    /// attempt number and the error.
+    /// [`RetryCause`] for, or the deadline ends it. Each retry logs one
+    /// warning naming `site`, the attempt number and the error.
     ///
     /// The first attempt is not bounded here; only the store's own request
     /// timeout and retries end it. Each retry is bounded by the time left
