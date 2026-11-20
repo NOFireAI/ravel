@@ -230,10 +230,13 @@ revert. The lint does not see language features or edition-behaviour
 changes stabilised in 1.98 to 1.100, and no standing check covers that half
 after R1's one-off `+1.97.0 check` (rejected alternatives, MSRV lane). This
 epic accepts that risk for the window until the floor is raised. Before any
-compiler rollback, run `cargo +1.97.0 check --locked --workspace
---all-targets` on the rollback candidate. That one command lists every
-language-feature use that has to be reverted along with the pin. The lint is
-in clippy's default-on
+compiler rollback, rerun R1's MSRV proof on the rollback candidate. That
+means `cargo +1.97.0 check --locked --workspace --all-targets` plus the same
+command with each feature set listed under Gating above (`sql`,
+`flight-sql`, `esql`, `otap`, `agents`, `mcp`, and the ravel-bench and
+ravel-cli sets). A default-feature check never compiles the flight-sql, esql
+or bench surfaces. Those runs together list the language-feature uses that
+have to be reverted along with the pin. The lint is in clippy's default-on
 `suspicious` group. It reads `rust-version` when there is no `clippy.toml`,
 and main has none. R1 confirms this once with a throwaway probe: a call to a
 1.98+ std API in a scratch commit must fail `clippy -D warnings`, and the
@@ -296,8 +299,10 @@ epic (decisions 6 and 7).
   - errors and refusals;
   - peak RSS (VmHWM per server start);
   - per-phase GET requests and wire bytes from the stats JSON.
-- **Rounds.** Five rounds, each an ABBA pair, with the server restarted per
-  arm and the page cache dropped before every cold statement.
+- **Rounds.** Five rounds of two timed arm runs each. The order alternates
+  between rounds: A then B in rounds 1, 3 and 5, B then A in rounds 2 and 4.
+  The server restarts for each arm run, and the page cache is dropped before
+  every cold statement.
 - **A/A first.** One A-against-A pair runs before the A/B rounds. It
   measures each figure's noise floor and whether per-phase GET counts and
   wire bytes are exact for one binary. Single-client statements should be;
@@ -563,7 +568,8 @@ rollback.
   first CI runs after the bump build cold until main saves new caches.
 - Until the separate floor raise, `incompatible_msrv` refuses std APIs from
   1.98 to 1.100. Nothing refuses a 1.98+ language feature in that window.
-  A rollback finds such uses with `cargo +1.97.0 check` (decision 2).
+  A rollback finds such uses by rerunning R1's MSRV proof across its feature
+  sets (decision 2).
 - R2 produces a compiler-only readout with binary hashes and
   reproduction commands. A repeated material regression blocks R1 from
   landing until it is explained or accepted by the owner.
