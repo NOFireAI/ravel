@@ -154,7 +154,102 @@ matcher tests and the already-rewritten exception.
 
 ## 2. #4503: remediation and communication
 
-(pending)
+### Claims checked against main
+
+- `ravel-cli erase` has `submit` and `status` only (services/ravel-cli/src/main.rs).
+  `status` prints per-bucket `dropped_count` from the `.done`.
+- The `.done` carries a hash of the predicate, never the matchers (ADR-0064
+  decision 1). The `.dreq`, which carries them, is swept after `.done` plus the
+  protection horizon. So once a request is swept, no object in the store holds
+  its predicate.
+
+### Decision
+
+Changelog plus a published advisory, no new command. The remedy is one existing
+command, `ravel-cli erase submit` with the same matchers and a new request id,
+and the advisory tells operators when they must run it.
+
+### Why
+
+A `resubmit` command would need the original predicate, and after the sweep the
+store no longer has it; it would take the matchers as arguments, which is
+`erase submit`. A command that lists "logs requests completed with zero drops"
+cannot tell a resource-scoped subject from a subject that had no records, so it
+would be a false signal either way. Tool work here delays the fix that closes the
+exposure, and the exposure closes at the moment the new request is acknowledged:
+query-time exclusion applies from the ack, before any rewrite runs (ADR-0064
+decision 2). That makes the instruction short and safe: submit first, the
+rewrite follows.
+
+### Conditions and follow-ups
+
+1. The changelog fragment `changelog.d/4503.fixed.md` carries the bullet below
+   (or its substance), and the same text goes in the 0.35.0 release notes.
+2. The advisory is published against 0.33.0 and 0.34.0 as a GitHub release
+   note addendum and a pinned issue. Before publishing, confirm the first
+   affected release from the history of the query-path change (the brief names
+   1f33d5eeb); if an earlier release carries it, name that release too.
+3. The advisory is outward facing. The human posts it (see section 7).
+4. A request that is still pending at upgrade and whose buckets were already
+   rewritten with zero drops needs the same re-submit: `AlreadyApplied` skips
+   those buckets for the old id. The advisory says so.
+
+### Confidence
+
+High.
+
+### Draft changelog bullet
+
+```markdown
+- **A logs erasure now drops records whose subject is named in a resource or
+  scope attribute.** The rewrite matched a record's own attributes only, while
+  queries hid the merged resource, scope and record view, so such a request was
+  hidden while pending, completed with zero drops and served again once its
+  request record was swept (#4503). The rewrite now drops exactly what queries
+  hide. A bucket an earlier version already rewrote for a request is skipped as
+  already applied, so a logs request submitted on 0.34.0 or earlier for a
+  subject named in a resource or scope attribute must be submitted again with a
+  new request id; the new request hides the records from the ack onward and its
+  rewrite drops them. `ravel-cli erase status` shows such a request completed
+  with `dropped_count=0` on every bucket.
+```
+
+### Draft advisory (plain language, for the 0.33.0 and 0.34.0 release pages)
+
+```markdown
+## Known issue in 0.33.0 and 0.34.0: logs erasure by resource or scope attribute does not erase
+
+Who is affected: anyone who submitted a logs erasure request (`ravel-cli erase
+submit --signal logs`) whose matcher names an attribute that arrives on the
+resource or the instrumentation scope rather than on the log record itself.
+`user_id` or `host.name` set on the OTLP resource is the usual case. Metrics
+and spans requests are not affected. A logs request whose matcher names a
+record attribute is not affected.
+
+What happens: the request hides the matching records from every query as soon
+as it is acknowledged, as designed. The rewrite that should remove them from
+storage matches record attributes only, so it removes nothing and reports the
+request completed with `dropped_count=0` on every bucket. About four and a half
+days after completion, with default settings, the request record is swept and
+the records are served again.
+
+What to do now, on any version: submit the same request again with a new
+request id. From the moment the new request is acknowledged the records are
+hidden again. On 0.33.0 and 0.34.0 the new request will also complete with zero
+drops and the records will return again after its sweep, so repeat this until
+you have upgraded.
+
+What to do after upgrading to the release that carries the fix for #4503: submit
+the same request once more with a new request id. The fixed rewrite removes the
+records from storage and the request completes with the real dropped counts.
+This last submission is required even if a request is still pending at the time
+of the upgrade: a bucket an earlier version already rewrote for a request is
+skipped for that request id.
+
+How to find affected requests: run `ravel-cli erase status --tenant <tenant>
+--signal logs` and look for completed requests whose every bucket reports
+`dropped_count=0`. Compare those against the attribute the request named.
+```
 
 ## 3. #4501: legal hold written mid-pass
 
