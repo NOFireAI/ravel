@@ -15,7 +15,8 @@
 //! restart only repeats that.
 //! A HEAD response has no body, so a skewed HEAD reaches startup as
 //! `AccessDenied`. The one startup check that reads with HEAD, the
-//! retired-reader gate's marker existence checks, classifies a HEAD refused
+//! retired-reader gate's marker existence checks (sent only by a build that
+//! retires a reader), classifies a HEAD refused
 //! with `AccessDenied` by one GET of the same key through the same store
 //! ([`head_refusal_retry_cause`]): a `ClockSkewed` answer retries it as a
 //! clock-skew refusal, and any other answer leaves the HEAD's refusal to
