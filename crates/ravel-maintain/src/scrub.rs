@@ -191,7 +191,9 @@ impl UnreadableReason {
     /// clear.
     pub fn of(err: &StoreError) -> Self {
         match err {
-            StoreError::AccessDenied(_) => UnreadableReason::AccessDenied,
+            StoreError::AccessDenied(_) | StoreError::ClockSkewed(_) => {
+                UnreadableReason::AccessDenied
+            }
             _ => UnreadableReason::Permanent,
         }
     }

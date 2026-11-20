@@ -2058,7 +2058,10 @@ fn superseded_anchor(
 fn delete_refused(e: &StoreError) -> bool {
     matches!(
         e,
-        StoreError::AccessDenied(_) | StoreError::PreconditionFailed | StoreError::Permanent(_)
+        StoreError::AccessDenied(_)
+            | StoreError::ClockSkewed(_)
+            | StoreError::PreconditionFailed
+            | StoreError::Permanent(_)
     )
 }
 

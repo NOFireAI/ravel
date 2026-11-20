@@ -272,14 +272,15 @@ impl CompatError {
         }
     }
 
-    /// Whether the store refused the request for lack of a grant
-    /// ([`StoreError::AccessDenied`]). Every other failure, a 5xx, a timeout
-    /// or a record this build cannot read included, is not.
+    /// Whether the store refused the request with a 403
+    /// ([`StoreError::AccessDenied`], or [`StoreError::ClockSkewed`] for a
+    /// rejected request clock). Every other failure, a 5xx, a timeout or a
+    /// record this build cannot read included, is not.
     pub fn is_access_denied(&self) -> bool {
         matches!(
             self,
             CompatError::Store {
-                source: StoreError::AccessDenied(_),
+                source: StoreError::AccessDenied(_) | StoreError::ClockSkewed(_),
                 ..
             }
         )

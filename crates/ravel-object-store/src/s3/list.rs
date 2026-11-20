@@ -675,6 +675,9 @@ pub(crate) fn status_error(prefix: &str, status: u16, code: Option<&str>) -> Sto
     };
     let context = format!("listing {prefix:?}");
     match status {
+        403 if code == Some(super::CLOCK_SKEW_CODE) => {
+            StoreError::ClockSkewed(format!("{context}: HTTP 403, {code_detail}"))
+        }
         403 => StoreError::AccessDenied(format!("{context}: HTTP 403, {code_detail}")),
         429 | 503 => StoreError::Throttled {
             retry_after_ms: 1000,
@@ -920,6 +923,14 @@ mod tests {
         assert!(matches!(
             status_error("p/", 403, Some("AccessDenied")),
             StoreError::AccessDenied(_)
+        ));
+        assert!(matches!(
+            status_error("p/", 403, Some("SignatureDoesNotMatch")),
+            StoreError::AccessDenied(_)
+        ));
+        assert!(matches!(
+            status_error("p/", 403, Some("RequestTimeTooSkewed")),
+            StoreError::ClockSkewed(_)
         ));
         for (status, code) in [
             (429, None),

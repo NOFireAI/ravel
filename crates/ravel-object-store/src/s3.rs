@@ -1530,11 +1530,8 @@ pub(crate) fn map_error_common(e: object_store::Error) -> StoreError {
         E::NotModified { path, source } => {
             StoreError::Transient(format!("not modified: {path}: {source}"))
         }
-        E::PermissionDenied { path, source } => {
-            StoreError::AccessDenied(format!("{path}: {source}"))
-        }
-        E::Unauthenticated { path, source } => {
-            StoreError::AccessDenied(format!("{path}: {source}"))
+        E::PermissionDenied { path, source } | E::Unauthenticated { path, source } => {
+            refused(format!("{path}: {source}"), source.as_ref())
         }
         E::InvalidPath { source } => StoreError::Permanent(format!("invalid path: {source}")),
         E::NotImplemented {
@@ -1563,6 +1560,23 @@ pub(crate) fn s3_error_code(
     let text = source.to_string();
     let start = text.find("<Error>")?;
     bucket_config::parse_error_code(&text.as_bytes()[start..])
+}
+
+/// The S3 error code of a refusal whose request signing time is too far from
+/// the store's clock.
+pub(crate) const CLOCK_SKEW_CODE: &str = "RequestTimeTooSkewed";
+
+/// A 401 or 403: [`StoreError::ClockSkewed`] when its S3 error code is
+/// [`CLOCK_SKEW_CODE`], else [`StoreError::AccessDenied`].
+fn refused(
+    detail: String,
+    source: &(dyn std::error::Error + Send + Sync + 'static),
+) -> StoreError {
+    if s3_error_code(source).as_deref() == Some(CLOCK_SKEW_CODE) {
+        StoreError::ClockSkewed(detail)
+    } else {
+        StoreError::AccessDenied(detail)
+    }
 }
 
 fn is_no_such_bucket(source: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
@@ -2244,6 +2258,7 @@ impl S3Store {
             Err(e @ StoreError::UnaddressableKey { .. }) => Err(e),
             Err(
                 StoreError::AccessDenied(_)
+                | StoreError::ClockSkewed(_)
                 | StoreError::PreconditionFailed
                 | StoreError::Corrupted(_)
                 | StoreError::InvalidRange(_)
@@ -4882,6 +4897,49 @@ mod tests {
             map_delete_error(not_found(BODILESS)),
             StoreError::Permanent(_)
         ));
+    }
+
+    /// A 403 or 401 whose S3 error code is `RequestTimeTooSkewed` is
+    /// `ClockSkewed` through the common, get and put mappers, and no other code
+    /// is, even one whose message names it.
+    #[test]
+    fn a_refusal_is_clock_skewed_only_by_its_s3_error_code() {
+        const SKEWED: &str = "Error performing GET http://h/b/k in 1ms - Server returned \
+             non-2xx status code: 403 Forbidden: <Error><Code>RequestTimeTooSkewed</Code>\
+             <Message>The difference between the request time and the current time is too \
+             large.</Message></Error>";
+        const DENIED: &str = "Error performing GET http://h/b/k in 1ms - Server returned \
+             non-2xx status code: 403 Forbidden: <Error><Code>AccessDenied</Code>\
+             <Message>RequestTimeTooSkewed</Message><Key>RequestTimeTooSkewed</Key></Error>";
+        const BAD_SIGNATURE: &str = "Error performing GET http://h/b/k in 1ms - Server \
+             returned non-2xx status code: 403 Forbidden: \
+             <Error><Code>SignatureDoesNotMatch</Code><Message>m</Message></Error>";
+        let forbidden = |text: &'static str| object_store::Error::PermissionDenied {
+            path: "k".into(),
+            source: Box::new(TextError(text)),
+        };
+        let unauthenticated = |text: &'static str| object_store::Error::Unauthenticated {
+            path: "k".into(),
+            source: Box::new(TextError(text)),
+        };
+        for mapped in [
+            map_error_common(forbidden(SKEWED)),
+            map_get_error(forbidden(SKEWED)),
+            map_put_error(forbidden(SKEWED), &PutMode::CreateIfAbsent),
+            map_error_common(unauthenticated(SKEWED)),
+        ] {
+            assert!(matches!(mapped, StoreError::ClockSkewed(_)), "{mapped:?}");
+            assert!(!mapped.is_retryable(), "{mapped:?}");
+        }
+        for text in [DENIED, BAD_SIGNATURE] {
+            for mapped in [
+                map_error_common(forbidden(text)),
+                map_get_error(forbidden(text)),
+                map_error_common(unauthenticated(text)),
+            ] {
+                assert!(matches!(mapped, StoreError::AccessDenied(_)), "{mapped:?}");
+            }
+        }
     }
 
     /// `map_put_error` remaps a conditional-write precondition failure by mode,
