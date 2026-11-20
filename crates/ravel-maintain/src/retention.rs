@@ -91,6 +91,7 @@ use crate::compact::{
 };
 use crate::config::{CompactorConfig, RetentionConfig};
 use crate::error::{MaintainError, Result};
+use crate::legal_hold::{Admit, DeleteBatch};
 use crate::reachability::{MarkerContext, MarkerPolicy, SnapshotGate};
 use crate::read::{BucketListing, list_bucket, verify_commit_key};
 use crate::sweep::LeaseCheck;
@@ -907,21 +908,40 @@ async fn physical_sweep(
         );
     }
 
+    // The bucket is one delete batch (ADR-0042, the delete-batch re-read
+    // amendment): the hold set is re-read here, immediately before the first
+    // delete, and the all-or-nothing legal-hold gate is applied again to that
+    // read. Every delete below, the tombstone's included, is judged from it. A
+    // failed re-read deletes nothing and leaves the tombstone.
+    let mut batch = DeleteBatch::new(lease, &bucket.tenant_hash, "retention bucket").observing();
+    let all_keys: Vec<&str> =
+        sweep_delete_keys(listing, &l0_data_keys, &l1_part_keys, tombstone_key).collect();
+    match batch.admit(store, &all_keys).await {
+        Admit::Delete => {}
+        Admit::Held => {
+            HELD_BY_LEASE_BUCKETS.fetch_add(1, Ordering::Relaxed);
+            let protected: Vec<&str> = all_keys
+                .iter()
+                .copied()
+                .filter(|k| batch.is_held(k))
+                .collect();
+            tracing::warn!(
+                tenant = %bucket.tenant_hash.to_hex(),
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                protected_keys = protected.len(),
+                first_protected_key = protected.first().copied().unwrap_or_default(),
+                "retention sweep held a tombstoned bucket: a legal hold read before the \
+                 bucket's first delete protects keys this pass would delete"
+            );
+            return Ok(RetentionOutcome::SweptPartial);
+        }
+        Admit::ReadFailed => return Ok(RetentionOutcome::SweptPartial),
+    }
+
     // Deletion order (docs/consistency-model.md "Deletion and GC", ADR-0019
     // decision 4): records, then data objects, then L1 parts, tombstone last.
-    //
-    // The tenant's holds re-read from the store, the evidence the
-    // HeldObjectNeverDeleted assertion in `delete_all` judges from. A failed
-    // re-read leaves `None`, the assertion records nothing, and the sweep goes
-    // on.
-    let holds_now = if ravel_invariant::EVALUATES && !dry_run {
-        crate::legal_hold::LegalHoldCheck::refresh(store, &bucket.tenant_hash)
-            .await
-            .ok()
-    } else {
-        None
-    };
-    let holds_now = holds_now.as_ref();
     for keys in [
         &listing.commit_keys,
         &listing.compaction_record_keys,
@@ -929,7 +949,7 @@ async fn physical_sweep(
         &l0_data_keys,
         &l1_part_keys,
     ] {
-        delete_all(store, lease, holds_now, keys, dry_run, deleted).await?;
+        delete_all(store, &batch, keys, dry_run, deleted).await?;
     }
 
     // Verify the bucket is empty before deleting the tombstone: the commit
@@ -943,7 +963,7 @@ async fn physical_sweep(
     if !bucket_is_empty_but_tombstone(store, bucket).await? {
         return Ok(RetentionOutcome::SweptPartial);
     }
-    if lease.is_protected(tombstone_key) {
+    if batch.is_held(tombstone_key) {
         return Ok(RetentionOutcome::SweptPartial);
     }
     // The marker goes before the tombstone (ADR-1133 decision 6). A marker
@@ -953,6 +973,7 @@ async fn physical_sweep(
         return Ok(RetentionOutcome::SweptPartial);
     }
     if !dry_run {
+        batch.assert_delete(&[tombstone_key]);
         store.delete(tombstone_key).await?;
         *deleted += 1;
         ravel_invariant::inv_reachable!(
@@ -1139,39 +1160,32 @@ fn protected_sweep_keys<'a>(
         .collect()
 }
 
-/// Delete each key idempotently, skipping any the [`LeaseCheck`] protects
+/// Delete each key idempotently, skipping any the batch's hold read protects
 /// (a protected key becomes residue that the verifying LIST will catch, so the
 /// tombstone stays for a later pass).
 ///
-/// In the retention sweep this per-key skip is now unreachable: the
-/// all-or-nothing gate in [`physical_sweep`] has already refused the pass if
-/// any of these keys is protected. It stays as the last line of defence, so a
+/// In the retention sweep this per-key skip is unreachable: the all-or-nothing
+/// gate in [`physical_sweep`] has already refused the pass if the same read
+/// protects any of these keys. It stays as the last line of defence, so a
 /// future caller that reaches the deletes by another route still cannot delete
 /// a held key.
 ///
-/// `holds_now` is the tenant's hold set re-read from the store, read only by
-/// the HeldObjectNeverDeleted assertion, which is false for a deleted key it
-/// protects; `None` records nothing. `deleted` is raised by one per delete
-/// the store accepted.
+/// `batch` has already read its hold set; the HeldObjectNeverDeleted
+/// assertion judges each delete from that read. `deleted` is raised by one per
+/// delete the store accepted.
 async fn delete_all(
     store: &dyn ObjectStoreBackend,
-    lease: &dyn LeaseCheck,
-    holds_now: Option<&crate::legal_hold::LegalHoldCheck>,
+    batch: &DeleteBatch<'_>,
     keys: &[String],
     dry_run: bool,
     deleted: &mut usize,
 ) -> Result<()> {
     for key in keys {
-        if lease.is_protected(key) {
+        if batch.is_held(key) {
             continue;
         }
         if !dry_run {
-            let _verdict = holds_now.map(|fresh| !fresh.is_protected(key));
-            ravel_invariant::inv_always_if_known!(
-                _verdict,
-                "gc: a held object is never deleted",
-                std::collections::BTreeMap::from([("key", key.clone())])
-            );
+            batch.assert_delete(&[key.as_str()]);
             store.delete(key).await?;
             *deleted += 1;
         }

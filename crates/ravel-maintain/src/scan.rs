@@ -949,6 +949,12 @@ pub struct MaintainMemo {
     ///
     /// In memory only, like `exact_expiry_ns`.
     rewrites_keep_nominal_bound: HashMap<BucketKey, bool>,
+    /// Decoded legal-hold records by hold commit-record key, so the per-batch
+    /// hold re-reads (ADR-0042, the delete-batch re-read amendment) pay one
+    /// LIST and no GET for a record this process already read. Hold records
+    /// are immutable, so an entry never goes stale. In memory only; shared,
+    /// not split, by [`Self::split_unit`].
+    hold_records: crate::legal_hold::HoldRecordCache,
 }
 
 impl MaintainMemo {
@@ -964,6 +970,7 @@ impl MaintainMemo {
             last_full_sweep_ns: HashMap::new(),
             exact_expiry_ns: HashMap::new(),
             rewrites_keep_nominal_bound: HashMap::new(),
+            hold_records: crate::legal_hold::HoldRecordCache::default(),
         }
     }
 
@@ -1158,7 +1165,13 @@ impl MaintainMemo {
             last_full_sweep_ns: moved_sweep,
             exact_expiry_ns: moved_expiry,
             rewrites_keep_nominal_bound: moved_bound,
+            hold_records: self.hold_records.clone(),
         }
+    }
+
+    /// The process's legal-hold record cache, shared with every clone.
+    pub fn hold_record_cache(&self) -> crate::legal_hold::HoldRecordCache {
+        self.hold_records.clone()
     }
 
     /// Merge a unit memo produced by [`Self::split_unit`] back into `self` after

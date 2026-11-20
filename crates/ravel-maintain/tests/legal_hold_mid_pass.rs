@@ -1,22 +1,15 @@
 //! A legal hold acknowledged while a maintain pass is running (issue #4501).
 //!
 //! ADR-0042 decision 2 and LifecycleGC.tla `HeldObjectNeverDeleted` say a hold
-//! present at a delete's own step stops that delete. The code loads the hold
-//! set once per pass (`LegalHoldCheck::refresh`) and every delete in the pass
-//! reads only that snapshot, so a hold acknowledged after the refresh is not
-//! honoured until the next pass.
+//! present at a delete's own step stops that delete. The pass's hold snapshot
+//! (`LegalHoldCheck::refresh`) is read once, before planning; every delete
+//! batch then re-reads the hold set through the snapshot's source immediately
+//! before its first delete and judges its deletes from that read (ADR-0042,
+//! the delete-batch re-read amendment). So a hold whose set record is durable
+//! after the snapshot and before the batch stops the batch.
 //!
-//! This test pins the shape of that window with the same entry points the
-//! maintain tick uses: one refresh, then `sweep_shard` with that snapshot. It
-//! asserts the ADR/model contract and is ignored until #4501 decides between
-//! the two contracts:
-//!
-//! 1. Code matches the model: a hold acknowledged before a delete batch stops
-//!    it (re-read holds before each batch, or fence hold writes against
-//!    running passes). This test then passes and loses its ignore.
-//! 2. Model matches the code: a hold takes effect from the next pass. This
-//!    test is then rewritten to assert the documented next-pass bound and the
-//!    ADR, model and hold CLI say so.
+//! This test pins that with the same entry points the maintain tick uses: one
+//! refresh, then `sweep_shard` with that snapshot.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -85,7 +78,6 @@ async fn commit_record_count(store: &dyn ObjectStoreBackend, bucket: &Bucket) ->
 }
 
 #[tokio::test]
-#[ignore = "contract decision pending #4501: a hold acknowledged after the pass's hold refresh does not stop that pass's deletes"]
 async fn a_hold_acknowledged_after_the_pass_refresh_stops_the_pass_deletes() {
     let created = sealed_now_ns();
     let past_horizon = created
@@ -113,10 +105,20 @@ async fn a_hold_acknowledged_after_the_pass_refresh_stops_the_pass_deletes() {
     )
     .await
     .expect("control sweep");
-    assert!(control_report.superseded_data_deleted > 0);
-    assert!(control_report.superseded_records_deleted > 0);
+    assert_eq!(
+        (
+            control_report.superseded_records_deleted,
+            control_report.superseded_data_deleted,
+            control_report.superseded_groups_held_by_legal_hold
+        ),
+        (2, 2, 0),
+        "with no hold both inputs' records and data objects are deleted"
+    );
     assert_eq!(l0_data_count(&control, &control_bucket).await, 0);
-    assert!(commit_record_count(&control, &control_bucket).await < control_records_before);
+    assert_eq!(
+        commit_record_count(&control, &control_bucket).await,
+        control_records_before - 2
+    );
 
     let store = MemoryStore::new();
     let clock = FixedClock::new(created);
@@ -172,6 +174,16 @@ async fn a_hold_acknowledged_after_the_pass_refresh_stops_the_pass_deletes() {
     .await
     .expect("sweep");
 
+    // Each compacted input is its own chain group: both are held whole.
+    assert_eq!(
+        (
+            report.superseded_records_deleted,
+            report.superseded_data_deleted,
+            report.superseded_groups_held_by_legal_hold
+        ),
+        (0, 0, 2),
+        "the delete batches' re-reads see the hold: {report:?}"
+    );
     assert_eq!(
         (
             l0_data_count(&store, &bucket).await,
