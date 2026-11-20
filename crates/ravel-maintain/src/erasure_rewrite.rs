@@ -267,31 +267,12 @@ impl LogErasureMatcher {
         }
     }
 
-    /// Conjunction of exact-match matchers against a log record's `attrs`.
-    /// Empty matchers matches nothing (fail-safe, same as [`ErasureMatcher`]).
-    pub fn matches_attrs(&self, attrs: &[(String, LogAttrValue)]) -> bool {
-        if self.matchers.is_empty() {
-            return false;
-        }
-        self.matchers.iter().all(|(k, v)| {
-            attrs.iter().any(|(ak, av)| {
-                ak == k && matches!(av, LogAttrValue::Str(s) if s.as_str() == v.as_str())
-            })
-        })
-    }
-
     /// Half-open `[window_start_ns, window_end_ns)`; zero on either side is
     /// unset, identical to [`ErasureMatcher::ts_in_window`].
     pub fn ts_in_window(&self, ts_ns: i64) -> bool {
         let after_start = self.window_start_ns == 0 || ts_ns >= self.window_start_ns;
         let before_end = self.window_end_ns == 0 || ts_ns < self.window_end_ns;
         after_start && before_end
-    }
-
-    /// Whether this predicate drops a log record with `attrs` recorded at
-    /// `ts_ns`, judged on the record's own attributes alone.
-    pub fn drops_record(&self, attrs: &[(String, LogAttrValue)], ts_ns: i64) -> bool {
-        self.matches_attrs(attrs) && self.ts_in_window(ts_ns)
     }
 
     /// Conjunction of exact-match matchers against the merged view of a
@@ -7759,7 +7740,7 @@ mod tests {
     /// Flip-line proof, both verified:
     ///
     /// - make `first_dropping_log_request`'s body `None` unconditionally
-    ///   (equivalently, flip `LogErasureMatcher::drops_record` to `false`).
+    ///   (equivalently, flip `LogErasureMatcher::drops_log_record` to `false`).
     ///   The erased record is re-encoded into the output, its `user_id` value
     ///   goes into the output block's bloom, and `!out_bloom` fires.
     /// - additionally build `build_rewrite_logs`'s writer as
