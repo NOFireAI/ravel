@@ -411,6 +411,66 @@ twentieth run (a 12-hour cap and about one hour of overshoot) is not in the
 plan of about 452 hours. It comes out of the rerun reserve or needs the
 owner's go, as a rerun beyond the reserve does.
 
+## Amendment (2026-11-18): per-workload expected set (#4336)
+
+<!-- amendment-applies: sections="1. One invariant, one carrier|7. Budget" pointer="per-workload amendment" -->
+
+The workload images build one ravel-server binary, and since #4444 it carries
+the instrumentation of every area. So `assert_always`'s guarantee that a
+property is reached (decision 1), and the clean-smoke band "every new SUT
+assertion reached" (decision 7), are judged per workload, against the areas
+that workload owns: an area is owned by the workload its
+`formal/tla/<area>/antithesis-mutants.tsv` mutants run on, and a workload's
+own driver assertions are its own. An always-assertion of an area the
+workload does not own is expected to go unreached there. It is listed, apart
+from the gated ones, and is never counted as a failure, in the local loop and
+in the triage of an Antithesis report alike. The workload that owns that area
+answers for reaching it. Owner decision, 2026-11-18.
+
+## Amendment (2026-11-18): forced situations for silent mutants (#4336)
+
+<!-- amendment-applies: sections="3. Mutant controls|4. Workloads|Amendment (2026-11-17): the clock jump runs in the Antithesis config (#4334)" pointer="forced-situation amendment" -->
+
+Decision 3 counts a mutant only when its property goes false, and never
+reached does not count. Four catalog mutants change what a server does only
+in a situation that faults and the planned clock jumps rarely or never
+produce: `lost-cas-proceeds` needs a fold that loses its HEAD CAS to a HEAD
+it did not build, `compaction-loser-overwrites` a compaction record PUT that
+loses its create-only PUT to a concurrent compaction of the same bucket,
+`sweep-superseded-no-head-gate` a full sweep pass past a compaction record's
+protection horizon and pinned-query window while HEAD has not folded the
+record, and `corrupt-head-ignores-delete-gate` a server sweep past the
+protection horizon while HEAD does not decode. A mutant like these gets a
+driver action that forces its situation, and each such action:
+
+- uses only steps the system must survive in production: every clock moving
+  forward together, a concurrent `ravel-cli` maintenance run, one store
+  request delayed in the network or refused, HEAD overwritten with garbage
+  through raw S3 as the driver's `corrupt_head` rule already does;
+- runs in the plain config as well as in the mutant run, and asserts that it
+  reached its situation with a sometimes-assertion the local loop requires,
+  so a plain run that never got there fails instead of passing every mutant
+  that needs it. Where the driver cannot see the server act, as with the
+  unreadable-HEAD sweep, the local loop also requires the SUT's own
+  reachability of that branch (`catalog: delete pass refused on an
+  unreadable HEAD`);
+- runs again in the `eventually` until it was reached once (the
+  unreadable-HEAD sweep runs there once).
+
+Two parts of the catalog-maintenance topology change with it. Decision 4's
+topology gains an `s3proxy` container between the ravel-server containers
+and the store. It forwards every byte unchanged until the driver sets a rule
+over its control port (hold the next compaction record PUT or one key's next
+PUT and report the store's answer to it, refuse record PUTs, refuse one key's
+PUTs), and it is a container of its own because the
+driver is excluded from faults. It signs nothing and keeps no wall-clock
+state, so it is the one container that does not run under libfaketime. And
+the clock-jump amendment's three planned jumps are no longer the only clock
+moves: a forced action moves every clock forward too, the same way and under
+the same write-gate hold, and logs each move so the local loop's offset check
+adds it. The sequences, and why each is legitimate, are in
+`antithesis/catalog-maintenance/README.md`, "The forced races".
+
 ## Amendment (2026-11-19): fault switches for ingest answers a store fault cannot reach (#4496)
 
 <!-- amendment-applies: none reason="adds a fault-switch macro and two ingest switches beside the mutant controls of decision 3, which stand as written; it retires and narrows no earlier wording" -->
@@ -475,60 +535,3 @@ faults these switches stand in for. `check-release-profile.sh` refuses
 Dockerfile and `publish-images.yml`) and in every workspace manifest, except
 `antithesis` forwarded by a feature of the same name, so a published binary
 compiles neither switch in.
-
-## Amendment (2026-11-18): per-workload expected set (#4336)
-
-<!-- amendment-applies: sections="1. One invariant, one carrier|7. Budget" pointer="per-workload amendment" -->
-
-The workload images build one ravel-server binary, and since #4444 it carries
-the instrumentation of every area. So `assert_always`'s guarantee that a
-property is reached (decision 1), and the clean-smoke band "every new SUT
-assertion reached" (decision 7), are judged per workload, against the areas
-that workload owns: an area is owned by the workload its
-`formal/tla/<area>/antithesis-mutants.tsv` mutants run on, and a workload's
-own driver assertions are its own. An always-assertion of an area the
-workload does not own is expected to go unreached there. It is listed, apart
-from the gated ones, and is never counted as a failure, in the local loop and
-in the triage of an Antithesis report alike. The workload that owns that area
-answers for reaching it. Owner decision, 2026-11-18.
-
-## Amendment (2026-11-18): forced situations for silent mutants (#4336)
-
-<!-- amendment-applies: sections="3. Mutant controls|4. Workloads|Amendment (2026-11-17): the clock jump runs in the Antithesis config (#4334)" pointer="forced-situation amendment" -->
-
-Decision 3 counts a mutant only when its property goes false, and never
-reached does not count. Four catalog mutants change what a server does only
-in a situation that faults and the planned clock jumps rarely or never
-produce: `lost-cas-proceeds` needs a fold that loses its HEAD CAS to a HEAD
-it did not build, `compaction-loser-overwrites` a compaction record PUT that
-loses its create-only PUT to a concurrent compaction of the same bucket,
-`sweep-superseded-no-head-gate` a full sweep pass past a compaction record's
-protection horizon and pinned-query window while HEAD has not folded the
-record, and `corrupt-head-ignores-delete-gate` a server sweep past the
-protection horizon while HEAD does not decode. A mutant like these gets a
-driver action that forces its situation, and each such action:
-
-- uses only steps the system must survive in production: every clock moving
-  forward together, a concurrent `ravel-cli` maintenance run, one store
-  request delayed in the network or refused, HEAD overwritten with garbage
-  through raw S3 as the driver's `corrupt_head` rule already does;
-- runs in the plain config as well as in the mutant run, and asserts that it
-  reached its situation with a sometimes-assertion the local loop requires,
-  so a plain run that never got there fails instead of passing every mutant
-  that needs it;
-- runs again in the `eventually` until it was reached once (the
-  unreadable-HEAD sweep runs there once).
-
-Two parts of the catalog-maintenance topology change with it. Decision 4's
-topology gains an `s3proxy` container between the ravel-server containers
-and the store. It forwards every byte unchanged until the driver sets a rule
-over its control port (hold the next compaction record PUT or one key's next
-PUT and report the store's answer to it, refuse record PUTs, refuse one key's
-PUTs), and it is a container of its own because the
-driver is excluded from faults. It signs nothing and keeps no wall-clock
-state, so it is the one container that does not run under libfaketime. And
-the clock-jump amendment's three planned jumps are no longer the only clock
-moves: a forced action moves every clock forward too, the same way and under
-the same write-gate hold, and logs each move so the local loop's offset check
-adds it. The sequences, and why each is legitimate, are in
-`antithesis/catalog-maintenance/README.md`, "The forced races".

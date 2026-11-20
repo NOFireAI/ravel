@@ -9,7 +9,14 @@ DEST="${1:?s3 destination prefix}"
 REG="${REGISTRY:-819709950457.dkr.ecr.us-east-1.amazonaws.com/ravel-antithesis}"
 case "${MUTANTS:-}" in
     '' | 0) TAG="${TAG:-catalog-maintenance}" SUFFIX="" ;;
-    1) TAG="${TAG:-catalog-maintenance-mutants}" SUFFIX=".mutants" ;;
+    1)
+        # build.sh, launch.sh, local-run.sh and mutant-config.sh all name this tag.
+        if [ -n "${TAG:-}" ]; then
+            echo "refused: TAG cannot be set with MUTANTS=1; the mutant images are always tagged catalog-maintenance-mutants" >&2
+            exit 1
+        fi
+        TAG=catalog-maintenance-mutants SUFFIX=".mutants"
+        ;;
     *) echo "refused: MUTANTS must be 1 or unset, not '$MUTANTS'" >&2; exit 1 ;;
 esac
 for name in ravel-server driver; do

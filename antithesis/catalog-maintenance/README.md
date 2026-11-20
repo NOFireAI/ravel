@@ -205,7 +205,7 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: a listed commit record decoded through ravel-cli` | sometimes | `audit` | A listed level-0 commit record decoded through `commit decode`. |
 | `catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead` | sometimes | `race_folds`, `eventually` | The skewed `ravel-cli` fold rebuilt HEAD with the hour ahead sealed, and the store refused the held server HEAD PUT (`held-result` reports 412 or 409), its version replaced by the skewed fold. |
 | `catalog: a server's compaction record PUT lost to a concurrent compaction` | sometimes | `race_records`, `eventually` | The record key the held server PUT names was in the store before the driver released that PUT, the PUT was released within the 18 s hold cap, and `held-result` reports 412 or 409 for that key. |
-| `catalog: the servers' sweeps ran past the protection horizon while HEAD was unreadable` | sometimes | `sweep_unreadable_head`, `eventually` | HEAD still held the sweep's own garbage after the clocks moved past the protection horizon and the 150 s wait for the servers' sweeps. |
+| `catalog: HEAD stayed unreadable while the clocks passed the protection horizon` | sometimes | `sweep_unreadable_head`, `eventually` | HEAD still held the sweep's own garbage after the clocks moved past the protection horizon and the 150 s wait for the servers' sweeps. Server HEAD PUTs are refused throughout, so this alone does not show a server swept; `local-run.sh` also requires the SUT's `catalog: delete pass refused on an unreadable HEAD`, hit when a server's sweep reads the undecodable HEAD and stops. |
 | `catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it` | sometimes | `sweep_unfolded`, `eventually` | HEAD's bytes were the same after both jumps and the servers' sweeps as before the compaction, the record was still there, and the store held at least one of its inputs before the jumps. |
 | `clock: the driver's clock jumped forward` | reachable | `jump_clock`, `eventually` | The jump reached the driver's own clock. |
 | `clock: the clocks jumped past the sweep's protection horizon and pinned-query window` | reachable | `jump_clock`, `eventually` | Both sweep jumps reached the driver's own clock. |
@@ -636,8 +636,10 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     its HEAD CAS to a fold one sealed hour ahead`, `catalog: a server's
     compaction record PUT lost to a concurrent compaction`, `catalog: the
     clocks passed a compaction record's protection horizon and pinned-query
-    window while HEAD had not folded it` and `catalog: the servers' sweeps
-    ran past the protection horizon while HEAD was unreadable`.
+    window while HEAD had not folded it` and `catalog: HEAD stayed
+    unreadable while the clocks passed the protection horizon`, together with
+    the SUT's `catalog: delete pass refused on an unreadable HEAD`, which
+    shows a server's sweep read that HEAD and stopped.
 - The local loop's bound on the driver's run after setup is `seconds` plus
   4800 s: the `eventually` runs the forced races before its fold.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
