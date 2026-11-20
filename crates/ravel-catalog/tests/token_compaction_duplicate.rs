@@ -1469,8 +1469,6 @@ async fn swept_token_beside_a_compaction_its_live_rewrite_replaced() {
     swept_token_beside_an_input_its_live_rewrite_replaced(true).await;
 }
 
-const REPLACED_OBJECT_PROPERTY: &str = "commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced";
-
 /// `(condition, details)` of every captured evaluation of the swept-token
 /// replaced-object property whose details mention `token`, or `None`
 /// outside the invariants lane. This crate forwards no
@@ -1483,8 +1481,10 @@ fn replaced_object_evaluations(token: &CommitToken) -> Option<Vec<(bool, String)
     let _ = &needle;
     ravel_invariant::inv_sometimes!(
         {
-            *found.borrow_mut() =
-                ravel_invariant::test_support::evaluations(REPLACED_OBJECT_PROPERTY, &needle);
+            *found.borrow_mut() = ravel_invariant::test_support::evaluations(
+                "commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced",
+                &needle,
+            );
             true
         },
         "ravel-catalog test: evaluations are read",
