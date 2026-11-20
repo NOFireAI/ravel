@@ -611,7 +611,8 @@ pub mod mutant {
 /// Such a condition compiles whenever `antithesis` or `capture` is on, while
 /// the `mutant` module needs `antithesis-mutants` and the `capture` module
 /// needs `capture`. These wrappers exist wherever the condition compiles and return
-/// the empty value when their backing module is absent.
+/// the empty value when their backing module is absent. `capturing` tells a
+/// test whether `capture` records, which a condition that runs cannot.
 #[cfg(any(feature = "antithesis", feature = "capture"))]
 #[doc(hidden)]
 pub mod test_support {
@@ -634,6 +635,12 @@ pub mod test_support {
     pub fn scoped_mutant(name: &str) -> Result<Option<Box<dyn Any>>, crate::InitError> {
         let _ = name;
         Ok(None)
+    }
+
+    /// Whether assertion sites record their evaluations: true exactly when
+    /// `capture` is on.
+    pub fn capturing() -> bool {
+        cfg!(feature = "capture")
     }
 
     /// `(condition, details)` of every captured evaluation of `message` whose
@@ -1555,5 +1562,17 @@ mod tests {
     #[test]
     fn test_support_evaluations_is_none_without_capture() {
         assert_eq!(crate::test_support::evaluations("any", ""), None);
+    }
+
+    #[cfg(feature = "capture")]
+    #[test]
+    fn test_support_capturing_is_true_with_capture() {
+        assert!(crate::test_support::capturing());
+    }
+
+    #[cfg(all(feature = "antithesis", not(feature = "capture")))]
+    #[test]
+    fn test_support_capturing_is_false_without_capture() {
+        assert!(!crate::test_support::capturing());
     }
 }
