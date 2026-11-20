@@ -12,9 +12,11 @@
 # killed, so every request the supervisor saw gets an answer.
 #
 # Every exit the supervisor did not ask for ends the supervisor with the
-# child's exit code, and a SIGTERM or SIGINT it receives is passed on to the
-# child, so a container stop or kill behaves as it does in the base variant,
-# where ravel-server is the entrypoint.
+# child's exit code. A SIGTERM or SIGINT it receives is passed on to the
+# child, and once the child is gone the supervisor exits 143, whatever the
+# child's own drain status was: a stop that lands mid-drain while the store
+# is down makes ravel-server exit 1 (drain exceeded --shutdown-timeout), and
+# that is the stop fault's outcome, not an unexpected container exit.
 #
 # RAVEL_SUPERVISE_SELF_CHECK=1 is the local loop's self-check: the first drain
 # kills the child with SIGKILL instead, and every later one is taken and never
@@ -138,7 +140,9 @@ while :; do
                 reap
                 if [ "$stopping" = 1 ]; then
                     report "seq=$seq interrupted"
-                    exit "$code"
+                    # A container stop ends the supervisor as a stopped
+                    # container: 143, not the child's own drain status.
+                    exit 143
                 fi
                 report "seq=$seq code=$code"
                 drained=1
@@ -150,6 +154,9 @@ while :; do
     if [ -z "$drained" ]; then
         reap
         echo "supervise: ravel-server exited with status $code"
+        if [ "$stopping" = 1 ]; then
+            exit 143
+        fi
         exit "$code"
     fi
 done
