@@ -13719,12 +13719,14 @@ pub(crate) mod tests {
         evaluations(FOLDED_HEAD_HELD, &folder_id.to_string()).len() as u64
     }
 
-    /// True in the invariants lane, where assertion sites record evaluations.
+    /// True in the invariants lane, where assertion sites record evaluations
+    /// (`ravel-invariant/capture`); false under `antithesis` alone, which
+    /// evaluates the assertions and records nothing.
     fn capturing() -> bool {
         let on = std::cell::Cell::new(false);
         ravel_invariant::inv_sometimes!(
             {
-                on.set(true);
+                on.set(ravel_invariant::test_support::capturing());
                 true
             },
             "ravel-catalog test: evaluations are captured",
