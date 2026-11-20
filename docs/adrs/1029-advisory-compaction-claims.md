@@ -776,8 +776,9 @@ publishes, and neither pass may skip it. Concretely:
    stolen from a live owner is caught by its renewal at the next checkpoint or
    by its re-list. An owner that stalls longer than the lease between its
    re-list and its record PUT is caught by neither: both ran before the steal,
-   so it publishes, and the pass that stole the claim can publish too. That is
-   the same short window the unclaimed callers of point 5 have. Between two
+   so it publishes, and the pass that stole the claim can publish too. The
+   outcome of that window is stated by the 2026-11-20 outcome amendment
+   below. That is the same short window the unclaimed callers of point 5 have. Between two
    compactions the re-list also changes how decision 2's convergence plays
    out: a losing compaction now usually finds the winner's record at its
    re-list and stops with `AlreadyCompacted`, so it rarely reaches
@@ -1049,3 +1050,42 @@ the worker id; `background_migrate_stands_down_for_a_claim_the_ticks_process_id_
 in the same file fails when the walk claims under the worker id, and, for
 a configuration that already carries a participant under the worker id,
 when the walk reuses that participant.
+
+## Amendment (2026-11-20, #4449): what the residual publish window does, and how it closes
+
+<!-- amendment-applies: sections="Amendment (2026-10-03): the claim fences the compaction and erasure rewrite publishes (issue #2199)" pointer="2026-11-20 outcome amendment" -->
+
+Point 7 of the 2026-10-03 amendment names the window the claim and the
+re-list leave open: an owner that stalls longer than the lease between its
+re-list and its record PUT publishes, and so does the pass that stole its
+claim. It did not say what that produces. Reproduced with claims on, with
+injected clocks and a store gate parking the compaction inside its record
+PUT (`crates/ravel-maintain/tests/erasure_claim_pause.rs`, PR #4507): both
+records land, every reader serves the compaction's parts beside the
+rewrite's, so the erased series is served again and the bucket's surviving
+rows are returned twice, and every later erasure pass over the bucket fails
+with `MultipleLiveRecords`, so the request never completes and its `.dreq`
+is never retired. The window is reached by any stall of about 200 to 300 s
+at the default lease (the claim is at most a third of the lease old at the
+publish checkpoint): a process freeze, a VM or container pause, or a PUT
+stalled inside the client's timeout. A claim renewal immediately before the
+PUT narrows it and cannot close it, because the stall can land after any
+client-side check and the store conditions a write on its own key only.
+
+The closure decided here, planned for 0.35.0 and not yet implemented, is on
+the read side, applied identically by every bucket resolution: a version 1
+compaction record that is not in a live rewrite's chain and whose every
+input is among that rewrite's effective inputs is dominated by the rewrite.
+Readers will drop its parts, the superseded-input sweep will reclaim it and
+its parts in the rewrite's chain group, as for a dominated version 2
+record, and the erasure pass will treat it as superseded. In the race above
+both passes planned from one listing, so the compaction's inputs are
+exactly the rewrite's, and the rewrite's parts hold every row of those
+inputs minus the erased ones; nothing is lost. A compaction record whose
+inputs are not all covered is a genuine conflict and stays served as
+today, counted and warned. Decision 2's statement that a claim bug cannot
+corrupt data is then restored in this form: between a compaction and an
+erasure rewrite a lost or late claim costs a wasted compaction, never a
+served erased row. Making the two record kinds collide at one create-only
+key per bucket, which point 6 rejected as a key-layout change, remains the
+store-side closure; the owner declined an ADR for it on 2026-11-20.

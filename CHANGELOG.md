@@ -14,14 +14,23 @@ install.** The operator watches HorizontalPodAutoscalers from startup. Without
 the new permissions, reconciles of every RavelCluster are delayed by up to
 about a minute per failed watch. See the first entry under Changed.
 
-**Known issue: keep maintenance claims on wherever erasures run (#4449).**
-With `--maintain-claims off` on a maintain process, or with `ravel-cli
-maintain compact-bucket`, `compact-tenant` or `migrate` run with `--no-claim`
-beside a live fleet, an
-erasure that races a compaction or migrate of the same bucket can leave the
-erased sample served and some rows returned twice. With claims on, the
-default, the two are fenced. 0.33.0 has the same race; the fix is planned
-for 0.35.0.
+**Known issue: an erasure that races a compaction or migrate of the same
+bucket can publish beside it (#4449).** When both publish, every reader serves
+the erased series again, rows of that bucket are returned twice, and every
+later erasure of the bucket fails with `MultipleLiveRecords`. With
+`--maintain-claims off`, or with `ravel-cli maintain compact-bucket`,
+`compact-tenant` or `migrate` run with `--no-claim` beside a live fleet,
+nothing fences the two. With claims on, the default, the bucket claim and the
+pre-publish re-list fence every case but one: a pass that stalls for longer
+than the remaining claim lease (about 200 to 300 s at the default 300 s lease,
+from a process freeze, a VM or container pause, or a PUT stalled inside the
+client's timeout) between its re-list and its record PUT publishes anyway, and
+so does the pass that took its claim. Keep claims on, keep the lease above the
+longest pause the platform can impose, and treat `MultipleLiveRecords` from the
+erasure pass as this issue. 0.33.0 has the same race. The fix, a reader-side
+rule under which the rewrite dominates a compaction record over the same
+inputs, is planned for 0.35.0. (Corrected 2026-11-20: this note first said
+claims on fences the two.)
 
 ### Added
 
