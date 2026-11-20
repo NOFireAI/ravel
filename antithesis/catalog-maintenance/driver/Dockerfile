@@ -8,7 +8,7 @@
 ARG SERVER_IMAGE=ravel-antithesis-server:catalog-maintenance
 FROM ${SERVER_IMAGE} AS server
 
-FROM rust:1.97.1-trixie AS build
+FROM rust:1.100.0-trixie AS build
 WORKDIR /src
 COPY ingest-durability/driver/Cargo.toml ingest-durability/driver/Cargo.lock ./ingest-durability/driver/
 COPY ingest-durability/driver/src ./ingest-durability/driver/src

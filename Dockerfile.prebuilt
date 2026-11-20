@@ -16,7 +16,7 @@
 # `scripts/kind-up.sh RAVEL_SKIP_IMAGE_BUILD=1` exists for exactly this split.
 #
 # That script runs the cargo build inside the root Dockerfile's builder image
-# (rust:1.97.1-bookworm), not on the runner, so the binaries link against the
+# (rust:1.100.0-bookworm), not on the runner, so the binaries link against the
 # same glibc as the shipping build (2.36) and this file can use the shipping
 # runtime base. A binary built on the runner itself links against the
 # runner's glibc and fails to exec on an older base: Ubuntu 24.04 (2.39)
