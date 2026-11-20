@@ -1,0 +1,17 @@
+{
+  "schema": "metricsbench-stage1-bands/1",
+  "profile": "history",
+  "status": "predicted: issue #3941 pre-registration",
+  "figures": [
+    {"name": "ravel_only_l0_data_objects", "file": "stamps.json", "path": "ravel_only.l0.objects.data.count", "min": 79000, "max": 96000,
+     "basis": "87,608 data objects measured on history, 2026-11-06, #3694 comment 6704570952, same stream and anchor rule; the band is about plus or minus 10 %"},
+    {"name": "ravel_only_l0_series_query_ms", "file": "stamps.json", "path": "ravel_only.l0.series_query_ms", "min": 100000, "max": 130000,
+     "basis": "predicted: the L0 listing reaching the 120 s deadline, 87,608 GETs at about 60 ms over fetch concurrency 32, about 164 s"},
+    {"name": "ravel_only_l1_parts", "file": "stamps.json", "path": "ravel_only.l1.objects.l1.count", "min": 20, "max": 130,
+     "basis": "predicted: 20.0 GB of L0 at the 0.16 shrink T8 measured on cardinality (26.7 GB to 4.33 GB, #4118), split into 256 MiB parts per (shard, ingest hour) bucket, gives 20 to 32 parts; with no shrink, 75 to 128"},
+    {"name": "ravel_only_l1_series_query_ms", "file": "stamps.json", "path": "ravel_only.l1.series_query_ms", "min": 0, "max": 30000,
+     "basis": "predicted: 2 GETs per L1 part plus the catalog section bytes; the provenance decode is skipped since #4461; a quarter of the 120 s deadline"},
+    {"name": "ravel_only_l1_store_get_calls_delta", "file": "stamps.json", "path": "ravel_only.l1.readback.store_get_calls.delta", "min": 20, "max": 400,
+     "basis": "predicted: 2 to 3 GETs per part over 20 to 130 parts"}
+  ]
+}
