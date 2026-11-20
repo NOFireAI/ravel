@@ -954,6 +954,156 @@ mod tests {
         assert!(!snapshot.is_protected("t/acme/l/l0/0007/other"));
     }
 
+    /// A re-read through a [`HoldSource`] LISTs the hold shard every time but
+    /// GETs a listed record's commit record and audit object only the first
+    /// time this source's cache sees it: hold records are immutable.
+    #[tokio::test]
+    async fn a_second_re_read_lists_again_and_gets_nothing_the_cache_holds() {
+        use ravel_object_store::InstrumentedStore;
+        use ravel_object_store::instrument::StoreOp;
+        use ravel_object_store::memory::MemoryStore;
+
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant = TenantHash([0x45; 16]);
+        for (i, scope) in ["t/a/", "t/b/"].iter().enumerate() {
+            write_hold_set(
+                &store,
+                &tenant,
+                Uuid::from_u128(i as u128 + 1),
+                1,
+                scope,
+                "",
+            )
+            .await
+            .expect("set");
+        }
+        let source = HoldSource::new(tenant);
+        let counts = |store: &InstrumentedStore<MemoryStore>| {
+            let snap = store.metrics().snapshot();
+            (snap.op(StoreOp::List).calls, snap.op(StoreOp::Get).calls)
+        };
+
+        let before = counts(&store);
+        let first = source.current(&store).await.expect("first read");
+        let after_first = counts(&store);
+        assert_eq!(first.active_prefixes(), ["t/a/", "t/b/"]);
+        assert_eq!(
+            (after_first.0 - before.0, after_first.1 - before.1),
+            (1, 4),
+            "a cold read: one LIST, then a commit-record GET and an audit-object GET per record"
+        );
+        assert_eq!(source.cache.len(), 2);
+
+        let second = source.current(&store).await.expect("second read");
+        let after_second = counts(&store);
+        assert_eq!(second.active_prefixes(), first.active_prefixes());
+        assert_eq!(
+            (
+                after_second.0 - after_first.0,
+                after_second.1 - after_first.1
+            ),
+            (1, 0),
+            "a warm read LISTs again and serves both records from the cache"
+        );
+
+        write_hold_clear(&store, &tenant, Uuid::from_u128(3), 2, "t/a/")
+            .await
+            .expect("clear");
+        let after_write = counts(&store);
+        let third = source.current(&store).await.expect("third read");
+        let after_third = counts(&store);
+        assert_eq!(
+            third.active_prefixes(),
+            ["t/b/"],
+            "the LIST is not cached: a record written since is folded in"
+        );
+        assert_eq!(
+            (after_third.0 - after_write.0, after_third.1 - after_write.1),
+            (1, 2),
+            "only the new record is read"
+        );
+        assert_eq!(
+            source.reread_failures(),
+            0,
+            "current() alone counts nothing"
+        );
+    }
+
+    /// A delete batch reads once, before its first admission, and a failed
+    /// read is counted once for the batch however many keys it then refuses;
+    /// the next batch reads again.
+    #[tokio::test]
+    async fn a_failed_batch_re_read_is_counted_once_and_the_next_batch_reads_again() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+        use ravel_object_store::memory::MemoryStore;
+
+        let tenant = TenantHash([0x46; 16]);
+        let hold_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Audit, AUDIT_HOLD_SHARD).expect("prefix");
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Transient("hold shard down".into()))
+                    .with_key_contains(hold_prefix)
+                    .with_occurrence(ravel_object_store::fault::Occurrence::Nth(2)),
+            ),
+        );
+        let snapshot = LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("the tick's refresh, LIST 1, succeeds");
+        let source = Arc::clone(snapshot.source().expect("bound to a source"));
+
+        let mut failed = DeleteBatch::new(&snapshot, &tenant, "test batch one");
+        assert_eq!(failed.admit(&store, &["t/x/1"]).await, Admit::ReadFailed);
+        assert_eq!(failed.admit(&store, &["t/x/2"]).await, Admit::ReadFailed);
+        assert!(failed.is_held("t/x/1"), "a failed batch holds everything");
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Transient),
+            1,
+            "the batch's re-read, LIST 2, really faulted"
+        );
+        assert_eq!(source.reread_failures(), 1, "one failed batch, one count");
+
+        let mut healthy = DeleteBatch::new(&snapshot, &tenant, "test batch two");
+        assert_eq!(healthy.admit(&store, &["t/x/1"]).await, Admit::Delete);
+        assert_eq!(store.fault_count(Op::List, FaultKind::Transient), 1);
+        assert_eq!(
+            source.reread_failures(),
+            1,
+            "a healthy batch counts nothing"
+        );
+    }
+
+    /// A batch judges from its own re-read, not the pass snapshot: a hold
+    /// written after the snapshot holds the batch's keys, and a hold cleared
+    /// after the snapshot no longer does.
+    #[tokio::test]
+    async fn a_batch_judges_from_its_re_read_not_the_snapshot() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let store = MemoryStore::new();
+        let tenant = TenantHash([0x47; 16]);
+        write_hold_set(&store, &tenant, Uuid::from_u128(1), 1, "t/old/", "")
+            .await
+            .expect("set");
+        let snapshot = LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+        assert!(snapshot.is_protected("t/old/k"));
+        write_hold_clear(&store, &tenant, Uuid::from_u128(2), 2, "t/old/")
+            .await
+            .expect("clear");
+        write_hold_set(&store, &tenant, Uuid::from_u128(3), 2, "t/new/", "")
+            .await
+            .expect("set");
+
+        let mut batch = DeleteBatch::new(&snapshot, &tenant, "test batch");
+        assert_eq!(batch.admit(&store, &["t/new/k"]).await, Admit::Held);
+        assert_eq!(batch.admit(&store, &["t/old/k"]).await, Admit::Delete);
+    }
+
     /// ADR-4233 decision 3: a hold write whose commit-record version this
     /// build cannot write is refused before its data PUT, counted.
     #[tokio::test]
