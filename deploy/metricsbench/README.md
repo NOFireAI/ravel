@@ -2025,8 +2025,11 @@ cases):
   changes nothing.
 
 The #3941 series-listing measurement launches on the real-S3 lane, so the
-listing pays real S3 GET latency, with `MB_STAGE1_BANDS` naming a band file
-pre-registered for `history` (none ships here). Create the measured run's
+listing pays real S3 GET latency, with `MB_STAGE1_BANDS` naming
+`deploy/metricsbench/stage1-bands.ravel-only.history.json`, the band file
+pre-registered for it (issue #3941): the L0 data object count, both
+listing times, the L1 part count and the L1 read-back's GET delta, each
+with its basis. Create the measured run's
 Ravel bucket and the ci smoke's four buckets first (`make-buckets.sh
 --ravel-only` makes `<prefix>-ravel` alone):
 
@@ -2034,7 +2037,8 @@ Ravel bucket and the ci smoke's four buckets first (`make-buckets.sh
 deploy/metricsbench/aws/make-buckets.sh --ravel-only <prefix>
 deploy/metricsbench/aws/make-buckets.sh <prefix>-ci
 MB_PROFILE=history MB_STAGE1=1 MB_STAGE1_ARMS=l1 MB_RAVEL_ONLY=1 \
-  MB_STAGE1_BANDS=<band file> MB_OBJECTS_BAND=<MIN:MAX> \
+  MB_STAGE1_BANDS=deploy/metricsbench/stage1-bands.ravel-only.history.json \
+  MB_OBJECTS_BAND=<MIN:MAX> \
   deploy/metricsbench/aws/launch.sh <harness-commit> <ravel-image@sha256:...> <ravel-source-commit> <anchor-ms> <label> <prefix>
 ```
 
@@ -2104,7 +2108,13 @@ Steps, in order, stopping at the first failure (case ro1):
    `--ravel-endpoint` and `--no-in-process-row` and no other row's
    endpoint, into `ingest.json`. A Ravel read-back that answered 422 is
    stamped `refused (budget)` in `ravel_only.ingest_readback` and the run
-   goes on (case ro4). Any other failed or extra row fails the step.
+   goes on (case ro4). One whose series listing answered 504 with the
+   server's query-deadline message is stamped `deadline` there and the run
+   goes on too (case ro4b); on `history` this read-back reads the unfolded
+   catalog under the same 120 s deadline. Either stamp carries `error` and
+   `series_query_ms`, graded as for the read-back verdict below. Any other
+   failed or extra row fails the step, a 504 without that message included
+   (case ro4c).
 5. `stage1-l0-fold`: ravel-server stopped (the writers), then a wait
    through `METRICSBENCH_SLEEP` until the last ingest hour seals (its end
    plus the 5 minute clock-skew allowance and a minute, the same wait
@@ -2175,6 +2185,15 @@ The verdict is one of these:
 - `refused (budget)`, when the series listing answered 422. The run goes on,
   and `series_query_ms` is the elapsed time that the error names (case
   ro4).
+- `deadline`, when the series listing answered 504 with the server's
+  query-deadline message (`query exceeded its deadline of 120s`). The run
+  goes on, `error` records the message, and `series_query_ms` is the
+  elapsed time that the error names, or the deadline it names when it
+  names no elapsed time (cases ro8 and ro8b). A 504 without that message,
+  or that message under another status, is `error` (cases ro8c and ro8d).
+  On `history` the client's read-back timeout is 300 s and the server's
+  query deadline 120 s (`--gc-max-query-duration` in `ravel.yml`), so a
+  listing that runs long ends here rather than at the client.
 
 A figure that was expected and not produced is a miss. A miss fails its
 step with exit 70 and the message names the missing key, for example no

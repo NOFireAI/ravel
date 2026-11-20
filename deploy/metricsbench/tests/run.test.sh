@@ -447,7 +447,11 @@
 #                                       (issue #4481); ro3: no l1 listing
 #                                       time and ro3b: no GET byte counter
 #                                       are misses (70); ro4: a 422 stamped
-#                                       refused (budget), exit 0; ro5: a
+#                                       refused (budget), exit 0; ro4b: a
+#                                       504 query deadline on the ingest
+#                                       read-back stamped deadline, exit 0;
+#                                       ro4c: a 504 there without the
+#                                       deadline message exit 70; ro5: a
 #                                       mismatch and ro5b: an error other
 #                                       than a 422 exit 70; ro6: an L0
 #                                       catalog that does not cover the
@@ -457,7 +461,13 @@
 #                                       Mimir, objects and read-backs naming
 #                                       PREFIX-ravel, ravel_only.store and
 #                                       object_store stamped; ro1's portable
-#                                       ravel_only.store.
+#                                       ravel_only.store; ro8: a 504 query
+#                                       deadline on L0 stamped deadline with
+#                                       its elapsed ms, L1 matched, exit 0;
+#                                       ro8b: the same on L1, the deadline
+#                                       as the ms; ro8c: a 504 without the
+#                                       deadline message and ro8d: the
+#                                       message on a 500 exit 70.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -484,6 +494,10 @@
 #                                       141 holders, 4 tokens, 145 opened),
 #                                       the prune mismatch out of band on
 #                                       si3, missing on si8.
+#                                       The Ravel-only history file (#3941):
+#                                       every figure in band on ro8 with
+#                                       history's object counts, the L1
+#                                       listing at 40000 ms out of band.
 #                                       box-run.sh, sourced: the band file
 #                                       per profile (refused for cardinality
 #                                       without MB_STAGE1_BANDS) and
@@ -1474,7 +1488,11 @@ printf 'metricsbench_ingest env token=%s\n' "${METRICSBENCH_RAVEL_TOKEN:+set}" >
 # STUB_READBACK_ONLY_SEQ, a word per call (the last repeats), overrides it:
 # 0 or 1 as above, 422 the series listing refused for its budget (exit 1),
 # mismatch a read-back that did not match (exit 1), noms a matching
-# read-back without the series listing's time (exit 0).
+# read-back without the series listing's time (exit 0). 504 the series
+# listing past the server's query deadline (exit 1), 504noms the same
+# without the elapsed time, naming only the deadline; 504other a 504
+# without the deadline message and 500deadline the deadline message on a
+# 500 (exit 1 each).
 if [ "${1:-}" = "--readback-only" ]; then
   mode="${STUB_READBACK_ONLY_EXIT:-0}"
   if [ -n "${STUB_READBACK_ONLY_SEQ:-}" ]; then
@@ -1487,6 +1505,10 @@ if [ "${1:-}" = "--readback-only" ]; then
     0) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":1000,"sample_count":120000,"matches_expected":true,"mismatches":[],"query_ms":{"series":12,"samples.0":5}}}' ;;
     1) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed: 503"}' ;;
     422) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed after 4321 ms: GET /api/v1/series answered 422 Unprocessable Entity: series budget exceeded"}' ;;
+    504) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed after 120013 ms: GET /api/v1/series answered 504 Gateway Timeout: query exceeded its deadline of 120s"}' ;;
+    504noms) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed: GET /api/v1/series answered 504 Gateway Timeout: {\"status\":\"error\",\"errorType\":\"timeout\",\"error\":\"query exceeded its deadline of 120s\"}"}' ;;
+    504other) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed after 60004 ms: GET /api/v1/series answered 504 Gateway Timeout: upstream request timeout"}' ;;
+    500deadline) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed after 120013 ms: GET /api/v1/series answered 500 Internal Server Error: query exceeded its deadline of 120s"}' ;;
     mismatch) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":999,"sample_count":120000,"matches_expected":false,"mismatches":["series_count 999, want 1000"],"query_ms":{"series":14,"samples.0":5}}}' ;;
     noms) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":1000,"sample_count":120000,"matches_expected":true,"mismatches":[],"query_ms":{"samples.0":5}}}' ;;
   esac
@@ -1522,6 +1544,10 @@ for ((i = 0; i < ${#args[@]}; i++)); do
         rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query samples.0 failed: 422\"}"
       elif [ "${STUB_INGEST_READBACK_422:-}" = "$sys" ]; then
         rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query series failed after 4321 ms: GET /api/v1/series answered 422 Unprocessable Entity: series budget exceeded\"}"
+      elif [ "${STUB_INGEST_READBACK_504:-}" = "$sys" ]; then
+        rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query series failed after 120013 ms: GET /api/v1/series answered 504 Gateway Timeout: query exceeded its deadline of 120s\"}"
+      elif [ "${STUB_INGEST_READBACK_504OTHER:-}" = "$sys" ]; then
+        rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query series failed after 60004 ms: GET /api/v1/series answered 504 Gateway Timeout: upstream request timeout\"}"
       else
         rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback\":{\"series_count\":1000,\"sample_count\":120000,\"matches_expected\":true,\"mismatches\":[]}}"
       fi
@@ -1532,7 +1558,7 @@ stalled=""
 [ -z "${STUB_INGEST_STALL:-}" ] ||
   stalled=",\"stalled\":[{\"system\":\"${STUB_INGEST_STALL}\",\"error\":\"projected 9000 s past the 600 s ceiling\"}]"
 printf '{"profile":{"name":"ci","scrape_interval_secs":15,"run":{"steps":120,"anchor_ms":%s}},"systems":[%s]%s}\n' "$anchor" "$rows" "$stalled"
-if [ -n "${STUB_INGEST_READBACK_FAIL:-}${STUB_INGEST_READBACK_422:-}${STUB_INGEST_STALL:-}${STUB_INGEST_EXIT_AFTER_REPORT:-}" ]; then
+if [ -n "${STUB_INGEST_READBACK_FAIL:-}${STUB_INGEST_READBACK_422:-}${STUB_INGEST_READBACK_504:-}${STUB_INGEST_READBACK_504OTHER:-}${STUB_INGEST_STALL:-}${STUB_INGEST_EXIT_AFTER_REPORT:-}" ]; then
   echo "stub ingest: a row failed its verification" >&2
   exit 1
 fi
@@ -4052,7 +4078,18 @@ expect_no_log "ro3b: no compaction after the miss" "compact-tenant"
 # (budget) with the time the error names, and the run passes.
 STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_422=ravel STUB_READBACK_ONLY_SEQ="0 422" run_stage1 ro4 history --ravel-only
 expect_rc ro4 0
-check "ro4: refused (budget) at ingest and on L1, matched on L0" 'j("stamps.json")["ravel_only"]["ingest_readback"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l0"]["verdict"] == "matched" and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 4321 and j("stamps.json")["status"] == "passed"'
+check "ro4: refused (budget) at ingest and on L1, matched on L0" 'j("stamps.json")["ravel_only"]["ingest_readback"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["ingest_readback"]["series_query_ms"] == 4321 and j("stamps.json")["ravel_only"]["l0"]["verdict"] == "matched" and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 4321 and j("stamps.json")["status"] == "passed"'
+# ro4b: a 504 query deadline on the ingest read-back is stamped deadline with
+# its elapsed ms and the run goes on through readback-l0.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_504=ravel STUB_READBACK_ONLY_SEQ="0" run_stage1 ro4b history --ravel-only
+expect_rc ro4b 0
+check "ro4b: deadline at ingest with its listing time and error, the run reached readback-l0 and passed" 'j("stamps.json")["ravel_only"]["ingest_readback"]["verdict"] == "deadline" and j("stamps.json")["ravel_only"]["ingest_readback"]["series_query_ms"] == 120013 and j("stamps.json")["ravel_only"]["ingest_readback"]["error"] == "query series failed after 120013 ms: GET /api/v1/series answered 504 Gateway Timeout: query exceeded its deadline of 120s" and "readback-l0" in j("stamps.json")["steps_completed"] and j("stamps.json")["ravel_only"]["l0"]["verdict"] == "matched" and j("stamps.json")["status"] == "passed"'
+expect_err "ro4b: the deadline is said with its listing time" "ingest: the Ravel read-back's series listing reached the server's query deadline after 120013 ms"
+# ro4c: a 504 on the ingest read-back without the deadline message fails the
+# ingest step.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_504OTHER=ravel STUB_READBACK_ONLY_SEQ="0" run_stage1 ro4c history --ravel-only
+expect_rc ro4c 70
+check "ro4c: a 504 without the deadline message fails ingest" 'j("stamps.json")["ravel_only"]["ingest_readback"].startswith("failed: metricsbench_ingest exited 1: query series failed after 60004 ms") and j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["status"] == "failed"'
 # ro5: a read-back that does not match fails its step.
 STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="mismatch" run_stage1 ro5 ci --ravel-only
 expect_rc ro5 70
@@ -4069,6 +4106,28 @@ expect_rc ro6 70
 expect_err "ro6: the refusal names the step, the watermark and the uncovered hour" "step stage1-l0 failed: refused: readback-l0 would read a catalog that does not cover the ingest: watermark_hour 490001 is before hour 490002, in which the ingest step ended, so ingest hours 490002..=490002 are not in the snapshot"
 check "ro6: the L0 catalog is stamped as not covering the ingest, the read-back refused" 'j("stamps.json")["failed_step"] == "stage1-l0" and j("stamps.json")["ravel_only"]["l0"]["catalog"]["covers_ingest"] is False and j("stamps.json")["ravel_only"]["l0"]["catalog"]["watermark_hour"] == 490001 and j("stamps.json")["ravel_only"]["l0"]["catalog"]["ingest_end_hour"] == 490002 and j("stamps.json")["ravel_only"]["l0"]["readback"].startswith("refused: the l0 catalog does not cover the ingest: watermark_hour 490001 ") and j("stamps.json")["ravel_only"]["l0"]["series_query_ms"] is None'
 expect_no_log "ro6: no read-back on the uncovered catalog" "--readback-only"
+
+# ro8: a series listing that answered 504 with the server's query deadline
+# message on the L0 catalog is stamped deadline with the elapsed time the
+# error names, and the run goes on to a matched L1 read-back.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="504 0" run_stage1 ro8 history --ravel-only
+expect_rc ro8 0
+check "ro8: deadline on L0 with its listing time and error, matched on L1, the run passed" 'j("stamps.json")["ravel_only"]["l0"]["verdict"] == "deadline" and j("stamps.json")["ravel_only"]["l0"]["readback"]["verdict"] == "deadline" and j("stamps.json")["ravel_only"]["l0"]["series_query_ms"] == 120013 and j("stamps.json")["ravel_only"]["l0"]["readback"]["error"] == "query series failed after 120013 ms: GET /api/v1/series answered 504 Gateway Timeout: query exceeded its deadline of 120s" and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "matched" and j("stamps.json")["steps_completed"][-2:] == ["objects-l1", "readback-l1"] and j("stamps.json")["status"] == "passed"'
+expect_err "ro8: the deadline is said with its listing time" "readback-l0: the series listing reached the server's query deadline after 120013 ms"
+# ro8b: the same on the L1 catalog, from an error that names the deadline
+# but no elapsed time: series_query_ms is the deadline, 120 s.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="0 504noms" run_stage1 ro8b history --ravel-only
+expect_rc ro8b 0
+check "ro8b: deadline on L1 with the deadline it names as its listing time" 'j("stamps.json")["ravel_only"]["l0"]["verdict"] == "matched" and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "deadline" and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 120000 and "query exceeded its deadline of 120s" in j("stamps.json")["ravel_only"]["l1"]["readback"]["error"] and j("stamps.json")["status"] == "passed"'
+# ro8c: a 504 without the deadline message fails readback-l0.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="504other" run_stage1 ro8c history --ravel-only
+expect_rc ro8c 70
+check "ro8c: a 504 without the deadline message is stamped error and fails readback-l0" 'j("stamps.json")["ravel_only"]["l0"]["verdict"] == "error" and j("stamps.json")["failed_step"] == "readback-l0" and j("stamps.json")["status"] == "failed"'
+expect_no_log "ro8c: no compaction after the failed read-back" "compact-tenant"
+# ro8d: the deadline message on a status other than 504 fails readback-l0.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="500deadline" run_stage1 ro8d history --ravel-only
+expect_rc ro8d 70
+check "ro8d: a 500 naming the deadline is stamped error and fails readback-l0" 'j("stamps.json")["ravel_only"]["l0"]["verdict"] == "error" and j("stamps.json")["failed_step"] == "readback-l0" and j("stamps.json")["status"] == "failed"'
 
 # ro7: the Ravel-only shape on the real-S3 lane (issue #4481): Ravel's store
 # on PREFIX-ravel, createbuckets checking that bucket alone, no Mimir, the
@@ -4644,6 +4703,32 @@ expect_check_err "check series si3: the series prune mismatch is out of band" 'o
 run_check series-off "${SERIES_BANDS}" "${TMP}/si8/out"
 expect_rc series-off 1
 expect_check_err "check series si8: the switch off leaves the series figures missing" 'missing holders_series_prune_mismatches: no series_prune_mismatches_count in stage1.holders (stamps.json stage1.holders.series_prune_mismatches_count)'
+
+# The Ravel-only history band file (issue #3941's pre-registration) against
+# case ro8's run: its L0 listing reached the deadline at 120013 ms, its L1
+# read-back matched in 12 ms with 100 GETs, and the object counts are set to
+# history's (87,608 L0 data objects, 24 L1 parts). A copy with the L1
+# listing at 40000 ms is out of band.
+RO_BANDS="${HERE}/../stage1-bands.ravel-only.history.json"
+RO_FIGURES="$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["figures"]))' "${RO_BANDS}")"
+rm -rf "${TMP}/check-ro" && cp -R "${TMP}/ro8/out" "${TMP}/check-ro"
+python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); ro=d["ravel_only"]; ro["l0"]["objects"]["data"]["count"]=87608; ro["l1"]["objects"]["l1"]["count"]=24; json.dump(d,open(p,"w"))' "${TMP}/check-ro/stamps.json"
+run_check ro-clean "${RO_BANDS}" "${TMP}/check-ro"
+if [ "${rc}" -eq 0 ] && [ "${RO_FIGURES}" -eq 5 ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq "${RO_FIGURES}" ] &&
+  grep -qxF 'ok ravel_only_l0_data_objects = 87608 in [79000, 96000] (stamps.json ravel_only.l0.objects.data.count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok ravel_only_l0_series_query_ms = 120013 in [100000, 130000] (stamps.json ravel_only.l0.series_query_ms)' "${CHECK_OUT}" &&
+  grep -qxF 'ok ravel_only_l1_parts = 24 in [20, 130] (stamps.json ravel_only.l1.objects.l1.count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok ravel_only_l1_series_query_ms = 12 in [0, 30000] (stamps.json ravel_only.l1.series_query_ms)' "${CHECK_OUT}" &&
+  grep -qxF 'ok ravel_only_l1_store_get_calls_delta = 100 in [20, 400] (stamps.json ravel_only.l1.readback.store_get_calls.delta)' "${CHECK_OUT}"; then
+  pass "check ravel-only: every one of the ${RO_FIGURES} figures in band on a history-shaped Ravel-only run"
+else
+  fail "check ravel-only: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
+fi
+python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["ravel_only"]["l1"]["series_query_ms"]=40000; json.dump(d,open(p,"w"))' "${TMP}/check-ro/stamps.json"
+run_check ro-slow-l1 "${RO_BANDS}" "${TMP}/check-ro"
+expect_rc "check ravel-only L1 listing at 40000 ms" 1
+expect_check_err "check ravel-only: the L1 listing at 40000 ms is out of band" 'out of band ravel_only_l1_series_query_ms = 40000 not in [0, 30000] (stamps.json ravel_only.l1.series_query_ms)'
+expect_check_err "check ravel-only: one failure counted" "stage1-check: 1 of ${RO_FIGURES} figures failed"
 
 # The arms' bands: every figure in band on case za's run, every arm on, but
 # the reference prune band, n/a since the extra-hour and l1 arms changed the
