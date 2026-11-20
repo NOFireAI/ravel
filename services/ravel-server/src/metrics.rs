@@ -6096,9 +6096,10 @@ pub struct MaintenanceSafetySignalSnapshot {
 /// an operator only through a `tracing` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceSafetySnapshot {
-    /// Legal-hold refresh failures (ADR-0048 decision 1). Not signal-scoped:
-    /// one refresh gates an entire tenant tick, so a failure skips every
-    /// signal and shard of that tick at once.
+    /// Legal-hold read failures (ADR-0048 decision 1). Not signal-scoped: a
+    /// failed per-tick refresh skips every signal and shard of that tenant's
+    /// tick at once, and a failed re-read before a delete batch skips that
+    /// batch (ADR-0042, the delete-batch re-read amendment).
     pub legal_hold_refresh_failures: u64,
     /// Objects physically deleted from `quarantine/` past the quarantine
     /// horizon, summed over every sweep pass of every signal since process
@@ -6313,7 +6314,7 @@ fn render_maintain_safety_family(
     write_header(
         out,
         "ravel_maintain_legal_hold_refresh_failures_total",
-        "Legal-hold refresh failures; each one skips that tenant's whole maintenance tick.",
+        "Legal-hold read failures; a failed per-tick refresh skips that tenant's whole maintenance tick, and a failed re-read before a delete batch skips that batch.",
         "counter",
     );
     write_sample(

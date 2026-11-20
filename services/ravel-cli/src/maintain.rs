@@ -1764,8 +1764,11 @@ pub async fn sweep_compactor_config(
 ///
 /// Refreshes the tenant's [`LegalHoldCheck`] before the pass, matching the
 /// server driver's semantics (ADR-0048 decision 1): the refresh happens once,
-/// per invocation, with no flag to skip it. A refresh failure skips the whole
-/// pass (`Err`, not a fallback to `NoLeases`), since running the sweep
+/// per invocation, with no flag to skip it, and planning reads it. Each delete
+/// batch then re-reads the hold set through the snapshot's source before its
+/// first delete (ADR-0042, the delete-batch re-read amendment); a batch whose
+/// re-read fails deletes nothing and is reported. A refresh failure skips the
+/// whole pass (`Err`, not a fallback to `NoLeases`), since running the sweep
 /// unprotected would convert a transient store fault into an unprotected
 /// delete pass.
 ///
@@ -1930,6 +1933,13 @@ pub async fn sweep_at(
         );
     } else if orphan_breaker_overridden {
         println!("orphan breaker: overridden by force_orphan_gc, deleted despite tripping");
+    }
+    let reread_failures = hold.source().map_or(0, |source| source.reread_failures());
+    if reread_failures > 0 {
+        println!(
+            "legal hold re-read failed for {reread_failures} delete batches; each deleted \
+             nothing (rerun once the hold shard is reachable)"
+        );
     }
     Ok(())
 }

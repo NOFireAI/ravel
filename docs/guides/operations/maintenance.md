@@ -2634,17 +2634,27 @@ These commands write and read the audit records that both maintenance drivers
 check before any destructive pass. Legal-hold records themselves are
 undeletable by every role, Maintain included.
 
-**The hold is not effective the instant the command returns.** After you place
-an urgent hold, run `ravel-cli hold list --tenant <id>` and confirm that the
-scope is present before you assume that the data is protected.
+**A hold is honored by every delete batch that re-reads holds after the record
+is durable.** A legal hold whose set record was durable before a delete batch
+re-read the hold set is honored by that batch; every delete batch re-reads the
+hold set immediately before its first delete, and a batch that cannot read it
+deletes nothing.
 
-- `hold set` returning success means only that the record was written, not
-  that a maintenance pass has picked it up.
-- Each maintenance tick refreshes its hold snapshot once, before its
-  destructive pass. A hold set after that tick's refresh is not honored until
-  the next one.
-- The exposure window is one `--maintain-interval-secs` interval, five minutes
-  by default.
+- `hold set` returns once the record is durable, and prints
+  `hold set: <scope>; honored by every delete batch that re-reads holds after
+  now` for each scope.
+- A delete batch is a superseded chain group, a retention bucket, a shard's
+  orphan quarantine moves or quarantine purges, a signal's erasure-request,
+  catalog object or idempotency-marker deletes, a shard's unreferenced part
+  deletes, or an alert or query-audit retention batch
+  ([deletion and GC](../../deletion-and-gc.md)). A running pass's later
+  batches honor the hold; it does not wait for the next maintenance tick.
+- The residual is a batch already deleting: a hold written after that batch's
+  re-read and before its delete requests return is not honored by that batch.
+  Run `ravel-cli hold list --tenant <id>` to confirm the scope is present.
+- A batch whose re-read fails deletes nothing and counts on
+  `ravel_maintain_legal_hold_refresh_failures_total`, the same counter a
+  failed per-tick refresh moves.
 
 ### Hold scopes
 

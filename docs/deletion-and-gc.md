@@ -25,16 +25,31 @@ only after that, so a small out-of-band commit-record loss below the
 mass-orphan breaker's thresholds is recoverable rather than permanent
 (ADR-0058 amendment; see the orphan-GC section below). One sweeper component implements all rules below; all are
 stateless per pass and restartable from zero, and every delete is
-idempotent. Reader leases are not implemented: the "not lease-protected"
-precondition holds trivially everywhere below, because the `LeaseCheck`
-hook always answers "unprotected" and nothing depends on it for
-correctness. The first four rules anchor on
+idempotent. Reader leases are not implemented; the one `LeaseCheck` that
+protects anything is legal hold (ADR-0042 decision 2), and the "legal hold"
+and "lease check" preconditions below are that check. The first four rules anchor on
 durable timestamps (never wall-clock at sweep time); `protection_horizon
 >= max_query_duration + grace + clock_skew_allowance` and `grace`
 (default 24 h) are shared across those four. The fifth rule (idempotency
 marker) anchors on the marker's own `<ingest_hour>` instead, and its own age
 gate carries a forward-skew tolerance the other four don't need (see below the
 table).
+
+**Legal hold blocks deletes per delete batch** (ADR-0042, the delete-batch
+re-read amendment). A legal hold whose set record was durable before a delete
+batch re-read the hold set is honored by that batch; every delete batch
+re-reads the hold set immediately before its first delete, and a batch that
+cannot read it deletes nothing. The batches are a superseded chain group, a
+retention bucket, a shard's orphan quarantine moves, a shard's quarantine
+purges, a signal's erasure-request (`.dreq`) deletes, a signal's catalog
+object deletes, a signal's idempotency-marker deletes, a shard's unreferenced
+`l1/` part deletes, an alert retention pass's deletes and one hour of
+query-audit retention deletes. Planning earlier in the pass reads the tick's
+hold snapshot; the delete itself is judged from the batch's own read. A hold
+written after a batch's re-read and before its delete requests return is not
+honored by that batch. A failed re-read is counted on
+`ravel_maintain_legal_hold_refresh_failures_total` and the pass goes on to
+its next batch.
 
 `protection_horizon`, `grace`, `max_query_duration`, `max_flush_lifetime`, and
 `head_cache_ttl` are not per-process knobs each component sets independently.
@@ -607,8 +622,10 @@ than deletes, so even a forced pass keeps the recovery window.
 - **The legal-hold gate decides a chain group as a whole, never part of
   one.** Every key in the group, the raw inputs, each generation's parts, and
   each generation's records, is checked against `LegalHoldCheck` before
-  anything is deleted; if the hold protects any one of them the whole group
-  is skipped for this pass and nothing in it is deleted. Hold scopes are per
+  anything is deleted, first against the tick's snapshot and then against
+  the hold set the group re-reads before its first delete; if a hold protects
+  any one of them the whole group is skipped for this pass and nothing in it
+  is deleted. Hold scopes are per
   prefix, so a hold covering a shard's data prefixes but not its commit
   prefix would otherwise let one pass delete a chain's records while the
   input bytes those records account for survive. The pass counts each

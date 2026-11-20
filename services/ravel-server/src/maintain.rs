@@ -44,12 +44,16 @@
 //! empty set, because that would be indistinguishable from healthy idleness,
 //! the exact silence this avoids.
 //!
-//! [`LegalHoldCheck::refresh`] is called once per tenant per tick, before
+//! [`LegalHoldCheck::refresh_from`] is called once per tenant per tick, before
 //! either pass, and its snapshot is the [`LeaseCheck`] threaded through every
-//! `(signal, shard)` of that tick (ADR-0048 decision 1). A refresh failure
-//! never falls back to [`NoLeases`]: the tenant's whole tick is skipped and
-//! retried next tick, so a transient store fault can never turn into an
-//! unprotected delete pass.
+//! `(signal, shard)` of that tick (ADR-0048 decision 1); planning decisions
+//! read it. Every delete batch then re-reads the hold set through the
+//! snapshot's [`ravel_maintain::HoldSource`] immediately before its first
+//! delete and judges its deletes from that read (ADR-0042, the delete-batch
+//! re-read amendment); a batch whose re-read fails deletes nothing and counts
+//! as a refresh failure. A refresh failure never falls back to [`NoLeases`]:
+//! the tenant's whole tick is skipped and retried next tick, so a transient
+//! store fault can never turn into an unprotected delete pass.
 //!
 //! One [`MaintainMemo`] is held across every tick and every tenant until
 //! shutdown. The memo records buckets already known
@@ -100,12 +104,12 @@ use ravel_maintain::worker_set::{
 };
 use ravel_maintain::{
     AlertKeepSet, Bucket, ClaimParticipant, Clock, CompactorConfig,
-    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureAbandon, ErasureRewriteOutcome, LeaseCheck,
-    LegalHoldCheck, MaintainError, MemoSnapshotLimits, MemoSnapshotReject, MemoSnapshotRejects,
-    OrphanPass, PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig, VerifiedSnapshot,
-    WorkerSet, erasure_rewrite_bucket, pending_erasure_requests, read_all_memo_snapshots,
-    scan_and_compact, sweep_alert_retention, sweep_audit_retention, sweep_erasure_requests,
-    sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
+    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureAbandon, ErasureRewriteOutcome, HoldSource,
+    LeaseCheck, LegalHoldCheck, MaintainError, MemoSnapshotLimits, MemoSnapshotReject,
+    MemoSnapshotRejects, OrphanPass, PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig,
+    VerifiedSnapshot, WorkerSet, erasure_rewrite_bucket, pending_erasure_requests,
+    read_all_memo_snapshots, scan_and_compact, sweep_alert_retention, sweep_audit_retention,
+    sweep_erasure_requests, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
     sweep_unreferenced_catalog_objects, write_memo_snapshot,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
@@ -830,8 +834,14 @@ impl MaintenanceSafetyMetrics {
     }
 
     pub fn record_legal_hold_refresh_failure(&self) {
+        self.record_legal_hold_refresh_failures(1);
+    }
+
+    /// Count `n` legal-hold read failures at once: a tick's failed per-batch
+    /// hold re-reads, each of which deleted nothing.
+    pub fn record_legal_hold_refresh_failures(&self, n: u64) {
         self.legal_hold_refresh_failures
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn record_conservation_abort(&self, signal: Signal) {
@@ -2236,7 +2246,9 @@ pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
 /// tenant tick without discovery or the timer.
 ///
 /// The legal hold refresh (ADR-0048 decision 1) runs once, before either
-/// pass, and its snapshot gates every `(signal, shard)` of this tick. If the
+/// pass, and its snapshot gates the planning of every `(signal, shard)` of
+/// this tick; each delete batch re-reads the hold set before its first delete
+/// and deletes nothing when that re-read fails. If the
 /// refresh fails, the entire tenant tick is skipped -- no signal, no shard,
 /// no pass runs -- and an empty [`MaintainReport`] is returned; the driver
 /// never falls back to [`ravel_maintain::NoLeases`], because that would
@@ -2531,7 +2543,11 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
     // faults could hold the alarm off indefinitely.
     note_owned_units(ownership, worker, live_set, tenant, shard_count);
 
-    let refresh = LegalHoldCheck::refresh(store, tenant).await;
+    // The tick's snapshot and every delete batch's re-read (ADR-0042, the
+    // delete-batch re-read amendment) go through one source, whose record
+    // cache lives as long as the memo.
+    let hold_source = Arc::new(HoldSource::with_cache(*tenant, memo.hold_record_cache()));
+    let refresh = LegalHoldCheck::refresh_from(store, Arc::clone(&hold_source)).await;
     // The store call's own result, carried to the RefreshFailureNeverSweeps
     // assertion at the end of the tick.
     let refresh_ok = refresh.is_ok();
@@ -2541,7 +2557,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
         // refresh as an empty hold set and proceed into the tick's sweeps
         // instead of skipping.
         Err(_) if ravel_invariant::inv_mutant!("lifecycle/refresh-failure-is-no-hold") => {
-            LegalHoldCheck::empty()
+            LegalHoldCheck::empty_with_source(Arc::clone(&hold_source))
         }
         Err(err) => {
             tracing::error!(
@@ -3227,6 +3243,9 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
         deleted += run_alert_retention(store, clock, compactor, &hold, tenant, safety).await;
     }
 
+    // Each delete batch whose hold re-read failed deleted nothing and counts
+    // as one refresh failure.
+    safety.record_legal_hold_refresh_failures(hold_source.reread_failures());
     assert_refresh_failure_never_sweeps(tenant, refresh_ok, deleted);
     total
 }
@@ -10908,6 +10927,19 @@ mod tests {
     async fn tick_with_deletable_work_under_a_failed_refresh(
         tenant_name: &str,
     ) -> FailedRefreshTick {
+        tick_with_deletable_work_under_hold_list_faults(
+            tenant_name,
+            ravel_object_store::fault::Occurrence::Always,
+        )
+        .await
+    }
+
+    /// [`tick_with_deletable_work_under_a_failed_refresh`] with the hold
+    /// shard's LIST faulting on `occurrence` only.
+    async fn tick_with_deletable_work_under_hold_list_faults(
+        tenant_name: &str,
+        occurrence: ravel_object_store::fault::Occurrence,
+    ) -> FailedRefreshTick {
         let tenant_id = TenantId::new(tenant_name);
         let tenant = tenant_id.hash();
         let written_ns: i64 = 1_700_000_000 * 1_000_000_000;
@@ -10980,7 +11012,8 @@ mod tests {
                     Op::List,
                     ScriptedFault::Transient("hold shard unavailable".into()),
                 )
-                .with_key_contains(hold_prefix),
+                .with_key_contains(hold_prefix)
+                .with_occurrence(occurrence),
             ),
         );
         run_tick_with_clock(
@@ -11031,6 +11064,39 @@ mod tests {
             assert!(
                 observed.evaluations.iter().all(|(held, _)| *held),
                 "RefreshFailureNeverSweeps never evaluates false on the shipped skip: {:?}",
+                observed.evaluations
+            );
+        }
+    }
+
+    /// A tick whose snapshot refresh succeeds but whose first delete batch's
+    /// hold re-read fails (the hold shard's second LIST): that batch, one of
+    /// the two superseded inputs' chain groups, deletes nothing and moves the
+    /// refresh-failure counter by exactly one, and the next batch, whose
+    /// re-read is healthy, deletes its input.
+    #[tokio::test]
+    async fn a_failed_batch_re_read_deletes_nothing_and_the_tick_goes_on() {
+        let observed = tick_with_deletable_work_under_hold_list_faults(
+            "batch-reread-fails",
+            ravel_object_store::fault::Occurrence::Nth(2),
+        )
+        .await;
+        assert_eq!(
+            observed.refresh_faults, 1,
+            "the first batch's re-read LIST really faulted"
+        );
+        assert_eq!(
+            observed.refresh_failures, 1,
+            "one failed batch, one refresh failure"
+        );
+        assert_eq!(
+            observed.superseded_data_deleted, 1,
+            "the failed batch keeps its input, the healthy one deletes its own"
+        );
+        if ravel_invariant::EVALUATES {
+            assert!(
+                observed.evaluations.iter().all(|(held, _)| *held),
+                "RefreshFailureNeverSweeps holds per batch: {:?}",
                 observed.evaluations
             );
         }

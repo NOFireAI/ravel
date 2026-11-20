@@ -5,6 +5,10 @@
 //! custody model. Set and clear write the existing immutable ADR-0040 audit
 //! records through `ravel_maintain::write_hold_set` / `write_hold_clear`;
 //! list is `LegalHoldCheck::refresh` plus printing `active_prefixes()`.
+//!
+//! A hold takes effect at the next delete batch, not the next maintain tick:
+//! every delete batch re-reads the hold set before its first delete (ADR-0042,
+//! the delete-batch re-read amendment), and `hold set` says so in its output.
 
 use std::sync::Arc;
 
@@ -168,10 +172,22 @@ pub async fn set(
         )
         .await
         .map_err(|err| anyhow::anyhow!("failed to write hold set for {scope}: {err}"))?;
-        println!("hold set: {scope}");
+        println!("{}", hold_set_line(scope));
     }
+    println!("{HOLD_SET_GUARANTEE}");
     Ok(())
 }
+
+/// The line `hold set` prints for each scope it wrote.
+fn hold_set_line(scope: &str) -> String {
+    format!("hold set: {scope}; honored by every delete batch that re-reads holds after now")
+}
+
+/// The guarantee `hold set` states once its records are durable (ADR-0042,
+/// the delete-batch re-read amendment).
+const HOLD_SET_GUARANTEE: &str = "A legal hold whose set record was durable before a delete \
+     batch re-read the hold set is honored by that batch; every delete batch re-reads the hold \
+     set immediately before its first delete, and a batch that cannot read it deletes nothing.";
 
 /// `hold clear`: release a legal hold on one or more scopes, each as a fresh
 /// immutable ADR-0040 `clear` record.
@@ -268,6 +284,23 @@ mod tests {
         let mut active = snapshot.active_prefixes().to_vec();
         active.sort();
         assert_eq!(active, expected);
+    }
+
+    /// `hold set` states the delete-batch guarantee, word for word as
+    /// ADR-0042's delete-batch re-read amendment and docs/deletion-and-gc.md
+    /// carry it.
+    #[test]
+    fn hold_set_output_states_the_delete_batch_guarantee() {
+        assert_eq!(
+            hold_set_line("t/abc/"),
+            "hold set: t/abc/; honored by every delete batch that re-reads holds after now"
+        );
+        assert_eq!(
+            HOLD_SET_GUARANTEE,
+            "A legal hold whose set record was durable before a delete batch re-read the hold \
+             set is honored by that batch; every delete batch re-reads the hold set immediately \
+             before its first delete, and a batch that cannot read it deletes nothing."
+        );
     }
 
     /// The three prefixes `shard_hold_scopes` returns really do live under the

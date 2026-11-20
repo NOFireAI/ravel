@@ -132,6 +132,7 @@ use uuid::Uuid;
 use crate::clock::Clock;
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
+use crate::legal_hold::{Admit, DeleteBatch};
 use crate::reachability::{
     MarkerContext, MarkerPolicy, MarkerStats, SnapshotBlock, SnapshotGate, SnapshotObject,
     SnapshotReachability, catalog_head_key,
@@ -141,10 +142,11 @@ use crate::unnamed_marker::{MarkerAnchor, MarkerKind, MarkerReapOutcome};
 
 use ravel_ingest::{IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, MARKER_SUFFIX};
 
-/// A hook the sweeper consults before every delete, in all five rules. The
-/// only implementation today is [`NoLeases`] (nothing is ever protected); this
-/// is a seam for future reader-lease / slow-consumer work, never
-/// a correctness dependency of the current design. In-flight readers are
+/// A hook the sweeper consults before every delete, in all five rules.
+/// [`NoLeases`] protects nothing; [`crate::LegalHoldCheck`] protects what a
+/// legal hold covers and, through [`Self::hold_source`], is re-read before
+/// each delete batch. As a reader lease it is a seam for future
+/// slow-consumer work, never a correctness dependency of the current design. In-flight readers are
 /// protected by the protection horizon, the age gates, the ADR-0020 HEAD
 /// delete blocker and, for the retention and superseded-input rules, the
 /// unnamed-since marker gate (ADR-1133): a candidate HEAD no longer names is
@@ -156,6 +158,13 @@ pub trait LeaseCheck: Send + Sync {
     /// Return `true` if `key` is protected by an active reader lease and must
     /// not be deleted this pass.
     fn is_protected(&self, key: &str) -> bool;
+
+    /// Where each delete batch re-reads the hold set before its first delete
+    /// (ADR-0042, the delete-batch re-read amendment). `None`, the default,
+    /// judges every delete from [`Self::is_protected`] alone.
+    fn hold_source(&self) -> Option<&crate::legal_hold::HoldSource> {
+        None
+    }
 }
 
 /// The shipped [`LeaseCheck`]: nothing is ever protected, so the
@@ -795,17 +804,10 @@ pub async fn sweep_orphans(
         });
     }
 
-    // The tenant's holds re-read from the store, not the pass's lease: the
-    // HeldObjectNeverDeleted assertion below is false for a deleted key this
-    // re-read protects. A failed re-read leaves `None`, the assertion records
-    // nothing, and the pass goes on.
-    let holds_now = if ravel_invariant::EVALUATES && !candidates.is_empty() {
-        crate::legal_hold::LegalHoldCheck::refresh(store, tenant)
-            .await
-            .ok()
-    } else {
-        None
-    };
+    // The pass's moves are one delete batch: it re-reads the hold set before
+    // its first move and judges every move from that read. A failed re-read
+    // moves nothing.
+    let mut batch = DeleteBatch::new(lease, tenant, "orphan quarantine move").observing();
 
     // Phase (d): quarantine. The breaker (phase (c)) already returned if the
     // pass should collect zero; here every surviving candidate is moved to the
@@ -817,6 +819,11 @@ pub async fn sweep_orphans(
     let mut quarantined = 0usize;
     let mut refused = 0usize;
     for (meta, _) in &candidates {
+        match batch.admit(store, &[meta.key.as_str()]).await {
+            Admit::Delete => {}
+            Admit::Held => continue,
+            Admit::ReadFailed => break,
+        }
         if config.dry_run {
             quarantined += 1;
             continue;
@@ -824,17 +831,7 @@ pub async fn sweep_orphans(
         let dest = quarantine_key(&meta.key, quarantined_at_ns);
         match quarantine_object(store, &meta.key, &dest).await {
             Ok(QuarantineMove::Copied) => {
-                let _verdict = holds_now
-                    .as_ref()
-                    .map(|fresh| !fresh.is_protected(&meta.key));
-                ravel_invariant::inv_always_if_known!(
-                    _verdict,
-                    "gc: a held object is never deleted",
-                    std::collections::BTreeMap::from([
-                        ("key", meta.key.clone()),
-                        ("tenant", tenant.to_hex()),
-                    ])
-                );
+                batch.assert_delete(&[meta.key.as_str()]);
                 store.delete(&meta.key).await?;
                 ravel_invariant::inv_reachable!(
                     "gc: orphan sweep delete",
@@ -1059,11 +1056,10 @@ pub async fn sweep_quarantine(
     let mut reaped = 0usize;
     let mut reaped_bytes = 0u64;
     let mut retained = 0usize;
-    // The tenant's holds re-read from the store once, before the pass's first
-    // delete, not the pass's lease: the HeldObjectNeverDeleted assertion below
-    // is false for a purge whose copy or original key this re-read protects.
-    // The inner `None` is a failed re-read, which records nothing.
-    let mut holds_now: Option<Option<crate::legal_hold::LegalHoldCheck>> = None;
+    // The pass's purges are one delete batch: it re-reads the hold set before
+    // its first purge and judges every purge, the copy's key and its original
+    // key, from that read. A failed re-read purges nothing.
+    let mut batch = DeleteBatch::new(lease, tenant, "quarantine purge").observing();
     for meta in objects {
         let Some(quarantined_at_ns) = parse_quarantine_timestamp(&meta.key) else {
             retained += 1;
@@ -1079,30 +1075,13 @@ pub async fn sweep_quarantine(
             retained += 1;
             continue;
         }
+        let judged: Vec<&str> = std::iter::once(meta.key.as_str()).chain(original).collect();
+        if batch.admit(store, &judged).await != Admit::Delete {
+            retained += 1;
+            continue;
+        }
         if !config.dry_run {
-            let _verdict = if ravel_invariant::EVALUATES {
-                if holds_now.is_none() {
-                    holds_now = Some(
-                        crate::legal_hold::LegalHoldCheck::refresh(store, tenant)
-                            .await
-                            .ok(),
-                    );
-                }
-                holds_now.as_ref().and_then(Option::as_ref).map(|fresh| {
-                    !(fresh.is_protected(&meta.key)
-                        || original.is_some_and(|k| fresh.is_protected(k)))
-                })
-            } else {
-                None
-            };
-            ravel_invariant::inv_always_if_known!(
-                _verdict,
-                "gc: a held object is never deleted",
-                std::collections::BTreeMap::from([
-                    ("key", meta.key.clone()),
-                    ("tenant", tenant.to_hex()),
-                ])
-            );
+            batch.assert_delete(&judged);
             store.delete(&meta.key).await?;
         }
         reaped += 1;
@@ -1876,6 +1855,15 @@ async fn sweep_superseded_impl(
     // below. Only that assertion fills or reads it, so where assertions
     // compile out it stays empty and never allocates.
     let _head_names_group: RefCell<HashMap<usize, bool>> = RefCell::default();
+    // Each cleared chain group is one delete batch (#4501): before its first
+    // delete it re-reads the hold set and checks every key of the group
+    // against that read. A group a hold now covers, or whose re-read failed,
+    // deletes nothing and stops, so it is reported held below.
+    let mut batches: Vec<DeleteBatch> = cleared
+        .iter()
+        .map(|_| DeleteBatch::new(lease, tenant, "superseded chain group"))
+        .collect();
+    let mut admitted: Vec<bool> = vec![false; cleared.len()];
     for delete_loop in [
         DeleteLoop::InputRecords,
         DeleteLoop::Data,
@@ -1890,7 +1878,39 @@ async fn sweep_superseded_impl(
                 if deleted.contains(k.as_str()) {
                     continue;
                 }
+                if !admitted[index] {
+                    let group_keys: Vec<&str> = group.keys().map(String::as_str).collect();
+                    match batches[index].admit(store, &group_keys).await {
+                        Admit::Delete => admitted[index] = true,
+                        Admit::Held => {
+                            let protected = group_keys
+                                .iter()
+                                .find(|k| batches[index].is_held(k))
+                                .copied()
+                                .unwrap_or_default();
+                            tracing::warn!(
+                                tenant_hash = %tenant.to_hex(),
+                                signal = signal.key_prefix(),
+                                shard,
+                                ingest_hour_bucket = group.ingest_hour_bucket,
+                                protected_key = %protected,
+                                group_objects = group.object_count(),
+                                "superseded-input sweep: a legal hold read before this chain's \
+                                 first delete protects a key in it, so the whole chain is \
+                                 skipped this pass"
+                            );
+                            outcome.chain_groups_held_by_legal_hold += 1;
+                            stopped[index] = true;
+                            break;
+                        }
+                        Admit::ReadFailed => {
+                            stopped[index] = true;
+                            break;
+                        }
+                    }
+                }
                 if !config.dry_run {
+                    batches[index].assert_delete(&[k.as_str()]);
                     // The HEAD as it stands at the group's first delete, read
                     // afresh, not the one the gate above planned from. A HEAD
                     // that cannot be read then proves nothing either way.
@@ -3419,6 +3439,8 @@ async fn sweep_unreferenced_parts_impl(
     let objects = list_l1_scoped(store, tenant, signal, shard, hours).await?;
     let mut deleted = 0usize;
     let mut deleted_bytes = 0u64;
+    // The pass's part deletes are one delete batch (#4501).
+    let mut batch = DeleteBatch::new(lease, tenant, "unreferenced part sweep");
     for meta in objects {
         let parsed = keys::parse_l1_part_key(&meta.key)?;
         let bucket = parsed.ingest_hour_bucket;
@@ -3443,7 +3465,13 @@ async fn sweep_unreferenced_parts_impl(
         if classify_part(&meta.key, bucket, &fresh_ref, &fresh_tomb) != Some(branch) {
             continue;
         }
+        match batch.admit(store, &[meta.key.as_str()]).await {
+            Admit::Delete => {}
+            Admit::Held => continue,
+            Admit::ReadFailed => break,
+        }
         if !config.dry_run {
+            batch.assert_delete(&[meta.key.as_str()]);
             store.delete(&meta.key).await?;
         }
         deleted += 1;
@@ -3591,6 +3619,8 @@ pub async fn sweep_idempotency_markers(
     let mut deleted = 0usize;
     let mut kept = 0usize;
     let mut skipped_malformed = 0usize;
+    // The pass's marker deletes are one delete batch (#4501).
+    let mut batch = DeleteBatch::new(lease, tenant, "idempotency marker sweep");
     for meta in objects {
         let Some(hour) = parse_marker_hour(&meta.key, &prefix) else {
             tracing::warn!(
@@ -3609,7 +3639,12 @@ pub async fn sweep_idempotency_markers(
             kept += 1;
             continue;
         }
+        if batch.admit(store, &[meta.key.as_str()]).await != Admit::Delete {
+            kept += 1;
+            continue;
+        }
         if !config.dry_run {
+            batch.assert_delete(&[meta.key.as_str()]);
             store.delete(&meta.key).await?;
         }
         deleted += 1;
@@ -3930,8 +3965,15 @@ pub async fn sweep_unreferenced_catalog_objects(
         kept,
         ..CatalogSweepOutcome::default()
     };
+    // The pass's catalog object deletes are one delete batch (#4501).
+    let mut batch = DeleteBatch::new(lease, tenant, "catalog object sweep");
     for meta in &candidates {
+        if batch.admit(store, &[meta.key.as_str()]).await != Admit::Delete {
+            outcome.kept += 1;
+            continue;
+        }
         if !config.dry_run {
+            batch.assert_delete(&[meta.key.as_str()]);
             // Judged from the bytes of the HEAD reads the pass decided from,
             // decoded here, not from the reference set built from them. A
             // HEAD corrupted after those reads does not bear on this delete.
@@ -4222,6 +4264,9 @@ pub async fn sweep_erasure_requests(
 
     let mut deleted = 0usize;
     let mut held_by_superseded_inputs = 0usize;
+    // The pass's `.dreq` deletes are one delete batch (#4501). The rule 2
+    // observation above is planning and keeps the pass snapshot.
+    let mut batch = DeleteBatch::new(lease, tenant, "erasure request sweep");
     for (request_id, dreq_key) in candidates {
         // The horizon has elapsed, but rule 2 may have held an object one of
         // this request's rewrites superseded: an input the live HEAD still
@@ -4252,7 +4297,12 @@ pub async fn sweep_erasure_requests(
             held_by_superseded_inputs += 1;
             continue;
         }
+        if batch.admit(store, &[dreq_key.as_str()]).await != Admit::Delete {
+            kept += 1;
+            continue;
+        }
         if !config.dry_run {
+            batch.assert_delete(&[dreq_key.as_str()]);
             store.delete(dreq_key).await?;
         }
         deleted += 1;
@@ -4776,42 +4826,130 @@ mod tests {
         );
     }
 
-    /// The pass's hold snapshot is taken before a hold is written, and the
-    /// pass then deletes the key the new hold covers: the property evaluates
-    /// false. This pins the gap between the model, which checks the hold at
-    /// the delete's own step, and the once-per-pass hold snapshot the sweep
-    /// honours (see the `legal_hold` module docs).
+    /// The pass's hold snapshot, empty, then a hold over `scope` written after
+    /// it: the state a delete batch meets when a hold lands mid-pass.
+    async fn snapshot_then_hold(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        scope: &str,
+    ) -> crate::legal_hold::LegalHoldCheck {
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(store, tenant)
+            .await
+            .expect("refresh");
+        assert!(snapshot.is_empty(), "the snapshot predates the hold");
+        crate::legal_hold::write_hold_set(
+            store,
+            tenant,
+            Uuid::from_u128(0x4501),
+            1,
+            scope,
+            "mid-pass",
+        )
+        .await
+        .expect("place hold after the snapshot");
+        snapshot
+    }
+
+    /// The pass's hold snapshot is taken before a hold is written: the orphan
+    /// move batch re-reads the hold set before its first move, sees the hold,
+    /// and moves nothing. Under capture, `HeldObjectNeverDeleted` is never
+    /// evaluated, because nothing is deleted. Control: the same pass with no
+    /// hold moves both orphans.
     #[tokio::test]
-    async fn a_hold_placed_after_the_snapshot_trips_held_object_never_deleted() {
-        if !crate::publish::tests::capturing() {
-            return;
-        }
+    async fn a_hold_placed_after_the_snapshot_stops_the_orphan_move_batch() {
         let tenant = TenantHash([0x5c; 16]);
         let signal = Signal::Metrics;
         let shard = 4;
-        let store = MemoryStore::new();
-        put_orphan(&store, &tenant, signal, shard, 0).await;
-        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
-            .await
-            .expect("refresh");
-        let scope = l0_data_prefix(&tenant, signal, shard).unwrap();
-        crate::legal_hold::write_hold_set(&store, &tenant, Uuid::from_u128(1), 0, &scope, "legal")
-            .await
-            .expect("place hold after the snapshot");
-
         let config = CompactorConfig::default();
         let clock = aged_clock(&config);
+        let scope = l0_data_prefix(&tenant, signal, shard).unwrap();
+
+        // The control runs as another tenant, so its deletes' evaluations are
+        // not counted below.
+        let control_tenant = TenantHash([0x63; 16]);
+        let control = MemoryStore::new();
+        for seq in 0..2u64 {
+            put_orphan(&control, &control_tenant, signal, shard, seq).await;
+        }
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&control, &control_tenant)
+            .await
+            .expect("refresh");
+        let outcome = sweep_orphans(
+            &control,
+            &clock,
+            &config,
+            &snapshot,
+            &control_tenant,
+            signal,
+            shard,
+        )
+        .await
+        .expect("control sweep");
+        assert_eq!((outcome.deleted, outcome.refused), (2, 0));
+
+        let store = MemoryStore::new();
+        for seq in 0..2u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let snapshot = snapshot_then_hold(&store, &tenant, &scope).await;
         let outcome = sweep_orphans(&store, &clock, &config, &snapshot, &tenant, signal, shard)
             .await
             .expect("sweep");
-        assert_eq!(outcome.deleted, 1, "the snapshot allows the delete");
-
-        let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &tenant.to_hex());
-        assert_eq!(found.len(), 1, "one evaluation at the delete: {found:?}");
-        assert!(
-            !found[0].0,
-            "a hold placed after the snapshot makes the property false: {found:?}"
+        assert_eq!(
+            (outcome.deleted, outcome.refused),
+            (0, 0),
+            "the batch's re-read sees the hold"
         );
+        assert_eq!(list_all(&store, &scope).await.unwrap().len(), 2);
+        assert!(
+            list_all(&store, QUARANTINE_PREFIX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing was copied to quarantine either"
+        );
+        if crate::publish::tests::capturing() {
+            let found = crate::publish::tests::evaluations(HELD_NEVER_DELETED, &tenant.to_hex());
+            assert!(
+                found.is_empty(),
+                "nothing deleted, nothing evaluated: {found:?}"
+            );
+        }
+    }
+
+    /// Two orphan passes of one tick share the tick's snapshot. The first
+    /// moves its orphan; a hold over the second shard is then written; the
+    /// second pass's own re-read honors it. A source that re-read once per
+    /// tick would move the second orphan.
+    #[tokio::test]
+    async fn a_hold_written_between_two_orphan_passes_stops_the_second() {
+        let tenant = TenantHash([0x5f; 16]);
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        put_orphan(&store, &tenant, signal, 9, 0).await;
+        put_orphan(&store, &tenant, signal, 10, 1).await;
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
+            .await
+            .expect("refresh");
+
+        let first = sweep_orphans(&store, &clock, &config, &snapshot, &tenant, signal, 9)
+            .await
+            .expect("first pass");
+        assert_eq!(first.deleted, 1);
+        let scope = l0_data_prefix(&tenant, signal, 10).unwrap();
+        crate::legal_hold::write_hold_set(&store, &tenant, Uuid::from_u128(7), 1, &scope, "")
+            .await
+            .expect("hold");
+        let second = sweep_orphans(&store, &clock, &config, &snapshot, &tenant, signal, 10)
+            .await
+            .expect("second pass");
+        assert_eq!(
+            second.deleted, 0,
+            "the second batch re-reads and sees the hold"
+        );
+        assert_eq!(list_all(&store, &scope).await.unwrap().len(), 1);
     }
 
     /// Seed one quarantine copy of data object `seq` of `shard`, quarantined
@@ -4886,6 +5024,177 @@ mod tests {
         assert!(
             held.is_empty(),
             "the held copy is never evaluated: {held:?}"
+        );
+    }
+
+    /// A hold over the original keys written after the pass's snapshot stops
+    /// the purge batch: both copies are retained.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_stops_the_quarantine_purge_batch() {
+        let tenant = TenantHash([0x60; 16]);
+        let store = MemoryStore::new();
+        let copies = [
+            put_quarantined(&store, &tenant, 11, 0).await,
+            put_quarantined(&store, &tenant, 11, 1).await,
+        ];
+        let scope = l0_data_prefix(&tenant, Signal::Metrics, 11).unwrap();
+        let snapshot = snapshot_then_hold(&store, &tenant, &scope).await;
+        let config = CompactorConfig::default();
+        let clock = past_quarantine_horizon(&config);
+
+        let outcome = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            11,
+        )
+        .await
+        .expect("purge");
+        assert_eq!((outcome.reaped, outcome.retained), (0, 2));
+        for copy in &copies {
+            assert!(store.head(copy).await.is_ok(), "{copy} stays");
+        }
+
+        // Control: the same copies under a store with no hold are purged.
+        let control = MemoryStore::new();
+        put_quarantined(&control, &tenant, 11, 0).await;
+        put_quarantined(&control, &tenant, 11, 1).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&control, &tenant)
+            .await
+            .expect("refresh");
+        let outcome = sweep_quarantine(
+            &control,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            11,
+        )
+        .await
+        .expect("control purge");
+        assert_eq!((outcome.reaped, outcome.retained), (2, 0));
+    }
+
+    /// A purge batch whose hold re-read fails purges nothing and is counted
+    /// once; the next shard's purge batch, with a healthy re-read, purges.
+    #[tokio::test]
+    async fn a_failed_re_read_purges_nothing_and_the_next_purge_proceeds() {
+        let tenant = TenantHash([0x61; 16]);
+        let hold_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Audit, crate::legal_hold::AUDIT_HOLD_SHARD)
+                .unwrap();
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Transient("hold shard down".into()))
+                    .with_key_contains(hold_prefix)
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+        let failed_copy = put_quarantined(store.inner(), &tenant, 12, 0).await;
+        let healthy_copy = put_quarantined(store.inner(), &tenant, 13, 0).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(store.inner(), &tenant)
+            .await
+            .expect("the tick's refresh");
+        let source = std::sync::Arc::clone(snapshot.source().expect("bound"));
+        let config = CompactorConfig::default();
+        let clock = past_quarantine_horizon(&config);
+
+        let failed = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            12,
+        )
+        .await
+        .expect("a failed re-read is not a pass error");
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Transient),
+            1,
+            "the purge batch's re-read faulted"
+        );
+        assert_eq!((failed.reaped, failed.retained), (0, 1));
+        assert_eq!(source.reread_failures(), 1);
+        assert!(store.inner().head(&failed_copy).await.is_ok());
+
+        let healthy = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            13,
+        )
+        .await
+        .expect("purge");
+        assert_eq!((healthy.reaped, healthy.retained), (1, 0));
+        assert_eq!(
+            source.reread_failures(),
+            1,
+            "a healthy batch counts nothing"
+        );
+        assert!(store.inner().head(&healthy_copy).await.is_err());
+    }
+
+    /// RefreshFailureNeverSweeps per batch, mutant arm: with
+    /// `lifecycle/refresh-failure-is-no-hold` selected a purge batch whose
+    /// re-read failed proceeds as if nothing were held, purges, and the
+    /// property evaluates false at the purge. The shipped arm is
+    /// `a_failed_re_read_purges_nothing_and_the_next_purge_proceeds`.
+    #[tokio::test]
+    async fn refresh_failure_is_no_hold_mutant_purges_under_a_failed_batch_re_read() {
+        let Some(_mutant) =
+            crate::publish::tests::scoped_mutant("lifecycle/refresh-failure-is-no-hold")
+        else {
+            return;
+        };
+        let tenant = TenantHash([0x62; 16]);
+        let hold_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Audit, crate::legal_hold::AUDIT_HOLD_SHARD)
+                .unwrap();
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Transient("hold shard down".into()))
+                    .with_key_contains(hold_prefix),
+            ),
+        );
+        let copy = put_quarantined(store.inner(), &tenant, 14, 0).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(store.inner(), &tenant)
+            .await
+            .expect("the tick's refresh");
+        let config = CompactorConfig::default();
+        let clock = past_quarantine_horizon(&config);
+
+        let outcome = sweep_quarantine(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+            14,
+        )
+        .await
+        .expect("purge");
+        assert!(store.fault_count(Op::List, FaultKind::Transient) >= 1);
+        assert_eq!(
+            outcome.reaped, 1,
+            "the mutant purges under the failed re-read"
+        );
+        let found =
+            crate::publish::tests::evaluations("gc: a failed hold refresh sweeps nothing", &copy);
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "RefreshFailureNeverSweeps must evaluate false under the mutant: {found:?}"
         );
     }
 
@@ -7239,6 +7548,122 @@ mod tests {
             present(&store, &held).await,
             "a held object must never be swept"
         );
+    }
+
+    /// A hold over the catalog prefix written after the pass's snapshot stops
+    /// the catalog object batch: the old unreferenced part is kept. Control:
+    /// with no hold the same part is deleted.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_stops_the_catalog_object_batch() {
+        async fn seeded(store: &MemoryStore, tenant: &TenantHash) -> String {
+            let signal = Signal::Metrics;
+            let referenced = format!(
+                "{}20260101T00.aaaa.csnap",
+                catalog_snap_prefix(tenant, signal)
+            );
+            let unreferenced = format!(
+                "{}20251231T00.cccc.csnap",
+                catalog_snap_prefix(tenant, signal)
+            );
+            put_catalog_object(store, &referenced).await;
+            put_catalog_object(store, &unreferenced).await;
+            put_head(
+                store,
+                tenant,
+                signal,
+                vec![part_ref(&referenced, [1u8; 32])],
+                None,
+            )
+            .await;
+            unreferenced
+        }
+        let tenant = tenant();
+        let config = CompactorConfig::default();
+        let clock = FixedClock::new(config.protection_horizon_ns.saturating_mul(2));
+
+        let control = MemoryStore::new();
+        seeded(&control, &tenant).await;
+        let snapshot = crate::legal_hold::LegalHoldCheck::refresh(&control, &tenant)
+            .await
+            .expect("refresh");
+        let outcome = sweep_unreferenced_catalog_objects(
+            &control,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+        )
+        .await
+        .expect("control sweep");
+        assert_eq!((outcome.deleted, outcome.kept), (1, 1));
+
+        let store = MemoryStore::new();
+        let unreferenced = seeded(&store, &tenant).await;
+        let snapshot =
+            snapshot_then_hold(&store, &tenant, &format!("t/{}/catalog/", tenant.to_hex())).await;
+        let outcome = sweep_unreferenced_catalog_objects(
+            &store,
+            &clock,
+            &config,
+            &snapshot,
+            &tenant,
+            Signal::Metrics,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!((outcome.deleted, outcome.kept), (0, 2));
+        assert!(present(&store, &unreferenced).await);
+    }
+
+    /// A hold over the idempotency-marker prefix written after the pass's
+    /// snapshot stops the marker batch. Control: with no hold the marker past
+    /// its window is deleted.
+    #[tokio::test]
+    async fn a_hold_placed_after_the_snapshot_stops_the_idempotency_marker_batch() {
+        let tenant_id = TenantId::new("acme-4501");
+        let tenant = tenant_id.hash();
+        let signal = Signal::Logs;
+        let now_hour = 10_000u32;
+        let config = CompactorConfig {
+            idem_dedup_window_hours: 24,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(i64::from(now_hour) * NS_PER_HOUR);
+        let old_hour = now_hour - 200;
+
+        for hold in [false, true] {
+            let store = MemoryStore::new();
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                b"old-key",
+                old_hour,
+                &idem_receipt(1),
+            )
+            .await
+            .expect("seed marker");
+            let snapshot = if hold {
+                snapshot_then_hold(&store, &tenant, &idem_prefix(&tenant, signal)).await
+            } else {
+                crate::legal_hold::LegalHoldCheck::refresh(&store, &tenant)
+                    .await
+                    .expect("refresh")
+            };
+            let outcome =
+                sweep_idempotency_markers(&store, &clock, &config, &snapshot, &tenant, signal)
+                    .await
+                    .expect("sweep");
+            let key = marker_key(&tenant_id, signal, b"old-key", old_hour);
+            if hold {
+                assert_eq!((outcome.deleted, outcome.kept), (0, 1));
+                assert!(present(&store, &key).await);
+            } else {
+                assert_eq!((outcome.deleted, outcome.kept), (1, 0));
+                assert!(!present(&store, &key).await);
+            }
+        }
     }
 
     /// Under `dry_run`, the sweep counts what it would delete but calls
