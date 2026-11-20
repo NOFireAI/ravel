@@ -96,6 +96,15 @@ while :; do
     if [ "$stopping" = 1 ]; then
         exit 143
     fi
+    # The fault-switch profile: ravel-server reads RAVEL_ANTITHESIS_FAULTS
+    # once at startup, so the driver turns the switches off for the
+    # eventually by writing faults-off and asking for a drain; every start
+    # after that, including one after a container restart, runs without them.
+    if [ -n "${RAVEL_ANTITHESIS_FAULTS:-}" ] && [ -e "$CONTROL/faults-off" ]; then
+        echo "supervise: $CONTROL/faults-off exists, starting without RAVEL_ANTITHESIS_FAULTS"
+        unset RAVEL_ANTITHESIS_FAULTS
+    fi
+    echo "supervise: RAVEL_ANTITHESIS_FAULTS='${RAVEL_ANTITHESIS_FAULTS:-}'"
     /usr/local/bin/ravel-server "$@" &
     child=$!
     echo "supervise: started ravel-server, pid $child"

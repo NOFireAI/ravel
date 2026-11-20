@@ -232,6 +232,40 @@ CONFIG=config-coverage antithesis/ingest-durability/scripts/launch.sh <max-compu
 run, for example to name image tags other than `:ingest-durability` on a
 build host that other work shares.
 
+## Fault-switch variant
+
+`config-faults/` is the coverage variant with Ravel's own Antithesis-only
+fault switches on in both servers (ADR-4326, fault-switch amendment; #4496):
+`RAVEL_ANTITHESIS_FAULTS=ingest/encode-cancelled=0.05,ingest/data-put-refused=0.05`.
+A cancelled encode makes a shard answer ShardUnavailable for that flush, and
+a refused data PUT abandons it, so a write that spans shards can commit on
+some and fail on others. These are the outcomes the 10 s strict-ack deadline
+otherwise hides from store faults (the "phase-b" lines of
+`local/coverage-required.tsv`). The driver's model already treats such
+answers as "may or may not be stored".
+
+Each server reads `RAVEL_ANTITHESIS_FAULTS` once at startup, and
+`ANTITHESIS_STOP_FAULTS` does not reach it. So once faults stop, the
+eventually writes `/control/faults-off`, asks each node's supervisor for a
+drain and waits for each to restart: the supervisor starts every child after
+that file appears without `RAVEL_ANTITHESIS_FAULTS`, including after a
+container restart. The driver asserts "every node restarted with its fault
+switches off before the eventually's checks", and every recovery check runs
+after it.
+
+`local/faults-required.tsv` gates the local loop: both switches must fire,
+the switch-off restart must succeed, and a strict partial success must be
+seen. The shard-level reachables are listed and reported, not gated.
+
+```sh
+CONFIG=config-faults WORKLOAD_EVENTUALLY_AFTER_SECS=600 \
+    antithesis/ingest-durability/scripts/local-run.sh out/faults1 900
+CONFIG=config-faults antithesis/ingest-durability/scripts/launch.sh <max-compute-hours> "<description>"
+```
+
+For a deterministic check of one switch, layer an override that sets its
+rate to 1 and the other to 0 with `LOCAL_COMPOSE_OVERRIDE`.
+
 ## Patterns
 
 None adopted. Ravel has no stateful client library, so the stateful-clients
@@ -386,8 +420,10 @@ The harness expects these fault flags (`scripts/launch.sh`):
 ```
 
 Driver environment for the local loop: `WORKLOAD_EVENTUALLY=off` turns the
-eventually off, `WORKLOAD_EVENTUALLY_AFTER_SECS=N` runs it after N seconds,
-and `WORKLOAD_MAX_WRITES` caps the writes per timeline (the compose file sets 2500; the eventually is proven at about 2400 writes).
+eventually off, `WORKLOAD_EVENTUALLY_AFTER_SECS=N` runs it after N seconds
+(inside the next rule, so no rule returns once it starts and the Hegel engine
+cannot spin empty rounds, #4502; if no rule takes the request within 600 s the
+timer thread runs it), and `WORKLOAD_MAX_WRITES` caps the writes per timeline (the compose file sets 2500; the eventually is proven at about 2400 writes).
 `WORKLOAD_INJECT_MISSING_RECORD=1` is a self-check: the model then expects one
 record more than is sent for each log write whose id is 3 modulo 50 (about one
 log write in 50; ids are shared with metrics writes, so about one write of any
