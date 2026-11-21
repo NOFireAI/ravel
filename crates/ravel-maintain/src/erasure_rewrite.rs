@@ -566,8 +566,10 @@ async fn resolve_live_record(
 /// by the same supersession rules a snapshot resolve applies, through the
 /// catalog's shared functions: every record a rewrite supersedes, following
 /// its chain through rewrite records and version 2 compaction records
-/// ([`ravel_catalog::resolve_rewrite_supersession`]); every version 2 record a
-/// rewrite dominates ([`ravel_catalog::erasure_dominated_compaction_records`]);
+/// ([`ravel_catalog::resolve_rewrite_supersession`]); every compaction record
+/// a live rewrite dominates, a version 1 record whose inputs one live rewrite
+/// covers or a version 2 record on a superseded or dominated predecessor
+/// ([`ravel_catalog::erasure_dominated_compaction_records`]);
 /// and every record a present version 2 record supersedes
 /// ([`ravel_catalog::select_authoritative_compaction_records`]). A cycle, an
 /// over-deep chain, or a version 2 record whose inputs differ from its
@@ -8709,6 +8711,67 @@ mod tests {
         match select_live_record(decoded, "prefix/") {
             Err(MaintainError::MultipleLiveRecords { live_keys, .. }) => {
                 assert_eq!(live_keys.len(), 2, "{live_keys:?}");
+            }
+            other => panic!("expected MultipleLiveRecords, got {other:?}"),
+        }
+    }
+
+    /// A raw L0 rewrite over inputs `seqs`, naming no record.
+    fn raw_rewrite_over(seqs: &[u64]) -> RewriteRecord {
+        RewriteRecord {
+            inputs: seqs.iter().copied().map(live_input).collect(),
+            superseded_record_key: String::new(),
+            ..rewrite_over("unused")
+        }
+    }
+
+    /// A version 1 record that published beside a raw L0 rewrite over the same
+    /// inputs (#4449) is dominated, so the rewrite is the one live record and
+    /// a later erasure pass proceeds from it. Flipped line:
+    /// `superseded.extend(dominated ...)` in `select_live_record`; without it
+    /// the version 1 record is live beside the rewrite and the answer is
+    /// `MultipleLiveRecords`.
+    #[test]
+    fn a_version_1_record_a_rewrite_covers_is_not_live() {
+        let decoded = vec![
+            (
+                "c1".to_string(),
+                LiveRecordBody::Compaction(version_1_record(vec![live_input(1), live_input(2)])),
+            ),
+            (
+                "rw".to_string(),
+                LiveRecordBody::Rewrite(raw_rewrite_over(&[1, 2])),
+            ),
+        ];
+        match select_live_record(decoded, "prefix/") {
+            Ok(LiveRecord::Existing { key, .. }) => assert_eq!(key, "rw"),
+            other => panic!("expected the rewrite as the live record, got {other:?}"),
+        }
+    }
+
+    /// Two version 1 records beside a rewrite that covers neither stay
+    /// `MultipleLiveRecords`, with the rewrite among the live keys: one record
+    /// shares an input with the rewrite and the other shares none.
+    #[test]
+    fn uncovered_version_1_records_are_still_multiple_live_records() {
+        let decoded = vec![
+            (
+                "c1".to_string(),
+                LiveRecordBody::Compaction(version_1_record(vec![live_input(1), live_input(2)])),
+            ),
+            (
+                "c3".to_string(),
+                LiveRecordBody::Compaction(version_1_record(vec![live_input(3)])),
+            ),
+            (
+                "rw".to_string(),
+                LiveRecordBody::Rewrite(raw_rewrite_over(&[1])),
+            ),
+        ];
+        match select_live_record(decoded, "prefix/") {
+            Err(MaintainError::MultipleLiveRecords { mut live_keys, .. }) => {
+                live_keys.sort();
+                assert_eq!(live_keys, vec!["c1", "c3", "rw"]);
             }
             other => panic!("expected MultipleLiveRecords, got {other:?}"),
         }
