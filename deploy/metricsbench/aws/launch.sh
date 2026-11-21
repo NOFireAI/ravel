@@ -23,7 +23,9 @@
 # integer, with l1 in MB_STAGE1_ARMS; the measured run only), MB_RAVEL_ONLY (1
 # runs the measured profile as run.sh --ravel-only: history or ci, with
 # MB_STAGE1=1 MB_STAGE1_ARMS=l1 and MB_OBJECTS_BAND, without MB_RSS_BAND or
-# MB_CONTROL_IMAGE, on either lane; the ci smoke stays a full run).
+# MB_CONTROL_IMAGE, on either lane; the ci smoke stays a full run),
+# MB_SERIES_INDEX (1 puts the metrics series index on in the measured run's
+# Stage 1 passes, as run.sh's MB_SERIES_INDEX; needs MB_STAGE1=1).
 # MB_STAGE1=1 on history needs MB_RAVEL_ONLY=1. AWS_PROFILE and AWS_REGION
 # select the account and region as for any aws CLI call.
 set -euo pipefail
@@ -120,6 +122,14 @@ if [ -n "$l1_max_part_bytes" ]; then
   [[ "$l1_max_part_bytes" =~ ^[1-9][0-9]*$ ]] ||
     { echo "MB_L1_MAX_PART_BYTES must be a positive integer, not '$l1_max_part_bytes'" >&2; exit 64; }
 fi
+# run.sh refuses the same, but only after the box has built the harness and
+# run the ci smoke.
+series_index=${MB_SERIES_INDEX:-}
+case "$series_index" in
+  ''|0) series_index="" ;;
+  1) [ -n "$stage1" ] || { echo "MB_SERIES_INDEX=1 puts the series index on in the Stage 1 passes and needs MB_STAGE1=1" >&2; exit 64; } ;;
+  *) echo "MB_SERIES_INDEX must be 1, 0 or unset, not '$series_index'" >&2; exit 64;;
+esac
 rss_band=${MB_RSS_BAND:-prometheus:2147483648:6442450944}
 [ -z "$ravel_only" ] || rss_band=""
 objects_band=${MB_OBJECTS_BAND:-14000:16500}
@@ -164,9 +174,9 @@ boxrun_sha256=$(shasum -a 256 "$boxrun" | cut -d' ' -f1)
 aws s3 cp --only-show-errors "$work/src.tar.gz" "s3://${MB_RESULTS_BUCKET}/${prefix}/src.tar.gz"
 aws s3 cp --only-show-errors "$boxrun" "s3://${MB_RESULTS_BUCKET}/${prefix}/box-run.sh"
 
-# Each value is shell-quoted: /mb/env is sourced on the box. RAVEL_ONLY and
-# L1_MAX_PART_BYTES are written only when set, so a launch without them renders
-# the same user data as before they existed.
+# Each value is shell-quoted: /mb/env is sourced on the box. RAVEL_ONLY,
+# L1_MAX_PART_BYTES and SERIES_INDEX are written only when set, so a launch
+# without them renders the same user data as before they existed.
 env_kvs=("BUCKET=${MB_RESULTS_BUCKET}" "PREFIX=${prefix}" "SRC_SHA256=${src_sha256}" \
   "BOXRUN_SHA256=${boxrun_sha256}" "HARNESS_COMMIT=${harness_sha}" "RAVEL_IMAGE=${ravel_image}" \
   "RAVEL_SOURCE_COMMIT=${ravel_source_commit}" "ANCHOR_MS=${anchor_ms}" "PROFILE=${profile}" \
@@ -176,6 +186,7 @@ env_kvs=("BUCKET=${MB_RESULTS_BUCKET}" "PREFIX=${prefix}" "SRC_SHA256=${src_sha2
   "AWS_DEFAULT_REGION=${region}")
 [ -z "$ravel_only" ] || env_kvs+=("RAVEL_ONLY=${ravel_only}")
 [ -z "$l1_max_part_bytes" ] || env_kvs+=("L1_MAX_PART_BYTES=${l1_max_part_bytes}")
+[ -z "$series_index" ] || env_kvs+=("SERIES_INDEX=${series_index}")
 env_block=$(
   for kv in "${env_kvs[@]}"; do
     printf '%s=%q\n' "${kv%%=*}" "${kv#*=}"

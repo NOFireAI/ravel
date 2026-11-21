@@ -15,7 +15,8 @@
 # measured run alone as MB_L1_MAX_PART_BYTES, and RAVEL_ONLY=1 runs it with
 # --ravel-only and no --rss-band, on the same lane and store flags as a full
 # run (with REAL_S3_PREFIX, on PREFIX-ravel alone); the ci smoke stays a full
-# four-engine run.
+# four-engine run. SERIES_INDEX=1 reaches the measured run alone as
+# MB_SERIES_INDEX: the ci smoke's band file describes the label-value route.
 # Exit codes beyond each step's own: 21 STAGE1=1 with no band file for the
 # measured profile (before anything is built), 22 the ci smoke's band check
 # failed, 23 the measured run exited 0 and its band check failed.
@@ -61,6 +62,7 @@ measured_run() {
   [ "${RAVEL_ONLY:-}" != 1 ] || shape=(--ravel-only)
   MB_STAGE1_ARMS="${STAGE1_ARMS:-}" MB_CONTROL_IMAGE="${CONTROL_IMAGE:-}" \
     MB_CONTROL_SOURCE_COMMIT="${CONTROL_SOURCE_COMMIT:-}" MB_L1_MAX_PART_BYTES="${L1_MAX_PART_BYTES:-}" \
+    MB_SERIES_INDEX="${SERIES_INDEX:-}" \
     deploy/metricsbench/run.sh --profile "$PROFILE" --ravel-image "$RAVEL_IMAGE" --ravel-source-commit "$RAVEL_SOURCE_COMMIT" \
     --bin-dir target/release --out-dir /mb/out-run --anchor-ms "$ANCHOR_MS" \
     "${shape[@]}" --ravel-objects-band "$OBJECTS_BAND" "$@"
