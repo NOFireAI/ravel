@@ -131,6 +131,9 @@ fn sigterm_in_the_readiness_window_drains_and_exits_zero() {
     let marker_at = Instant::now();
     send_sigterm(pid);
     let signalled_after = marker_at.elapsed();
+    // hygiene-allow: wall-clock -- the window under test is the seam's
+    // real-time sleep in the child process, which no injected clock reaches;
+    // a SIGTERM sent after it closes would pass on either order.
     assert!(
         signalled_after < WINDOW_SLEEP,
         "the SIGTERM landed {signalled_after:?} after the window marker, after the \
