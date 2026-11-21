@@ -350,8 +350,13 @@ version is a ceiling for the fold, not the version it writes: it must be a
 version this build reads (`ravel_catalog::fold_read_versions`) at or above
 the highest version the fold writes for the family
 (`ravel_catalog::fold_write_version`; for `kidx` that is 2 for every
-signal), and otherwise the cycle is refused before anything is read or
-written. The fold passes no bucket, so a blind view does not stop it. With
+signal, except that a metrics fold with the key-index leaf build, the
+`label_value` leaf and the series index (ADR-4146) all on writes its
+series-index leaves at 3, so the gate checks 3 for it), and otherwise the
+cycle is refused before anything is read or written. That refusal of a
+series-index fold on a store with `kidx` active at 2 repeats every cycle;
+its message names `--fold-metrics-series-index` and says to drop the flag
+to resume metrics folding, since no activation raises `kidx` to 3 yet. The fold passes no bucket, so a blind view does not stop it. With
 no policy the fold writes what it always has. A server first touch reads
 the bucket's provisioning record. A record that exists is validated and
 adopted whatever the view's freshness. A touch that would create the record,
