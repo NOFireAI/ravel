@@ -304,7 +304,255 @@ remove.
 
 ## 3. The fence options
 
-<!-- section 3 -->
+### 3.0 The measure all of (a) and (b) share
+
+"Past the seal" has to be decided without a writer clock, and identically by
+every process that asks. One measure does both:
+
+> A commit record in hour `H` is **late** when the store's `last_modified`
+> for it is at or after the cutoff
+> `C(H) = end(H) + max_flush_lifetime + clock_skew_allowance`.
+
+`C(H)` is a function of the hour in the record's key and of configuration
+(`crates/ravel-maintain/src/bucket.rs:36-40`,
+`crates/ravel-maintain/src/config.rs:2778-2781`). `last_modified` is
+assigned by the store and returned on every LIST entry and HEAD
+(`crates/ravel-object-store/src/lib.rs:204-212`). A commit record is
+create-only (`crates/ravel-commit/src/publish.rs:120`), so its stamp is set
+once. The verdict uses no reader clock and no writer clock, so two processes
+with different clocks reach the same verdict about the same record.
+
+What that does to store-versus-maintain skew: skew no longer changes the
+verdict. It changes only when a lister may trust that every on-time record
+is already visible. A lister whose clock runs ahead of the store can LIST
+before the store's clock has reached `C(H)`, and an on-time record can still
+arrive afterwards. That is closed by making the lister wait on the store's
+clock as well as its own, using the observation the S3 adapter already keeps
+from response `Date` headers: `observed_store_time_ns` "only under-reports",
+so a caller "may use it to bound how far *behind* the store its own clock
+is" (`crates/ravel-object-store/src/lib.rs:950-964`). `O >= C(H) + settle`
+therefore proves the store's clock has passed the cutoff.
+
+Limits of the measure, which every option built on it inherits:
+
+- `last_modified` "may have 1-second granularity"
+  (`docs/object-store-contract.md:409`). The cutoff is whole seconds at any
+  whole-second configuration; the implementation truncates `C(H)` to a whole
+  second so a second-granular and a millisecond-granular reading of one
+  record give the same verdict.
+- The stamp is when the store stamped the request, which is not when the
+  record became visible to a LIST. The gap is the store's own processing
+  time. Nothing on this checkout bounds it; `settle` (section 4.1) is the
+  allowance for it. **[external]**
+- A store whose objects are copied or restored by a tool that assigns new
+  timestamps makes every commit record of every sealed hour look late.
+  **[external]** for which tools do. This is the failure mode that decides
+  between (a) and (b).
+- The contract today restricts the field: "it exists for advisory age
+  decisions (GC age checks, claim expiry) only ... it may only cost
+  duplicated work, never correctness"
+  (`docs/object-store-contract.md:409-416`). An option is inside that
+  sentence only if a wrong stamp cannot make an answer wrong.
+
+### 3.1 Option (a): fold and reader side
+
+Rule: every resolution ignores (or quarantines) a late commit record.
+
+- **Reads that change:** all of them. The listing resolution
+  (`process_bucket`, `crates/ravel-catalog/src/catalog.rs:3728`), the fold's
+  classifier (`classify_bucket`, `crates/ravel-catalog/src/fold.rs:7882`),
+  both token paths (`crates/ravel-catalog/src/catalog.rs:4538`, `:4822`),
+  seal-divergence verification
+  (`crates/ravel-catalog/src/seal_divergence.rs:233`), the erasure
+  completion gate (`crates/ravel-maintain/src/erasure_rewrite.rs:3305-3321`),
+  migrate's raw-served set (`crates/ravel-maintain/src/migrate.rs:1716`) and
+  the sweep's referenced-L0 set (`crates/ravel-maintain/src/sweep.rs:924`),
+  which today is what keeps a late record's data object from being an
+  orphan (`crates/ravel-maintain/src/sweep.rs:758-766`).
+- **Can an acknowledged write be lost: yes.** A strict write acked outside
+  the clock contract (section 1.2) is token-readable today and would stop
+  being readable. A record that lands between the maintain seal and the fold
+  seal is folded and served today (section 2.1) and would be hidden. Once
+  the sweep stops counting the record as a reference, its data object is
+  quarantined after the orphan age gate
+  (`crates/ravel-maintain/src/config.rs:2783-2791`).
+- **Other failure modes:** a re-stamped store hides every L0 of every sealed
+  hour that has no compaction record. During a rolling upgrade an old reader
+  serves a late record and a new reader does not, so two replicas answer one
+  query differently. A wrong stamp makes an answer wrong, which is outside
+  the contract sentence above.
+- **Existing store:** a late L0 already present disappears from reads at
+  upgrade. An existing conflicting compaction record is not repaired: it
+  still names the late input and its parts still hold that input's rows.
+- **Needs:** a new ADR that reverses ADR-0018's "stays included"
+  (`docs/adrs/0018-l0-l1-compaction.md:185-189`) with an amendment marker
+  there, a change to the `last_modified` contract, and a compatibility gate
+  for the mixed-version window. No persistent format changes.
+- **Cost:** no extra requests on listing paths; the token path's single GET
+  must surface the stamp. Six or more resolution sites across three signals,
+  each with its own tests.
+
+Rejected for the tag. It becomes safe only after the writer stops
+acknowledging late records on store evidence (3.4) and every pre-change
+writer is known gone.
+
+### 3.2 Option (b): maintenance planning side
+
+Rule: compaction, migrate and the erasure rewrite plan only from on-time
+commit records. Two variants differ in what happens to the late ones.
+
+**(b1) Leave them.** A late L0 stays a raw L0, served exactly as today, kept
+by the sweep exactly as today.
+
+- **Reads that change:** none.
+- **Can an acknowledged write be lost: no.** Nothing is deleted, moved or
+  hidden. A late record is treated the way a late record that arrives after
+  a compaction record is treated today (section 2.2).
+- **Why it prevents the partial cover:** every planner evaluates the same
+  pure predicate over the same store facts, so every planner's input set for
+  a sealed bucket is the same set, the on-time records. A compaction that
+  publishes beside a rewrite then names exactly the rewrite's inputs, which
+  is the dominated case (`crates/ravel-catalog/src/catalog.rs:6134-6139`).
+  The third ingredient of section 2.3 is gone.
+- **Failure modes:** a wrong or unstable stamp returns the bucket to today's
+  behaviour for that record, no worse. A re-stamped store stops compaction,
+  migration and RawL0 erasure rewrites of sealed hours that have no record
+  yet; nothing is hidden and nothing is served twice; the late counter is
+  non-zero on every such bucket, and a configuration switch restores today's
+  planning. A late L0 that holds an erasure subject blocks that request's
+  completion, as a stray does today
+  (`crates/ravel-maintain/src/erasure_rewrite.rs:3333-3337`). A late L0
+  below a format floor is counted by the migrate walk as still served raw
+  (`crates/ravel-maintain/src/migrate.rs:2119-2127`) and holds the floor
+  down, as a stray does today.
+- **Existing store:** a late L0 already present is unchanged. An existing
+  conflicting record is unchanged; this prevents new ones and repairs none
+  (section 5.3).
+- **Needs:** no format change and no key change. A decision record
+  (ADR-4561, numbered by its issue per `docs/adrs/README.md:5-13`), because
+  the rule gives `last_modified` a use the contract's list does not name;
+  amendment pointers in ADR-0018 decision 1 and in ADR-1029's 2026-11-21
+  amendment (`docs/adrs/README.md:234-238`). It stays inside "never
+  correctness": a wrong stamp costs a deferred compaction or the old race,
+  not a wrong answer.
+- **Cost:** no extra request. The stamp is already in the LIST the planner
+  issues (`crates/ravel-maintain/src/read.rs:105-107`) and the store-clock
+  observation is an in-process read. A bucket becomes plannable `settle`
+  later than it seals.
+
+**(b2) Reclaim or quarantine them in the sweep.** Same planning rule, and
+the sweep also moves a late L0 out of the bucket.
+
+- **Can an acknowledged write be lost: yes**, for the same records as
+  option (a), since a quarantined record is gone from every read.
+- Rejected until 3.4 exists. It is the right end state, not a pre-tag step.
+
+### 3.3 Option (c): writer side, a commit PUT that cannot land late
+
+What the store offers:
+
+- **A condition on time: none.** The commit PUT is already conditional, on
+  the key not existing (`crates/ravel-commit/src/publish.rs:120`). The
+  adapter's conditional vocabulary is create-if-absent and CAS on version
+  (`docs/object-store-contract.md:250-252`); there is no "reject after
+  instant" precondition in it.
+- **Signature age.** S3 refuses a request whose signing time is too far
+  from its own clock, and the adapter surfaces that as
+  `StoreError::ClockSkewed` (`crates/ravel-object-store/src/lib.rs:712-718`).
+  That is a store-enforced bound on how late a signed request may *arrive*.
+  The window is 15 minutes **[external]**, which is wider than the 5-minute
+  gap between the writer's bound and the maintain seal and narrower than the
+  20-minute gap to the fold seal. It is not configurable and it does not
+  bound how long the store takes to apply a request it accepted.
+- **An expiring presigned request.** A presigned PUT carries an absolute
+  expiry the store checks on its own clock **[external]**. Setting it to
+  `end(H) + max_flush_lifetime` would make the store refuse the commit PUT
+  on arrival after the writer's own bound, independent of the writer's
+  clock. The adapter builds no presigned write today (no `presign` or
+  `signed_url` in `crates/ravel-object-store/src/s3.rs`), the create-if-absent
+  header and the checksum the commit PUT sends
+  (`crates/ravel-commit/src/publish.rs:119-120`) would have to ride on it,
+  and `MemoryStore` and any non-S3 backend would need an equivalent or the
+  bound is S3-only.
+
+- **Reads that change:** none. **Acknowledged write lost:** no; a refused
+  PUT is an abandon, which is already retryable.
+- **Failure modes:** bounds arrival, not application, so a residual remains
+  and (b) is still needed behind it. A second PUT path beside the adapter's
+  for the most durability-critical object in the system.
+- **Existing store:** no effect.
+- **Needs:** an object-store contract change and an ADR for the new request
+  path; no persistent format change.
+- **Cost:** no extra requests; a new signing path and its conformance tests.
+
+Not before the tag. Worth its own ticket as the store-side bound.
+
+### 3.4 Option (d1): the writer acknowledges on store evidence
+
+Rule: a flush acks `Ok` only when it holds store evidence that its commit
+record's stamp is before `C(H)`; otherwise it answers `Abandoned`.
+
+- Evidence without an extra request: the `Date` of the commit PUT's own
+  response is at or after the record's stamp. Today the adapter parses
+  response dates into one process-wide "latest wins" value
+  (`crates/ravel-object-store/src/lib.rs:950-956`), which is not per
+  request, and `put` returns only an etag and a version
+  (`crates/ravel-object-store/src/lib.rs:175-178`). The change is to return
+  the response date with the outcome. On the `AlreadyExists` branch the
+  writer already GETs the record
+  (`crates/ravel-commit/src/publish.rs:235-242`).
+- Sites: the three `Some(Ok(token))` arms
+  (`crates/ravel-ingest/src/shard.rs:1358-1366`,
+  `crates/ravel-ingest/src/log_shard.rs:1488-1496`,
+  `crates/ravel-ingest/src/span_shard.rs:728-736`).
+- **Acknowledged write lost:** no. It removes the strict cases of section
+  1.2 at the source: after it, strict `Ok` implies an on-time record. It
+  also closes the existing hole where a strict write is acked into an hour
+  the fold has sealed (`docs/consistency-model.md:606-617`).
+- It does not prevent the partial cover by itself: an unacknowledged late
+  record still lands and still enters a listing. It is what makes (b2) and
+  (a) safe later, for records written by processes that have it.
+- **Needs:** an object-store API addition (not a persistent format), a
+  consistency-model change, tests on all three shards. Touches the ack path.
+
+Not before the tag: it changes the acknowledgement path days before a
+release, and it is not needed for prevention.
+
+### 3.5 Option (d2): record the sealed set in the store
+
+Rule: the first planner to list a sealed bucket publishes, create-if-absent,
+a per-bucket seal object naming the input set it saw; every later planner
+plans from that object and treats any commit record it does not name as
+late.
+
+- No clock and no `last_modified` at all, so no re-stamp hazard and no
+  settle allowance.
+- **Reads that change:** none. **Acknowledged write lost:** no.
+- **Needs:** a new object and a new key. It cannot live in the bucket's own
+  prefix: an unknown key shape there is a hard error for every lister
+  (`crates/ravel-maintain/src/read.rs:174-176`), so an older binary would
+  fail on it. That makes it a key-layout change, which the invariants
+  require an ADR and a new prefix for. The owner declined an ADR for the
+  neighbouring store-side closure (one create-only key shared by the two
+  record kinds) on 2026-11-20
+  (`docs/adrs/1029-advisory-compaction-claims.md:1090-1092`).
+- **Failure mode:** a planner with a fast clock seals early and freezes a
+  short set; the on-time records it missed become permanent strays.
+- **Cost:** one PUT per sealed bucket and one GET per plan.
+
+Not before the tag: a persistent format addition with the full procedure.
+It is the fallback if `last_modified` proves unusable on a supported store.
+
+### 3.6 Side by side
+
+| | Reads change | Acked write can be lost | Prevents partial cover | Format or key change | Before the tag |
+|---|---|---|---|---|---|
+| (a) readers ignore late | all | yes | yes | no | no |
+| (b1) planners leave late out | none | no | yes | no | **yes** |
+| (b2) b1 plus sweep reclaim | all, via deletion | yes | yes | no | no |
+| (c) expiring commit PUT | none | no | narrows, does not close | no | no |
+| (d1) ack on store evidence | none | no | no | no | no |
+| (d2) seal object | none | no | yes | yes | no |
 
 ## 4. Decision
 
