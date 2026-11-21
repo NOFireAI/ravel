@@ -4453,16 +4453,17 @@ pub struct ErasureRequestSweepOutcome {
 ///   ([`SupersededHolds::conflict_truncated_buckets`]) keeps every candidate
 ///   the same way.
 /// - no late commit record may hold the subject: no bucket of the signal
-///   without a retention tombstone holds a commit record stamped at or after
-///   its late-commit cutoff ([`crate::read::is_late_stamp`]) whose event-time
-///   span the request's window may overlap
-///   ([`crate::erasure_rewrite::bucket_may_overlap`]; a request with no window
-///   overlaps every such bucket). No planner takes a late record, so no
-///   rewrite erased it, and a `.done` written before it landed says nothing
-///   about it: the filter is what hides its rows. The keep is recomputed every
-///   pass and never persisted; it ends once the record is deleted or its
-///   bucket tombstoned. A late record applied after this pass's commit LIST is
-///   not seen by it.
+///   holds a commit record stamped at or after its late-commit cutoff
+///   ([`crate::read::is_late_stamp`]) whose event-time span the request's
+///   window may overlap ([`crate::erasure_rewrite::bucket_may_overlap`]; a
+///   request with no window overlaps every such bucket). No planner takes a
+///   late record, so no rewrite erased it, and a `.done` written before it
+///   landed says nothing about it: the filter is what hides its rows. A
+///   retention tombstone does not end the keep, since a HEAD that already
+///   folded the bucket serves it until a fold observes the tombstone. The keep
+///   is recomputed every pass and never persisted; it ends once the record is
+///   deleted. A late record applied after this pass's commit LIST is not seen
+///   by it.
 /// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
 ///   request exactly as it pins any other object.
 ///
@@ -4691,9 +4692,11 @@ struct LateBucket {
 /// The classification is the planners' own and does not depend on
 /// [`crate::config::LateCommitFence`]: a stamp says what the store applied
 /// late whether or not this pass's planners fence it. A bucket with a
-/// retention tombstone serves nothing and is skipped. A record deleted between
-/// the LIST and its GET is skipped; any other read or decode failure fails the
-/// pass, which deletes no `.dreq`.
+/// retention tombstone counts like any other: a bucket already folded into a
+/// HEAD keeps serving until the fold that observes its tombstone, so its late
+/// record keeps a `.dreq` until retention deletes the record. A record deleted
+/// between the LIST and its GET is skipped; any other read or decode failure
+/// fails the pass, which deletes no `.dreq`.
 async fn late_commit_buckets(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -4701,21 +4704,12 @@ async fn late_commit_buckets(
     signal: Signal,
     commit_keyspace: &[ObjectMeta],
 ) -> Result<Vec<LateBucket>> {
-    let mut tombstoned: HashSet<(u32, u32)> = HashSet::new();
-    for meta in commit_keyspace {
-        if let Ok(BucketEntry::Tombstone(pk)) = keys::partition_bucket_entry(&meta.key) {
-            tombstoned.insert((pk.shard, pk.ingest_hour_bucket));
-        }
-    }
     let mut late: BTreeMap<(u32, u32), LateBucket> = BTreeMap::new();
     for meta in commit_keyspace {
         let Ok(BucketEntry::CommitRecord(pk)) = keys::partition_bucket_entry(&meta.key) else {
             continue;
         };
         let at = (pk.shard, pk.ingest_hour_bucket);
-        if tombstoned.contains(&at) {
-            continue;
-        }
         let bucket = Bucket::new(*tenant, signal, pk.shard, pk.ingest_hour_bucket);
         if !crate::read::is_late_stamp(
             meta.last_modified_unix_ms,

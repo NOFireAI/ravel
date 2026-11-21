@@ -897,8 +897,10 @@ the record is stored and the request's window may overlap its event times. A
 request with no window is kept by any late record of its tenant and signal.
 The sweep counts each keep in
 `ravel_maintain_dreq_held_by_superseded_inputs_total` and logs a warn line
-naming the bucket. The keep ends when the record is deleted or retention
-tombstones the bucket.
+naming the bucket. The keep ends when the record is deleted. A retention
+tombstone does not end it, because a bucket a catalog HEAD already folded
+is still served until the next fold observes the tombstone; the keep ends
+once retention deletes the bucket's records.
 
 `--late-commit-fence off` plans from every listed commit record as soon as
 the bucket seals, which was the behaviour before the fence. Use it for a
