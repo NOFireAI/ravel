@@ -3083,8 +3083,8 @@ impl Catalog {
         };
 
         // Record-absent tokens run first: their fallback adds a replacement's
-        // parts whatever the set holds, and a present token is left out once
-        // the set holds such a part, so the answer does not depend on the
+        // parts unless the set already serves the token's rows, and a present
+        // token is left out once the set holds such a part, so the answer does not depend on the
         // order of the tokens (docs/catalog-and-mvcc.md step 5).
         let erasure_pending = !pending_erasure.is_empty();
         let mut present_tokens: Vec<(&CommitToken, SegmentRef)> = Vec::new();
@@ -4534,7 +4534,8 @@ impl Catalog {
 
     /// The token's L0 input when its commit record is present, or `None`
     /// when the record is absent after one retry and the token goes to
-    /// [`Self::resolve_min_token_fallback`].
+    /// [`Self::resolve_min_token_fallback`]. A record-cache hit still costs
+    /// one GET, which proves the record present.
     async fn probe_min_token(
         &self,
         tenant: &TenantHash,
@@ -4543,12 +4544,17 @@ impl Catalog {
         accounting: &QueryAccounting,
     ) -> Result<Option<SegmentRef>, CatalogError> {
         let key = keys::commit_key_for_token(tenant, signal, token)?;
-        if let Some(cached) = self.cache.get_cached(tenant, &key, accounting)
-            && validate_expected_fields(self, &cached.record, tenant, signal, token.shard, &key)
-                .is_ok()
-        {
-            return self.l0_segment_ref(tenant, &key, &cached).map(Some);
-        }
+        // The record cache has no TTL and records are immutable, so a cached
+        // record proves the content, not that the record is still present: a
+        // sweep may have deleted it after a compaction or rewrite replaced its
+        // object. The GET below re-validates presence before it counts.
+        let cached = self
+            .cache
+            .get_cached(tenant, &key, accounting)
+            .filter(|cached| {
+                validate_expected_fields(self, &cached.record, tenant, signal, token.shard, &key)
+                    .is_ok()
+            });
 
         // Independent retry budgets for the two distinct failure modes. A
         // transient store fault (Throttled/Timeout/Transient) and a NotFound
@@ -4565,6 +4571,14 @@ impl Catalog {
         loop {
             match self.guarded_get(&key, GetRange::Full, accounting).await {
                 Ok(got) => {
+                    if let Some(cached) = &cached {
+                        ravel_invariant::inv_always!(
+                            record::token_for(&cached.record).is_ok_and(|stored| stored == *token),
+                            "commit: a commit token never resolves to a stale answer",
+                            token_answer_details(tenant, signal, token, "served")
+                        );
+                        return self.l0_segment_ref(tenant, &key, cached).map(Some);
+                    }
                     let bytes = got.data.len() as u64;
                     let record = record::decode(&got.data)?;
                     validate_expected_fields(self, &record, tenant, signal, token.shard, &key)?;
@@ -4657,15 +4671,13 @@ impl Catalog {
     /// What serves the token's L0 input, whose commit record is still
     /// present, in its place (docs/catalog-and-mvcc.md step 5): `None` when
     /// the input itself is added, otherwise the segments to add instead.
-    /// For logs, spans and every other signal without query-time dedup the
-    /// input stays out when:
+    /// The bucket is LISTed and its compaction (cached) and rewrite records
+    /// loaded, as the missing-record fallback does. The input stays out when:
     ///
     /// - the bucket is tombstoned: satisfied with zero segments, as the
     ///   missing-record fallback answers;
-    /// - a compaction or rewrite record of the token's bucket, live or not,
-    ///   names the input (a rewrite through its effective inputs) and `out`
-    ///   holds one of that record's output parts, which serves the input's
-    ///   rows already: nothing is added;
+    /// - `out` already serves the input's rows
+    ///   ([`set_serves_token_rows`]): nothing is added;
     /// - otherwise, a live rewrite names the input (the one the
     ///   missing-record fallback picks) and `out` holds nothing that rewrite
     ///   replaced: its parts are added, as the missing-record fallback adds
@@ -4673,13 +4685,10 @@ impl Catalog {
     ///   is added, since the rewrite's parts would serve that object's rows a
     ///   second time.
     ///
-    /// The check runs only when `out` holds an output part of the bucket or
-    /// an erasure request is pending (a live rewrite's `.dreq` outlives its
-    /// inputs' commit records), so with neither the answer is `None` at no
-    /// store read, tombstone or not. Otherwise the
-    /// bucket is LISTed and its compaction (cached) and rewrite records
-    /// loaded, as the missing-record fallback does. Metrics dedup at query
-    /// time and always get `None`.
+    /// These checks run, for every signal, only when `out` holds an output
+    /// part of the bucket, an erasure request is pending, or a live rewrite
+    /// names the input. With none of the three the answer is `None` whatever
+    /// the bucket holds, tombstone or not.
     async fn token_input_replacement(
         &self,
         tenant: &TenantHash,
@@ -4694,52 +4703,33 @@ impl Catalog {
                 && segment.shard == token.shard
                 && segment.ingest_hour_bucket == token.ingest_hour_bucket
         });
-        // Metrics dedup on (series_id, ts) at query time, so the input beside
-        // its replacement is harmless there and the step stays as it was.
-        if signal == Signal::Metrics || (!bucket_output_in_out && !erasure_pending) {
-            return Ok(None);
-        }
+        let checked = bucket_output_in_out || erasure_pending;
         let Some(bucket) = self
             .load_token_bucket(tenant, signal, token, accounting)
             .await?
         else {
-            return Ok(Some(Vec::new()));
+            return Ok(checked.then(Vec::new));
         };
         let identity = token_identity(token);
-        for (_, record) in &bucket.compaction_records {
-            if !names_input(&record.inputs, &identity) {
-                continue;
-            }
-            for part in &record.parts {
-                if out.contains_key(&keys::reconstruct_l1_part_key(record, part)?) {
-                    return Ok(Some(Vec::new()));
-                }
-            }
+        let superseded_records = bucket.supersession()?.superseded_records;
+        let live_rewrite = bucket.live_rewrite_naming(&superseded_records, &identity)?;
+        // Metrics are checked too: query-time dedup removes duplicate samples,
+        // not erased ones.
+        if !checked && live_rewrite.is_none() {
+            return Ok(None);
         }
         // A served part of a superseded rewrite (a stale HEAD) is checked
         // before a live successor is added, which would serve its rows twice.
-        for (rkey, record) in &bucket.rewrite_records {
-            if !bucket
-                .rewrite_effective_inputs(rkey, record)?
-                .contains(&identity)
-            {
-                continue;
-            }
-            for part in &record.parts {
-                if out.contains_key(&keys::reconstruct_rewrite_part_key(record, part)?) {
-                    return Ok(Some(Vec::new()));
-                }
-            }
+        if set_serves_token_rows(&bucket, token, out)? {
+            return Ok(Some(Vec::new()));
         }
-        let superseded_records = bucket.supersession()?.superseded_records;
         self.check_rewrite_siblings(
             token.shard,
             token.ingest_hour_bucket,
             &bucket.rewrite_records,
             &superseded_records,
         );
-        let Some((rkey, record)) = bucket.live_rewrite_naming(&superseded_records, &identity)?
-        else {
+        let Some((rkey, record)) = live_rewrite else {
             return Ok(None);
         };
         // The rewrite's parts also carry the rows of every other input it
@@ -4814,6 +4804,8 @@ impl Catalog {
     ///
     /// - Tombstone present: satisfied with zero segments (the data was
     ///   retired, not lost).
+    /// - The set already serves the token's rows ([`set_serves_token_rows`]):
+    ///   satisfied with nothing added.
     /// - The token's writer identity found in a compaction record's input
     ///   list: satisfied via that record's parts (all of them; the token's
     ///   data is somewhere among them, and read-your-write ignores event
@@ -4837,6 +4829,14 @@ impl Catalog {
                 .await;
             return Ok(());
         };
+        // A set built from a cached HEAD can still hold the token's swept
+        // input, or a replacement's part: a replacement's parts added beside
+        // it would serve the token's rows twice.
+        if set_serves_token_rows(&bucket, token, out)? {
+            self.assert_token_never_stale(tenant, signal, token, false, "served by the set")
+                .await;
+            return Ok(());
+        }
         let token_identity = token_identity(token);
         let TokenBucketSupersession {
             non_authoritative,
@@ -5441,6 +5441,54 @@ impl TokenBucketRecords {
 
 fn token_identity(token: &CommitToken) -> (String, u64, u64) {
     (token.writer_id.to_string(), token.epoch, token.seq)
+}
+
+/// Whether `out` already serves the rows of `token`'s level-0 input: it holds
+/// that input (same shard, hour, writer id, writer epoch and writer seq), or
+/// an output part of a compaction or rewrite record of the token's bucket,
+/// live or superseded, that names the input (a rewrite through its effective
+/// inputs).
+fn set_serves_token_rows(
+    bucket: &TokenBucketRecords,
+    token: &CommitToken,
+    out: &HashMap<String, SegmentRef>,
+) -> Result<bool, CatalogError> {
+    let own_input = out.values().any(|segment| {
+        segment.level == SegmentLevel::L0
+            && segment.shard == token.shard
+            && segment.ingest_hour_bucket == token.ingest_hour_bucket
+            && segment.writer_id == token.writer_id
+            && segment.writer_epoch == token.epoch
+            && segment.writer_seq == token.seq
+    });
+    if own_input {
+        return Ok(true);
+    }
+    let identity = token_identity(token);
+    for (_, record) in &bucket.compaction_records {
+        if !names_input(&record.inputs, &identity) {
+            continue;
+        }
+        for part in &record.parts {
+            if out.contains_key(&keys::reconstruct_l1_part_key(record, part)?) {
+                return Ok(true);
+            }
+        }
+    }
+    for (rkey, record) in &bucket.rewrite_records {
+        if !bucket
+            .rewrite_effective_inputs(rkey, record)?
+            .contains(&identity)
+        {
+            continue;
+        }
+        for part in &record.parts {
+            if out.contains_key(&keys::reconstruct_rewrite_part_key(record, part)?) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn names_input(inputs: &[CompactionInputIdentity], identity: &(String, u64, u64)) -> bool {
