@@ -907,7 +907,9 @@ pub(crate) fn directory_from_proto(
         }
         let fingerprints: Vec<u32> = p
             .fingerprints
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         if fingerprints.windows(2).any(|w| w[0] > w[1]) {

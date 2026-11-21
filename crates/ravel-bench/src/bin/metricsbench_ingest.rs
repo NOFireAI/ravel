@@ -748,6 +748,10 @@ fn assemble(
     report
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "RunFailure carries the run's report by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
     refuse_readback_flags(args)?;
     let workload = load_workload(&args.workload).map_err(|e| RunError::Workload(e.to_string()))?;

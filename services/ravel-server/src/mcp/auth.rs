@@ -75,6 +75,10 @@ pub(crate) struct McpAuth {
 
 /// Run every check and return the request the protocol layer may serve, or the
 /// response that refuses it.
+#[expect(
+    clippy::result_large_err,
+    reason = "the refusal is the built axum Response; boxing it is a type change outside the toolchain bump"
+)]
 pub(crate) async fn check(
     auth: &McpAuth,
     service: &QueryService,

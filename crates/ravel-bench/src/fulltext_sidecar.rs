@@ -1574,12 +1574,11 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
              ratio = mean sidecar cost / mean bloom cost over {} tokens",
             per_token.len()
         ),
-        format!(
-            "build: build/sidecar_cpu_ms is the thread CPU of tokenizing the decoded bodies and \
-             encoding the sidecar; build/compaction_cpu_ms is the thread CPU of decoding every \
-             block and re-encoding with the production writer; rewrite amplification is \
-             (objects + sidecars) / objects in bytes written"
-        ),
+        "build: build/sidecar_cpu_ms is the thread CPU of tokenizing the decoded bodies and \
+         encoding the sidecar; build/compaction_cpu_ms is the thread CPU of decoding every \
+         block and re-encoding with the production writer; rewrite amplification is \
+         (objects + sidecars) / objects in bytes written"
+            .to_string(),
         format!(
             "deletion: erased row {erased} of object 0 ({} terms only it held); the object is \
              rewritten without it by the production writer and the sidecar rebuilt from the \

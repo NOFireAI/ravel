@@ -113,7 +113,7 @@ impl SplitBrainNTimes {
     fn take_poison(&self) -> bool {
         let spent_skip = self
             .skip
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 if n > 0 { Some(n - 1) } else { None }
             })
             .is_ok();
@@ -121,7 +121,7 @@ impl SplitBrainNTimes {
             return false;
         }
         self.remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 if n > 0 { Some(n - 1) } else { None }
             })
             .is_ok()

@@ -1193,7 +1193,9 @@ fn decode_token(token: &str) -> Option<String> {
         return None;
     }
     let bytes = digits
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Some(hex_digit(pair[0])? << 4 | hex_digit(pair[1])?))
         .collect::<Option<Vec<u8>>>()?;
     String::from_utf8(bytes).ok()
@@ -1349,9 +1351,9 @@ pub(super) fn md5(data: &[u8]) -> [u8; 16] {
         message.push(0);
     }
     message.extend_from_slice(&bit_len.to_le_bytes());
-    for block in message.chunks_exact(64) {
+    for block in message.as_chunks::<64>().0 {
         let mut words = [0u32; 16];
-        for (word, bytes) in words.iter_mut().zip(block.chunks_exact(4)) {
+        for (word, bytes) in words.iter_mut().zip(block.as_chunks::<4>().0) {
             *word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         let [mut a, mut b, mut c, mut d] = state;
@@ -1374,7 +1376,7 @@ pub(super) fn md5(data: &[u8]) -> [u8; 16] {
         state[3] = state[3].wrapping_add(d);
     }
     let mut digest = [0u8; 16];
-    for (out, word) in digest.chunks_exact_mut(4).zip(state) {
+    for (out, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
         out.copy_from_slice(&word.to_le_bytes());
     }
     digest

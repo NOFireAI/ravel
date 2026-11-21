@@ -4753,7 +4753,9 @@ mod tests {
         let count = u32::from_le_bytes(frame[..4].try_into().expect("count")) as usize;
         let raw = zstd::bulk::decompress(&frame[8..], count * 12).expect("bucket payload");
         assert_eq!(raw.len(), count * 12);
-        raw.chunks_exact(12)
+        raw.as_chunks::<12>()
+            .0
+            .iter()
             .map(|e| {
                 (
                     e[..8].try_into().expect("key8"),

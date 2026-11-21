@@ -698,7 +698,7 @@ impl ObjectStoreBackend for RecordingStore {
         let mut read = self.inner.get_pinned(key, range, pin).await?;
         let left = self
             .short_in
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             });
         if left == Ok(1) {

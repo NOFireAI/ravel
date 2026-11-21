@@ -995,9 +995,9 @@ async fn a_sub_bound_block_set_opens_the_holder_unplanned() {
         .filter(|&n| !recorder.of(&fx.objects[n].key).is_empty())
         .collect();
     assert_eq!(opened, [1, 2, 3, 4, 5]);
-    for n in 1..=5 {
+    for (n, object) in fx.objects[..=5].iter().enumerate().skip(1) {
         assert_eq!(
-            recorder.of(&fx.objects[n].key),
+            recorder.of(&object.key),
             [GetRange::Full],
             "object {n}: a sub-bound segment opened unplanned is read whole"
         );
@@ -1038,9 +1038,9 @@ async fn a_logs_version_one_leaf_is_rejected_and_the_part_reads_uncovered() {
     assert_eq!(key_index(&v, "leafGetRequests"), 1, "{v}");
     assert_signal_key_index_matches(&v);
     assert_eq!(moved, Totals::only(KeyIndexPartOutcome::Rejected, 1, 1));
-    for n in 1..=16 {
+    for (n, object) in fx.objects[..=16].iter().enumerate().skip(1) {
         assert_eq!(
-            recorder.of(&fx.objects[n].key),
+            recorder.of(&object.key),
             [GetRange::Full],
             "object {n}: tier 1 reads a small object whole"
         );
