@@ -402,14 +402,14 @@ async fn listed_token_after_compaction_serves_the_part_once(signal: Signal) {
             .any(|s| s.data_object_key == l0_key(&l)),
         "L is not in the snapshot"
     );
-    // The listing cached L's commit record and C, so the token adds only the
-    // one LIST of its bucket.
+    // The listing cached L's commit record and C, so the token adds the one
+    // LIST of its bucket and the GET that re-validates L's cached record.
     assert_eq!(
         reads,
         Reads {
             lists: plain_reads.lists + 1,
-            gets: plain_reads.gets,
-            total: plain_reads.total + 1,
+            gets: plain_reads.gets + 1,
+            total: plain_reads.total + 2,
         }
     );
 }
@@ -472,21 +472,11 @@ async fn spans_folded_token_after_compaction_serves_the_part_once() {
     folded_token_after_compaction_serves_the_part_once(Signal::Spans).await;
 }
 
-/// Metrics dedup on (series_id, ts) at query time, so the step is unchanged
-/// there: L is still added beside P, from the commit record the listing
-/// cached, at no extra read.
+/// Metrics get the same check as logs and spans (issue #4570): L is not
+/// added beside P.
 #[tokio::test]
-async fn metrics_token_after_compaction_is_unchanged() {
-    let store = Arc::new(MemoryStore::new());
-    let (l, c) = compacted_bucket(store.as_ref(), Signal::Metrics).await;
-
-    let (_, plain_reads) = resolve_counted(&store, Signal::Metrics, live_window(), &[]).await;
-    let (snapshot, reads) =
-        resolve_counted(&store, Signal::Metrics, live_window(), &[token(&l)]).await;
-    let mut expected = vec![part_key(&c), l0_key(&l)];
-    expected.sort();
-    assert_eq!(sorted_keys(&snapshot), expected);
-    assert_eq!(reads, plain_reads);
+async fn metrics_listed_token_after_compaction_serves_the_part_once() {
+    listed_token_after_compaction_serves_the_part_once(Signal::Metrics).await;
 }
 
 /// An uncompacted token in a bucket the snapshot holds no level-1 part of,
@@ -518,7 +508,15 @@ async fn uncompacted_token_newer_than_head_is_added(signal: Signal) {
     let mut expected = vec![part_key(&c), l0_key(&n)];
     expected.sort();
     assert_eq!(sorted_keys(&snapshot), expected, "read-your-write holds");
-    assert_eq!(reads, plain_reads);
+    // Only the GET that re-validates N's cached record.
+    assert_eq!(
+        reads,
+        Reads {
+            lists: plain_reads.lists,
+            gets: plain_reads.gets + 1,
+            total: plain_reads.total + 1,
+        }
+    );
 }
 
 #[tokio::test]
@@ -553,8 +551,8 @@ async fn uncompacted_token_beside_a_compacted_sibling_is_added() {
         reads,
         Reads {
             lists: plain_reads.lists + 1,
-            gets: plain_reads.gets,
-            total: plain_reads.total + 1,
+            gets: plain_reads.gets + 1,
+            total: plain_reads.total + 2,
         }
     );
 }
@@ -580,13 +578,14 @@ async fn token_after_rewrite_is_not_brought_back(signal: Signal) {
     );
     assert_eq!(rows(&snapshot), L_ROWS - 1);
     assert_eq!(snapshot.pending_erasure.len(), 1);
-    // One LIST and one GET of the rewrite, which no cache holds.
+    // One LIST, the GET that re-validates L's cached record, and one GET of
+    // the rewrite, which no cache holds.
     assert_eq!(
         reads,
         Reads {
             lists: plain_reads.lists + 1,
-            gets: plain_reads.gets + 1,
-            total: plain_reads.total + 2,
+            gets: plain_reads.gets + 2,
+            total: plain_reads.total + 3,
         }
     );
 }
@@ -647,13 +646,14 @@ async fn token_after_rewrite_out_of_range_is_served_by_the_rewrite() {
         "a live rewrite's input is never added back; its part serves the token"
     );
     assert_eq!(rows(&snapshot), L_ROWS - 1);
-    // One LIST and one GET of the rewrite, which no cache holds.
+    // One LIST, the GET that re-validates L's cached record, and one GET of
+    // the rewrite, which no cache holds.
     assert_eq!(
         reads,
         Reads {
             lists: plain_reads.lists + 1,
-            gets: plain_reads.gets + 1,
-            total: plain_reads.total + 2,
+            gets: plain_reads.gets + 2,
+            total: plain_reads.total + 3,
         }
     );
 
@@ -900,8 +900,8 @@ async fn token_named_by_a_record_whose_part_is_not_in_the_set_is_added() {
         reads,
         Reads {
             lists: plain_reads.lists + 1,
-            gets: plain_reads.gets,
-            total: plain_reads.total + 1,
+            gets: plain_reads.gets + 1,
+            total: plain_reads.total + 2,
         }
     );
 }
@@ -994,8 +994,8 @@ async fn tokens_on_two_shards_each_serve_their_part_once() {
         reads,
         Reads {
             lists: plain_reads.lists + 2,
-            gets: plain_reads.gets,
-            total: plain_reads.total + 2,
+            gets: plain_reads.gets + 2,
+            total: plain_reads.total + 4,
         }
     );
 }
@@ -1021,8 +1021,8 @@ async fn two_tokens_of_one_bucket_list_it_once_each() {
         reads,
         Reads {
             lists: plain_reads.lists + 2,
-            gets: plain_reads.gets,
-            total: plain_reads.total + 2,
+            gets: plain_reads.gets + 2,
+            total: plain_reads.total + 4,
         }
     );
 }
@@ -1162,7 +1162,8 @@ async fn token_step_rewrite_get_error_fails_the_resolve() {
 }
 
 /// While an erasure is pending, every present token whose input is not in
-/// the set pays the bucket LIST and a GET per rewrite record, even in a
+/// the set pays the GET that re-validates its cached record, the bucket
+/// LIST and a GET per rewrite record, even in a
 /// bucket nothing compacted and with inputs no rewrite names; nothing is
 /// shared between the two tokens.
 #[tokio::test]
@@ -1198,8 +1199,8 @@ async fn pending_erasure_charges_each_token_a_list_and_the_rewrite_gets() {
         reads,
         Reads {
             lists: plain_reads.lists + 2,
-            gets: plain_reads.gets + 2,
-            total: plain_reads.total + 4,
+            gets: plain_reads.gets + 4,
+            total: plain_reads.total + 6,
         }
     );
 }
@@ -1593,9 +1594,10 @@ async fn swept_token_beside_a_compaction_its_live_rewrite_replaced_is_evaluated_
 
 /// HEAD folded after the rewrite R over P and M landed, so it names R's own
 /// part and no object R replaced. P's commit record and data object are
-/// deleted, and resolving P's token reaches the swept-token fallback's
-/// live-rewrite branch with R's part already in the set: the property holds
-/// and the snapshot serves R's part once.
+/// deleted. The query range leaves R's part out of the set, so resolving P's
+/// token reaches the swept-token fallback's live-rewrite branch (a set that
+/// already held R's part would be served before it): the property holds and
+/// the snapshot serves R's part once.
 #[tokio::test]
 async fn swept_token_with_its_rewrite_part_in_head_is_evaluated_true() {
     let store = Arc::new(MemoryStore::new());
@@ -1628,9 +1630,10 @@ async fn swept_token_with_its_rewrite_part_in_head_is_evaluated_true() {
         .await
         .expect("delete P's data object");
 
-    let (plain, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[]).await;
-    assert_eq!(sorted_keys(&plain), vec![rewrite_part_key(&rw)]);
-    let (snapshot, _) = resolve_counted(&store, Signal::Logs, sealed_window(), &[token(&p)]).await;
+    let window = (late_window().0, sealed_window().1);
+    let (plain, _) = resolve_counted(&store, Signal::Logs, window, &[]).await;
+    assert!(plain.segments.is_empty());
+    let (snapshot, _) = resolve_counted(&store, Signal::Logs, window, &[token(&p)]).await;
     assert_eq!(sorted_keys(&snapshot), vec![rewrite_part_key(&rw)]);
     assert_eq!(
         rows(&snapshot),
@@ -1639,5 +1642,5 @@ async fn swept_token_with_its_rewrite_part_in_head_is_evaluated_true() {
     );
 
     let evaluations = replaced_object_evaluations(&token(&p)).expect("capturing");
-    assert_one_replaced_object_evaluation(&evaluations, true, 1);
+    assert_one_replaced_object_evaluation(&evaluations, true, 0);
 }
