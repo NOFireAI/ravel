@@ -45,12 +45,12 @@ use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, CatalogPartKind, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION_1, HEAD_FORMAT_VERSIONS,
-    KEY_INDEX_LEAF_FORMAT_VERSION, KeyIndexLeafEncodeError, KeyIndexLeafEntry, KeyIndexLeafInput,
-    KeyIndexLeafLimits, KeyIndexLeafSummary, KeyIndexSlice, NamePostings, NewerPartVersion,
-    PartLimits, SnapshotFormatError, column_stats_segments_concat, encode_key_index_leaf,
-    encoded_entry_len, key_index_leaf_format_version, key_index_leaf_prefix_range,
-    key_index_leaf_version_accepted, key_index_leaf_version_is_newer, select_key_index_slice,
-    split_key_index_entries, verify_key_index_leaf_frames,
+    KEY_INDEX_LEAF_FORMAT_VERSION, KEY_INDEX_LEAF_FORMAT_VERSION_3, KeyIndexLeafEncodeError,
+    KeyIndexLeafEntry, KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, KeyIndexSlice,
+    NamePostings, NewerPartVersion, PartLimits, SnapshotFormatError, column_stats_segments_concat,
+    encode_key_index_leaf, encoded_entry_len, key_index_leaf_format_version,
+    key_index_leaf_prefix_range, key_index_leaf_version_accepted, key_index_leaf_version_is_newer,
+    select_key_index_slice, split_key_index_entries, verify_key_index_leaf_frames,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -1011,11 +1011,14 @@ pub const FOLD_CATALOG_FAMILIES: [&str; 5] = [
 /// The highest version of `family` a fold of `signal` can emit. HEAD carries
 /// a version that follows its content (2 only when a part ref carries a
 /// retired hour), so the highest one is what an active version has to be at
-/// or above. Every other catalog family has one write version: the fold
-/// stamps every key-index leaf [`KEY_INDEX_LEAF_FORMAT_VERSION`], whatever
-/// the signal; a metrics leaf may be read at 3 (the posting leaf of
-/// ADR-4146), but no fold writes one. `None` for a family the fold does not
-/// write.
+/// or above. Every other catalog family has one write version per signal:
+/// the fold stamps a key-index leaf [`KEY_INDEX_LEAF_FORMAT_VERSION`], except
+/// that a metrics fold with [`CatalogConfig::metrics_label_index`] and
+/// [`CatalogConfig::metrics_series_index`] both on also writes the
+/// series-index leaves at [`KEY_INDEX_LEAF_FORMAT_VERSION_3`] (ADR-4146).
+/// This table does not see the config, so it names 2 for kidx; the
+/// write-policy gate, [`Catalog::fold_compat_versions`], checks 3 for that
+/// fold. `None` for a family the fold does not write.
 pub fn fold_write_version(family: &str, _signal: Signal) -> Option<u16> {
     let version = match family {
         compat::FAMILY_CATALOG_HEAD => {
@@ -1085,8 +1088,10 @@ impl Catalog {
     }
 
     /// The highest version of each catalog family a fold of `signal` emits,
-    /// [`fold_write_version`], once the installed policy admits it, or the
-    /// first family the policy refuses.
+    /// [`fold_write_version`], except kidx at
+    /// [`KEY_INDEX_LEAF_FORMAT_VERSION_3`] for a metrics fold that builds the
+    /// series-index fields, once the installed policy admits it, or the first
+    /// family the policy refuses.
     ///
     /// The active version is a ceiling: the fold writes what its content
     /// needs, at or below it. The check is made before the fold reads
@@ -1102,7 +1107,7 @@ impl Catalog {
     ) -> Result<Vec<(&'static str, u16)>, FoldCompatRefusal> {
         let mut versions = Vec::with_capacity(FOLD_CATALOG_FAMILIES.len());
         for family in FOLD_CATALOG_FAMILIES {
-            let Some(written) = fold_write_version(family, signal) else {
+            let Some(written) = self.fold_checked_write_version(family, signal) else {
                 continue;
             };
             if let Some(view) = &self.compat_policy {
@@ -1120,6 +1125,20 @@ impl Catalog {
             versions.push((family, written));
         }
         Ok(versions)
+    }
+
+    /// The version of `family` the write-policy gate checks for a fold of
+    /// `signal` under this catalog's config: [`fold_write_version`], or
+    /// [`KEY_INDEX_LEAF_FORMAT_VERSION_3`] for kidx when a metrics fold
+    /// builds the series-index fields ([`metrics_series_index_declared`]).
+    fn fold_checked_write_version(&self, family: &str, signal: Signal) -> Option<u16> {
+        if family == compat::FAMILY_KIDX
+            && signal == Signal::Metrics
+            && metrics_series_index_declared(self.config())
+        {
+            return u16::try_from(KEY_INDEX_LEAF_FORMAT_VERSION_3).ok();
+        }
+        fold_write_version(family, signal)
     }
 }
 
@@ -1872,7 +1891,7 @@ pub(crate) fn declared_key_index_fields(
         )]),
         Signal::Metrics if catalog_config.metrics_label_index => {
             let mut fields = vec![(METRICS_LABEL_VALUE_FIELD.to_string(), KeyType::Str)];
-            if catalog_config.metrics_series_index {
+            if metrics_series_index_declared(catalog_config) {
                 fields.extend(
                     series_index::METRICS_SERIES_INDEX_FIELDS
                         .iter()
@@ -1883,6 +1902,13 @@ pub(crate) fn declared_key_index_fields(
         }
         _ => None,
     }
+}
+
+/// Whether [`declared_key_index_fields`] lists the three series-index fields
+/// for a metrics fold under `catalog_config`, whose leaves the fold stamps
+/// [`KEY_INDEX_LEAF_FORMAT_VERSION_3`].
+fn metrics_series_index_declared(catalog_config: &CatalogConfig) -> bool {
+    catalog_config.metrics_label_index && catalog_config.metrics_series_index
 }
 
 /// The metrics key-index field (ADR-3694 decision 2): key8 of every
@@ -11883,12 +11909,27 @@ pub(crate) mod tests {
         signal: Signal,
         policy: FoldPolicy<'_>,
     ) -> (
-        Result<(), FoldCompatRefusal>,
+        Result<Vec<(&'static str, u16)>, FoldCompatRefusal>,
+        Result<FoldReport, CatalogError>,
+        Vec<(String, Bytes)>,
+    ) {
+        fold_kidx_fixture_with(signal, policy, None).await
+    }
+
+    /// [`fold_kidx_fixture`] with `metrics_label_index` and
+    /// `metrics_series_index` set to `switches`, when `Some`, for every
+    /// signal.
+    async fn fold_kidx_fixture_with(
+        signal: Signal,
+        policy: FoldPolicy<'_>,
+        switches: Option<(bool, bool)>,
+    ) -> (
+        Result<Vec<(&'static str, u16)>, FoldCompatRefusal>,
         Result<FoldReport, CatalogError>,
         Vec<(String, Bytes)>,
     ) {
         let store = Arc::new(MemoryStore::new());
-        let config = match signal {
+        let mut config = match signal {
             Signal::Metrics => {
                 publish_label_fixture(store.as_ref()).await;
                 metrics_kidx_config()
@@ -11905,6 +11946,10 @@ pub(crate) mod tests {
                 kidx_config()
             }
         };
+        if let Some((label, series)) = switches {
+            config.metrics_label_index = label;
+            config.metrics_series_index = series;
+        }
         let now = now_at_seal(KIDX_HOUR);
         let view = match policy {
             FoldPolicy::NotInstalled => None,
@@ -11916,7 +11961,7 @@ pub(crate) mod tests {
         let catalog = Catalog::new(store.clone(), config)
             .expect("catalog")
             .with_compat_policy(view);
-        let gate = catalog.fold_compat_versions(signal, now).map(|_| ());
+        let gate = catalog.fold_compat_versions(signal, now);
         let report = catalog
             .fold(&tenant(), signal, Uuid::from_u128(0xf01d), now, &[], None)
             .await;
@@ -12050,6 +12095,129 @@ pub(crate) mod tests {
             );
             assert!(report.is_err(), "{signal:?}");
         }
+    }
+
+    /// The kidx version a successful gate checked.
+    fn kidx_checked(versions: &[(&'static str, u16)]) -> Option<u16> {
+        versions
+            .iter()
+            .find(|(family, _)| *family == compat::FAMILY_KIDX)
+            .map(|(_, version)| *version)
+    }
+
+    /// A metrics fold with `metrics_label_index` and `metrics_series_index`
+    /// both on writes its series-index leaves at 3, so kidx active at 2
+    /// refuses it, naming kidx, before any catalog object lands. With either
+    /// switch off, and for logs and spans, the gate checks 2 and the fold
+    /// writes what it writes with no policy. kidx active at 3 admits the
+    /// series fold.
+    #[tokio::test]
+    async fn series_index_fold_refused_when_kidx_active_at_2() {
+        let mut at_two = BASELINE_CATALOG_VERSIONS;
+        at_two[4] = (compat::FAMILY_KIDX, 2);
+        let both = Some((true, true));
+
+        // With no policy installed the gate is skipped and the series fold
+        // writes its version-3 leaves beside the version-2 label leaf.
+        let (gate, report, series_unpoliced) =
+            fold_kidx_fixture_with(Signal::Metrics, FoldPolicy::NotInstalled, both).await;
+        let versions = gate.expect("no policy never refuses");
+        assert_eq!(kidx_checked(&versions), Some(3));
+        report.expect("fold with no policy");
+        let mut written = leaf_versions(&series_unpoliced);
+        written.sort_unstable();
+        written.dedup();
+        assert_eq!(written, vec![2, 3], "the fixture writes series leaves");
+
+        let (gate, report, objects) =
+            fold_kidx_fixture_with(Signal::Metrics, FoldPolicy::Record(&at_two), both).await;
+        let refusal = gate.expect_err("the series leaves are written at 3");
+        assert_eq!(refusal.family, compat::FAMILY_KIDX);
+        assert_eq!(
+            refusal.refusal,
+            compat::CompatRefusal::ActiveVersionNotWritable {
+                family: compat::FAMILY_KIDX.to_string(),
+                active: 2,
+                writable: vec![3],
+            }
+        );
+        assert!(
+            refusal.to_string().contains(compat::FAMILY_KIDX),
+            "{refusal}"
+        );
+        assert!(
+            matches!(report, Err(CatalogError::InvalidConfig(_))),
+            "{report:?}"
+        );
+        assert!(
+            !objects
+                .iter()
+                .any(|(key, _)| key.ends_with(".kidx") || key.ends_with("/HEAD")),
+            "a refused fold writes no leaf and no HEAD: {:?}",
+            objects.iter().map(|(key, _)| key).collect::<Vec<_>>()
+        );
+        let published: Vec<&String> = series_unpoliced
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|key| !key.contains("/catalog/"))
+            .collect();
+        assert_eq!(
+            objects.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            published,
+            "a refused fold writes no catalog object"
+        );
+
+        // Label index on, series index off: version-2 leaves, as today.
+        let (_, _, unpoliced) = fold_kidx_fixture(Signal::Metrics, FoldPolicy::NotInstalled).await;
+        let (gate, report, objects) = fold_kidx_fixture_with(
+            Signal::Metrics,
+            FoldPolicy::Record(&at_two),
+            Some((true, false)),
+        )
+        .await;
+        let versions = gate.unwrap_or_else(|refusal| panic!("label only: {refusal}"));
+        assert_eq!(kidx_checked(&versions), Some(2));
+        let report = report.unwrap_or_else(|err| panic!("label only: {err}"));
+        assert_eq!(report.key_index_leaves_written, 1, "{report:?}");
+        assert_eq!(leaf_versions(&objects), vec![2]);
+        assert_eq!(objects, unpoliced, "label only");
+
+        // Series index on, label index off: no series field is declared.
+        let series_only = Some((false, true));
+        let (_, _, unpoliced) =
+            fold_kidx_fixture_with(Signal::Metrics, FoldPolicy::NotInstalled, series_only).await;
+        let (gate, report, objects) =
+            fold_kidx_fixture_with(Signal::Metrics, FoldPolicy::Record(&at_two), series_only).await;
+        let versions = gate.unwrap_or_else(|refusal| panic!("series only: {refusal}"));
+        assert_eq!(kidx_checked(&versions), Some(2));
+        report.unwrap_or_else(|err| panic!("series only: {err}"));
+        assert_eq!(leaf_versions(&objects), Vec::<u32>::new());
+        assert_eq!(objects, unpoliced, "series only");
+
+        // Logs and spans declare no series field, whatever the switches.
+        for signal in [Signal::Logs, Signal::Spans] {
+            let (_, _, unpoliced) = fold_kidx_fixture(signal, FoldPolicy::NotInstalled).await;
+            let (gate, report, objects) =
+                fold_kidx_fixture_with(signal, FoldPolicy::Record(&at_two), both).await;
+            let versions = gate.unwrap_or_else(|refusal| panic!("{signal:?}: {refusal}"));
+            assert_eq!(kidx_checked(&versions), Some(2), "{signal:?}");
+            let report = report.unwrap_or_else(|err| panic!("{signal:?}: {err}"));
+            assert_eq!(report.key_index_leaves_written, 1, "{signal:?}: {report:?}");
+            assert_eq!(leaf_versions(&objects), vec![2], "{signal:?}");
+            assert_eq!(objects, unpoliced, "{signal:?}");
+        }
+
+        // kidx active at 3 admits the series fold, byte for byte.
+        let (gate, report, objects) = fold_kidx_fixture_with(
+            Signal::Metrics,
+            FoldPolicy::Record(&BASELINE_CATALOG_VERSIONS),
+            both,
+        )
+        .await;
+        let versions = gate.unwrap_or_else(|refusal| panic!("kidx 3: {refusal}"));
+        assert_eq!(kidx_checked(&versions), Some(3));
+        report.unwrap_or_else(|err| panic!("kidx 3: {err}"));
+        assert_eq!(objects, series_unpoliced, "kidx 3");
     }
 
     struct FixedCompatClock(i64);
