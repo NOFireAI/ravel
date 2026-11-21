@@ -269,6 +269,123 @@ CONFIG=config-faults antithesis/ingest-durability/scripts/launch.sh <max-compute
 For a deterministic check of one switch, layer an override that sets its
 rate to 1 and the other to 0 with `LOCAL_COMPOSE_OVERRIDE`.
 
+## Perf variant
+
+`config-perf/` is the base config with `WORKLOAD_PERF=1` on the driver
+(`driver/src/perf.rs`). In the eventually, after faults stop, the driver
+measures two figures and reports them; no latency bound is asserted yet
+(#4559). `WORKLOAD_PERF=1` together with `WORKLOAD_COVERAGE=1` is refused:
+the driver exits 1 before setup complete.
+
+- t0 is taken immediately after the eventually runs `ANTITHESIS_STOP_FAULTS`.
+  The driver tells apart three results: the variable is absent (`unset`), the
+  command ran and exited 0 (`ok`), or it could not be spawned or exited
+  non-zero (`failed`). On `failed` the variant prints
+  `perf skipped reason=stop-faults-failed`, hits the unreachable below and
+  measures nothing; the rest of the eventually runs as in the base variant.
+- Figure (a), time to first strict ack (TTFA), per node. From t0, beside the
+  existing recovery wait, one prober per node sends a probe write to its own
+  node every 1 s, each with a 5 s client timeout, with at most 5 in flight. It
+  stops at the first answer the driver classifies as acked, or 300 s after
+  t0. The sample is the time from t0 to the receipt of that first ack. No ack
+  within 300 s gives the sample `none`. Both probers are joined before the
+  recovery assertion's exit and before the 5 s settle sleep.
+- Figure (b), strict-ack latency after recovery, per probe. Only when the
+  system recovered and both TTFA samples acked: after the 5 s settle sleep,
+  one thread per node sends 10 probe writes to its own node, one after the
+  other, alternating logs (even) and metrics (odd), each with the 15 s write
+  timeout. The interval is the HTTP call alone. Per node, the median is the
+  element at index 5 of the 10 latencies sorted ascending, with every
+  probe that was not acknowledged counted as infinity, so it is finite only
+  when at least 6 probes acked.
+
+A probe write is strict, unkeyed, not gzip, one log record in one stream or
+one sample. It is registered in the model before it is sent, past the
+`WORKLOAD_MAX_WRITES` cap, and judged and recorded the way a rule's write is,
+with no retry. The ack probes run before the eventually takes its list of
+acknowledged writes, so its token reads and scans check the probe writes
+too. No probe takes the rule gate or a stop helper.
+
+The clock is the driver's monotonic clock (`mono_ms`). Each figure also
+carries the signed wall-clock difference over the same interval
+(`wall_ms`, negative if the wall clock went back), and the log lines carry
+both, for comparison against the event log's vtime.
+
+A sample of `none`, a probe that was not acknowledged and a median of `inf`
+count against every "within" rung of their ladder; none is dropped. Every
+assertion goes through `assert_raw` and is catalogued only when
+`WORKLOAD_PERF=1`, so other variants' property lists do not change.
+
+| Assertion message | Kind | Evaluated |
+|---|---|---|
+| a node's first strict ack came within 5 s of faults stopping | sometimes | once per node per eventually |
+| a node's first strict ack came within 15 s of faults stopping | sometimes | once per node per eventually |
+| a node's first strict ack came within 30 s of faults stopping | sometimes | once per node per eventually |
+| a node's first strict ack came within 60 s of faults stopping | sometimes | once per node per eventually |
+| a node's first strict ack came within 120 s of faults stopping | sometimes | once per node per eventually |
+| a node's first strict ack came within 300 s of faults stopping | sometimes | once per node per eventually |
+| a strict write after recovery was acknowledged within 1 s | sometimes | once per ack probe |
+| a strict write after recovery was acknowledged within 2 s | sometimes | once per ack probe |
+| a strict write after recovery was acknowledged within 5 s | sometimes | once per ack probe |
+| a strict write after recovery was acknowledged within 10 s | sometimes | once per ack probe |
+| a strict write after recovery was answered within the client timeout | sometimes | once per ack probe; false only for no response |
+| a node's median strict-ack latency after recovery is within 1 s | sometimes | once per node per eventually |
+| a node's median strict-ack latency after recovery is within 2 s | sometimes | once per node per eventually |
+| a node's median strict-ack latency after recovery is within 5 s | sometimes | once per node per eventually |
+| a node's median strict-ack latency after recovery is within 8 s | sometimes | once per node per eventually |
+| a perf interval saw the wall and monotonic clocks disagree by more than 1 s | sometimes | once per acked TTFA sample and per ack probe |
+| the driver could not stop faults before measuring | unreachable | hit when stop-faults failed |
+| the perf probes ran in an eventually | reachable | once per eventually, with the summary line |
+
+"Within N s" means `mono_ms <= N * 1000`. The log lines, one `println` each,
+fields in this order:
+
+```text
+perf t0 stop_faults=<ok or unset>
+perf skipped reason=stop-faults-failed
+perf ttfa node=<n> mono_ms=<integer or none> wall_ms=<integer or none> probes=<integer> outcome=<acked or none> last=<text without spaces>
+perf ack-start node=<n> i=<i>
+perf ack node=<n> i=<i> signal=<logs or metrics> mono_ms=<integer> wall_ms=<integer> outcome=<acked or refused-<status> or partial or no-response>
+perf median node=<n> mono_ms=<integer or inf>
+perf summary ttfa=<TTFA lines printed> ack=<perf ack lines printed> recovered=<true or false>
+```
+
+`probes` is the probe writes sent so far and `last` the outcome of the
+latest answer that was not an ack, or `-`. The summary is printed once per
+eventually in which stop-faults did not fail, before the durability checks or
+before the not-recovered exit.
+
+`CONFIG=config-perf` selects the variant in `scripts/local-run.sh` (it needs
+`WORKLOAD_EVENTUALLY_AFTER_SECS`) and `scripts/launch.sh` (test
+`ravel-ingest-durability-perf`, `attrs.variant=perf`); neither takes a
+mutant. The local gate reads `local/perf-required.tsv`. Its bands are the
+local expectations of the plan, predicted and not yet measured:
+
+- Clean run: exactly 1 `perf summary`, 2 `perf ttfa` and 20 `perf ack`
+  lines and no `perf skipped` line; every `perf ack` line acked with
+  500 <= `mono_ms` <= 1500; every `perf ttfa` line acked with
+  500 <= `mono_ms` <= 1500 and `probes` 1 or 2; every `required` line hit
+  with its condition true.
+- `PERF_LEVER=slow-ack` layers `local/docker-compose.perf-slow-ack.yaml`
+  (`--max-flush-delay 4s`, `--max-flush-delay-idle 5s`): the same counts,
+  every `perf ack` line acked with 3500 <= `mono_ms` <= 6000, no
+  `slow-ack-never` line hit true and every `slow-ack-required` line hit true.
+  It is meant to show that the figures move with the flush cadence.
+- `PERF_LEVER=no-ack` layers `local/docker-compose.perf-no-ack.yaml`
+  (both flush delays 600 s): 1 summary, 2 `perf ttfa` lines, both
+  `outcome=none`, no `perf ack` line, and the `no-ack-never` line never hit
+  true. It is meant to show that a node that never acks is reported, not
+  dropped.
+
+The base gate (no always-type assertion violated) applies to every perf run.
+
+```sh
+CONFIG=config-perf WORKLOAD_EVENTUALLY_AFTER_SECS=180 antithesis/ingest-durability/scripts/local-run.sh out/perf1 900
+CONFIG=config-perf PERF_LEVER=slow-ack WORKLOAD_EVENTUALLY_AFTER_SECS=180 antithesis/ingest-durability/scripts/local-run.sh out/perf-slow 900
+CONFIG=config-perf PERF_LEVER=no-ack WORKLOAD_EVENTUALLY_AFTER_SECS=60 antithesis/ingest-durability/scripts/local-run.sh out/perf-noack 900
+CONFIG=config-perf antithesis/ingest-durability/scripts/launch.sh <max-compute-hours> "<description>"
+```
+
 ## Patterns
 
 None adopted. Ravel has no stateful client library, so the stateful-clients
@@ -431,4 +548,5 @@ timer thread runs it), and `WORKLOAD_MAX_WRITES` caps the writes per timeline (t
 record more than is sent for each log write whose id is 3 modulo 50 (about one
 log write in 50; ids are shared with metrics writes, so about one write of any
 signal in 75 at the default rule weights), and the presence assertions must
-fail.
+fail. `WORKLOAD_PERF=1` turns on the perf variant (see "Perf variant"; the
+`config-perf` compose file sets it).
