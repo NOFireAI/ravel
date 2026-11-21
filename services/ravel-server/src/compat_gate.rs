@@ -69,6 +69,15 @@ pub struct CertifiedFamily {
     pub watermark_stale: bool,
 }
 
+/// The store request behind a [`CompatGateError::Store`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateRequest {
+    /// The HEAD of a marker key.
+    Head,
+    /// The listing of the tenant prefix.
+    List,
+}
+
 /// A refusal to start. Every variant names the family it concerns, when one
 /// applies, and the step that clears it.
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +105,8 @@ pub enum CompatGateError {
     #[error("could not check {key} for the retired-reader gate: {source}")]
     Store {
         key: &'static str,
+        /// The request `source` answered.
+        request: GateRequest,
         #[source]
         source: StoreError,
     },
@@ -238,6 +249,7 @@ async fn without_compat(store: &dyn ObjectStoreBackend) -> Result<GateOutcome, C
             .await
             .map_err(|source| CompatGateError::Store {
                 key: TENANT_PREFIX,
+                request: GateRequest::List,
                 source,
             })?;
     if has_tenant_data {
@@ -253,7 +265,11 @@ async fn exists(
     match store.head(key).await {
         Ok(_) => Ok(true),
         Err(StoreError::NotFound) => Ok(false),
-        Err(source) => Err(CompatGateError::Store { key, source }),
+        Err(source) => Err(CompatGateError::Store {
+            key,
+            request: GateRequest::Head,
+            source,
+        }),
     }
 }
 
@@ -568,6 +584,7 @@ mod tests {
             enforce(&store, Some(&KEY), &[RSEG_8], NOW_NS).await,
             Err(CompatGateError::Store {
                 key: TENANT_PREFIX,
+                request: GateRequest::List,
                 ..
             })
         ));
@@ -601,6 +618,7 @@ mod tests {
             enforce(&store, Some(&KEY), &[RSEG_8], NOW_NS).await,
             Err(CompatGateError::Store {
                 key: COMPAT_KEY,
+                request: GateRequest::Head,
                 ..
             })
         ));
