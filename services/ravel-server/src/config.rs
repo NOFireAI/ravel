@@ -1815,7 +1815,11 @@ pub struct MaintenanceArgs {
     /// gets none of them. While a tenant has a pending metrics erasure the
     /// fold writes no series leaf. Off by default: turn it on only after
     /// every query, maintain and fold process runs a build that reads leaf
-    /// format version 3. Refused in `--mode gateway`, which runs no fold.
+    /// format version 3. The series leaves are key-index (kidx) version 3,
+    /// so on a store whose `sys/compat` record has kidx active at 2 every
+    /// metrics fold is refused while this is on, and nothing is written; drop
+    /// the flag to resume metrics folding (activation to kidx 3 is issue
+    /// #4545). Refused in `--mode gateway`, which runs no fold.
     #[arg(long)]
     pub fold_metrics_series_index: bool,
 

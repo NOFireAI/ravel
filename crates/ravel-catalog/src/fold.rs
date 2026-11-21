@@ -1065,13 +1065,22 @@ pub fn fold_read_versions(family: &str) -> Vec<u16> {
 /// policy: the policy refused one catalog family. Nothing was written.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "catalog fold of {signal:?} refused by the sys/compat write policy for family {family}: {refusal}"
+    "catalog fold of {signal:?} refused by the sys/compat write policy for family {family}: {refusal}{remedy}"
 )]
 pub struct FoldCompatRefusal {
     pub family: &'static str,
     pub signal: Signal,
     pub refusal: compat::CompatRefusal,
+    /// What the operator can change, appended to the message; empty when the
+    /// refusal follows from the build alone.
+    pub remedy: &'static str,
 }
+
+/// [`FoldCompatRefusal::remedy`] for a metrics fold whose kidx check is
+/// version 3 only because the series index is on.
+pub const SERIES_INDEX_KIDX_REMEDY: &str = "; the metrics series index \
+    (--fold-metrics-series-index) writes kidx 3: drop the flag to resume \
+    metrics folding (activation to kidx 3 is issue #4545)";
 
 impl Catalog {
     /// Install the `sys/compat` write policy the fold follows for the catalog
@@ -1115,11 +1124,17 @@ impl Catalog {
                     .into_iter()
                     .filter(|v| *v >= written)
                     .collect();
+                let remedy = if fold_write_version(family, signal) == Some(written) {
+                    ""
+                } else {
+                    SERIES_INDEX_KIDX_REMEDY
+                };
                 view.write_policy(now_ns, family, &ceilings, written, None)
                     .map_err(|refusal| FoldCompatRefusal {
                         family,
                         signal,
                         refusal,
+                        remedy,
                     })?;
             }
             versions.push((family, written));
@@ -1130,10 +1145,13 @@ impl Catalog {
     /// The version of `family` the write-policy gate checks for a fold of
     /// `signal` under this catalog's config: [`fold_write_version`], or
     /// [`KEY_INDEX_LEAF_FORMAT_VERSION_3`] for kidx when a metrics fold
-    /// builds the series-index fields ([`metrics_series_index_declared`]).
+    /// builds the series-index fields: leaves on
+    /// ([`CatalogConfig::build_key_index_leaves`]) and
+    /// [`metrics_series_index_declared`].
     fn fold_checked_write_version(&self, family: &str, signal: Signal) -> Option<u16> {
         if family == compat::FAMILY_KIDX
             && signal == Signal::Metrics
+            && self.config().build_key_index_leaves
             && metrics_series_index_declared(self.config())
         {
             return u16::try_from(KEY_INDEX_LEAF_FORMAT_VERSION_3).ok();
@@ -12055,6 +12073,7 @@ pub(crate) mod tests {
                 fold_kidx_fixture(signal, FoldPolicy::Record(&at_one)).await;
             let refusal = gate.expect_err("kidx 1 is below the written 2");
             assert_eq!(refusal.family, compat::FAMILY_KIDX, "{signal:?}");
+            assert_eq!(refusal.remedy, "", "{signal:?}: not a series-index refusal");
             assert_eq!(
                 refusal.refusal,
                 compat::CompatRefusal::ActiveVersionNotWritable {
@@ -12145,6 +12164,19 @@ pub(crate) mod tests {
             refusal.to_string().contains(compat::FAMILY_KIDX),
             "{refusal}"
         );
+        // The refusal repeats every cycle, so it names the flag, the versions
+        // and the remedy.
+        assert_eq!(refusal.remedy, SERIES_INDEX_KIDX_REMEDY);
+        let message = refusal.to_string();
+        for needle in [
+            "--fold-metrics-series-index",
+            "active write version 2",
+            "kidx 3",
+            "drop the flag",
+            "#4545",
+        ] {
+            assert!(message.contains(needle), "{needle} in {message}");
+        }
         assert!(
             matches!(report, Err(CatalogError::InvalidConfig(_))),
             "{report:?}"
@@ -12218,6 +12250,48 @@ pub(crate) mod tests {
         assert_eq!(kidx_checked(&versions), Some(3));
         report.unwrap_or_else(|err| panic!("kidx 3: {err}"));
         assert_eq!(objects, series_unpoliced, "kidx 3");
+    }
+
+    /// With `build_key_index_leaves` off the fold builds no key-index leaf,
+    /// so both series switches on do not raise the kidx version the gate
+    /// checks: kidx active at 2 folds metrics, and no leaf lands.
+    #[tokio::test]
+    async fn series_index_switches_with_leaves_off_fold_at_kidx_2() {
+        let mut at_two = BASELINE_CATALOG_VERSIONS;
+        at_two[4] = (compat::FAMILY_KIDX, 2);
+        let store = Arc::new(MemoryStore::new());
+        publish_label_fixture(store.as_ref()).await;
+        let mut config = metrics_kidx_config();
+        config.metrics_label_index = true;
+        config.metrics_series_index = true;
+        config.build_key_index_leaves = false;
+        let now = now_at_seal(KIDX_HOUR);
+        let view = refreshed_compat_view(store.clone(), now, Some(&at_two)).await;
+        let catalog = Catalog::new(store.clone(), config)
+            .expect("catalog")
+            .with_compat_policy(Some(view));
+        let versions = catalog
+            .fold_compat_versions(Signal::Metrics, now)
+            .unwrap_or_else(|refusal| panic!("leaves off: {refusal}"));
+        assert_eq!(kidx_checked(&versions), Some(2));
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::from_u128(0xf01d),
+                now,
+                &[],
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("leaves off: {err}"));
+        assert_eq!(report.key_index_leaves_written, 0, "{report:?}");
+        let keys = list_all_keys(store.as_ref(), &format!("t/{}/", tenant().to_hex())).await;
+        assert!(
+            keys.iter().any(|key| key.ends_with("/HEAD")),
+            "the fold published: {keys:?}"
+        );
+        assert!(!keys.iter().any(|key| key.ends_with(".kidx")), "{keys:?}");
     }
 
     struct FixedCompatClock(i64);
