@@ -1,6 +1,6 @@
 [package]
 name = "ravel-compat-tests"
-version = "0.34.0"
+version = "0.35.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.97"
@@ -15,20 +15,20 @@ publish = false
 [dependencies]
 
 [dev-dependencies]
-ravel-catalog = { path = "../ravel-catalog", version = "0.34.0" }
-ravel-commit = { path = "../ravel-commit", version = "0.34.0" }
+ravel-catalog = { path = "../ravel-catalog", version = "0.35.0" }
+ravel-commit = { path = "../ravel-commit", version = "0.35.0" }
 # `IngestConfig::default()`, the RLOG writer configuration the corpus's log
 # object is written with. Already a dependency of ravel-maintain.
-ravel-ingest = { path = "../ravel-ingest", version = "0.34.0" }
-ravel-maintain = { path = "../ravel-maintain", version = "0.34.0" }
-ravel-object-store = { path = "../ravel-object-store", version = "0.34.0" }
-ravel-proto = { path = "../ravel-proto", version = "0.34.0" }
-ravel-types = { path = "../ravel-types", version = "0.34.0" }
+ravel-ingest = { path = "../ravel-ingest", version = "0.35.0" }
+ravel-maintain = { path = "../ravel-maintain", version = "0.35.0" }
+ravel-object-store = { path = "../ravel-object-store", version = "0.35.0" }
+ravel-proto = { path = "../ravel-proto", version = "0.35.0" }
+ravel-types = { path = "../ravel-types", version = "0.35.0" }
 # The drill versions (RSEG 8, RLOG 6, RSPAN 6), test-only. This table is the
 # one place scripts/guards/check-release-profile.sh rule 5 allows them.
-ravel-segment = { path = "../ravel-segment", version = "0.34.0", features = ["format-drill"] }
-ravel-logseg = { path = "../ravel-logseg", version = "0.34.0", features = ["format-drill"] }
-ravel-rspan = { path = "../ravel-rspan", version = "0.34.0", features = ["format-drill"] }
+ravel-segment = { path = "../ravel-segment", version = "0.35.0", features = ["format-drill"] }
+ravel-logseg = { path = "../ravel-logseg", version = "0.35.0", features = ["format-drill"] }
+ravel-rspan = { path = "../ravel-rspan", version = "0.35.0", features = ["format-drill"] }
 # Decoding the on-store ProvisioningRecord/CompatRecord in the matrix tests,
 # to assert format_version and the compat fence fields. Already a transitive
 # dependency through ravel-proto; pinned here for the test's direct use.
