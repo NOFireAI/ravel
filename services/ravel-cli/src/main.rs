@@ -2548,7 +2548,9 @@ enum MaintainCommand {
         /// bucket name the same inputs. `off` plans from every listed commit
         /// record once the bucket seals: for a bucket whose commit records were
         /// all written after it sealed, such as one `commit reconstruct`
-        /// rebuilt, which `on` leaves uncompacted.
+        /// rebuilt, which `on` leaves uncompacted. `on` refuses a
+        /// `--max-flush-lifetime` other than the default: the cutoff is derived
+        /// from it, and every maintainer of a store must use the same one.
         #[arg(long, value_enum, default_value_t = maintain::LateCommitFenceArg::On)]
         late_commit_fence: maintain::LateCommitFenceArg,
         /// Override the compactor's `max_flush_lifetime` (humantime duration,
@@ -2559,7 +2561,8 @@ enum MaintainCommand {
         /// a bucket a writer is still flushing into can then be sealed and
         /// compacted, and that writer's later-published object is missed by the
         /// compaction. The default is the safe 1h; use this only for a tenant
-        /// known quiescent, such as one whose bulk load has finished.
+        /// known quiescent, such as one whose bulk load has finished. A value
+        /// other than 1h needs `--late-commit-fence off`.
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
@@ -2648,7 +2651,9 @@ enum MaintainCommand {
         /// bucket name the same inputs. `off` plans from every listed commit
         /// record once the bucket seals: for a bucket whose commit records were
         /// all written after it sealed, such as one `commit reconstruct`
-        /// rebuilt, which `on` leaves uncompacted.
+        /// rebuilt, which `on` leaves uncompacted. `on` refuses a
+        /// `--max-flush-lifetime` other than the default: the cutoff is derived
+        /// from it, and every maintainer of a store must use the same one.
         #[arg(long, value_enum, default_value_t = maintain::LateCommitFenceArg::On)]
         late_commit_fence: maintain::LateCommitFenceArg,
         /// Override the compactor's `max_flush_lifetime` (humantime duration,
@@ -2659,7 +2664,8 @@ enum MaintainCommand {
         /// a bucket a writer is still flushing into can then be sealed and
         /// compacted, and that writer's later-published object is missed by the
         /// compaction. The default is the safe 1h; use this only for a tenant
-        /// known quiescent, such as one whose bulk load has finished.
+        /// known quiescent, such as one whose bulk load has finished. A value
+        /// other than 1h needs `--late-commit-fence off`.
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
@@ -3750,6 +3756,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant_kms,
                 },
         } => {
+            maintain::check_fence_flush_lifetime(late_commit_fence, max_flush_lifetime)?;
             let scratch = scratch.options()?;
             maintain::compact_with_part_split_targets(
                 store::build_tenant_data_store(
@@ -3798,6 +3805,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant_kms,
                 },
         } => {
+            maintain::check_fence_flush_lifetime(late_commit_fence, max_flush_lifetime)?;
             let scratch = scratch.options()?;
             maintain::compact_tenant(
                 store::build_tenant_data_store(

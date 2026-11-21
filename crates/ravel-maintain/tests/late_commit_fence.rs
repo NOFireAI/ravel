@@ -30,7 +30,9 @@ use ravel_maintain::{
     late_commit_records_total, migrate_bucket_format, migrate_family, read,
     store_clock_unobserved_total, sweep_erasure_requests, sweep_shard, sweep_superseded,
 };
-use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_proto::commit::v1::{
@@ -1138,6 +1140,94 @@ async fn a_late_l0_keeps_a_windowless_request_blocked_whatever_it_holds() {
             .into_iter()
             .collect()
     );
+}
+
+/// The completion gate judges a bucket under the test the raw-L0 erasure
+/// rewrite plans under. Under the fence a bucket that is sealed but not yet
+/// plannable, by the pass's clock or by the store's, keeps a request it held
+/// at acknowledgement blocked and is not listed at all; once plannable it is
+/// judged, and a request whose window holds nothing it serves completes. With
+/// the fence off the gate judges the bucket as soon as it seals, as before.
+#[tokio::test]
+async fn completion_waits_until_the_bucket_is_plannable() {
+    let _serial = SERIAL.lock().await;
+    let (memory, _) = erasure_fixture_without_late().await;
+    let b = base_ns();
+    let mut pending = request("victim", Some((b + 10_000_000, b + 20_000_000)), 0x4566);
+    pending[0].request.created_unix_ns = b + 30 * 60 * NS_PER_SECOND;
+    let request_id = pending[0].request.request_id.clone();
+    let config = fenced(FENCE, CompactorConfig::default());
+    let sealed = bucket().end_ns() + config.seal_margin_ns();
+    let settled = cutoff_ns() + LATE_COMMIT_SETTLE_NS;
+    assert!(bucket().is_sealed(sealed, &config));
+    assert!(
+        sealed < settled,
+        "the seal comes before the bucket is plannable"
+    );
+
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket().tenant_hash,
+        bucket().signal,
+        bucket().shard,
+        bucket().ingest_hour_bucket,
+    )
+    .expect("bucket prefix");
+    let store = FaultStore::new(
+        memory,
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::List, ScriptedFault::Permanent("bucket listed".into()))
+                .with_key_contains(prefix),
+        ),
+    );
+    for (now_ns, observed) in [(sealed, None), (settled, Some(settled - NS_PER_SECOND))] {
+        store.inner().set_observed_store_time_ns(observed);
+        let completion = bucket_erasure_completion(
+            &store,
+            &FixedClock::new(now_ns),
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+        )
+        .await
+        .expect("a bucket that is not plannable is not listed");
+        assert_eq!(
+            completion.blocked,
+            [request_id.clone()].into_iter().collect(),
+            "at {now_ns} with the store clock at {observed:?}"
+        );
+        assert!(!completion.unresolved);
+    }
+    assert_eq!(store.fault_count(Op::List, FaultKind::Permanent), 0);
+
+    let memory = store.inner();
+    memory.set_observed_store_time_ns(Some(settled));
+    let completion = bucket_erasure_completion(
+        memory,
+        &FixedClock::new(settled),
+        &config,
+        &NoLeases,
+        &bucket(),
+        &pending,
+    )
+    .await
+    .expect("completion");
+    assert!(completion.blocked.is_empty(), "{:?}", completion.blocked);
+    assert!(!completion.unresolved);
+
+    memory.set_observed_store_time_ns(None);
+    let off = fenced(LateCommitFence::Off, CompactorConfig::default());
+    let completion = bucket_erasure_completion(
+        memory,
+        &FixedClock::new(sealed),
+        &off,
+        &NoLeases,
+        &bucket(),
+        &pending,
+    )
+    .await
+    .expect("completion");
+    assert!(completion.blocked.is_empty(), "{:?}", completion.blocked);
 }
 
 /// The pinned-query window (ADR-1133) zeroed, so the sweep's observing rule-2
