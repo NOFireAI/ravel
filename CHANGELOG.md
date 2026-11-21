@@ -20,6 +20,51 @@ no manual step, except an hour already folded into the catalog snapshot, which
 keeps serving both records until a fold reconciles that hour again. See the
 entry under Fixed.
 
+**Upgrade: the late-commit fence is on by default (#4561).** Maintenance now
+plans a sealed hour only from commit records the store stamped before the
+hour's cutoff, so the first compaction of an hour starts about a minute later
+than in 0.34.0. The fence holds for a store only once every maintainer of it,
+`ravel-server` maintenance and every `ravel-cli maintain` run, is on 0.35.0: a
+0.34.0 maintainer running beside a 0.35.0 one during a rolling upgrade plans
+without it. Every maintainer of a store must use the same
+`max_flush_lifetime` and clock-skew allowance while the fence is on, and
+`ravel-cli maintain compact-bucket` and `compact-tenant` refuse a
+`--max-flush-lifetime` other than `1h` unless `--late-commit-fence off` is
+given. Hours rebuilt with `ravel-cli commit reconstruct` count as late and are
+not compacted until that shard's maintenance runs once with
+`--late-commit-fence off`, after the writers for those hours are gone. Before
+any run with the fence off, list the tenant's erasure requests with
+`ravel-cli erase status` and, after the run, resubmit every completed request
+whose window overlaps the hours it compacted, or the erased rows can be
+served again. The fence relies on the store stamping each object with a stable
+time and listing it within 60 s of that time; where either fails, a bucket
+can be planned as in 0.34.0, and a conflict that results is counted in
+`ravel_catalog_erasure_overlap_conflicts_total`. The fence prevents new
+partial covers but does not repair a store that already holds one: such a
+bucket keeps its erasure requests from completing, while the `.dreq` keep
+still hides the erased rows.
+
+**Upgrade: a read with a commit token can now be refused where it returned
+erased data (#4570).** A read whose commit token names a write that was erased,
+and whose erasure rewrite has since been rewritten, now fails as unavailable
+(HTTP 503 on the query API) with `requested commit token is not yet visible;
+retry` when the read's time
+window does not cover the rewritten data. Before, a query node that had
+cached the write's commit record answered with rows, which could include the
+erased data. Retrying with the same token gets the same answer: retry without
+the token, or with a token from a later write. Token reads also cost more
+store requests; see the entry under Fixed.
+
+**Known issue: a commit record that lands after its hour sealed is never
+compacted (#4561).** Such a late record is still served and kept. An erasure
+request whose window overlaps it does not complete and raises the erasure
+deadline alarm, and a format floor stays down while it is stored. 0.34.0 had
+the same for a late record that landed after its bucket's compaction; the
+fence extends it to one that lands between the seal and the first plan. Each
+plan counts the records it leaves out in
+`ravel_maintain_late_commit_records_total`. A later release disposes of late
+records.
+
 **`ravel_maintain_legal_hold_refresh_failures_total` now counts every failed
 hold read, not only failed tick refreshes.** It adds one for each delete batch
 whose hold re-read failed and one for each erasure-request pass whose re-read
@@ -191,6 +236,70 @@ left behind.
   behind it cannot be known, so while such a rewrite shares its bucket with
   a served compaction record every `.dreq` for that tenant and signal is
   kept the same way.
+- **Maintenance plans a sealed bucket only from on-time commit records
+  (#4561).** A commit PUT the store applies after its hour's maintain seal (a
+  late L0) could be taken by one maintenance pass and missed by another, so
+  a compaction could publish beside an erasure rewrite that covered only
+  part of its inputs: both records were served, surviving rows of the shared
+  inputs could be returned twice, and every later erasure of the bucket
+  failed with `MultipleLiveRecords`. Compaction, `maintain migrate` and the
+  raw-L0 erasure rewrite now leave out every commit record the store stamped
+  at or after `end(H) + max_flush_lifetime + clock_skew_allowance`, and plan
+  only once both their own clock and the store's are 60 s past it, so every
+  plan of a bucket names the same inputs. A late record is still served and
+  kept; nothing is deleted or hidden. Each plan counts the records it leaves
+  out in `ravel_maintain_late_commit_records_total` and logs each key at
+  warn, `ravel_maintain_store_clock_unobserved_total` counts plans with no
+  store clock reading, and `ravel-cli maintain status --hour` prints
+  `late_commit_records`. `maintain migrate` names a bucket whose remaining
+  below-target records are late with `reason=late_commit_records`. The fence
+  is on in `ravel-server`'s maintenance and in `ravel-cli maintain
+  compact-bucket`, `compact-tenant` and `migrate`; `--late-commit-fence off`
+  restores the old planning for a bucket whose records were all written
+  after it sealed, such as one `ravel-cli commit reconstruct` rebuilt, which
+  the fence otherwise never compacts. The first compaction of an hour starts
+  about a minute later than before, and an erasure request whose scope held
+  the hour completes no earlier than that. Every maintainer of a store must
+  use the same `max_flush_lifetime` and clock-skew allowance while the fence
+  is on, so `compact-bucket` and `compact-tenant` refuse a
+  `--max-flush-lifetime` other than `1h` unless `--late-commit-fence off` is
+  given. Before running with the fence off over a bucket holding a late
+  record, list erasure requests with `ravel-cli erase status` and resubmit,
+  after the run, every completed one whose window overlaps those hours.
+- **A late commit record keeps a completed erasure request's filter
+  (#4561).** A commit record the store applied after its bucket's late-commit
+  cutoff is served but never rewritten, and if it landed after an erasure
+  request completed, the completion gate never saw it. Once the request
+  passed its horizon the erasure-request sweep deleted its `.dreq`, and with
+  it the query-time filter that was hiding the subject's rows in that
+  record. The sweep now keeps the `.dreq` while any bucket of the tenant and
+  signal holds a late record whose event times the request's window may
+  overlap (a request with no window overlaps every such bucket), including a
+  bucket with a retention tombstone, which a HEAD that already folded it
+  serves until the next fold. Each keep is counted in
+  `ravel_maintain_dreq_held_by_superseded_inputs_total` and logged at warn
+  naming the bucket; the `.dreq` is released on the first pass after the
+  record is deleted, by an operator or by retention. Compacting such a bucket
+  with `--late-commit-fence off` carries the record's rows into parts the
+  completed request never revisits, so check first that no completed
+  request's window overlaps it.
+- **A read with a commit token no longer returns a write's rows twice or
+  erased data (#4570).** After a compaction, a token read could return an
+  acknowledged write's rows twice. On a query node that had cached the write's
+  commit record, it could also return data an erasure had removed, once the
+  erasure had completed and its request had been released: for metrics after
+  any erasure, and for logs and spans after the erasure's rewrite had itself
+  been rewritten. 0.34.0 had the same behaviour. Both are fixed. Where a
+  token's write was erased, its erasure rewrite has since been rewritten, and
+  the read's time window does not cover the rewritten data, the read now fails as unavailable with `requested commit token is not yet
+  visible; retry` instead of returning rows; retry without the token or with
+  a later write's token. A token read now costs one GET per token whose
+  commit record the node had cached, unless the read already holds that
+  write's object. A metrics token read now checks the token's bucket as a
+  logs or spans read does (one LIST and a GET per rewrite record when the
+  read holds a compacted part of that bucket or an erasure is pending), and
+  once a tenant has a completed erasure, any token read whose object is not
+  already in the read pays that check too.
 - **A legal hold now stops the deletes of a maintenance pass that is already
   running.** Maintenance read the hold set once per tenant per tick, so a hold
   placed after that read was not honored until the next tick, up to one
