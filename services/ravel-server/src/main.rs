@@ -761,10 +761,13 @@ async fn main() -> anyhow::Result<()> {
     // The SIGTERM and SIGINT handlers are installed after the startup store
     // checks and before `start`. A signal during the startup store checks
     // still takes its default action (or is discarded when the server is
-    // PID 1, issue #4438). A signal during `start`, including its retried
-    // ipcrypt startup marker read, or between readiness and the await below,
-    // is held by the installed handler and drained once `start` returns Ok
-    // (an `Err` from `start` ends `main` with that error instead).
+    // PID 1, issue #4438). A signal during `start`, or between readiness and
+    // the await below, is held by the installed handler until `start` returns,
+    // then drained (an `Err` from `start` ends `main` with that error instead).
+    // Only the ipcrypt startup marker read inside `start` is bounded by
+    // `startup_retry`; its other store calls are bounded only by the store
+    // client's own timeouts, so against a stalling store the hold can outlast
+    // an orchestrator's grace period and end in SIGKILL.
     let mut shutdown_listener = ShutdownListener::install();
 
     let running = ravel_server::start_with_heartbeat_and_ipcrypt(

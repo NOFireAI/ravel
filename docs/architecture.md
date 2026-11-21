@@ -267,9 +267,13 @@ The server installs its SIGTERM and SIGINT handlers before `/readyz` reports
 200, so a signal delivered the instant the pod becomes ready drains rather than
 taking the signal's default disposition and killing the process. It installs
 them after the startup store checks, so a signal during those checks is not
-handled yet. A signal while the server starts, which can retry the ipcrypt
-startup marker read up to `--startup-store-deadline`, is held and drained once
-startup succeeds; a failed startup exits non-zero instead.
+handled yet. A signal while the server starts is held until startup returns,
+then drained, or the process exits non-zero if startup fails. Only the ipcrypt
+startup marker read during startup is under `--startup-store-deadline`; the
+other store reads there are bounded only by the object store client's own
+retry and request timeouts, so against a stalling store the hold can outlast a
+short termination grace period and the orchestrator's SIGKILL ends the
+process.
 
 On SIGTERM, `/readyz` is the drain signal. The process does these steps in
 order:
