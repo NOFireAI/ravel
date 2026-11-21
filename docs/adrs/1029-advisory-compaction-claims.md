@@ -1217,7 +1217,9 @@ cannot tell that case from a served record that shares nothing with the
 rewrite, so the keep covers both and lasts until the served record is
 deleted or dominated, or retention removes the bucket. The sweep also
 records a bucket's conflicts before it selects the bucket's authoritative
-compaction records, so a bucket whose selection fails keeps them.
+compaction records, so a bucket whose selection fails keeps them, and it
+reports a bucket whose dominance pass itself fails the same fail-safe way,
+since that bucket's conflicts are unknown.
 
 `ErasureDominance::conflicts` now also reports a version 2 record (a
 `migrate` re-encode) that no rewrite's chain names, that is not dominated

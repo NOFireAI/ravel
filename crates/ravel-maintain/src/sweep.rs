@@ -2446,6 +2446,9 @@ impl Version2Groups {
                 Err(error) => {
                     unresolvable(error);
                     out.unresolved.insert(bucket);
+                    // The bucket's conflicts are unknown, so rule 6 keeps
+                    // every .dreq as it does for a cut conflict chain.
+                    out.conflict_truncated.insert(bucket);
                     continue;
                 }
             };
