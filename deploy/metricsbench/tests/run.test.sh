@@ -4026,7 +4026,7 @@ check "ro1: the steps it does not run say why" 'all(j("stamps.json")[k].startswi
 # mp1: MB_L1_MAX_PART_BYTES reaches compact-tenant's argv and the stamps.
 MB_STAGE1=1 MB_STAGE1_ARMS=l1 MB_L1_MAX_PART_BYTES=134217728 run_stage1 mp1 ci
 expect_rc mp1 0
-expect_log "mp1: compact-tenant gets --max-l1-part-bytes" "compact-tenant --tenant metricsbench --signal metrics --shards 4 --max-flush-lifetime 0s --max-l1-part-bytes 134217728"
+expect_log "mp1: compact-tenant gets --max-l1-part-bytes" "compact-tenant --tenant metricsbench --signal metrics --shards 4 --max-flush-lifetime 0s --late-commit-fence off --max-l1-part-bytes 134217728"
 check "mp1: the value is stamped, and named in the compaction command" 'j("stamps.json")["stage1"]["l1_max_part_bytes"] == "134217728" and j("stamps.json")["stage1"]["l1_compact"]["command"].endswith(" --max-l1-part-bytes 134217728")'
 MB_STAGE1=1 MB_STAGE1_ARMS=l1 MB_L1_MAX_PART_BYTES=0 run_stage1 mp1-zero ci
 expect_rc mp1-zero 64
