@@ -6,7 +6,7 @@
 ARG SERVER_IMAGE=ravel-antithesis-server:lifecycle-gc
 FROM ${SERVER_IMAGE} AS server
 
-FROM rust:1.97.1-trixie AS build
+FROM rust:1.100.0-trixie AS build
 WORKDIR /src
 COPY driver/Cargo.toml driver/Cargo.lock ./
 COPY driver/src ./src
