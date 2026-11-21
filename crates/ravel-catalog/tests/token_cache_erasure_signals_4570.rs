@@ -489,7 +489,6 @@ async fn x2_rewrite_output_compacted(signal: Signal) {
 /// `token_input_replacement` returns `None` for metrics whatever the bucket
 /// holds, so the cached A is added beside P.
 #[tokio::test]
-#[ignore = "fails until #4570 is fixed"]
 async fn metrics_x1_record_cache_hit_after_horizon() {
     x1_record_cache_hit_after_horizon(Signal::Metrics).await;
 }
@@ -505,7 +504,6 @@ async fn spans_x1_record_cache_hit_after_horizon() {
 }
 
 #[tokio::test]
-#[ignore = "fails until #4570 is fixed"]
 async fn metrics_x2_rewrite_output_compacted() {
     x2_rewrite_output_compacted(Signal::Metrics).await;
 }
@@ -513,13 +511,11 @@ async fn metrics_x2_rewrite_output_compacted() {
 /// With R gone, no record in the bucket names A's identity, so the cached A
 /// is added beside P2.
 #[tokio::test]
-#[ignore = "fails until #4570 is fixed"]
 async fn logs_x2_rewrite_output_compacted() {
     x2_rewrite_output_compacted(Signal::Logs).await;
 }
 
 #[tokio::test]
-#[ignore = "fails until #4570 is fixed"]
 async fn spans_x2_rewrite_output_compacted() {
     x2_rewrite_output_compacted(Signal::Spans).await;
 }
