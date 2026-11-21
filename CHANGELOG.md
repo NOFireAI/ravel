@@ -8,6 +8,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.35.0] - 2026-11-21
 
+**Upgrade: scripts that run the preview `ravel-cli compat` commands must
+change.** A refused `compat` command now exits 5, not 2, and `compat
+activate` needs `--writer-roles-can-read-compat`. See the `ravel-cli compat`
+entry under Changed.
+
+**The 0.34.0 known issue #4449 is fixed.** An erasure rewrite now wins over a
+compaction or migrate record whose inputs it covers in full, with claims on or
+off. After the upgrade, a bucket already in that state is read correctly with
+no manual step, except an hour already folded into the catalog snapshot, which
+keeps serving both records until a fold reconciles that hour again. See the
+entry under Fixed.
+
+**`ravel_maintain_legal_hold_refresh_failures_total` now counts every failed
+hold read, not only failed tick refreshes.** It adds one for each delete batch
+whose hold re-read failed and one for each erasure-request pass whose re-read
+failed. In 0.34.0 every increment meant a tenant's whole maintenance tick was
+skipped. Now one tick can add several, and an increment can mean only that one
+batch deleted nothing. Review alerts that read an increase as a skipped tick.
+
+**A logs erasure that 0.34.0 already applied to a bucket is not applied again
+(#4503).** If the subject was named only in a resource or scope attribute,
+submit a new erasure request for it after the upgrade to remove the records
+left behind.
+
 ### Added
 
 - **The fold can build the metrics series index, behind a switch that is off
@@ -22,6 +46,19 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   metrics erasure request is pending, and `--rebuild-key-index` with the
   flag attaches the fields to parts that lack them. Turn it on only once
   every query, maintain and fold process runs a build that reads version 3.
+  No active version admits version 3 leaves yet (activation is #4545), so
+  both switches refuse to write them on a store that uses `sys/compat`. In
+  `ravel-server`, with the key-index leaf build, the metrics label index and
+  the series index all on, the fold's write-policy gate checks the key-index
+  family at version 3 and refuses a metrics fold on a store whose active
+  version is 2, before anything is read or written. The refusal names the
+  `kidx` family and `--fold-metrics-series-index`, and says to drop the flag
+  to resume metrics folding. Logs and spans folds, and metrics folds with any
+  of the three off, are checked at version 2. `ravel-cli catalog fold
+  --metrics-series-index`, and `--rebuild-key-index` with it, check for the
+  `sys/compat` object before the fold or rebuild starts. They write nothing
+  and exit non-zero when it exists or when the check itself fails. Without
+  the flag nothing changes and no extra request is made.
 - **MetricsBench's Stage 1 lane can measure the metrics series index.**
   `MB_SERIES_INDEX=1` with `MB_STAGE1=1` runs the routed passes with
   `ravel-server --fold-metrics-series-index` and every label-index-on fold
@@ -34,12 +71,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   carries ADR-4146's rows A1 and A6 as predicted bands. With the switch off
   no series flag or stamp is added, and the holders stamp and compare output
   are unchanged.
-- **`l1_listing_charge` bench measures what a series listing charges the memory
-  budget per L1 metrics part.** It compacts a MetricsBench-shaped shard bucket
-  at several `max_l1_part_bytes` caps and binary-searches the smallest budget
-  under which listing one part succeeds, to 1 %, beside the
-  `(64 + 32) * samples + catalog` formula and the wire bytes the listing's GETs
-  hold, which that formula leaves out.
+- **The `l1_listing_charge` bench measures the memory-budget charge of one L1
+  metrics part.** It compacts a MetricsBench-shaped shard bucket at several
+  `max_l1_part_bytes` caps. For each cap it binary-searches, to 1 %, the
+  smallest budget under which a series listing of one part succeeds, and the
+  same for a sample read of it. It compares the listing against the wire bytes
+  its GETs hold plus the catalog decode length, and the sample read against
+  `(64 + 32) * samples + catalog` plus those held bytes, which that formula
+  leaves out.
 
 ### Fixed
 
@@ -50,9 +89,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   crossover on their pages first and, when it fires, reads the object whole
   after its probe instead of first fetching the BLOOM and POSTINGS sections
   the scan would have needed. Rows are unchanged.
-- A background format migration on S3 no longer skips a range of buckets
-  until its walk finishes again when a stale run overwrites a resume cursor
-  that was deleted and recreated with the same bytes.
+- A format migration on S3, by `ravel-cli maintain migrate` or the server's
+  background migrate, no longer skips a range of buckets until its walk
+  finishes again when a stale run overwrites a resume cursor that was deleted
+  and recreated with the same bytes. A 0.34.0 process that reads the new
+  cursor walks from the start.
 - **Every description of a buffer dropped on a stale provisioning view names
   every cause.** The ERROR log, the `Abandoned` message a strict waiter gets,
   the shard and metrics doc comments, `docs/ingest.md` and
@@ -65,7 +106,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Compat maintenance fixes (ADR-4233 decision 7).** A release that retires
   a reader now refuses to start on a bucket with no `sys/compat` and no
   `sys/tenancy` that already holds tenant data under `t/`, instead of
-  treating it as fresh; the refusal names `ravel-cli compat init`. Background
+  treating it as fresh; the refusal names `ravel-cli compat init`. 0.35.0
+  retires no reader, so this check does not run in this release. Background
   migrate walks a contradicted family once per certificate and watermark:
   after a walk drains clean it skips the family until either changes,
   instead of re-listing every bucket each tick. The maintenance unit no
@@ -99,16 +141,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the tick of the same process holds: it claims under its own process id,
   which the server logs at startup beside the worker id. A claim's owner id
   can therefore be one with no `sys/maintain/workers/` heartbeat key.
-  `--maintain-claims off` turns claiming off for both.
-- **An erased series is no longer served after a compaction races its
-  erasure rewrite.** When a compaction stalled past its claim's lease inside
-  its record PUT (a process freeze, a VM or container pause, or a slow PUT),
-  it could publish beside an erasure rewrite of the same bucket. Every read
-  then served the compaction's parts next to the rewrite's: the erased series
-  came back and the bucket's other rows were returned twice, and every later
-  erasure pass over the bucket failed with `MultipleLiveRecords`, so the
-  request never completed. A compaction record whose inputs one erasure
-  rewrite covers in full is now superseded by that rewrite: reads serve only
+  `--maintain-claims off` turns claiming off for both. In 0.34.0 the
+  background migrate had nothing it could publish, since no class-A family
+  could be activated above the baseline; the claim closes the gap before a
+  release allows it.
+- **An erased series is no longer served after a compaction or migrate
+  publishes beside its erasure rewrite (#4449).** A compaction or `migrate`
+  pass could publish beside an erasure rewrite of the same bucket. With
+  claims on, the default, this happened when a pass stalled past its claim
+  lease inside its record PUT (a process freeze, a VM or container pause, or
+  a slow PUT). With `--maintain-claims off`, or a `ravel-cli maintain
+  compact-bucket`, `compact-tenant` or `migrate` run with `--no-claim`, it
+  took only one pass's record PUT landing between the other's re-list and its
+  PUT. Every read then served the compaction's parts next to the rewrite's:
+  the erased series came back and the bucket's other rows were returned
+  twice, and every later erasure pass over the bucket failed with
+  `MultipleLiveRecords`, so the request never completed. A compaction record,
+  written by compaction or migrate, whose inputs one erasure rewrite covers
+  in full is now superseded by that rewrite, whether or not claims were on:
+  reads serve only
   the rewrite's parts, the erasure pass completes, and the maintenance sweep
   deletes the compaction's record and parts with the rewrite's superseded
   inputs, under the usual horizon and legal-hold rules. After an upgrade, a
@@ -122,8 +173,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   covers only in part is still a conflict and is served as before; it is now
   counted in `ravel_catalog_erasure_overlap_conflicts_total` and logged at
   warn. `ravel_catalog_dominated_compaction_records_total` counts the
-  records the new rule supersedes. Both count per resolution: a record still
-  present is counted again by every later read of its bucket.
+  records the new rule supersedes. Both count once per bucket resolution
+  (queries, the fold, scrub, migrate and the erasure pass; the sweep does not
+  count), so a record still present is counted again by every later
+  resolution.
 - **A legal hold now stops the deletes of a maintenance pass that is already
   running.** Maintenance read the hold set once per tenant per tick, so a hold
   placed after that read was not honored until the next tick, up to one
@@ -176,22 +229,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `sys/compat` or `sys/tenancy` (sent only by a release that retires a reader)
   is refused as access denied, startup sends one
   GET of the same key and retries the HEAD only if that GET is refused for
-  clock skew; otherwise it refuses at once, as before.
-- **The fold's write-policy gate checks the series-index leaf version.** With
-  the metrics label index and series index switches both on, a metrics fold
-  writes its series-index key-index leaves at version 3, but the
-  `sys/compat` write-policy gate checked version 2, so a fold on a store
-  whose active key-index version is 2 wrote version 3 leaves. The gate now
-  checks version 3 for that fold and refuses it, naming the `kidx` family,
-  before anything is read or written. Logs and spans folds, and metrics
-  folds with either switch off, are checked at version 2 as before.
-- **`ravel-cli catalog fold --metrics-series-index` is refused on a store
-  that holds `sys/compat`.** The series index writes key-index leaves at
-  version 3, which no active version on an activated store admits and v0.33.0
-  cannot read (activation is #4545). The fold and `--rebuild-key-index` now
-  check for the `sys/compat` object before the fold or rebuild starts, write
-  nothing, and exit non-zero when it exists or when the check itself fails. Without the
-  flag nothing changes and no extra request is made.
+  clock skew; otherwise it refuses at once, as before. 0.35.0 retires no
+  reader, so that HEAD is not sent in this release.
 
 ### Changed
 
