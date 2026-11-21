@@ -117,7 +117,9 @@ For a bucket of hour `H` under configuration `config`:
    candidate `.dreq` past its horizon while a bucket of the request's tenant
    and signal holds a late record (R2) whose event-time span the request's
    window may overlap (`bucket_may_overlap`; a request with no window
-   overlaps every bucket). It does so whatever the fence setting.
+   overlaps every bucket). It does so whatever the fence setting, and
+   whether or not the bucket carries a retention tombstone: the keep lasts
+   until the late record is deleted.
 
 ### Why this removes the partial cover
 
@@ -178,13 +180,19 @@ no record and so of no chain.
 R9 closes it at rule 6. The sweep already lists the signal's commit
 keyspace once for its observing rule-2 pass; it classifies each commit
 record of that listing by R2 against its own bucket's cutoff, GETs each late
-one for its event-time span, and skips a bucket with a retention tombstone,
-which serves nothing. Only when there is a late record does it GET each
-candidate `.dreq` to compare windows. A kept request is counted in
+one for its event-time span. Only when there is a late record does it GET
+each candidate `.dreq` to compare windows. A kept request is counted in
 `ravel_maintain_dreq_held_by_superseded_inputs_total`, the counter every
 other rule-6 keep uses, and logged once at warn naming the bucket. The keep
 is recomputed every pass and never persisted, so the `.dreq` is released on
-the first pass after the late record is deleted or its bucket tombstoned.
+the first pass after the late record is deleted.
+
+A bucket with a retention tombstone is not skipped. The tombstone hides the
+bucket from a snapshot only once a fold observes it; a HEAD that already
+folded the bucket keeps serving its records, the late one included, until
+that fold. Releasing the `.dreq` at the tombstone would drop the filter
+while those rows are still readable, so the keep lasts until retention
+deletes the record.
 
 The classification is applied whatever the fence setting, because a stamp
 says what the store applied late whether or not this pass's planners fence
@@ -335,11 +343,15 @@ In `crates/ravel-maintain/tests/late_commit_fence.rs`, with stamps set on
   lands. Past the horizon, after rule 2 has removed the rewrite's
   superseded inputs, rule 6 keeps the `.dreq` and counts it as held.
   Without the keep it deletes it.
+  `with_the_fence_off_a_late_l0_landing_after_completion_keeps_the_dreq`
+  runs the same sweep with the fence off, and fails if the classification
+  is gated on the fence.
   `a_late_l0_keeps_a_windowless_dreq_whatever_it_holds`,
   `a_late_l0_outside_the_window_does_not_keep_the_dreq`,
   `the_dreq_is_released_once_the_late_l0_is_gone` and
-  `a_late_l0_in_a_tombstoned_bucket_does_not_keep_the_dreq` pin the
-  window rule, the release and the tombstone skip.
+  `a_late_l0_in_a_tombstoned_bucket_keeps_the_dreq_until_it_is_deleted` pin
+  the window rule, the release, and the keep across a retention tombstone
+  until the record is deleted.
 - `a_late_below_target_l0_is_named_and_the_walk_goes_on` (site 10).
 - `determinism::the_split_is_the_same_for_every_order_and_page_boundary`,
   a property test over insertion order and two-key listing pages, and
