@@ -3508,9 +3508,14 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      claimed them (a lost or late advisory claim, ADR-1029), so its parts
      may hold an erased subject; the rewrite wins exactly as it does over a
      dominated version 2 record, and a version 2 record whose predecessor
-     is a dominated version 1 record is dominated too. A version 1 record
-     whose inputs a live rewrite covers only in part is not dominated: it
-     stays an overlap conflict for the selection below. It is counted in
+     is a dominated version 1 record is dominated too. A compaction record of
+     either version that no rewrite's chain names, that is not dominated, and
+     that shares an input with a live rewrite is an overlap conflict and is
+     left to the selection below; a version 2 re-encode carries its
+     predecessor's inputs, so it stays a conflict after its version 1
+     predecessor is reclaimed. The erasure-request sweep keeps the `.dreq` of
+     every request such a rewrite applied while the conflict stands
+     (docs/deletion-and-gc.md). A conflicting record is counted in
      `ravel_catalog_erasure_overlap_conflicts_total`, once however many
      rewrites it overlaps, and each such record-rewrite pair is logged at
      WARN, a recently logged pair not again. A dominated version 1 record is
