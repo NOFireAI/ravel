@@ -519,7 +519,6 @@ async fn e1_erased_input_cached_on_the_node_is_not_served() {
 /// compaction input identity can name a rewrite's output, so R2 is how a
 /// rewritten bucket's output is replaced.
 #[tokio::test]
-#[ignore = "fails until #4570 is fixed"]
 async fn e2_erased_input_cached_on_the_node_after_a_rewrite_of_the_rewrite() {
     let (store, warm, clock, a, (r_key, _)) = erased_after_warm_read().await;
 
@@ -559,7 +558,6 @@ fn assert_served_once(snapshot: &Snapshot, a: &CommitRecord, c: &CompactionRecor
 /// C compacted A into L and the sweep deleted A's commit record. The token's
 /// fallback must not add L beside A.
 #[tokio::test]
-#[ignore = "fails until #4570 is fixed"]
 async fn d1_swept_token_over_a_cached_head_naming_its_input_serves_it_once() {
     let store = Arc::new(MemoryStore::new());
     let node = cold_record_node(&store);

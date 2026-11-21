@@ -3461,8 +3461,9 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    times the largest bucket's decoded records, and that figure is per
    concurrent resolve, which is the number to hold next to the host-memory
    gate. Two paths stay outside the once-per-resolve rule: a `min_token`
-   lookup reads its record through the cache after the listing and
-   re-fetches it when a later miss evicted it, and compaction records keep
+   lookup reads its record through the cache after the listing, GETs it
+   again to prove it still present (step 5), and decodes that GET when a
+   later miss evicted it, and compaction records keep
    their own prewarm plus a cache re-read, so at a cap below their count
    each is read twice. Rewrite records are not cached at all: one GET per
    record per resolve, whatever the cap.
@@ -3599,22 +3600,35 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
 4. Filter the remaining L0 commit records: [min_event_ts, max_event_ts]
    overlaps the query range.
 5. For each `min_token`: reconstruct its commit key and GET it directly
-   (never by re-listing). Present: ensure it is in the snapshot set (its
-   event range might not overlap; include it anyway so read-your-write
-   holds), with one exception for every signal but metrics: when the check
-   below runs, the input is not added when the set already serves its rows
-   from a replacement, when a live rewrite replaced it and the set holds
-   nothing else that rewrite replaced, or when its bucket is tombstoned. A
-   compacted input's commit record stays present until the sweep, and logs
-   and spans have no query-time dedup, so adding it beside the part that
-   holds its rows would count each of its records twice. The step checks
-   only when the set holds a level-1 part of the token's (shard,
-   ingest_hour) bucket or step 6 found a pending erasure request (that LIST
-   therefore completes before this step). Without either, the input is
-   added as before, even when its bucket is tombstoned; its rows are not
-   counted twice there, because the set then holds no level-1 part of the
-   bucket that could also hold them. When the check runs, it LISTs the
-   bucket and, in this order:
+   (never by re-listing). The commit-record cache has no TTL and a sweep
+   deletes the record of an input a compaction or rewrite replaced, so a
+   cached record counts as present only once that GET returns it (the
+   cached decoded record is reused, not decoded again); a NotFound after
+   the one retry sends the token to the absent-record path below. The GET
+   is skipped only when the set already holds the token's own level-0
+   object, where both paths add nothing for the token. Present: ensure it
+   is in the snapshot set (its event range might not overlap; include it
+   anyway so read-your-write holds), with one exception for every signal:
+   when the check below runs, the input is not added when the set already
+   serves its rows from a replacement, when a live rewrite replaced it and
+   the set holds nothing else that rewrite replaced, or when its bucket is
+   tombstoned. A compacted input's commit record stays present until the
+   sweep, and logs and spans have no query-time dedup, so adding it beside
+   the part that holds its rows would count each of its records twice.
+   Metrics get the same check: query-time dedup removes duplicate samples,
+   not erased ones, so a metrics input an erasure rewrite replaced is never
+   added beside or instead of the rewrite's output. The step checks only
+   when the set holds a level-1 part of the token's (shard, ingest_hour)
+   bucket, step 6 found a pending erasure request, or a live rewrite of the
+   bucket names the input (step 6's LIST, which therefore completes before
+   this step, is the source of the first two). Finding that live rewrite
+   takes the bucket LIST, so it is looked for only when step 6 listed a
+   `.done`: a `.dreq` is deleted only once its `.done` exists, so with
+   neither listed no rewrite can be live without its request pending.
+   Without any of the three, the input is added as before, even when its
+   bucket is tombstoned; its rows are not counted twice there, because the
+   set then holds no level-1 part of the bucket that could also hold them.
+   When the check runs, it LISTs the bucket and, in this order:
 
    - a tombstone in the bucket: the input is not added, the answer the
      absent-record path below gives (satisfied with zero segments);
@@ -3644,28 +3658,41 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    Records are matched by the input identities they hold, never by object
    key. Tokens whose commit record is absent are resolved first and present
    ones after them, so a present token sees every part an absent token's
-   fallback added and the answer does not depend on token order. Metrics
-   keep adding the input, since query-time dedup collapses the overlap.
+   fallback added and the answer does not depend on token order.
    Cost, per present token: nothing beyond the commit-record GET when the
-   check does not run; otherwise one LIST of its bucket (more pages only
+   check does not run (that GET also runs when the record was cached,
+   unless the set holds the token's object); otherwise one LIST of its
+   bucket (more pages only
    past the page size), one GET per compaction record the cache does not
    hold and one GET per rewrite record, which no cache holds. Nothing is
    shared across tokens, so N tokens whose check runs pay N LISTs even in
    one bucket, and each re-fetches that bucket's rewrite records. While an
-   erasure request is pending, the check runs for every present token of a
-   signal other than metrics whose input is not already in the set, so each
-   pays that LIST and the rewrite GETs whether or not its bucket was
-   compacted or rewritten. Absent: fall back to GETting the
-   bucket's compaction record(s) (cacheable, same as step 2) and check the
-   token's writer identity against each record's input list. Found in an
-   input list: satisfied via
-   that record's parts. A rewrite record (ADR-0064) is treated the same:
-   if the token's identity is among a live (non-superseded) rewrite's
-   effective inputs, it is satisfied via that rewrite's erased output parts,
-   and a rewrite-superseded compaction record's parts are never served. A
-   tombstone present for the bucket: satisfied with zero segments (the data
-   was retired, not lost). Neither found after one retry: error
-   `unsatisfiable token`, surfaced as 5xx.
+   erasure request is pending, the check runs for every present token whose
+   input is not already in the set, so each pays that LIST and the rewrite
+   GETs whether or not its bucket was compacted or rewritten; once step 6
+   lists a `.done`, every present token whose input is not already in the
+   set pays the LIST and the rewrite GETs too. Absent: LIST the bucket and
+   GET its compaction record(s) (cacheable, same as step 2) and rewrite
+   records. A tombstone present for the bucket: satisfied with zero
+   segments (the data was retired, not lost). The set already serves the
+   token's rows (it holds the token's own level-0 object, or an output part
+   of a compaction or rewrite record of any status naming the input, a
+   rewrite through its effective inputs): satisfied with nothing added, so
+   a set served from a cached HEAD that still names the swept input, or a
+   replacement's part, never gets a second copy of its rows. Otherwise
+   check the token's writer identity against each live compaction record's
+   input list. Found in an input list: satisfied via that record's parts. A
+   rewrite record (ADR-0064) is treated the same: if the token's identity
+   is among a live (non-superseded) rewrite's effective inputs, it is
+   satisfied via that rewrite's erased output parts, and a
+   rewrite-superseded compaction record's parts are never served. A
+   rewrite whose `superseded_record_key` chain reaches a record the sweep
+   already deleted has lost that record's input identities; when at least
+   one live rewrite of the bucket has such a chain and the set holds an
+   output part of every one of them (or the rewrite has no parts), the
+   token's rows are served whichever one holds them: satisfied with nothing
+   added. None of these after one retry: error `unsatisfiable token`,
+   surfaced as 5xx.
 6. Attach pending selective-erasure predicates (ADR-0064 decision 2). Once
    per resolve -- independent of whether any physical rewrite has run -- LIST
    `t/<th>/<sig>/del/` one time only. This LIST is started before the shard
