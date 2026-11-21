@@ -13,6 +13,14 @@
 //! because a process that has just started (after a VM resume or an NTP step,
 //! say) can sign with a clock the store has not caught up with yet, and a
 //! restart only repeats that.
+//! A HEAD response has no body, so a skewed HEAD reaches startup as
+//! `AccessDenied`. The one startup check that reads with HEAD, the
+//! retired-reader gate's marker existence checks (sent only by a build that
+//! retires a reader), classifies a HEAD refused
+//! with `AccessDenied` by one GET of the same key through the same store
+//! ([`head_refusal_retry_cause`]): a `ClockSkewed` answer retries it as a
+//! clock-skew refusal, and any other answer leaves the HEAD's refusal to
+//! refuse at once.
 //! The wait between attempts is capped exponential backoff with jitter, and
 //! one deadline shared by every site and measured from process start
 //! (`--startup-store-deadline`) bounds the retries and each retry: a retry
@@ -39,10 +47,10 @@ use std::time::Duration;
 
 use ravel_maintain::GcConfigValues;
 use ravel_object_store::s3::S3Store;
-use ravel_object_store::{KmsRoutingStore, ObjectStoreBackend, StoreError};
+use ravel_object_store::{GetRange, KmsRoutingStore, ObjectStoreBackend, StoreError};
 use ravel_types::{ConfiguredScheme, TenantHash};
 
-use crate::compat_gate::{CompatGateError, GateOutcome, RetiredReader};
+use crate::compat_gate::{CompatGateError, GateOutcome, GateRequest, RetiredReader};
 use crate::config::{Mode, StoreKind};
 use crate::tenancy::{ResolvedTenancy, TenancyError};
 use crate::tenant_kms::{TenantKmsConfig, TenantKmsError};
@@ -456,6 +464,23 @@ pub fn chain_retry_cause(err: &(dyn StdError + 'static)) -> Option<RetryCause> {
     None
 }
 
+/// Why startup retries a HEAD (or `pin_of`) of `key` that `store` refused with
+/// `AccessDenied`. A HEAD response has no body, so the S3 adapter cannot tell
+/// a clock-skew refusal from a missing grant there; one GET of the same key
+/// through the same store can, and only its [`StoreError::ClockSkewed`] gives
+/// [`RetryCause::ClockSkew`]. Any other answer, success and `NotFound`
+/// included, gives `None` and the HEAD's refusal stands. The GET's outcome
+/// only classifies: it never stands in for the HEAD's result.
+pub async fn head_refusal_retry_cause(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Option<RetryCause> {
+    match store.get(key, GetRange::Full).await {
+        Err(StoreError::ClockSkewed(_)) => Some(RetryCause::ClockSkew),
+        _ => None,
+    }
+}
+
 /// `TenantKmsError` holds its `KeyEpochError` in a field that is not a
 /// source, so the chain walk starts there.
 fn tenant_kms_retry_cause(err: &TenantKmsError) -> Option<RetryCause> {
@@ -495,6 +520,9 @@ pub async fn enforce_qualification(
 /// gate wraps, in [`CompatGateError::Store`] or through
 /// [`CompatGateError::CompatUnreadable`], retries when it is transient; every
 /// refusal the gate decides from what it read refuses on the first attempt.
+/// A marker HEAD refused with `AccessDenied` is classified by
+/// [`head_refusal_retry_cause`]: retried as a clock-skew refusal when its
+/// probe GET is refused for clock skew, refused at once otherwise.
 /// It sends no request while `retired` is empty. The deployment key comes
 /// from the configured scheme, as `--tenant-hash-key-file` gives it.
 pub async fn enforce_retired_reader_gate(
@@ -511,17 +539,46 @@ pub async fn enforce_retired_reader_gate(
     let outcome = retry
         .run(
             SITE_RETIRED_READER_GATE,
-            || crate::compat_gate::enforce(store, deployment_key, retired, now_ns),
-            |err: &CompatGateError| chain_retry_cause(err),
+            || async {
+                let error =
+                    match crate::compat_gate::enforce(store, deployment_key, retired, now_ns).await
+                    {
+                        Ok(outcome) => return Ok(outcome),
+                        Err(error) => error,
+                    };
+                let retry = match &error {
+                    CompatGateError::Store {
+                        key,
+                        request: GateRequest::Head,
+                        source: StoreError::AccessDenied(_),
+                    } => head_refusal_retry_cause(store, key).await,
+                    _ => chain_retry_cause(&error),
+                };
+                Err(GateAttemptError { error, retry })
+            },
+            |err| err.retry,
         )
         .await
         .map_err(|failure| {
             failure.into_anyhow(|err| {
-                anyhow::Error::new(err).context("retired-reader gate (sys/compat) refused startup")
+                anyhow::Error::new(err.error)
+                    .context("retired-reader gate (sys/compat) refused startup")
             })
         })?;
     tracing::debug!(outcome = ?outcome, "retired-reader gate passed");
     Ok(outcome)
+}
+
+/// One failed retired-reader gate attempt and why startup retries it.
+struct GateAttemptError {
+    error: CompatGateError,
+    retry: Option<RetryCause>,
+}
+
+impl Display for GateAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
 }
 
 /// Tenant-hash scheme resolution and marker bootstrap (ADR-0050 section 3),
@@ -833,6 +890,131 @@ pub(crate) mod test_support {
         }
 
         async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Answers the `head`s of `key` with `heads` in order and the `get`s of
+    /// `key` with `gets` in order, each then passing through; every other
+    /// call passes through. Counts both.
+    pub(crate) struct ScriptedHeadRefusals {
+        inner: Arc<dyn ObjectStoreBackend>,
+        key: String,
+        heads: Mutex<VecDeque<StoreError>>,
+        gets: Mutex<VecDeque<StoreError>>,
+        head_count: Mutex<u64>,
+        get_count: Mutex<u64>,
+    }
+
+    impl ScriptedHeadRefusals {
+        pub(crate) fn new(
+            inner: Arc<dyn ObjectStoreBackend>,
+            key: &str,
+            heads: impl IntoIterator<Item = StoreError>,
+            gets: impl IntoIterator<Item = StoreError>,
+        ) -> Self {
+            ScriptedHeadRefusals {
+                inner,
+                key: key.to_string(),
+                heads: Mutex::new(heads.into_iter().collect()),
+                gets: Mutex::new(gets.into_iter().collect()),
+                head_count: Mutex::new(0),
+                get_count: Mutex::new(0),
+            }
+        }
+
+        /// The `head`s of `key` so far.
+        pub(crate) fn heads(&self) -> u64 {
+            *self.head_count.lock().expect("heads lock")
+        }
+
+        /// The `get`s of `key` so far.
+        pub(crate) fn gets(&self) -> u64 {
+            *self.get_count.lock().expect("gets lock")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for ScriptedHeadRefusals {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            if key == self.key {
+                *self.get_count.lock().expect("gets lock") += 1;
+                if let Some(refusal) = self.gets.lock().expect("gets lock").pop_front() {
+                    return Err(refusal);
+                }
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn get_pinned(
+            &self,
+            key: &str,
+            range: GetRange,
+            pin: &Pin,
+        ) -> Result<PinnedRead, StoreError> {
+            self.inner.get_pinned(key, range, pin).await
+        }
+
+        async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+            self.inner.get_with_pin(key, range).await
+        }
+
+        async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+            self.inner.pin_of(key).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            if key == self.key {
+                *self.head_count.lock().expect("heads lock") += 1;
+                if let Some(refusal) = self.heads.lock().expect("heads lock").pop_front() {
+                    return Err(refusal);
+                }
+            }
             self.inner.head(key).await
         }
 
@@ -2115,6 +2297,172 @@ mod tests {
         assert_eq!(store.fault_count(Op::Head, FaultKind::Permanent), 0);
         assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 0);
         assert!(clock.sleeps().is_empty());
+    }
+
+    /// The two marker keys the gate HEADs.
+    const GATE_HEAD_KEYS: [&str; 2] = [
+        ravel_catalog::compat::COMPAT_KEY,
+        crate::tenancy::TENANCY_MARKER_KEY,
+    ];
+
+    /// A HEAD refused for a missing grant, its text naming no S3 error code.
+    fn head_denied() -> StoreError {
+        StoreError::AccessDenied("k: Server returned non-2xx status code: 403 Forbidden".into())
+    }
+
+    /// A marker HEAD refused with `AccessDenied` twice, each time a GET of the
+    /// key is refused for clock skew, then answered: the gate retries both as
+    /// clock-skew refusals and starts after 3 HEADs, 2 probe GETs and 2
+    /// sleeps.
+    #[tokio::test]
+    async fn retired_reader_gate_retries_a_head_refusal_its_probe_get_finds_skewed() {
+        for key in GATE_HEAD_KEYS {
+            let clock = Arc::new(ManualClock::default());
+            let store = ScriptedHeadRefusals::new(
+                Arc::new(MemoryStore::new()),
+                key,
+                [head_denied(), head_denied()],
+                [clock_skewed(), clock_skewed()],
+            );
+            let outcome = enforce_retired_reader_gate(
+                &retry_on(clock.clone()),
+                &store,
+                &keyed(),
+                &[RSEG_8],
+                GATE_NOW_NS,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{key}: starts once the HEAD is answered: {err:#}"));
+            assert_eq!(outcome, crate::compat_gate::GateOutcome::Fresh, "{key}");
+            assert_eq!(store.heads(), 3, "{key}: HEADs");
+            assert_eq!(store.gets(), 2, "{key}: probe GETs");
+            assert_eq!(clock.sleeps().len(), 2, "{key}: sleeps");
+        }
+    }
+
+    /// A marker HEAD refused with `AccessDenied`, its text naming the clock-skew
+    /// code, whose probe GET is refused for a grant, answered, or finds no
+    /// object: refused after 1 HEAD and 1 GET, with no sleep and the gate's
+    /// refusal text.
+    #[tokio::test]
+    async fn retired_reader_gate_refuses_a_head_refusal_its_probe_get_does_not_find_skewed() {
+        type Probe = fn() -> Option<StoreError>;
+        let cases: [(&str, Probe, bool); 3] = [
+            ("probe refused", || Some(head_denied()), false),
+            ("probe answered", || None, true),
+            ("probe found nothing", || None, false),
+        ];
+        for key in GATE_HEAD_KEYS {
+            for (name, probe, present) in cases {
+                let clock = Arc::new(ManualClock::default());
+                let inner = MemoryStore::new();
+                if present {
+                    inner
+                        .put(key, Bytes::from_static(b"marker"), PutOptions::default())
+                        .await
+                        .expect("seed the key");
+                }
+                let store = ScriptedHeadRefusals::new(
+                    Arc::new(inner),
+                    key,
+                    [denied_naming_clock_skew()],
+                    probe(),
+                );
+                let err = enforce_retired_reader_gate(
+                    &retry_on(clock.clone()),
+                    &store,
+                    &keyed(),
+                    &[RSEG_8],
+                    GATE_NOW_NS,
+                )
+                .await
+                .expect_err(name);
+                assert_eq!(store.heads(), 1, "{key} {name}: HEADs");
+                assert_eq!(store.gets(), 1, "{key} {name}: probe GETs");
+                assert!(clock.sleeps().is_empty(), "{key} {name}: retried");
+                assert_eq!(err.to_string(), GATE_REFUSAL, "{key} {name}");
+                assert!(
+                    matches!(
+                        err.downcast_ref::<CompatGateError>(),
+                        Some(CompatGateError::Store {
+                            request: crate::compat_gate::GateRequest::Head,
+                            source: StoreError::AccessDenied(_),
+                            ..
+                        })
+                    ),
+                    "{key} {name}: {err:#}"
+                );
+            }
+        }
+    }
+
+    /// A marker HEAD that is answered sends no probe GET.
+    #[tokio::test]
+    async fn retired_reader_gate_answered_head_sends_no_probe_get() {
+        for (key, present) in [
+            (ravel_catalog::compat::COMPAT_KEY, false),
+            (crate::tenancy::TENANCY_MARKER_KEY, true),
+        ] {
+            let clock = Arc::new(ManualClock::default());
+            let inner = MemoryStore::new();
+            if present {
+                put_tenancy_marker(&inner).await;
+            }
+            let store = ScriptedHeadRefusals::new(Arc::new(inner), key, [], []);
+            let result = enforce_retired_reader_gate(
+                &retry_on(clock.clone()),
+                &store,
+                &keyed(),
+                &[RSEG_8],
+                GATE_NOW_NS,
+            )
+            .await;
+            if present {
+                assert!(
+                    matches!(
+                        result
+                            .as_ref()
+                            .map_err(|err| err.downcast_ref::<CompatGateError>()),
+                        Err(Some(CompatGateError::TenancyWithoutCompat))
+                    ),
+                    "{key}: {result:?}"
+                );
+            } else {
+                assert_eq!(
+                    result.expect("fresh"),
+                    crate::compat_gate::GateOutcome::Fresh
+                );
+            }
+            assert_eq!(store.heads(), 1, "{key}: HEADs");
+            assert_eq!(store.gets(), 0, "{key}: GETs");
+            assert!(clock.sleeps().is_empty(), "{key}: retried");
+        }
+    }
+
+    /// A marker HEAD whose probe GET keeps finding clock skew refuses at the
+    /// deadline naming clock skew.
+    #[tokio::test]
+    async fn retired_reader_gate_head_clock_skew_past_the_deadline_refuses_naming_clock_skew() {
+        let clock = Arc::new(ManualClock::default());
+        let store = ScriptedHeadRefusals::new(
+            Arc::new(MemoryStore::new()),
+            ravel_catalog::compat::COMPAT_KEY,
+            std::iter::repeat_with(head_denied).take(1000),
+            std::iter::repeat_with(clock_skewed).take(1000),
+        );
+        let err = enforce_retired_reader_gate(
+            &retry_on(clock.clone()),
+            &store,
+            &keyed(),
+            &[RSEG_8],
+            GATE_NOW_NS,
+        )
+        .await
+        .expect_err("refuses once the deadline passes");
+        assert_clock_skew_deadline_refusal(&err, SITE_RETIRED_READER_GATE, store.heads());
+        assert_eq!(store.gets(), store.heads());
+        assert_eq!(clock.sleeps().len() as u64, store.heads() - 1);
+        assert!(format!("{err:#}").contains(GATE_REFUSAL), "{err:#}");
     }
 
     // --- tenancy ---
