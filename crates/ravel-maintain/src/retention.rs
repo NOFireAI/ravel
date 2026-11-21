@@ -1420,6 +1420,7 @@ mod tests {
             compaction_record_keys: vec!["compaction".to_string()],
             rewrite_record_keys: vec!["rewrite".to_string()],
             tombstone_key: Some("tombstone".to_string()),
+            ..BucketListing::default()
         }
     }
 
