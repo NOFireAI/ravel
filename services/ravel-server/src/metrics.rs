@@ -4824,8 +4824,9 @@ fn render_provisioning_family(
 /// present is counted again by each later resolve until the sweep reclaims it.
 /// The sweep's own dominance evaluation does not count.
 ///
-/// `ravel_catalog_erasure_overlap_conflicts_total` counts version 1 records
-/// that share inputs with a live rewrite that does not cover all of them, each
+/// `ravel_catalog_erasure_overlap_conflicts_total` counts compaction records of
+/// either version, not dominated and named by no rewrite's chain, that share
+/// inputs with a live rewrite that does not cover all of them, each
 /// once per resolution however many rewrites it overlaps. Such a record is not dropped and the bucket may serve rows
 /// the rewrite erased or serve rows twice; each pair is logged at WARN with the
 /// bucket and both record keys, without repeating a recently logged pair.
@@ -4850,7 +4851,7 @@ fn render_erasure_dominance_family(
     write_header(
         out,
         "ravel_catalog_erasure_overlap_conflicts_total",
-        "Version 1 compaction records a bucket resolution found sharing inputs with a live erasure rewrite that does not cover all of them. Each record is counted once per resolution that finds it, so a record still present counts again on every later resolution. The record is not dropped; each pair is logged at WARN without repeating a recently logged pair.",
+        "Compaction records of either version, not dominated and named by no rewrite's chain, that a bucket resolution found sharing inputs with a live erasure rewrite that does not cover all of them. Each record is counted once per resolution that finds it, so a record still present counts again on every later resolution. The record is not dropped; each pair is logged at WARN without repeating a recently logged pair.",
         "counter",
     );
     write_sample(
@@ -6072,9 +6073,11 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// `ravel_maintain_superseded_groups_held_by_legal_hold_total`.
     pub superseded_groups_held_by_legal_hold: u64,
     /// `.dreq`s the erasure-request sweep kept past their horizon because its
-    /// own observing pass held a chain group naming the request, or held a
-    /// chain it could not walk to the end anywhere in the signal, summed per
-    /// tick since process start. Backs
+    /// own observing pass held a chain group naming the request, held a chain
+    /// it could not walk to the end anywhere in the signal, found a live
+    /// rewrite applying the request with a conflicting compaction record, or
+    /// found a conflict whose rewrite chain is cut or whose bucket did not
+    /// resolve (#4560), summed per tick since process start. Backs
     /// `ravel_maintain_dreq_held_by_superseded_inputs_total`.
     pub dreq_held_by_superseded_inputs: u64,
     /// Objects physically deleted from `quarantine/` past the quarantine
@@ -6821,7 +6824,10 @@ fn render_maintain_safety_family(
          per tick that keeps them. The erasure-request sweep's own observing pass of the \
          superseded-input sweep, over every hour and chains of any age, held a chain group \
          naming the request, or held a chain it could not walk to the end anywhere in the \
-         signal, which keeps every such .dreq. The query-time exclusion filter stays in force \
+         signal, which keeps every such .dreq. It also keeps a request applied by a live \
+         rewrite that a compaction record conflicts with, and every .dreq of the signal while \
+         a conflict's rewrite chain is cut or a bucket's conflicts cannot be resolved (#4560). \
+         The query-time exclusion filter stays in force \
          meanwhile. This can grow while the superseded hold counters stay flat.",
         "counter",
     );
