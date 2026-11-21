@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-alerting"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -1663,7 +1663,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-cache"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-catalog"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-codec"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -1716,7 +1716,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-commit"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-compat-tests"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-cpu-gate"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "thiserror",
  "tokio",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-fleet"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "futures",
@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-ingest"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -1812,11 +1812,11 @@ dependencies = [
 
 [[package]]
 name = "ravel-invariant"
-version = "0.34.0"
+version = "0.35.0"
 
 [[package]]
 name = "ravel-ipcrypt"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "hex",
@@ -1829,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-logseg"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -1849,7 +1849,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-maintain"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1880,14 +1880,14 @@ dependencies = [
 
 [[package]]
 name = "ravel-memory"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "tracing",
 ]
 
 [[package]]
 name = "ravel-object-store"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "async-trait",
  "base64 0.23.0",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-otlp"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "hex",
  "opentelemetry-proto",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-proto"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-rspan"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "crc32c",
  "prost",
@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-segment"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -1962,7 +1962,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-types"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "base64 0.23.0",
  "blake3",

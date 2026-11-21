@@ -6,6 +6,267 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-11-21
+
+**Upgrade: scripts that run the preview `ravel-cli compat` commands must
+change.** A refused `compat` command now exits 5, not 2, and `compat
+activate` needs `--writer-roles-can-read-compat`. See the `ravel-cli compat`
+entry under Changed.
+
+**The 0.34.0 known issue #4449 is fixed.** An erasure rewrite now wins over a
+compaction or migrate record whose inputs it covers in full, with claims on or
+off. After the upgrade, a bucket already in that state is read correctly with
+no manual step, except an hour already folded into the catalog snapshot, which
+keeps serving both records until a fold reconciles that hour again. See the
+entry under Fixed.
+
+**`ravel_maintain_legal_hold_refresh_failures_total` now counts every failed
+hold read, not only failed tick refreshes.** It adds one for each delete batch
+whose hold re-read failed and one for each erasure-request pass whose re-read
+failed. In 0.34.0 every increment meant a tenant's whole maintenance tick was
+skipped. Now one tick can add several, and an increment can mean only that one
+batch deleted nothing. Review alerts that read an increase as a skipped tick.
+
+**A logs erasure that 0.34.0 already applied to a bucket is not applied again
+(#4503).** If the subject was named only in a resource or scope attribute,
+submit a new erasure request for it after the upgrade to remove the records
+left behind.
+
+### Added
+
+- **The fold can build the metrics series index, behind a switch that is off
+  by default.** With `ravel-server --fold-metrics-series-index` or
+  `ravel-cli catalog fold --metrics-series-index`, and the key-index leaf
+  build and the metrics `label_value` leaf on, every metrics part the fold
+  re-encodes also gets the three ADR-4146 fields `series_label`,
+  `series_class` and `class_objects`, at key-index leaf format version 3,
+  which the PromQL series route reads. A part whose three fields would pass
+  1 % of its objects' bytes gets none of them
+  (`metrics_series_index_parts_over_cap`), no series leaf is built while a
+  metrics erasure request is pending, and `--rebuild-key-index` with the
+  flag attaches the fields to parts that lack them. Turn it on only once
+  every query, maintain and fold process runs a build that reads version 3.
+  No active version admits version 3 leaves yet (activation is #4545), so
+  both switches refuse to write them on a store that uses `sys/compat`. In
+  `ravel-server`, with the key-index leaf build, the metrics label index and
+  the series index all on, the fold's write-policy gate checks the key-index
+  family at version 3 and refuses a metrics fold on a store whose active
+  version is 2, before anything is read or written. The refusal names the
+  `kidx` family and `--fold-metrics-series-index`, and says to drop the flag
+  to resume metrics folding. Logs and spans folds, and metrics folds with any
+  of the three off, are checked at version 2. `ravel-cli catalog fold
+  --metrics-series-index`, and `--rebuild-key-index` with it, check for the
+  `sys/compat` object before the fold or rebuild starts. They write nothing
+  and exit non-zero when it exists or when the check itself fails. Without
+  the flag nothing changes and no extra request is made.
+- **MetricsBench's Stage 1 lane can measure the metrics series index.**
+  `MB_SERIES_INDEX=1` with `MB_STAGE1=1` runs the routed passes with
+  `ravel-server --fold-metrics-series-index` and every label-index-on fold
+  with `ravel-cli catalog fold --metrics-series-index`, and refuses before
+  anything starts when either binary's help does not list its flag.
+  `holders.json` gains `series_holders` and
+  `expected_series_prunes` per statement, and the holders check compares each
+  record the series route answered by its `segmentsPrunedBySeriesIndex`,
+  naming any statement that differs. `stage1-bands.series.cardinality.json`
+  carries ADR-4146's rows A1 and A6 as predicted bands. With the switch off
+  no series flag or stamp is added, and the holders stamp and compare output
+  are unchanged.
+- **The `l1_listing_charge` bench measures the memory-budget charge of one L1
+  metrics part.** It compacts a MetricsBench-shaped shard bucket at several
+  `max_l1_part_bytes` caps. For each cap it binary-searches, to 1 %, the
+  smallest budget under which a series listing of one part succeeds, and the
+  same for a sample read of it. It compares the listing against the wire bytes
+  its GETs hold plus the catalog decode length, and the sample read against
+  `(64 + 32) * samples + catalog` plus those held bytes, which that formula
+  leaves out.
+
+### Fixed
+
+- **A TopK row fetch whose winners cross the coverage crossover no longer
+  fetches filter sections it then discards.** When the winners' positions name
+  the last block the skip index keeps, every kept block survives and the
+  winners are known without opening the scan, so phase 2 checks the coverage
+  crossover on their pages first and, when it fires, reads the object whole
+  after its probe instead of first fetching the BLOOM and POSTINGS sections
+  the scan would have needed. Rows are unchanged.
+- A format migration on S3, by `ravel-cli maintain migrate` or the server's
+  background migrate, no longer skips a range of buckets until its walk
+  finishes again when a stale run overwrites a resume cursor that was deleted
+  and recreated with the same bytes. A 0.34.0 process that reads the new
+  cursor walks from the start.
+- **Every description of a buffer dropped on a stale provisioning view names
+  every cause.** The ERROR log, the `Abandoned` message a strict waiter gets,
+  the shard and metrics doc comments, `docs/ingest.md` and
+  `docs/consistency-model.md` said a read issued after the hold was spent did
+  not confirm the view, which is wrong when the drop came at the deadline with
+  no such read issued. They now say that a read issued after the hold was
+  spent failed, or `max_flush_lifetime` more passed with no read confirming the
+  view, or a teardown drain did not confirm it. The corpus identity check is
+  named as the release step in the frozen-corpus test's module doc.
+- **Compat maintenance fixes (ADR-4233 decision 7).** A release that retires
+  a reader now refuses to start on a bucket with no `sys/compat` and no
+  `sys/tenancy` that already holds tenant data under `t/`, instead of
+  treating it as fresh; the refusal names `ravel-cli compat init`. 0.35.0
+  retires no reader, so this check does not run in this release. Background
+  migrate walks a contradicted family once per certificate and watermark:
+  after a walk drains clean it skips the family until either changes,
+  instead of re-listing every bucket each tick. The maintenance unit no
+  longer runs certify finalization when the certificate was replaced during
+  its late-write pass, and a server shutting down stops background migrate
+  before its next unit. `ravel-cli compat verify --family` refuses a family
+  outside class A. A new `--mode maintain` gauge,
+  `ravel_compat_late_write_watermark_age_seconds{family}`, reports the
+  seconds from each certified family's late-write watermark to the scrape;
+  above 25 hours, passes are not completing. The
+  `ravel_compat_certify_finalization_pending` help text
+  now says it reads `sys/compat` only, and the drop help text for
+  `ravel_ingest_abandoned_stale_provisioning_total` names every cause.
+- **A metrics series listing no longer decodes per-sample provenance.**
+  `/api/v1/series`, `/api/v1/labels` and `/api/v1/label/{name}/values` read
+  only series ids and labels, but the catalog decode of each run-merged L1
+  object materialized and charged its per-sample provenance, 96 bytes per
+  sample, so a large object needed a budget of about 97 bytes per sample just
+  to be listed. The listing's catalog decode now passes over those columns
+  without decoding them: on a 288,000-sample object its peak memory-budget
+  charge drops from 27,972,364 to 324,364 bytes. The listed series, labels and
+  erasure exclusions are unchanged, and PromQL and SQL sample reads still
+  decode and charge provenance.
+- **The server's background migrate takes the bucket's compaction claim.**
+  `ravel-server --mode maintain --background-migrate` merged buckets without a
+  claim, so a migration racing an erasure rewrite of the same bucket could
+  publish after it and leave the erased sample readable, with duplicate rows,
+  until a rerun of the erasure failed on the bucket's two live records. The
+  background migrate now takes the same claim as the maintenance tick, with
+  the same clock and lease, and stands down on a held bucket, including one
+  the tick of the same process holds: it claims under its own process id,
+  which the server logs at startup beside the worker id. A claim's owner id
+  can therefore be one with no `sys/maintain/workers/` heartbeat key.
+  `--maintain-claims off` turns claiming off for both. In 0.34.0 the
+  background migrate had nothing it could publish, since no class-A family
+  could be activated above the baseline; the claim closes the gap before a
+  release allows it.
+- **An erased series is no longer served after a compaction or migrate
+  publishes beside its erasure rewrite (#4449).** A compaction or `migrate`
+  pass could publish beside an erasure rewrite of the same bucket. With
+  claims on, the default, this happened when a pass stalled past its claim
+  lease inside its record PUT (a process freeze, a VM or container pause, or
+  a slow PUT). With `--maintain-claims off`, or a `ravel-cli maintain
+  compact-bucket`, `compact-tenant` or `migrate` run with `--no-claim`, it
+  took only one pass's record PUT landing between the other's re-list and its
+  PUT. Every read then served the compaction's parts next to the rewrite's:
+  the erased series came back and the bucket's other rows were returned
+  twice, and every later erasure pass over the bucket failed with
+  `MultipleLiveRecords`, so the request never completed. A compaction record,
+  written by compaction or migrate, whose inputs one erasure rewrite covers
+  in full is now superseded by that rewrite, whether or not claims were on:
+  reads serve only
+  the rewrite's parts, the erasure pass completes, and the maintenance sweep
+  deletes the compaction's record and parts with the rewrite's superseded
+  inputs, under the usual horizon and legal-hold rules. After an upgrade, a
+  bucket already in this state is read correctly with no manual step
+  wherever it is resolved from its commit records, and `MultipleLiveRecords`
+  from this cause stops. An hour that was already folded into the catalog
+  snapshot while in this state keeps serving both records' parts until a
+  fold reconciles that hour again: through the fold's reconcile window, its
+  retention-frontier band, or a re-fold request the sweep hands to a fold
+  running in the same process. A compaction record that an erasure rewrite
+  covers only in part is still a conflict and is served as before; it is now
+  counted in `ravel_catalog_erasure_overlap_conflicts_total` and logged at
+  warn. `ravel_catalog_dominated_compaction_records_total` counts the
+  records the new rule supersedes. Both count once per bucket resolution
+  (queries, the fold, scrub, migrate and the erasure pass; the sweep does not
+  count), so a record still present is counted again by every later
+  resolution.
+- **A legal hold now stops the deletes of a maintenance pass that is already
+  running.** Maintenance read the hold set once per tenant per tick, so a hold
+  placed after that read was not honored until the next tick, up to one
+  `--maintain-interval-secs` later. Every delete batch (a superseded chain
+  group, a retention bucket, a shard's orphan quarantine moves or purges, a
+  signal's erasure-request, catalog object or idempotency-marker deletes, a
+  shard's unreferenced part deletes, an alert or query-audit retention batch)
+  now re-reads the hold set immediately before its first delete and judges its
+  deletes from that read. A hold written after a batch's re-read and before
+  its delete requests return is still not honored by that batch. A batch
+  whose re-read fails deletes nothing and counts on
+  `ravel_maintain_legal_hold_refresh_failures_total`; the pass goes on. Each
+  batch with something to delete costs a fresh listing of the hold shard;
+  hold records are cached by key for the life of the process. `ravel-cli hold
+  set` now prints `hold set: <scope>; honored by every delete batch that
+  re-reads holds after now` and the guarantee.
+- **The erasure-request sweep also honors a legal hold placed during a
+  maintenance pass (#4501).** Before it deletes an erasure request's `.dreq`,
+  the sweep checks whether the superseded inputs that request still filters
+  are kept by a hold. It made that check from the tick's hold snapshot, so a
+  hold placed after the snapshot could keep those inputs stored while the
+  sweep deleted the `.dreq` that hides them. Once a pass has a `.dreq` to
+  delete, it now re-reads the hold set and treats a chain as held when either
+  the snapshot or the re-read covers it. A failed re-read keeps every `.dreq`
+  of that pass and counts once on
+  `ravel_maintain_legal_hold_refresh_failures_total`.
+- **A logs erasure of a subject named only in a resource or scope attribute
+  is now permanent (#4503).** Queries hid such records while the request was
+  pending, but the rewrite matched record attributes only, so it dropped
+  nothing and the records were served again once the request was swept. The
+  rewrite now drops exactly what queries hide: a record matches when the
+  request's conjunction matches either its own attributes or its merged
+  resource, scope and record view, each read as the first string value
+  under a key. A bucket an earlier version already rewrote for a request is
+  not rewritten again for that same request, even if it is still pending, so
+  submit a new request for the same subject to remove records left behind.
+  One case narrows: a key held twice in a record's own attributes used to
+  match any of its values in the rewrite, so the rewrite could drop a record
+  queries still served; it now matches only what queries hide.
+- **A server whose clock is skewed at boot now waits out the skew instead of
+  refusing to start.** S3 refuses a request whose signing time is too far from
+  its own clock with a 403 `RequestTimeTooSkewed`, which a host can hit for the
+  first seconds after boot while time sync steps its clock. The server's
+  startup store checks now retry that refusal like a transient error, under the
+  same `--startup-store-deadline`, backoff and per-attempt bound. A refusal
+  that outlasts the deadline names clock skew and says to check time sync
+  (NTP) between the host and the store; the `sys/gc` check no longer calls it
+  a missing grant. Outside startup the refusal is still not retried. A HEAD
+  response carries no error code, so when the retired-reader gate's HEAD of
+  `sys/compat` or `sys/tenancy` (sent only by a release that retires a reader)
+  is refused as access denied, startup sends one
+  GET of the same key and retries the HEAD only if that GET is refused for
+  clock skew; otherwise it refuses at once, as before. 0.35.0 retires no
+  reader, so that HEAD is not sent in this release.
+
+### Changed
+
+- **The key-index router charges each segment its own tier-1 cost.** A logs
+  or spans part is now left to tier 1 when its worst-case leaf GETs exceed
+  the sum of its segments' tier-1 costs: 1 GET for a segment tier 1 reads
+  whole in one GET (at or under the logs fetcher's block-range threshold,
+  counted only up to 512 KiB, or the spans fetcher's trace probe length), 2
+  for any other, where every segment was charged 2 before. A logs segment
+  read whole above 512 KiB, under a raised or saturated threshold, is still
+  charged 2. Parts of small objects go to tier 1 more
+  often; rows are unchanged.
+- **`ravel-cli compat` refusals exit 5, not 2, and `compat activate` takes
+  the writer-role attestation as its own required flag.** These change the
+  preview `compat` commands shipped in 0.34.0. A refused `compat` command
+  (an unkeyed store, a missing attestation, an unwritable version, the
+  certify time gate, a held member) now exits 5; in 0.34.0 it exited 2, the
+  code clap still uses for a usage error. 0, 1, 3 and 4 keep their
+  meanings. A script that tests for 2 on a refusal must test for 5.
+  `compat activate` now also requires `--writer-roles-can-read-compat`,
+  which alone attests that every writer role can read `sys/compat`; in
+  0.34.0 `--pre-baseline-processes-terminated` implied it, and it no longer
+  does. Both attestations are recorded in `activated_by`, and the refusal
+  and `--help` name the residual: a writer role not granted read on
+  `sys/compat` keeps writing the baseline version to unprovisioned paths
+  and to buckets it first touches after the activation.
+  `compat status` and `compat verify` now report `finalization_pending` as
+  the maintain process and the retired-reader gate compute it: true while
+  an uncontradicted certificate's watermark is at or below
+  `certified_unix_ns`, so at equality it now reads `true`, and a
+  contradicted certificate now reads `false`. The `ConcurrentCertify`
+  refusal now says the run lost a conditional write on the certify cursor
+  and that a rerun resumes from whatever cursor is there, instead of
+  "another certify run owns the cursor". `docs/reference/ravel-cli-flags.md`
+  now lists the `--version` flag of `compat activate` and `compat certify`.
+
 ## [0.34.0] - 2026-11-18
 
 **Upgrade: apply the updated operator ClusterRole
