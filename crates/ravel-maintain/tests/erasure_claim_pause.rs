@@ -13,7 +13,8 @@
 //! fired from the gate's held-call registry. No test sleeps.
 //!
 //! Contract checked on the final state, with no `.dreq` in the store (the
-//! state once the request is retired): the bucket holds one live record set,
+//! state once the request is retired): the bucket holds one live record set
+//! once erasure-dominated compaction records are dropped,
 //! the catalog serves exactly the rewrite record's parts, the erased series is
 //! not served, and no sample is served from two segments.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -37,7 +38,9 @@ use ravel_maintain::{
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
-use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest, RewriteRecord};
+use ravel_proto::commit::v1::{
+    CompactionRecord, ErasurePredicateMatcher, ErasureRequest, RewriteRecord,
+};
 use ravel_types::{Signal, TimeRange};
 use uuid::Uuid;
 
@@ -193,14 +196,13 @@ async fn contract_violations(store: &Arc<FaultStore<MemoryStore>>, now_ns: i64) 
         "records: compaction={:?} rewrite={:?}",
         listing.compaction_record_keys, listing.rewrite_record_keys
     );
-    let live = listing.compaction_record_keys.len() + listing.rewrite_record_keys.len();
-    if live > 1 {
-        violations.push(format!(
-            "{live} live record sets in one bucket: compaction {:?}, rewrite {:?}",
-            listing.compaction_record_keys, listing.rewrite_record_keys
-        ));
+    let mut compactions: Vec<(String, CompactionRecord)> = Vec::new();
+    for key in &listing.compaction_record_keys {
+        let record = CompactionRecord::decode(get_full(store.as_ref(), key).await.as_ref())
+            .expect("decode compaction record");
+        compactions.push((key.clone(), record));
     }
-
+    let mut rewrites: Vec<(String, RewriteRecord)> = Vec::new();
     let mut rewrite_parts = BTreeSet::new();
     for key in &listing.rewrite_record_keys {
         let record = RewriteRecord::decode(get_full(store.as_ref(), key).await.as_ref())
@@ -209,6 +211,24 @@ async fn contract_violations(store: &Arc<FaultStore<MemoryStore>>, now_ns: i64) 
             rewrite_parts
                 .insert(keys::reconstruct_rewrite_part_key(&record, part).expect("part key"));
         }
+        rewrites.push((key.clone(), record));
+    }
+    // A compaction record an erasure rewrite dominates (#4449) is not a live
+    // record set: every reader drops it before selection.
+    let dominated = ravel_catalog::erasure_dominance(&compactions, &rewrites, "bucket")
+        .expect("dominance resolves")
+        .dominated;
+    let live_compactions: Vec<&String> = compactions
+        .iter()
+        .map(|(key, _)| key)
+        .filter(|key| !dominated.contains(key.as_str()))
+        .collect();
+    let live = live_compactions.len() + rewrites.len();
+    if live > 1 {
+        violations.push(format!(
+            "{live} live record sets in one bucket: compaction {live_compactions:?}, rewrite {:?}",
+            listing.rewrite_record_keys
+        ));
     }
 
     let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
@@ -315,11 +335,16 @@ async fn contract_violations(store: &Arc<FaultStore<MemoryStore>>, now_ns: i64) 
 /// re-list, and is paused inside its record PUT before the PUT reaches the
 /// store. Both clocks move two leases. Erasure E, a second process, steals the
 /// expired claim and publishes its rewrite record. A resumes and its PUT
-/// lands under its own create-only key.
+/// lands under its own create-only key. E's rewrite covers every input of
+/// A's version 1 record, so every reader drops A's record as erasure-dominated
+/// (#4449): the catalog serves E's parts alone, and a later erasure pass
+/// finds one live record.
+///
+/// Flipped line: the `covering` search in `ravel_catalog::erasure_dominance`
+/// made to find nothing. A's record is then live beside E's, and the
+/// contract check reports two live record sets, A's parts served, the
+/// erased series served and the kept samples served twice.
 #[tokio::test]
-#[ignore = "suspected defect #4449: a claimed compaction paused between its re-list and its \
-            record PUT publishes beside an erasure rewrite that stole its expired claim, and the \
-            catalog serves the erased series"]
 async fn a_compaction_paused_inside_its_record_put_publishes_beside_the_erasure_rewrite() {
     let now_ns = sealed_now_ns();
     let store = seeded_store(now_ns).await;
@@ -399,6 +424,10 @@ async fn a_compaction_paused_inside_its_record_put_publishes_beside_the_erasure_
         violations.is_empty(),
         "contract broken with claims on (A: {a_outcome:?}):\n{}",
         violations.join("\n")
+    );
+    assert!(
+        matches!(rerun, Ok(ErasureRewriteOutcome::AlreadyApplied)),
+        "a later erasure pass finds E's rewrite the one live record: {rerun:?}"
     );
 }
 
