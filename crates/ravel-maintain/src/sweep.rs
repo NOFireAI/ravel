@@ -112,7 +112,7 @@
 //! for that deviation.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 use ravel_catalog::{erasure_dominance, select_authoritative_compaction_records};
@@ -127,6 +127,7 @@ use ravel_proto::commit::v1::{
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
+use crate::bucket::Bucket;
 use crate::clock::Clock;
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
@@ -4389,8 +4390,10 @@ pub struct ErasureRequestSweepOutcome {
     /// found a compaction record conflicting with a live rewrite that applies
     /// it ([`SupersededHolds::conflict_request_ids`]), or any request while a
     /// bucket's conflicts cannot be known
-    /// ([`SupersededHolds::conflict_truncated_buckets`]); its WARN line names
-    /// that reason. The server's maintain loop sums it into
+    /// ([`SupersededHolds::conflict_truncated_buckets`]), or because a commit
+    /// record stamped after its bucket's late-commit cutoff may hold the
+    /// subject; each WARN line names its reason. The server's maintain loop
+    /// sums it into
     /// `ravel_maintain_dreq_held_by_superseded_inputs_total`.
     pub held_by_superseded_inputs: usize,
 }
@@ -4449,6 +4452,17 @@ pub struct ErasureRequestSweepOutcome {
 ///   because a rewrite's chain names a record that is gone
 ///   ([`SupersededHolds::conflict_truncated_buckets`]) keeps every candidate
 ///   the same way.
+/// - no late commit record may hold the subject: no bucket of the signal
+///   without a retention tombstone holds a commit record stamped at or after
+///   its late-commit cutoff ([`crate::read::is_late_stamp`]) whose event-time
+///   span the request's window may overlap
+///   ([`crate::erasure_rewrite::bucket_may_overlap`]; a request with no window
+///   overlaps every such bucket). No planner takes a late record, so no
+///   rewrite erased it, and a `.done` written before it landed says nothing
+///   about it: the filter is what hides its rows. The keep is recomputed every
+///   pass and never persisted; it ends once the record is deleted or its
+///   bucket tombstoned. A late record applied after this pass's commit LIST is
+///   not seen by it.
 /// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
 ///   request exactly as it pins any other object.
 ///
@@ -4478,7 +4492,8 @@ pub struct ErasureRequestSweepOutcome {
 ///
 /// This is rule 6's only entry, and `ravel-server`'s maintenance tick calls
 /// it. The observation costs one rule-2-shaped pass plus, under a lease with a
-/// hold source, one hold-shard listing, and runs
+/// hold source, one hold-shard listing, plus one GET per late commit record
+/// and, when there is one, one GET per candidate `.dreq`, and runs
 /// only when there is a `.dreq` past its horizon to decide about. An ordinary
 /// pass, where every request is either incomplete or still inside its
 /// horizon, reads nothing but the `del/` listing and the completions.
@@ -4550,7 +4565,8 @@ pub async fn sweep_erasure_requests(
         });
     }
 
-    let Some(holds) = observe_superseded_holds(store, clock, config, lease, tenant, signal).await?
+    let Some((holds, commit_keyspace)) =
+        observe_superseded_holds(store, clock, config, lease, tenant, signal).await?
     else {
         // The observation's hold re-read failed: no chain's hold can be ruled
         // out, so every candidate stays this pass.
@@ -4561,6 +4577,7 @@ pub async fn sweep_erasure_requests(
             held_by_superseded_inputs: 0,
         });
     };
+    let late_buckets = late_commit_buckets(store, config, tenant, signal, &commit_keyspace).await?;
 
     let mut deleted = 0usize;
     let mut held_by_superseded_inputs = 0usize;
@@ -4616,6 +4633,28 @@ pub async fn sweep_erasure_requests(
             held_by_superseded_inputs += 1;
             continue;
         }
+        // A late L0 is served but left out of every plan, so no rewrite has
+        // erased it and the completion gate saw only what it read then. The
+        // filter is all that hides a subject such a record holds.
+        if !late_buckets.is_empty()
+            && let Some(late) = late_bucket_holding(store, dreq_key, &late_buckets).await?
+        {
+            tracing::warn!(
+                tenant_hash = %tenant.to_hex(),
+                signal = signal.key_prefix(),
+                request_id = %request_id,
+                shard = late.shard,
+                ingest_hour_bucket = late.ingest_hour_bucket,
+                late_commit_records = late.records,
+                "erasure-request sweep: keeping a .dreq past its horizon because a commit \
+                 record stamped after its bucket's late-commit cutoff may hold the subject; \
+                 no rewrite plans from such a record, so the query-time exclusion filter is \
+                 what hides it (#4561)"
+            );
+            kept += 1;
+            held_by_superseded_inputs += 1;
+            continue;
+        }
         if batch.admit(store, &[dreq_key.as_str()]).await != Admit::Delete {
             kept += 1;
             continue;
@@ -4632,6 +4671,98 @@ pub async fn sweep_erasure_requests(
         kept,
         held_by_superseded_inputs,
     })
+}
+
+/// The late commit records of one `(shard, hour)` bucket, with the event-time
+/// span they cover together.
+#[derive(Debug, Clone, Copy)]
+struct LateBucket {
+    shard: u32,
+    ingest_hour_bucket: u32,
+    records: usize,
+    min_event_ts_ns: i64,
+    max_event_ts_ns: i64,
+}
+
+/// Every bucket of one `(tenant, signal)` holding a commit record stamped at
+/// or after the bucket's late-commit cutoff ([`crate::read::is_late_stamp`]),
+/// read off `commit_keyspace`, one LIST of [`signal_commit_prefix`].
+///
+/// The classification is the planners' own and does not depend on
+/// [`crate::config::LateCommitFence`]: a stamp says what the store applied
+/// late whether or not this pass's planners fence it. A bucket with a
+/// retention tombstone serves nothing and is skipped. A record deleted between
+/// the LIST and its GET is skipped; any other read or decode failure fails the
+/// pass, which deletes no `.dreq`.
+async fn late_commit_buckets(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    tenant: &TenantHash,
+    signal: Signal,
+    commit_keyspace: &[ObjectMeta],
+) -> Result<Vec<LateBucket>> {
+    let mut tombstoned: HashSet<(u32, u32)> = HashSet::new();
+    for meta in commit_keyspace {
+        if let Ok(BucketEntry::Tombstone(pk)) = keys::partition_bucket_entry(&meta.key) {
+            tombstoned.insert((pk.shard, pk.ingest_hour_bucket));
+        }
+    }
+    let mut late: BTreeMap<(u32, u32), LateBucket> = BTreeMap::new();
+    for meta in commit_keyspace {
+        let Ok(BucketEntry::CommitRecord(pk)) = keys::partition_bucket_entry(&meta.key) else {
+            continue;
+        };
+        let at = (pk.shard, pk.ingest_hour_bucket);
+        if tombstoned.contains(&at) {
+            continue;
+        }
+        let bucket = Bucket::new(*tenant, signal, pk.shard, pk.ingest_hour_bucket);
+        if !crate::read::is_late_stamp(
+            meta.last_modified_unix_ms,
+            bucket.late_commit_cutoff_ns(config),
+        ) {
+            continue;
+        }
+        let got = match store.get(&meta.key, GetRange::Full).await {
+            Ok(got) => got,
+            Err(StoreError::NotFound) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let rec = record::decode(&got.data)?;
+        verify_commit_key(&rec, &meta.key)?;
+        let entry = late.entry(at).or_insert(LateBucket {
+            shard: pk.shard,
+            ingest_hour_bucket: pk.ingest_hour_bucket,
+            records: 0,
+            min_event_ts_ns: i64::MAX,
+            max_event_ts_ns: i64::MIN,
+        });
+        entry.records += 1;
+        entry.min_event_ts_ns = entry.min_event_ts_ns.min(rec.min_event_ts_ns);
+        entry.max_event_ts_ns = entry.max_event_ts_ns.max(rec.max_event_ts_ns);
+    }
+    Ok(late.into_values().collect())
+}
+
+/// The first of `late` whose event-time span the request at `dreq_key` may
+/// overlap ([`crate::erasure_rewrite::bucket_may_overlap`]; a request with no
+/// window overlaps every bucket). A request deleted since the `del/` LIST
+/// needs no keep.
+async fn late_bucket_holding(
+    store: &dyn ObjectStoreBackend,
+    dreq_key: &str,
+    late: &[LateBucket],
+) -> Result<Option<LateBucket>> {
+    let got = match store.get(dreq_key, GetRange::Full).await {
+        Ok(got) => got,
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let request = ravel_commit::erasure::decode_request(&got.data)?;
+    keys::verify_erasure_request_key(&request, dreq_key)?;
+    Ok(late.iter().copied().find(|b| {
+        crate::erasure_rewrite::bucket_may_overlap(b.min_event_ts_ns, b.max_event_ts_ns, &request)
+    }))
 }
 
 /// Observe what rule 2 holds, without deleting anything, for rule 6.
@@ -4658,8 +4789,9 @@ pub async fn sweep_erasure_requests(
 /// when rule 2 held a group for it earlier in the tick. A lease with no
 /// source is judged from its snapshot alone.
 ///
-/// Returns `None` when the re-read fails: the failure is counted once on the
-/// source and the caller keeps every candidate.
+/// Returns the holds with the signal's commit keyspace listing they were
+/// observed from, or `None` when the re-read fails: the failure is counted
+/// once on the source and the caller keeps every candidate.
 ///
 /// [`HoldSource`]: crate::legal_hold::HoldSource
 async fn observe_superseded_holds(
@@ -4669,7 +4801,7 @@ async fn observe_superseded_holds(
     lease: &dyn LeaseCheck,
     tenant: &TenantHash,
     signal: Signal,
-) -> Result<Option<SupersededHolds>> {
+) -> Result<Option<(SupersededHolds, Vec<ObjectMeta>)>> {
     let reread = match lease.hold_source() {
         None => None,
         Some(source) => match source.current(store).await {
@@ -4701,7 +4833,8 @@ async fn observe_superseded_holds(
     let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
     let mut holds = SupersededHolds::default();
 
-    for shard in signal_shards(store, tenant, signal).await? {
+    let commit_keyspace = list_all(store, &signal_commit_prefix(tenant, signal)).await?;
+    for shard in signal_shards(&commit_keyspace)? {
         let (outcome, _data_bytes) = sweep_superseded_impl(
             &mut reach,
             store,
@@ -4717,7 +4850,7 @@ async fn observe_superseded_holds(
         .await?;
         holds.absorb(&outcome);
     }
-    Ok(Some(holds))
+    Ok(Some((holds, commit_keyspace)))
 }
 
 /// A key is protected when the pass snapshot or a later re-read of the hold
@@ -4737,20 +4870,21 @@ impl LeaseCheck for SnapshotOrReread<'_> {
     }
 }
 
+/// `t/<tenant_hash_hex>/<signal>/c/` -- the commit keyspace of one
+/// `(tenant, signal)`, across every shard and hour.
+fn signal_commit_prefix(tenant: &TenantHash, signal: Signal) -> String {
+    format!("t/{}/{}/c/", tenant.to_hex(), signal.key_prefix())
+}
+
 /// Every shard with at least one commit-prefix key for one `(tenant, signal)`,
-/// from one LIST of `t/<tenant_hash_hex>/<signal>/c/`.
+/// from `commit_keyspace`, one LIST of [`signal_commit_prefix`].
 ///
 /// A shard with no commit key holds no supersession chain and so can hold
 /// nothing, which is why key presence is the right enumeration and no shard
 /// count needs to be configured or guessed.
-async fn signal_shards(
-    store: &dyn ObjectStoreBackend,
-    tenant: &TenantHash,
-    signal: Signal,
-) -> Result<Vec<u32>> {
-    let prefix = format!("t/{}/{}/c/", tenant.to_hex(), signal.key_prefix());
+fn signal_shards(commit_keyspace: &[ObjectMeta]) -> Result<Vec<u32>> {
     let mut shards: BTreeSet<u32> = BTreeSet::new();
-    for meta in list_all(store, &prefix).await? {
+    for meta in commit_keyspace {
         match keys::partition_bucket_entry(&meta.key) {
             Ok(BucketEntry::CommitRecord(pk)) => {
                 shards.insert(pk.shard);
