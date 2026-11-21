@@ -1045,9 +1045,12 @@ lifetime, is abandoned in the queue without a PUT and counted on
 `abandoned_hour_bound` (`ravel_ingest_abandoned_hour_bound_total`). It is not
 re-pinned to a later hour. The bound sits inside the maintain seal (`end(H) +
 max_flush_lifetime + clock_skew_allowance`, 65 minutes at defaults) and the
-fold seal (80 minutes), so a late flush cannot publish into an hour the
-catalog has already sealed, where token-less queries would not see it and
-retention could delete it with no trace. A flush granted inside its hour gets
+fold seal (80 minutes), so a late flush does not issue its commit PUT into
+an hour the catalog has already sealed, where token-less queries would not
+see it and retention could delete it with no trace. A PUT issued before the
+bound can still be applied by the store after the seal; maintenance leaves
+such a late commit record out of its plans and keeps it (ADR-4561). A flush
+granted inside its hour gets
 the full lifetime from grant. Strict writes are unaffected: their
 10 s ack deadline expires first.
 

@@ -1114,7 +1114,8 @@ the key layout changed. The rule is stated normatively in
 docs/catalog-and-mvcc.md, step 3.
 
 A record whose inputs a live rewrite covers only in part stays a conflict
-for the overlap selection. Such a record is counted in
+for the overlap selection (a late L0 can no longer produce one, per the
+#4561 amendment below). Such a record is counted in
 `ravel_catalog_erasure_overlap_conflicts_total` and each such record and
 rewrite pair is logged at warn; each dominated version 1 record is counted
 in `ravel_catalog_dominated_compaction_records_total`. Both counters are on
@@ -1171,7 +1172,8 @@ the record is dominated, and readers serve the rewrite's parts alone.
 
 It does not hold when a late L0 lands after the maintain seal and the
 compaction's listing takes it while the rewrite's did not (the third-stall
-ordering in #4542). The compaction record then names more inputs than any
+ordering in #4542; the #4561 amendment below keeps such an L0 out of every
+plan). The compaction record then names more inputs than any
 one live rewrite covers, so it is not dominated: it is a conflict
 (`ErasureDominance::conflicts`), served beside the rewrite. The bucket can
 return the surviving rows of the shared inputs twice, an erasure pass over
@@ -1255,3 +1257,33 @@ the conflicts are recorded after the selection's error arm; and
 `a_version_2_record_over_a_conflicting_record_is_a_conflict` in
 `crates/ravel-catalog/src/catalog.rs`, fails when version 2 records are
 left out of the conflicts.
+
+## Amendment (2026-11-21, #4561): a late L0 no longer makes a partial cover
+
+<!-- amendment-applies: sections="Amendment (2026-11-21, #4449): erasure dominance of version 1 records has landed|Amendment (2026-11-21, #4560): a conflicting compaction record keeps the erasure request's `.dreq`" pointer="#4561 amendment" -->
+
+The #4560 amendment names the one ordering that still produces a partially
+covered compaction record: a late L0 that one pass lists and the other did
+not. ADR-4561 removes it. With the late-commit fence on, compaction, the
+migrate primitive and the raw-L0 erasure rewrite plan only from the commit
+records the store stamped before the bucket's cutoff, once the store's clock
+is past that cutoff by 60 s, so every plan of a sealed bucket names the same
+inputs. A compaction that publishes beside a rewrite in the residual window
+of the 2026-11-20 amendment is then over the rewrite's inputs exactly and
+dominated by it. The pre-publish re-list compares the on-time records only:
+a late arrival between plan and publish no longer abandons the pass, and an
+on-time arrival still does.
+
+The fence repairs no conflict already stored; the #4560 keep still covers
+one. It rests on two store properties this repository cannot test: a stamp
+that a copy or restore does not change, and a stamp that precedes the
+record's visibility in a LIST by less than 60 s. When either fails the
+bucket gets the behaviour before the fence, still counted by
+`ravel_catalog_erasure_overlap_conflicts_total`.
+
+Test: `a_late_l0_between_the_two_listings_is_a_full_cover` in
+`crates/ravel-maintain/tests/late_commit_fence.rs` drives the erasure
+rewrite and a compaction past their re-lists with a late L0 landing between
+their listings; with the fence off the same script leaves the two records
+in conflict and the erasure rerun fails with `MultipleLiveRecords`
+(`with_the_fence_off_a_late_l0_between_the_listings_is_a_partial_cover`).

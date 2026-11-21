@@ -105,7 +105,12 @@ Buffered mode (opt-in per request, named "buffered"):
   deadline at grant is `min(now, end(H)) + max_flush_lifetime` (ADR-2708 D3),
   so a flush granted past `end(H) + max_flush_lifetime` is abandoned without a
   PUT, is not moved to a later hour, and is counted on `abandoned_hour_bound`.
-  That keeps every publish inside the catalog's seal of `H`.
+  That keeps every commit PUT the writer issues inside the catalog's seal of
+  `H`. It does not bound when the store applies a PUT already issued: one
+  can land after the seal (a late L0). A late L0 is served as an extra
+  segment wherever the bucket is resolved from its commit records, and
+  maintenance, with the late-commit fence on, leaves it out of every plan
+  and never deletes it (ADR-4561).
   The same deadline also bounds the flush's wait for a write gate permit
   for its encode (case six below).
 - A stalled prefix holds at most `max_inflight_flushes_per_tenant` of its

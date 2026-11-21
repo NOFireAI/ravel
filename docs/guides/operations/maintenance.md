@@ -807,6 +807,68 @@ Two flags configure claiming, and a third has no effect:
   the same bucket from publishing over each other. The flag is still accepted
   so that existing deployments start unchanged. Zero is still refused.
 
+### Commit records that land after the seal
+
+A writer stops issuing commit PUTs for hour `H` at `end(H) +
+max_flush_lifetime`, but the store can apply a PUT it already received later
+than that. Such a record is a late commit record. Readers serve it as an
+extra segment. Without a fence, two maintenance passes over the same bucket
+could list different commit records, and a compaction could then publish
+next to an erasure rewrite that it only partly overlaps.
+
+The late-commit fence closes that. It is on by default in `ravel-server`'s
+maintenance loop and in `ravel-cli maintain compact-bucket`, `compact-tenant`
+and `migrate`:
+
+- The cutoff of hour `H` is `C(H) = end(H) + max_flush_lifetime +
+  clock_skew_allowance`, 65 minutes past the hour at the defaults, truncated
+  to a whole second.
+- A compaction, a format migration or a raw-L0 erasure rewrite of the bucket
+  plans only from the commit records that the store stamped (`LastModified`)
+  before `C(H)`. A record stamped at or after `C(H)` is left out of the plan.
+  It is still served, kept by the sweep, held by a legal hold and expired by
+  retention, the same as any other record.
+- A pass plans the bucket only once its own clock and the store's clock are
+  both at least `C(H) + 60 s`. The pass reads the store's clock from the
+  `Date` of a response it gets after its planning LIST. Before that the
+  bucket reports `NotSealed`, so the first compaction of an hour starts about
+  a minute later than it did before the fence.
+
+What you see:
+
+- `ravel_maintain_late_commit_records_total{signal}` counts the late records
+  each plan left out, and a warn line names each one. A late record stays in
+  its bucket, so every pass that plans the bucket counts it again.
+- `ravel_maintain_store_clock_unobserved_total{signal}` counts the plans that
+  got no store clock reading. Those plans rely on this process's clock alone.
+  The S3 adapter reads the store's clock from every response, so this counter
+  should stay at zero against S3.
+- `ravel-cli maintain status ... --hour <n>` prints `late_commit_records`
+  under `l0_commit_records`.
+- `maintain migrate` names a bucket whose remaining below-target commit
+  records are late under `not_migrated` with
+  `reason=late_commit_records records=<n>`. It migrates the bucket's on-time
+  records. The format floor stays down while the late records are stored.
+
+A late record stays raw for the life of its bucket. An erasure request whose
+window overlaps it stays blocked while the record is stored, and so does a
+format floor raise. Both were already true of a late record that landed
+after a bucket's compaction. The fence extends them to a record that lands
+between the seal and the first plan.
+
+`--late-commit-fence off` plans from every listed commit record as soon as
+the bucket seals, which was the behaviour before the fence. Use it for a
+bucket whose commit records were all written after it sealed:
+
+- records that `ravel-cli commit reconstruct` rebuilt;
+- a store restored or copied by a path that gives every object a new
+  `LastModified`.
+
+With the fence on, such a bucket is never compacted, and every pass counts
+all of its records as late. Run the affected shard's maintenance once with the
+flag, after the writers for those hours are gone, then go back to the
+default.
+
 ### A log object compaction cannot rewrite
 
 The RLOG writer refuses a `stream_attrs` blob the reader cannot decode (a
