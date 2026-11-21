@@ -41,8 +41,10 @@ use crate::{Catalog, CatalogError};
 /// First 4 bytes of every key-index leaf.
 pub const KEY_INDEX_LEAF_MAGIC: [u8; 4] = *b"RKI1";
 
-/// The header `format_version` this module writes, for every signal, and
-/// reads for every signal (ADR-3692 amendment "Leaf format version 2").
+/// The header `format_version` [`encode_key_index_leaf`] writes, for every
+/// signal, and this module reads for every signal (ADR-3692 amendment "Leaf
+/// format version 2"). Metrics series-index leaves are written at
+/// [`KEY_INDEX_LEAF_FORMAT_VERSION_3`] instead.
 pub const KEY_INDEX_LEAF_FORMAT_VERSION: u32 = 2;
 
 /// The header `format_version` written before
