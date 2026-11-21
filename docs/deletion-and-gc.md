@@ -982,7 +982,8 @@ marker (ADR-2993, erasure amendment):
   its `.done` exists, `now >= done.completed_unix_ns + protection_horizon`,
   the superseded-input sweep held nothing belonging to that request on this
   pass, no compaction record that conflicts with a live rewrite applying the
-  request is live, and the legal-hold check passes. The horizon and that hold
+  request is live, no bucket's conflicts are unknown because a rewrite's
+  chain names a record that is gone, and the legal-hold check passes. The horizon and that hold
   together are what guarantee the query-time filter only disappears after no
   resolvable snapshot can still include a pre-rewrite input: the horizon
   covers the ordinary case, and the hold covers the two cases that outlive
@@ -1095,6 +1096,20 @@ marker (ADR-2993, erasure amendment):
   deleted or a later rewrite dominates it. The keep lasts as long as the
   conflict, which no sweep resolves on its own; an operator sees it on
   `ravel_catalog_erasure_overlap_conflicts_total` and the catalog's warn line.
+  A rewrite chain that names a record no longer present (rule 2 reclaims a
+  predecessor generation under its live successor) has lost that record's
+  inputs and requests: the dominance pass resolves the rewrite to fewer
+  inputs than it superseded, so a compaction record over the missing ones is
+  no longer reported as a conflict, and the requests the missing generation
+  applied are named by no surviving record. The sweep then reports the bucket
+  instead (`conflict_truncated_buckets`) whenever such a rewrite either has a
+  conflict or shares its bucket with a served compaction record (one that is
+  neither dominated nor named by another record), and the erasure rule keeps
+  every candidate `.dreq` for the tenant and signal while any bucket is
+  reported, with the same count and warn line. The two cases cannot be told
+  apart from the records present, so this keep also covers a served record
+  that shares nothing with the rewrite, and lasts until that record is
+  deleted or dominated or retention removes the bucket.
 
 - **Why the hold terminates.** Apart from a refused chain, the cut-chain hold
   counts only objects the superseded-input sweep actually held on this pass,
@@ -1113,7 +1128,9 @@ marker (ADR-2993, erasure amendment):
   fold reconciling the hour, an operator rebuilding HEAD, or a human clearing
   the legal hold, and no state pins a request forever. A conflicting
   compaction record (above) keeps a `.dreq` only while the conflict is live,
-  and ends when the record is deleted or dominated. A refused chain is the
+  and ends when the record is deleted or dominated; a bucket whose conflicts
+  are unknown keeps every `.dreq` while its served compaction record lives,
+  and ends the same way. A refused chain is the
   one hold the HEAD gate does not decide: it lasts while its bucket's
   supersession does not resolve, which is also every resolve over that bucket
   failing, so it ends when an operator repairs the bucket, and each pass logs
