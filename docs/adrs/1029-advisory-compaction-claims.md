@@ -1201,6 +1201,24 @@ the set is recomputed from the records present on every pass, so the
 `.dreq` is released by the ordinary rule once the conflicting record is
 deleted or a later live rewrite dominates it.
 
+A chain that names a record no longer present is not walked to the end.
+Rule 2 reclaims a predecessor rewrite under its live successor once the
+predecessor's horizon passes; the successor then resolves to fewer inputs
+than it superseded, so a compaction record over the missing inputs is no
+longer reported as a conflict, and the requests the missing generation
+applied are named by no surviving record. The same holds for a version 2
+link whose predecessor is gone. The sweep reports such a bucket fail-safe
+(`SupersededSweepOutcome::conflict_truncated_buckets`) when a rewrite whose
+chain is cut either has a conflict or shares the bucket with a served
+compaction record, one neither dominated nor named by another record, and
+rule 6 keeps every candidate `.dreq` for the tenant and signal while any
+bucket is reported, with the same count and warn line. The records present
+cannot tell that case from a served record that shares nothing with the
+rewrite, so the keep covers both and lasts until the served record is
+deleted or dominated, or retention removes the bucket. The sweep also
+records a bucket's conflicts before it selects the bucket's authoritative
+compaction records, so a bucket whose selection fails keeps them.
+
 `ErasureDominance::conflicts` now also reports a version 2 record (a
 `migrate` re-encode) that no rewrite's chain names, that is not dominated
 and that shares an input with a live rewrite. A version 2 record carries
@@ -1225,7 +1243,12 @@ when rule 6 ignores the conflict set (the `.dreq` is deleted);
 `a_kept_dreq_is_released_once_the_conflicting_record_is_deleted` and
 `a_kept_dreq_is_released_once_a_later_rewrite_dominates_the_record` fail
 when the keep follows every live rewrite in the bucket instead of the
-conflicts (the `.dreq` is kept after the conflict is gone); and
+conflicts (the `.dreq` is kept after the conflict is gone);
+`rule_6_keeps_every_dreq_while_a_conflicting_rewrite_chain_is_truncated`
+fails without the cut-chain report (the `.dreq` is deleted once the
+predecessor rewrite is reclaimed);
+`rule_6_keeps_a_conflict_dreq_when_the_bucket_selection_fails` fails when
+the conflicts are recorded after the selection's error arm; and
 `rule_6_keeps_a_dreq_while_a_conflicting_version_2_record_is_live`, with
 `a_version_2_record_over_a_conflicting_record_is_a_conflict` in
 `crates/ravel-catalog/src/catalog.rs`, fails when version 2 records are
