@@ -422,8 +422,8 @@ Disk facts that decide whether a gate may start:
   Sequence with other sessions, or push the gate to pull request CI with
   `FLEET_MERGE_SKIP_GATES=1`, which still needs a valid receipt.
 
-Source and repository checks, wired into `gates.sh` and CI's `doc-scripts`
-job unless noted. Each has a suppression marker that needs a reason, and
+Source and repository checks, wired into `gates.sh` and CI's
+`doc-scripts-rest` job unless noted. Each has a suppression marker that needs a reason, and
 each treats "could not check" as a failure; the README has the marker
 syntax and exit codes:
 
@@ -443,8 +443,8 @@ syntax and exit codes:
   `persist-credentials: false`.
 - `check-changelog-touched.sh <base-ref> [head-ref]`: a `feat`/`fix`
   commit touching `crates/` or `services/` needs a `CHANGELOG.md` change
-  in the range or a `Changelog: none` trailer. CI's `doc-scripts` job
-  only; `gates.sh` does not run it.
+  in the range or a `Changelog: none` trailer. CI's `doc-scripts-rest`
+  job only; `gates.sh` does not run it.
 - `check-amendment-integrity.sh`, `check-adr-band-sources.sh`: an ADR
   amendment's marker matches the document, and every band table row has a
   source. `docs/adrs/README.md`, "Amending an ADR", has the marker syntax.
