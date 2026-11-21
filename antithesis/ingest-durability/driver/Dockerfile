@@ -1,7 +1,7 @@
 # The workload driver. Build context: antithesis/ingest-durability.
 # Built with Antithesis's compile-time coverage flags (the driver has no LTO).
 
-FROM rust:1.97.1-trixie AS build
+FROM rust:1.100.0-trixie AS build
 WORKDIR /src
 COPY driver/Cargo.toml driver/Cargo.lock ./
 COPY driver/src ./src

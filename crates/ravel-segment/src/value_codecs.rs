@@ -441,9 +441,8 @@ pub fn decode_gcd_delta_for_into(
                 return Err(codec_err("GCD-FOR raw body length mismatch"));
             }
             out.reserve_exact(count);
-            for chunk in body.chunks_exact(8) {
-                let arr: [u8; 8] = chunk.try_into().map_err(|_| SegmentError::Truncated)?;
-                out.push(f64::from_bits(u64::from_le_bytes(arr)));
+            for chunk in body.as_chunks::<8>().0 {
+                out.push(f64::from_bits(u64::from_le_bytes(*chunk)));
             }
             Ok(())
         }

@@ -824,6 +824,10 @@ impl ParquetQueryError {
 /// A name whose newest version is a drop is no table, exactly as
 /// [`resolve_tables`] treats it, so the statements that stop here agree with
 /// the ones that resolve in full that a dropped table is an unknown one.
+#[expect(
+    clippy::result_large_err,
+    reason = "ParquetQueryError carries ExternalStoreError by value; boxing it is a type change outside the toolchain bump"
+)]
 pub(crate) async fn first_live_table(
     sources: &ParquetSources,
     tenant: &TenantHash,
@@ -881,6 +885,10 @@ pub(crate) fn estimate_cost(resolution: &ParquetResolution, resolve_requests: u6
 ///
 /// The caller has checked [`ParquetSources::is_configured`]; without profiles
 /// [`build_tables`] refuses with [`ParquetQueryError::NotConfigured`].
+#[expect(
+    clippy::result_large_err,
+    reason = "ParquetQueryError carries ExternalStoreError by value; boxing it is a type change outside the toolchain bump"
+)]
 pub(crate) async fn resolve_tables(
     sources: &ParquetSources,
     tenant: &TenantHash,
@@ -918,6 +926,10 @@ pub(crate) async fn resolve_tables(
 /// pins live versions. So is a pin above [`MAX_MANIFEST_VERSION`], before any
 /// read: `GetFlightInfo` resolves through `resolve::newest`, which never
 /// returns one. The caller has checked that `pins` is not empty.
+#[expect(
+    clippy::result_large_err,
+    reason = "ParquetQueryError carries ExternalStoreError by value; boxing it is a type change outside the toolchain bump"
+)]
 pub(crate) async fn resolve_pinned_tables(
     sources: &ParquetSources,
     tenant: &TenantHash,
@@ -949,6 +961,10 @@ pub(crate) async fn resolve_pinned_tables(
 
 /// `manifests` as a [`ParquetResolution`], once every file of each lies inside
 /// a grant the tenant holds now, under the profile the file is read through.
+#[expect(
+    clippy::result_large_err,
+    reason = "ParquetQueryError carries ExternalStoreError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn granted_resolution(
     store: &ResolveStore,
     tenant: &TenantHash,
@@ -977,6 +993,10 @@ async fn granted_resolution(
 /// registry answers with. `parallel` is ADR-2040 D6's file grouping. Every
 /// read the tables make, this footer read included, is admitted against
 /// `limits`.
+#[expect(
+    clippy::result_large_err,
+    reason = "ParquetQueryError carries ExternalStoreError by value; boxing it is a type change outside the toolchain bump"
+)]
 pub(crate) async fn build_tables(
     sources: &ParquetSources,
     tenant: TenantHash,

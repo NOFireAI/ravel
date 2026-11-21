@@ -98,7 +98,7 @@ jobs:
         run: rustup toolchain install nightly --profile minimal
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz@0.13.2 --locked
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

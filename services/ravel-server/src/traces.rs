@@ -85,7 +85,7 @@ pub fn parse_trace_id(raw: &str) -> Result<[u8; 16], ApiError> {
         return Err(invalid());
     }
     let mut id = [0u8; 16];
-    for (out, pair) in id.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (out, pair) in id.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let hi = hex_nibble(pair[0]).ok_or_else(invalid)?;
         let lo = hex_nibble(pair[1]).ok_or_else(invalid)?;
         *out = hi << 4 | lo;

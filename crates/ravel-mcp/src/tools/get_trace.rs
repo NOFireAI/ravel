@@ -797,7 +797,7 @@ fn parse_trace_id(raw: &str) -> Result<[u8; 16], Failure> {
         return Err(invalid_id());
     }
     let mut id = [0u8; 16];
-    for (out, pair) in id.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (out, pair) in id.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let hi = char::from(pair[0]).to_digit(16).ok_or_else(invalid_id)?;
         let lo = char::from(pair[1]).to_digit(16).ok_or_else(invalid_id)?;
         *out = (hi << 4 | lo) as u8;

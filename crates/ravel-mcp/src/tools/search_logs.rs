@@ -806,7 +806,9 @@ fn decode_hex(raw: &str) -> Option<Vec<u8>> {
         return None;
     }
     digits
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let hi = char::from(pair[0]).to_digit(16)?;
             let lo = char::from(pair[1]).to_digit(16)?;

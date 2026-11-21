@@ -11,9 +11,9 @@
 # `--target operator`, or `--target ingest-router` builds only that one image.
 
 # ---- Builder ----------------------------------------------------------------
-# Pinned to the workspace toolchain (rust-toolchain.toml channel = 1.97.1) so
+# Pinned to the workspace toolchain (rust-toolchain.toml channel = 1.100.0) so
 # the image build uses the same compiler CI and local development pin to.
-FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
+FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder
 
 WORKDIR /app
 

@@ -25,7 +25,7 @@
 ARG GUEST_IMAGE=ghcr.io/brig-sh/claude-code-stock:root@sha256:f6bfd5213245c86ebb4165a4267b45d6b55727e11ae44cb3db311a3397d39b60
 
 # The same builder image the root Dockerfile pins.
-ARG FETCH_IMAGE=rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+ARG FETCH_IMAGE=rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 
 ARG NEXTEST_VERSION=0.9.143
 ARG CARGO_DENY_VERSION=0.20.2
