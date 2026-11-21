@@ -907,7 +907,7 @@ pub struct MergeLiveBytes {
 
 /// Subtract `bytes` from a live term, stopping at zero rather than wrapping.
 fn saturating_release(term: &AtomicU64, bytes: u64) {
-    let _ = term.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+    let _ = term.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_sub(bytes))
     });
 }

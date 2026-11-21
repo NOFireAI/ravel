@@ -2682,7 +2682,11 @@ impl MultisetDigest {
         one.update_point(point);
         let hash = one.hasher.finalize();
         let mut carry = false;
-        for (limb, chunk) in self.limbs.iter_mut().zip(hash.as_bytes().chunks_exact(8)) {
+        for (limb, chunk) in self
+            .limbs
+            .iter_mut()
+            .zip(hash.as_bytes().as_chunks::<8>().0)
+        {
             let mut word = [0u8; 8];
             word.copy_from_slice(chunk);
             let (sum, c1) = limb.overflowing_add(u64::from_le_bytes(word));

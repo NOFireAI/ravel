@@ -573,6 +573,10 @@ pub fn key_index_leaf_gets_total(signal: Signal) -> u64 {
 /// are parallel to `snapshot.segments`. A leaf breach is the only
 /// statement-failing outcome besides a `parts`/`snapshot` mismatch; every
 /// other failure leaves the part [`SegmentRoute::Uncovered`] and counts it.
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 pub async fn route(input: RouteInput<'_>) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
     let ceiling = Ceiling::for_keys(input.key_set.keys.len());
     route_under(input, ceiling, &ROUTE_TOTALS).await
@@ -582,6 +586,10 @@ pub async fn route(input: RouteInput<'_>) -> Result<(Vec<SegmentRoute>, RouteFig
 /// the ADR's `P_max`: a test reaches the beyond-ceiling outcome with a
 /// handful of parts instead of a thousand. The leaf GET ceiling stays the
 /// key set's.
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 pub async fn route_with_max_parts(
     input: RouteInput<'_>,
     max_parts: usize,
@@ -661,6 +669,10 @@ impl ValueRouting {
 /// conjunction. A plan with no value is not routed. Nothing is routed, and
 /// no leaf is read, while the snapshot carries a pending erasure or when no
 /// part a snapshot segment comes from has a leaf for `input.field`.
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 pub async fn route_values(
     input: ValueRouteInput<'_>,
     plans: &[Vec<(&str, &str)>],
@@ -668,6 +680,10 @@ pub async fn route_values(
     route_values_under(input, plans, ADR_CEILING, &ROUTE_TOTALS).await
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn route_values_under(
     input: ValueRouteInput<'_>,
     plans: &[Vec<(&str, &str)>],
@@ -681,6 +697,10 @@ async fn route_values_under(
 /// still needs this route on that part. A value is probed only on the parts
 /// some plan carrying it needs, and is not probed at all, nor reported, when
 /// no plan carrying it needs any part.
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn route_values_masked(
     input: ValueRouteInput<'_>,
     plans: &[Vec<(&str, &str)>],
@@ -866,6 +886,10 @@ impl Drop for LeafCharge<'_> {
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn route_under(
     input: RouteInput<'_>,
     ceiling: Ceiling,
@@ -876,6 +900,10 @@ async fn route_under(
 
 /// `part_mask`, when given, leaves every part it marks false out of the pass:
 /// no leaf GET, no part outcome, and its segments [`SegmentRoute::Uncovered`].
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn route_under_masked(
     input: RouteInput<'_>,
     ceiling: Ceiling,
@@ -1019,6 +1047,10 @@ fn plan_part<'a>(
     }))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn route_parts(
     input: &RouteInput<'_>,
     ceiling: Ceiling,
@@ -1210,6 +1242,10 @@ fn merge_answer(answer: &mut PartAnswer, slice: KeyIndexSetAnswer) -> Result<(),
 /// holds at most `LEAF_READ_CONCURRENCY` runs' bytes, in flight or waiting
 /// their turn to decode, and the decode reservations of the slices not yet
 /// finished.
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn probe_part(
     input: &RouteInput<'_>,
     plan: &PartPlan<'_>,

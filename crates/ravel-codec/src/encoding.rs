@@ -391,14 +391,10 @@ pub fn count_present(bits: &[u8], rows: usize) -> Result<usize, CodecError> {
         )));
     }
     let full = rows / 8;
-    let words = bits[..full].chunks_exact(8);
-    let rest = words.remainder();
+    let (words, rest) = bits[..full].as_chunks::<8>();
     let mut n: usize = words
-        .map(|w| {
-            let mut word = [0u8; 8];
-            word.copy_from_slice(w);
-            u64::from_le_bytes(word).count_ones() as usize
-        })
+        .iter()
+        .map(|w| u64::from_le_bytes(*w).count_ones() as usize)
         .sum();
     n += rest.iter().map(|b| b.count_ones() as usize).sum::<usize>();
     let tail = rows % 8;

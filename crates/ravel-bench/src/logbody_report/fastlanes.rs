@@ -87,8 +87,8 @@ fn unpack(
     }
     let need = w * LANES * 8;
     let src = bytes.get(..need)?;
-    for (dst, chunk) in words.iter_mut().zip(src.chunks_exact(8)) {
-        *dst = u64::from_le_bytes(chunk.try_into().ok()?);
+    for (dst, chunk) in words.iter_mut().zip(src.as_chunks::<8>().0) {
+        *dst = u64::from_le_bytes(*chunk);
     }
     let mask = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
     for j in 0..ROWS {

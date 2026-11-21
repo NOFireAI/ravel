@@ -217,7 +217,7 @@ To start again from an empty store, delete that directory after `down`:
 ## Building from source
 
 This path is for changing Ravel's code. It needs the Rust toolchain pinned in
-[`rust-toolchain.toml`](../../rust-toolchain.toml) (1.97.1; `rustup` installs
+[`rust-toolchain.toml`](../../rust-toolchain.toml) (1.100.0; `rustup` installs
 it on the first `cargo` run) and Docker with `docker compose`. The
 [contributing guide](../../CONTRIBUTING.md) covers the checks to run before a
 pull request.

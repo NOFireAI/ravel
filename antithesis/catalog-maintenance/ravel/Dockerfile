@@ -28,7 +28,7 @@ RUN curl -fsSL --max-time 300 -o libfaketime.tar.gz \
  && mkdir -p /out \
  && cp src/libfaketimeMT.so.1 /out/
 
-FROM rust:1.97.1-trixie AS server
+FROM rust:1.100.0-trixie AS server
 # scripts/build.sh passes sql,antithesis,antithesis-mutants for the
 # catalog-maintenance-mutants image only (ADR-4326 decision 3).
 ARG SERVER_FEATURES=sql,antithesis
@@ -46,7 +46,7 @@ RUN cargo build --release --locked -p ravel-server --features "$SERVER_FEATURES"
 # ravel-cli qualifies the bucket here, and the driver image copies it from
 # this image to seed, fold, compact, sweep and decode. It is not under test,
 # and no mutant is compiled into it.
-FROM rust:1.97.1-trixie AS cli
+FROM rust:1.100.0-trixie AS cli
 WORKDIR /src
 ENV CARGO_BUILD_JOBS=8
 COPY . .
