@@ -1665,6 +1665,12 @@ async fn sweep_does_not_follow_a_version_2_link_in_an_unresolved_bucket() {
                 shard: b.shard,
                 ingest_hour_bucket: b.ingest_hour_bucket,
             }]),
+            // The bucket's dominance does not resolve, so its conflicts are
+            // unknown and it is reported fail-safe (#4560).
+            conflict_truncated_buckets: BTreeSet::from([HeldBucket {
+                shard: b.shard,
+                ingest_hour_bucket: b.ingest_hour_bucket,
+            }]),
             ..SupersededSweepOutcome::default()
         }
     );
@@ -1976,6 +1982,12 @@ async fn sweep_holds_an_over_deep_rewrite_chain_and_reclaims_the_other_buckets()
             data_deleted: 2,
             held_request_ids: BTreeSet::from([top_request]),
             held_truncated_buckets: BTreeSet::from([HeldBucket {
+                shard: deep.shard,
+                ingest_hour_bucket: deep.ingest_hour_bucket,
+            }]),
+            // The over-deep chain makes the bucket's dominance fail, so its
+            // conflicts are unknown and it is reported fail-safe (#4560).
+            conflict_truncated_buckets: BTreeSet::from([HeldBucket {
                 shard: deep.shard,
                 ingest_hour_bucket: deep.ingest_hour_bucket,
             }]),
