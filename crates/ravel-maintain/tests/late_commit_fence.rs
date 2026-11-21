@@ -1232,12 +1232,12 @@ async fn completion_waits_until_the_bucket_is_plannable() {
 
 /// The pinned-query window (ADR-1133) zeroed, so the sweep's observing rule-2
 /// pass sees its other rules alone.
-fn sweep_config() -> CompactorConfig {
+fn sweep_config(fence: LateCommitFence) -> CompactorConfig {
     CompactorConfig {
         max_query_duration_ns: 0,
         head_cache_ttl_ns: 0,
         clock_skew_allowance_ns: 0,
-        ..fenced(FENCE, CompactorConfig::default())
+        ..fenced(fence, CompactorConfig::default())
     }
 }
 
@@ -1320,7 +1320,15 @@ async fn completed_before_a_late_l0(
 /// so releases rule 6's hold on them, then rule 6, both past the completion's
 /// protection horizon.
 async fn sweep_requests(store: &dyn ObjectStoreBackend) -> ErasureRequestSweepOutcome {
-    let config = sweep_config();
+    sweep_requests_under(FENCE, store).await
+}
+
+/// [`sweep_requests`] with the late-commit fence set to `fence`.
+async fn sweep_requests_under(
+    fence: LateCommitFence,
+    store: &dyn ObjectStoreBackend,
+) -> ErasureRequestSweepOutcome {
+    let config = sweep_config(fence);
     let clock = FixedClock::new(completed_ns() + config.protection_horizon_ns + NS_PER_HOUR);
     let b = bucket();
     sweep_superseded(
@@ -1361,6 +1369,26 @@ async fn a_late_l0_landing_after_completion_keeps_the_dreq() {
     let pending = windowed_victim();
     let (store, _late) = completed_before_a_late_l0(&pending, "victim", 4_000).await;
     let outcome = sweep_requests(&store).await;
+    assert_eq!(
+        outcome,
+        ErasureRequestSweepOutcome {
+            deleted: 0,
+            kept: 1,
+            held_by_superseded_inputs: 1,
+        }
+    );
+    assert!(exists(&store, &pending[0].request_key).await);
+}
+
+/// R9 does not depend on the fence: with the fence off the same late L0 keeps
+/// the `.dreq`, because a stamp says what the store applied late whether or
+/// not the planners leave it out.
+#[tokio::test]
+async fn with_the_fence_off_a_late_l0_landing_after_completion_keeps_the_dreq() {
+    let _serial = SERIAL.lock().await;
+    let pending = windowed_victim();
+    let (store, _late) = completed_before_a_late_l0(&pending, "victim", 4_000).await;
+    let outcome = sweep_requests_under(LateCommitFence::Off, &store).await;
     assert_eq!(
         outcome,
         ErasureRequestSweepOutcome {
@@ -1417,13 +1445,15 @@ async fn the_dreq_is_released_once_the_late_l0_is_gone() {
     assert!(!exists(&store, &pending[0].request_key).await);
 }
 
-/// Commit 2: a bucket under a retention tombstone serves nothing, so its late
-/// L0 does not keep the `.dreq`.
+/// R9: a retention tombstone does not release the keep. A HEAD that already
+/// folded the bucket serves its late L0 until a fold observes the tombstone,
+/// so the `.dreq` stays while the late record is stored, and is deleted on the
+/// first pass after retention deletes it.
 #[tokio::test]
-async fn a_late_l0_in_a_tombstoned_bucket_does_not_keep_the_dreq() {
+async fn a_late_l0_in_a_tombstoned_bucket_keeps_the_dreq_until_it_is_deleted() {
     let _serial = SERIAL.lock().await;
     let pending = windowed_victim();
-    let (store, _late) = completed_before_a_late_l0(&pending, "victim", 4_000).await;
+    let (store, late) = completed_before_a_late_l0(&pending, "victim", 4_000).await;
     let b = bucket();
     let tombstone = RetentionTombstone {
         format_version: 1,
@@ -1444,7 +1474,23 @@ async fn a_late_l0_in_a_tombstoned_bucket_does_not_keep_the_dreq() {
         .await
         .expect("put tombstone");
     let outcome = sweep_requests(&store).await;
-    assert_eq!((outcome.deleted, outcome.held_by_superseded_inputs), (1, 0));
+    assert_eq!(
+        outcome,
+        ErasureRequestSweepOutcome {
+            deleted: 0,
+            kept: 1,
+            held_by_superseded_inputs: 1,
+        }
+    );
+    assert!(exists(&store, &pending[0].request_key).await);
+
+    store
+        .delete(&late)
+        .await
+        .expect("retention deletes the late record");
+    let outcome = sweep_requests(&store).await;
+    assert_eq!((outcome.deleted, outcome.kept), (1, 0));
+    assert!(!exists(&store, &pending[0].request_key).await);
 }
 
 /// Test 7 (site 10): a bucket whose remaining below-target L0 is late is named
