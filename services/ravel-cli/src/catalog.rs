@@ -14,10 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ravel_catalog::{
-    CatalogConfig, FoldReport, KeyIndexRebuildError, KeyIndexRebuildOptions, KeyIndexRebuildReport,
-    PartLimits, RefoldRequest,
+    COMPAT_KEY, CatalogConfig, FoldReport, KeyIndexRebuildError, KeyIndexRebuildOptions,
+    KeyIndexRebuildReport, PartLimits, RefoldRequest,
 };
-use ravel_object_store::{GetRange, ObjectStoreBackend};
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::catalog::v1::{SnapshotColumnStatsPartRef, SnapshotKeyIndexLeafRef};
 use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
@@ -385,6 +385,45 @@ pub(crate) fn enforcing_catalog(
     Ok(ravel_catalog::Catalog::new(store, config)?.with_provisioning_enforcement())
 }
 
+/// Why `--metrics-series-index` was refused before any fold or rebuild ran.
+#[derive(Debug, thiserror::Error)]
+pub enum SeriesIndexRefusal {
+    /// The store holds a `sys/compat` record. Its MAC keys are not available
+    /// here, so the record is not decoded: its presence alone means an active
+    /// version gates what may be written.
+    #[error(
+        "--metrics-series-index refused: {COMPAT_KEY} exists on this store, and \
+         --metrics-series-index writes key-index leaves at version 3, which no active \
+         version on this store admits; activation is tracked by issue #4545"
+    )]
+    CompatPresent,
+    /// Whether `sys/compat` exists could not be learned.
+    #[error(
+        "--metrics-series-index refused: could not check whether {COMPAT_KEY} exists on this \
+         store: {0}"
+    )]
+    CompatUnknown(StoreError),
+}
+
+/// Refuses `--metrics-series-index` on a store that holds an object at
+/// [`COMPAT_KEY`]: the series index writes key-index leaves at version 3, and
+/// nothing can activate that version yet (#4545). Any store error other than
+/// `NotFound` refuses too. With `metrics_series_index` off it issues no
+/// request.
+pub async fn refuse_series_index_on_compat_store(
+    store: &dyn ObjectStoreBackend,
+    metrics_series_index: bool,
+) -> Result<(), SeriesIndexRefusal> {
+    if !metrics_series_index {
+        return Ok(());
+    }
+    match store.head(COMPAT_KEY).await {
+        Ok(_) => Err(SeriesIndexRefusal::CompatPresent),
+        Err(StoreError::NotFound) => Ok(()),
+        Err(err) => Err(SeriesIndexRefusal::CompatUnknown(err)),
+    }
+}
+
 /// The testable core of [`fold`]. `column_stats_ceiling_override`, when
 /// `Some`, replaces the per-part column-statistics ceiling (normally
 /// [`ravel_catalog::DEFAULT_MAX_COLUMN_STATS_BYTES`], 256 MiB) via
@@ -445,6 +484,7 @@ async fn fold_core(
     json: bool,
     column_stats_ceiling_override: Option<u64>,
 ) -> anyhow::Result<(FoldReport, String)> {
+    refuse_series_index_on_compat_store(store.as_ref(), metrics_series_index).await?;
     let mut catalog_config = CatalogConfig {
         shard_count,
         build_key_index_leaves,
@@ -939,6 +979,7 @@ pub async fn rebuild_key_index_outcome_with_series_index(
     metrics_series_index: bool,
     json: bool,
 ) -> anyhow::Result<(Result<KeyIndexRebuildReport, KeyIndexRebuildError>, String)> {
+    refuse_series_index_on_compat_store(store.as_ref(), metrics_series_index).await?;
     let tenant_hash = TenantId::new(tenant).hash();
     require_tenant_data_present(
         selection,
