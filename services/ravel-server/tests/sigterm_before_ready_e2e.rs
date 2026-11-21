@@ -42,8 +42,9 @@ const WINDOW_SLEEP: Duration = Duration::from_secs(3);
 const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The marker `main`'s seam logs as it enters the hold, after readiness is
-/// attached and before the drain await. Its presence proves `/readyz` is 200
-/// and the process is sitting in the window.
+/// attached and before the drain await. It is logged after `start` returned,
+/// and `start` latches readiness before it returns, so its presence shows the
+/// process is sitting in the window. The test does not probe `/readyz`.
 const WINDOW_MARKER: &str = "test seam: holding the shutdown window open after readiness";
 
 /// The first line `main` logs on the drain path, and the last.
