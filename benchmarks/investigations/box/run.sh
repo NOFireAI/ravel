@@ -1191,7 +1191,7 @@ compact_child() {
   for sig in spans logs; do
     "$PY" "$LIB" measure --out "$WORK/compact-$sig.measure.json" --stdout "$WORK/compact-$sig.out" -- \
       "${CLI[@]}" maintain compact-tenant --tenant "$TENANT" --signal "$sig" --shards "$SHARDS" \
-      --max-flush-lifetime 0s --no-claim &
+      --max-flush-lifetime 0s ${COMPACT_FENCE[@]+"${COMPACT_FENCE[@]}"} --no-claim &
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do
@@ -1204,6 +1204,27 @@ compact_child() {
     i=$((i + 1))
   done
   return "$code"
+}
+
+# compact_fence_flags: a ravel-cli whose maintain compact-tenant --help lists
+# --late-commit-fence refuses --max-flush-lifetime 0s while that fence is on
+# (ADR-4561), and an older one rejects the flag, so COMPACT_FENCE holds
+# "--late-commit-fence off" only when this binary's --help lists it.
+COMPACT_FENCE=()
+compact_fence_flags() {
+  local code=0
+  COMPACT_FENCE=()
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'DRY-RUN: %q maintain compact-tenant --help lists --late-commit-fence\n' "$BIN"
+    COMPACT_FENCE=(--late-commit-fence off)
+    return 0
+  fi
+  "$BIN" maintain compact-tenant --help >"$WORK/compact-help.out" 2>&1 || code=$?
+  [ "$code" = 0 ] || { failed_at "maintain compact-tenant --help" "$code" "$WORK/compact-help.out"; return 1; }
+  if grep -q -e '--late-commit-fence' "$WORK/compact-help.out"; then
+    COMPACT_FENCE=(--late-commit-fence off)
+  fi
+  return 0
 }
 
 # wait_sealed: compact-tenant seals an hour at its end plus
@@ -1226,6 +1247,7 @@ state_compaction() {
   local compact_s
   compact_s="$(estimate_s compaction_in_flight)" || fail "run.toml step_estimate_minutes.compaction_in_flight"
   fits compaction_in_flight "wait_sealed and compaction" "$((WAIT_SEALED_MAX_S + compact_s))" || return 0
+  compact_fence_flags || return 1
   stop_server
   wait_sealed
   # One restart before the in-flight calls; they run against this server.
@@ -1235,7 +1257,8 @@ state_compaction() {
     for sig in spans logs; do
       run "$PY" "$LIB" measure --out "$WORK/compact-$sig.measure.json" --stdout "$WORK/compact-$sig.out" -- \
         "${CLI[@]}" maintain compact-tenant --tenant "$TENANT" --signal "$sig" --shards "$SHARDS" \
-        --max-flush-lifetime 0s --no-claim || { code=$?; failed_sig="${failed_sig:-$sig}"; }
+        --max-flush-lifetime 0s ${COMPACT_FENCE[@]+"${COMPACT_FENCE[@]}"} --no-claim \
+        || { code=$?; failed_sig="${failed_sig:-$sig}"; }
     done
     printf 'DRY-RUN: the compactions above run as background children, both signals at once, while the in-flight calls run\n'
     statements compaction_in_flight --temp inflight
