@@ -3,7 +3,8 @@
 //! amendment, #4501). These tests drive the superseded-input sweep, whose batch
 //! is one chain group, and the retention physical sweep, whose batch is one
 //! bucket, with a hold written between the pass's snapshot and a batch, and
-//! with a hold re-read that fails.
+//! with a hold re-read that fails. The erasure-request sweep's chain-hold
+//! observation, which re-reads once per pass, is driven the same way.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -12,18 +13,21 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use common::*;
-use ravel_commit::keys;
+use ravel_commit::{erasure, keys, signal};
 use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
 use ravel_maintain::{
-    AUDIT_HOLD_SHARD, Bucket, CompactionOutcome, CompactorConfig, FixedClock, LegalHoldCheck,
-    NoLeases, RetentionConfig, RetentionOutcome, RetentionPolicy, SweepReport, compact_bucket,
-    retention_sweep_bucket, shard_hold_scopes, sweep_shard, write_hold_set,
+    AUDIT_HOLD_SHARD, Bucket, Clock, CompactionOutcome, CompactorConfig,
+    ErasureRequestSweepOutcome, ErasureRewriteOutcome, FixedClock, LegalHoldCheck, MaintainMemo,
+    NoLeases, PendingErasureRequest, RetentionConfig, RetentionOutcome, RetentionPolicy,
+    SweepReport, compact_bucket, erasure_rewrite_bucket, retention_sweep_bucket, shard_hold_scopes,
+    sweep_erasure_requests, sweep_shard, write_hold_clear, write_hold_set,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, list_all};
+use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
+use ravel_proto::commit::v1::{ErasureCompletion, ErasurePredicateMatcher, ErasureRequest};
 use uuid::Uuid;
 
 fn cfg() -> CompactorConfig {
@@ -472,5 +476,281 @@ async fn a_hold_placed_after_the_snapshot_keeps_an_unreferenced_part() {
         .expect("sweep");
         assert_eq!(deleted, usize::from(!hold), "hold={hold}");
         assert_eq!(store.head(&stray_key).await.is_ok(), hold, "hold={hold}");
+    }
+}
+
+// --- erasure requests: rule 6 judges chain holds from its own re-read ------
+
+const REQUEST: u128 = 0x4501_0042;
+
+/// A windowless erasure request for every series named `victim`.
+fn victim_request() -> PendingErasureRequest {
+    let request_id = Uuid::from_u128(REQUEST);
+    PendingErasureRequest {
+        request_key: keys::erasure_request_key(
+            &tenant_hash(),
+            ravel_types::Signal::Metrics,
+            request_id,
+        )
+        .expect("dreq key"),
+        request: ErasureRequest {
+            format_version: 1,
+            tenant_hash: tenant_hash().0.to_vec(),
+            signal: signal::to_proto(ravel_types::Signal::Metrics) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: 0,
+            predicate: vec![ErasurePredicateMatcher {
+                key: "__name__".to_string(),
+                value: "victim".to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        },
+    }
+}
+
+/// Two raw inputs in [`HOUR`], both carrying `victim`, rewritten by
+/// [`victim_request`], whose `.dreq` and a `.done` completed at the rewrite
+/// are then written. The rewrite supersedes both inputs, so the shard holds a
+/// superseded chain naming the request. Returns the `.dreq` key.
+async fn erased_chain_with_completed_request(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+) -> String {
+    for seq in [1, 2] {
+        let spec = InputSpec::new_at(
+            HOUR,
+            Uuid::from_u128(0xc3),
+            10,
+            seq,
+            vec![
+                raw_series("keep", &[("k", "a")], &[(seq as i64 * 1_000, 1.0)]),
+                raw_series("victim", &[("k", "b")], &[(seq as i64 * 1_000, 2.0)]),
+            ],
+        );
+        seed_input(store, &spec).await;
+    }
+    let pending = victim_request();
+    let outcome = erasure_rewrite_bucket(
+        store,
+        clock,
+        &cfg(),
+        &NoLeases,
+        &bucket_at(HOUR),
+        std::slice::from_ref(&pending),
+        &mut MaintainMemo::with_default_interval(),
+    )
+    .await
+    .expect("rewrite");
+    assert!(
+        matches!(outcome, ErasureRewriteOutcome::Rewritten { .. }),
+        "{outcome:?}"
+    );
+    store
+        .put(
+            &pending.request_key,
+            erasure::encode_request(&pending.request),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put dreq");
+    let completion = ErasureCompletion {
+        format_version: 1,
+        tenant_hash: tenant_hash().0.to_vec(),
+        signal: signal::to_proto(ravel_types::Signal::Metrics) as i32,
+        request_id: pending.request.request_id.clone(),
+        predicate_hash: vec![0x11; 32],
+        bucket_drops: vec![],
+        requested_unix_ns: 0,
+        completed_unix_ns: clock.now_ns(),
+        deferral_cause: 0,
+    };
+    store
+        .put(
+            &keys::erasure_completion_key(
+                &tenant_hash(),
+                ravel_types::Signal::Metrics,
+                Uuid::from_u128(REQUEST),
+            )
+            .expect("done key"),
+            erasure::encode_completion(&completion),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put done");
+    pending.request_key
+}
+
+async fn clear_the_shard(store: &dyn ObjectStoreBackend, id: u128) {
+    for (i, scope) in shard_hold_scopes(&tenant_hash(), ravel_types::Signal::Metrics, SHARD)
+        .expect("scopes")
+        .iter()
+        .enumerate()
+    {
+        write_hold_clear(
+            store,
+            &tenant_hash(),
+            Uuid::from_u128(id + i as u128),
+            sealed_ns() + 1,
+            scope,
+        )
+        .await
+        .expect("clear hold");
+    }
+}
+
+async fn sweep_requests(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+    lease: &LegalHoldCheck,
+) -> ErasureRequestSweepOutcome {
+    sweep_erasure_requests(
+        store,
+        clock,
+        &cfg(),
+        lease,
+        &tenant_hash(),
+        ravel_types::Signal::Metrics,
+    )
+    .await
+    .expect("sweep_erasure_requests")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainHold {
+    /// No hold at any point.
+    None,
+    /// A hold over the shard written after the tick snapshot.
+    AfterSnapshot,
+    /// A hold over the shard in the tick snapshot, cleared after the rule 2
+    /// pass and before rule 6.
+    ClearedBeforeRule6,
+}
+
+/// Rule 2 and rule 6 agree on a superseded chain a legal hold covers, whether
+/// the snapshot or only a later read saw the hold. With a hold written after
+/// the tick snapshot, rule 2's batch re-read keeps the chain group, and rule 6
+/// keeps the `.dreq` from its own re-read. With a hold the snapshot saw and
+/// that is cleared before rule 6 reads again, rule 2 keeps the group from the
+/// snapshot, and rule 6 keeps the `.dreq` because it joins the snapshot with
+/// its re-read. Control: with no hold rule 2 deletes the chain and rule 6
+/// deletes the `.dreq`.
+#[tokio::test]
+async fn rule_6_keeps_the_dreq_of_a_chain_rule_2_held_for_a_hold_after_the_snapshot() {
+    for case in [
+        ChainHold::None,
+        ChainHold::AfterSnapshot,
+        ChainHold::ClearedBeforeRule6,
+    ] {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(sealed_ns());
+        let dreq_key = erased_chain_with_completed_request(&store, &clock).await;
+        if case == ChainHold::ClearedBeforeRule6 {
+            hold_the_shard(&store, 0x4510).await;
+        }
+        let snapshot = LegalHoldCheck::refresh(&store, &tenant_hash())
+            .await
+            .expect("refresh");
+        assert_eq!(
+            snapshot.is_empty(),
+            case != ChainHold::ClearedBeforeRule6,
+            "{case:?}"
+        );
+        if case == ChainHold::AfterSnapshot {
+            hold_the_shard(&store, 0x4520).await;
+        }
+        clock.set(past_horizon());
+
+        let report = sweep(&store, &clock, &snapshot).await;
+        if case == ChainHold::ClearedBeforeRule6 {
+            clear_the_shard(&store, 0x4530).await;
+        }
+        let out = sweep_requests(&store, &clock, &snapshot).await;
+
+        if case == ChainHold::None {
+            assert_eq!(
+                report.superseded_groups_held_by_legal_hold, 0,
+                "{case:?}: {report:?}"
+            );
+            assert!(report.superseded_data_deleted > 0, "{case:?}: {report:?}");
+            assert_eq!(
+                (out.deleted, out.held_by_superseded_inputs),
+                (1, 0),
+                "{case:?}: nothing holds the chain, so the .dreq is deleted: {out:?}"
+            );
+            assert!(store.head(&dreq_key).await.is_err(), "{case:?}");
+        } else {
+            assert!(
+                report.superseded_groups_held_by_legal_hold > 0,
+                "{case:?}: rule 2 keeps the held chain group: {report:?}"
+            );
+            assert_eq!(report.superseded_data_deleted, 0, "{case:?}: {report:?}");
+            assert_eq!(
+                (out.deleted, out.held_by_superseded_inputs),
+                (0, 1),
+                "{case:?}: rule 6 keeps the .dreq of the chain rule 2 held: {out:?}"
+            );
+            assert!(store.head(&dreq_key).await.is_ok(), "{case:?}: .dreq kept");
+        }
+    }
+}
+
+/// A failed hold re-read in rule 6's observation keeps every candidate
+/// `.dreq`, is counted once on the hold source, and the pass returns `Ok`.
+/// Control: the same pass with a healthy hold shard deletes the `.dreq`.
+#[tokio::test]
+async fn a_failed_rule_6_re_read_keeps_the_dreq_and_is_counted_once() {
+    for fault in [false, true] {
+        let mem = Arc::new(MemoryStore::new());
+        let clock = FixedClock::new(sealed_ns());
+        let dreq_key = erased_chain_with_completed_request(mem.as_ref(), &clock).await;
+        let snapshot = LegalHoldCheck::refresh(mem.as_ref(), &tenant_hash())
+            .await
+            .expect("refresh");
+        let source = Arc::clone(snapshot.source().expect("bound"));
+        clock.set(past_horizon());
+        // Rule 2 reclaims the chain first, so nothing but the fault can keep
+        // the request.
+        let report = sweep(mem.as_ref(), &clock, &snapshot).await;
+        assert!(report.superseded_data_deleted > 0, "{report:?}");
+        assert_eq!(source.reread_failures(), 0);
+
+        let hold_prefix =
+            keys::commit_shard_prefix(&tenant_hash(), ravel_types::Signal::Audit, AUDIT_HOLD_SHARD)
+                .expect("prefix");
+        let plan = if fault {
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Transient("hold shard down".into()))
+                    .with_key_contains(hold_prefix)
+                    .with_occurrence(Occurrence::Nth(1)),
+            )
+        } else {
+            FaultPlan::empty()
+        };
+        let store = FaultStore::new(Arc::clone(&mem), plan);
+        let out = sweep_requests(&store, &clock, &snapshot).await;
+
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Transient),
+            u64::from(fault),
+            "fault={fault}: the observation's re-read faulted"
+        );
+        assert_eq!(
+            source.reread_failures(),
+            u64::from(fault),
+            "fault={fault}: one failed re-read, counted once"
+        );
+        if fault {
+            assert_eq!(
+                (out.deleted, out.kept, out.held_by_superseded_inputs),
+                (0, 1, 0),
+                "the failed re-read keeps the candidate: {out:?}"
+            );
+            assert!(mem.head(&dreq_key).await.is_ok(), ".dreq kept");
+        } else {
+            assert_eq!((out.deleted, out.kept), (1, 0), "{out:?}");
+            assert!(mem.head(&dreq_key).await.is_err(), ".dreq deleted");
+        }
     }
 }

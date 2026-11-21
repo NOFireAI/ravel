@@ -4107,8 +4107,9 @@ pub struct ErasureRequestSweepOutcome {
     pub deleted: usize,
     /// `.dreq` objects left in place: no `.done` yet (erasure not complete),
     /// still inside the post-completion protection horizon, lease/legal-hold
-    /// protected, or held off this pass's own observing rule-2 pass
-    /// (`held_by_superseded_inputs` below counts that subset).
+    /// protected, held off this pass's own observing rule-2 pass
+    /// (`held_by_superseded_inputs` below counts that subset), or kept
+    /// because that observation's hold re-read failed.
     pub kept: usize,
     /// The subset of `kept` held past their horizon because this pass's
     /// observing rule-2 pass ([`SweepMode::GateOnly`], over every hour and
@@ -4159,7 +4160,12 @@ pub struct ErasureRequestSweepOutcome {
 ///   a snapshot still resolves it, and a chain still inside its own protection
 ///   horizon is the likeliest one a stale HEAD names. That is why no entry
 ///   takes a deleting pass's holds instead: a deleting pass walks no rewrite
-///   still inside its horizon, nor any record below one.
+///   still inside its horizon, nor any record below one. The observation
+///   judges chain holds from the pass snapshot joined with a hold re-read it
+///   takes itself, once, before walking the shards (see
+///   [`observe_superseded_holds`] for the residual); if that re-read fails,
+///   every candidate is kept this pass and the failure is counted on the
+///   lease's [`crate::legal_hold::HoldSource`].
 /// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
 ///   request exactly as it pins any other object.
 ///
@@ -4188,7 +4194,8 @@ pub struct ErasureRequestSweepOutcome {
 /// discipline for this keyspace.
 ///
 /// This is rule 6's only entry, and `ravel-server`'s maintenance tick calls
-/// it. The observation costs one rule-2-shaped pass and nothing more, and runs
+/// it. The observation costs one rule-2-shaped pass plus, under a lease with a
+/// hold source, one hold-shard listing, and runs
 /// only when there is a `.dreq` past its horizon to decide about. An ordinary
 /// pass, where every request is either incomplete or still inside its
 /// horizon, reads nothing but the `del/` listing and the completions.
@@ -4260,12 +4267,23 @@ pub async fn sweep_erasure_requests(
         });
     }
 
-    let holds = observe_superseded_holds(store, clock, config, lease, tenant, signal).await?;
+    let Some(holds) = observe_superseded_holds(store, clock, config, lease, tenant, signal).await?
+    else {
+        // The observation's hold re-read failed: no chain's hold can be ruled
+        // out, so every candidate stays this pass.
+        kept += candidates.len();
+        return Ok(ErasureRequestSweepOutcome {
+            deleted: 0,
+            kept,
+            held_by_superseded_inputs: 0,
+        });
+    };
 
     let mut deleted = 0usize;
     let mut held_by_superseded_inputs = 0usize;
-    // The pass's `.dreq` deletes are one delete batch (#4501). The rule 2
-    // observation above is planning and keeps the pass snapshot.
+    // The pass's `.dreq` deletes are one delete batch (#4501). The `del/`
+    // keyspace lies outside every shard hold scope, so this batch's re-read
+    // does not stand in for the observation's own one above.
     let mut batch = DeleteBatch::new(lease, tenant, "erasure request sweep");
     for (request_id, dreq_key) in candidates {
         // The horizon has elapsed, but rule 2 may have held an object one of
@@ -4327,6 +4345,22 @@ pub async fn sweep_erasure_requests(
 /// scope costs listing, never correctness.
 ///
 /// The pass runs only when there is a `.dreq` past its horizon to decide about.
+///
+/// Chain holds are judged from a hold read this observation takes itself
+/// (ADR-0042, the delete-batch re-read amendment): before the shards are
+/// walked, the hold set is re-read once through `lease`'s [`HoldSource`],
+/// and a chain group is held when the pass snapshot or that re-read covers
+/// any of its keys. The deleting rule 2 pass judges each chain group from its
+/// own batch re-read, so a snapshot-only observation could report unheld a
+/// chain rule 2 kept for a hold written after the snapshot. A hold written
+/// after the snapshot and cleared before this re-read is not seen here, even
+/// when rule 2 held a group for it earlier in the tick. A lease with no
+/// source is judged from its snapshot alone.
+///
+/// Returns `None` when the re-read fails: the failure is counted once on the
+/// source and the caller keeps every candidate.
+///
+/// [`HoldSource`]: crate::legal_hold::HoldSource
 async fn observe_superseded_holds(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -4334,7 +4368,33 @@ async fn observe_superseded_holds(
     lease: &dyn LeaseCheck,
     tenant: &TenantHash,
     signal: Signal,
-) -> Result<SupersededHolds> {
+) -> Result<Option<SupersededHolds>> {
+    let reread = match lease.hold_source() {
+        None => None,
+        Some(source) => match source.current(store).await {
+            Ok(fresh) => Some(SnapshotOrReread {
+                snapshot: lease,
+                fresh,
+            }),
+            Err(err) => {
+                source.note_reread_failure();
+                tracing::error!(
+                    tenant_hash = %tenant.to_hex(),
+                    signal = signal.key_prefix(),
+                    error = %err,
+                    "erasure-request sweep: legal hold re-read failed before observing \
+                     superseded-chain holds; every candidate request is kept and retried on a \
+                     later pass"
+                );
+                return Ok(None);
+            }
+        },
+    };
+    let lease: &dyn LeaseCheck = match &reread {
+        Some(union) => union,
+        None => lease,
+    };
+
     // One pass, one reachability cache: HEAD is read at most once no matter how
     // many shards are observed.
     let mut reach = SnapshotReachability::new().with_read_gate(config.read_gate.clone());
@@ -4356,7 +4416,24 @@ async fn observe_superseded_holds(
         .await?;
         holds.absorb(&outcome);
     }
-    Ok(holds)
+    Ok(Some(holds))
+}
+
+/// A key is protected when the pass snapshot or a later re-read of the hold
+/// set protects it.
+struct SnapshotOrReread<'a> {
+    snapshot: &'a dyn LeaseCheck,
+    fresh: crate::legal_hold::LegalHoldCheck,
+}
+
+impl LeaseCheck for SnapshotOrReread<'_> {
+    fn is_protected(&self, key: &str) -> bool {
+        self.snapshot.is_protected(key) || self.fresh.is_protected(key)
+    }
+
+    fn hold_source(&self) -> Option<&crate::legal_hold::HoldSource> {
+        self.snapshot.hold_source()
+    }
 }
 
 /// Every shard with at least one commit-prefix key for one `(tenant, signal)`,
