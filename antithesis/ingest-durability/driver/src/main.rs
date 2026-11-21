@@ -7,9 +7,11 @@
 //! The driver is a hegel concurrent state machine. Each rule sends one write
 //! or one query to a ravel-server node and records the outcome in the model
 //! (`model.rs`). See antithesis/ingest-durability/README.md for the properties.
-//! `WORKLOAD_COVERAGE=1` turns on the coverage variant (`coverage.rs`).
+//! `WORKLOAD_COVERAGE=1` turns on the coverage variant (`coverage.rs`),
+//! `WORKLOAD_PERF=1` the perf variant (`perf.rs`).
 
 mod coverage;
+mod perf;
 mod stop;
 
 use ravel_antithesis_driver::{model, otlp, ravel};
@@ -29,6 +31,7 @@ use antithesis_instrumentation as _;
 use coverage::Coverage;
 use model::{Attempt, Mode, Model, Signal, Write};
 use otlp::{METRIC_SERIES, PartialSuccess, Sample, VALUE_STRIDE};
+use perf::{Answer, Outcome, Perf, Stamp, StopFaults};
 use ravel::{Ravel, Reply, SqlFailure};
 
 /// Retries after the first attempt of a write with no definite outcome.
@@ -99,6 +102,8 @@ struct Shared {
     inject_missing: bool,
     /// The coverage variant's state; `None` in the base variant.
     cov: Option<Coverage>,
+    /// The perf variant's switch; `None` unless `WORKLOAD_PERF=1`.
+    perf: Option<Perf>,
 }
 
 struct Workload(Arc<Shared>);
@@ -215,32 +220,46 @@ impl Shared {
         if m.writes.len() >= self.max_writes {
             return None;
         }
-        let id = m.next_id;
-        m.next_id += 1;
-        let ts_ns = now_ns();
-        let ms = ts_ns / 1_000_000 * 1_000_000;
-        let mut sample_list = Vec::new();
-        for i in 0..u64::from(samples) {
-            let seq = m.next_sample;
-            m.next_sample += 1;
-            sample_list.push(Sample {
-                series: (series_offset + i) % METRIC_SERIES,
-                ts_ns: ms + seq % 1_000_000,
-                value: (id * VALUE_STRIDE + i) as f64,
-            });
-        }
-        let w = Write {
-            id,
+        Some(register_in(
+            &mut m,
             signal,
             mode,
-            key: keyed.then(|| format!("wl-key-{id}")),
             records,
-            samples: sample_list,
-            ts_ns,
-            attempts: Vec::new(),
+            samples,
+            series_offset,
+            keyed,
+        ))
+    }
+
+    /// One perf probe write to `node`: strict, unkeyed, not gzip, one log
+    /// record in one stream or one sample, registered past the
+    /// `WORKLOAD_MAX_WRITES` cap, sent once. It takes neither the gate nor a
+    /// stop helper, so it can run while the eventually holds the gate.
+    fn probe_write(&self, node: usize, signal: Signal, timeout: Duration) -> Answer {
+        let w = {
+            let mut m = lock(&self.model);
+            match signal {
+                Signal::Logs => register_in(&mut m, signal, Mode::Strict, 1, 0, 0, false),
+                Signal::Metrics => register_in(&mut m, signal, Mode::Strict, 0, 1, 0, false),
+            }
         };
-        m.writes.insert(id, w.clone());
-        Some(w)
+        let (path, body) = match signal {
+            Signal::Logs => ("/v1/logs", otlp::logs_request(w.id, 1, 1, w.ts_ns)),
+            Signal::Metrics => ("/v1/metrics", otlp::metrics_request(&w.samples)),
+        };
+        let k = self.begin_attempt(w.id);
+        let sent = Stamp::now();
+        let reply = self
+            .ravel
+            .export(node, path, &body, w.mode.header(), None, false, timeout);
+        let received = Stamp::now();
+        let attempt = self.judge_reply(&w, node, &reply);
+        self.finish_attempt(w.id, k, attempt.clone());
+        Answer {
+            outcome: Outcome::from_attempt(&attempt),
+            sent,
+            received,
+        }
     }
 
     fn begin_attempt(&self, id: u64) -> usize {
@@ -601,6 +620,44 @@ impl Shared {
     }
 }
 
+/// Register a write in the model, with no cap.
+fn register_in(
+    m: &mut Model,
+    signal: Signal,
+    mode: Mode,
+    records: u32,
+    samples: u32,
+    series_offset: u64,
+    keyed: bool,
+) -> Write {
+    let id = m.next_id;
+    m.next_id += 1;
+    let ts_ns = now_ns();
+    let ms = ts_ns / 1_000_000 * 1_000_000;
+    let mut sample_list = Vec::new();
+    for i in 0..u64::from(samples) {
+        let seq = m.next_sample;
+        m.next_sample += 1;
+        sample_list.push(Sample {
+            series: (series_offset + i) % METRIC_SERIES,
+            ts_ns: ms + seq % 1_000_000,
+            value: (id * VALUE_STRIDE + i) as f64,
+        });
+    }
+    let w = Write {
+        id,
+        signal,
+        mode,
+        key: keyed.then(|| format!("wl-key-{id}")),
+        records,
+        samples: sample_list,
+        ts_ns,
+        attempts: Vec::new(),
+    };
+    m.writes.insert(id, w.clone());
+    w
+}
+
 fn first(lines: &[String]) -> serde_json::Value {
     json!({ "count": lines.len(), "first": lines.iter().take(5).collect::<Vec<_>>() })
 }
@@ -904,12 +961,27 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     // of a test run (snouty docs:
     // /docs/product/writing_tests/controlling_faults/pause_faults/). The local
     // loop injects no faults and leaves it unset, so this is a no-op there.
-    if let Ok(cmd) = std::env::var("ANTITHESIS_STOP_FAULTS") {
-        match std::process::Command::new(&cmd).arg("3600").status() {
-            Ok(st) => println!("eventually: {cmd} 3600 exited {st}"),
-            Err(e) => println!("eventually: running {cmd} failed: {e}"),
-        }
-    }
+    let stop_faults = match std::env::var("ANTITHESIS_STOP_FAULTS") {
+        Ok(cmd) => match std::process::Command::new(&cmd).arg("3600").status() {
+            Ok(st) => {
+                println!("eventually: {cmd} 3600 exited {st}");
+                if st.success() {
+                    StopFaults::Ok
+                } else {
+                    StopFaults::Failed
+                }
+            }
+            Err(e) => {
+                println!("eventually: running {cmd} failed: {e}");
+                StopFaults::Failed
+            }
+        },
+        Err(std::env::VarError::NotPresent) => StopFaults::Unset,
+        // Set but not UTF-8: the command was never run.
+        Err(std::env::VarError::NotUnicode(_)) => StopFaults::Failed,
+    };
+    let t0 = Stamp::now();
+    let mut perf_run = s.perf.as_ref().and_then(|p| p.start(stop_faults, t0));
     // No drain may start once the checks below begin.
     if let Some(cov) = &s.cov {
         cov.settle_drains();
@@ -919,23 +991,44 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         cov.switch_faults_off(&s.ravel.nodes, &|node| s.ravel.ready(node).is_ok());
     }
 
-    let deadline = Instant::now() + Duration::from_secs(300);
-    let mut last = String::new();
-    let mut recovered = false;
-    while Instant::now() < deadline {
-        match s.all_nodes_serve() {
-            Ok(()) => {
-                recovered = true;
-                break;
-            }
-            Err(e) => {
-                if e != last {
-                    println!("eventually: waiting for recovery: {e}");
-                    last = e;
+    let n = s.ravel.nodes.len();
+    let (recovered, last, ttfa) = std::thread::scope(|sc| {
+        // The perf variant's TTFA probers, one per node, beside the recovery
+        // wait; none takes the gate or a stop helper.
+        let probers: Vec<_> = match &perf_run {
+            Some(run) => (0..n)
+                .map(|node| {
+                    sc.spawn(move || run.probe_ttfa(|t| s.probe_write(node, Signal::Logs, t)))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let mut last = String::new();
+        let mut recovered = false;
+        while Instant::now() < deadline {
+            match s.all_nodes_serve() {
+                Ok(()) => {
+                    recovered = true;
+                    break;
                 }
-                std::thread::sleep(Duration::from_secs(2));
+                Err(e) => {
+                    if e != last {
+                        println!("eventually: waiting for recovery: {e}");
+                        last = e;
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                }
             }
         }
+        let ttfa: Vec<perf::TtfaSample> = probers
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| perf::TtfaSample::none(0)))
+            .collect();
+        (recovered, last, ttfa)
+    });
+    if let Some(run) = perf_run.as_mut() {
+        run.record_ttfa(&ttfa);
     }
     assert_always!(
         recovered,
@@ -943,10 +1036,35 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         &json!({ "last_error": last })
     );
     if !recovered {
+        if let Some(run) = &perf_run {
+            run.finish(recovered);
+        }
         println!("eventually: not recovered, ending the timeline");
         std::process::exit(0);
     }
     std::thread::sleep(Duration::from_secs(5));
+    if let Some(run) = perf_run.as_mut() {
+        if run.ack_probes_due(recovered) {
+            let run_ref = &*run;
+            let per_node: Vec<Vec<perf::AckSample>> = std::thread::scope(|sc| {
+                let handles: Vec<_> = (0..n)
+                    .map(|node| {
+                        sc.spawn(move || {
+                            run_ref.probe_acks(node, WRITE_TIMEOUT, |signal, t| {
+                                s.probe_write(node, signal, t)
+                            })
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
+            run.record_acks(&per_node);
+        }
+        run.finish(recovered);
+    }
 
     let (acked_logs, acked_metrics) = {
         let m = lock(&s.model);
@@ -1082,6 +1200,13 @@ fn wait_for(what: &str, mut check: impl FnMut() -> Result<(), String>) {
 #[hegel::main(phases = [hegel::Phase::Generate])]
 fn main(tc: TestCase) {
     antithesis_sdk::antithesis_init();
+    if perf::conflicts(
+        std::env::var("WORKLOAD_PERF").ok().as_deref(),
+        std::env::var("WORKLOAD_COVERAGE").ok().as_deref(),
+    ) {
+        eprintln!("driver: WORKLOAD_PERF and WORKLOAD_COVERAGE cannot both be on");
+        std::process::exit(1);
+    }
     let cfg = Config::from_env();
     let ravel = match Ravel::new(cfg.nodes.clone(), cfg.token.clone()) {
         Ok(r) => r,
@@ -1099,6 +1224,7 @@ fn main(tc: TestCase) {
         max_writes: cfg.max_writes,
         inject_missing: std::env::var("WORKLOAD_INJECT_MISSING_RECORD").is_ok_and(|v| v == "1"),
         cov: Coverage::from_env(),
+        perf: Perf::from_env(),
     });
 
     for node in 0..shared.ravel.nodes.len() {
