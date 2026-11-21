@@ -856,6 +856,16 @@ format floor raise. Both were already true of a late record that landed
 after a bucket's compaction. The fence extends them to a record that lands
 between the seal and the first plan.
 
+A late record can also land after an erasure request has completed. No
+rewrite erased it, so the erasure-request sweep keeps that request's `.dreq`
+past its horizon, and with it the query filter that hides the subject, while
+the record is stored and the request's window may overlap its event times. A
+request with no window is kept by any late record of its tenant and signal.
+The sweep counts each keep in
+`ravel_maintain_dreq_held_by_superseded_inputs_total` and logs a warn line
+naming the bucket. The keep ends when the record is deleted or retention
+tombstones the bucket.
+
 `--late-commit-fence off` plans from every listed commit record as soon as
 the bucket seals, which was the behaviour before the fence. Use it for a
 bucket whose commit records were all written after it sealed:
@@ -868,6 +878,12 @@ With the fence on, such a bucket is never compacted, and every pass counts
 all of its records as late. Run the affected shard's maintenance once with the
 flag, after the writers for those hours are gone, then go back to the
 default.
+
+Before you do, check that no completed erasure request's window overlaps the
+bucket's late records. The compaction carries their rows into its parts, and
+a completed request's rewrite never revisits them. Once the sweep reclaims
+the late records, the request's `.dreq` is deleted and those rows are served
+again.
 
 ### A log object compaction cannot rewrite
 
