@@ -757,7 +757,10 @@ strip_code_span() {
 # item is the item after the attribute (and any further attributes): through
 # its first line when that line ends in , (a field), else through the first
 # line ending in ; when no brace opened before it, else through the line where
-# its braces balance, and never past a closing brace of the enclosing scope. The scan is textual: a /* or a brace inside a
+# its braces balance, and never past a closing brace of the enclosing scope. A
+# live line ending in ( is also joined with the live lines after it, each with
+# its leading blanks dropped, up to and including the first that holds a ), so
+# a call rustfmt wrapped after its opening parenthesis still matches. The scan is textual: a /* or a brace inside a
 # string or char literal is taken at face value. The literal is passed
 # through the environment, never as awk program text or -v, so backslashes
 # stay literal.
@@ -770,6 +773,7 @@ rust_literal_live() {
             if (depth < 0 || (opened && depth <= 0) || (!opened && (s ~ /;[[:space:]]*$/ || (head && s ~ /,[[:space:]]*$/)))) skipping = 0
             head = 0
         }
+        { held = prev; prev = "" }
         in_block { if (index($0, "*/")) in_block = 0; next }
         skipping { skip_line($0); next }
         /^[[:space:]]*#\[cfg\(test\)\]/ { pending = 1; next }
@@ -784,6 +788,15 @@ rust_literal_live() {
                 line = substr(line, 1, p - 1)
             }
             if (index(line, ENVIRON["RUST_LITERAL"])) { found = 1; exit }
+            rest = line
+            sub(/^[[:space:]]+/, "", rest)
+            sub(/[[:space:]]+$/, "", rest)
+            if (held != "") {
+                joined = held rest
+                if (index(joined, ENVIRON["RUST_LITERAL"])) { found = 1; exit }
+                if (!index(rest, ")")) prev = joined
+            }
+            if (rest ~ /\($/) prev = (held != "" && !index(rest, ")")) ? joined : rest
         }
         END { exit !found }' "$2"
 }
@@ -797,7 +810,7 @@ rust_literal_live_under() {
         rel="${f#"$REPO_ROOT"/}"
         case "$rel" in tests/*|*/tests/*) continue ;; esac
         rust_literal_live "$lit" "$f" && return 0
-    done < <(grep -rlF --include='*.rs' -- "$lit" "$@" 2>/dev/null)
+    done < <(grep -rlF --include='*.rs' -- "${RUST_GREP_KEY:-$lit}" "$@" 2>/dev/null)
     return 1
 }
 
@@ -906,7 +919,7 @@ check_antithesis_tsv() {
             note "$where: mutant '$f2' must be named '$area/$stem'"; rc=1; continue
         fi
         if [ "${#roots[@]}" -eq 0 ] \
-            || ! rust_literal_live_under "inv_mutant!(\"$f2\")" "${roots[@]}"; then
+            || ! RUST_GREP_KEY="\"$f2\"" rust_literal_live_under "inv_mutant!(\"$f2\")" "${roots[@]}"; then
             note "$where: mutant '$f2' not found as inv_mutant!(\"$f2\") in Rust"; rc=1
         fi
         if [ -z "$f3" ]; then

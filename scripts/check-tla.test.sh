@@ -1550,6 +1550,32 @@ impl Cfg {
     }
 }
 EOF
+cat > "$airepo/crates/m/wrapped.rs" <<'EOF'
+fn live(x: Option<u8>) {
+    match x {
+        Some(i)
+            if !ravel_invariant::inv_mutant!(
+                "enr/wrapped"
+            ) =>
+        {
+            let _ = i;
+        }
+        _ => {}
+    }
+    // if inv_mutant!(
+    //     "enr/wrapped-comment"
+    // ) {}
+    if inv_mutant!(
+        other("enr/wrapped-other")
+    ) {}
+}
+#[cfg(test)]
+fn t() {
+    if inv_mutant!(
+        "enr/wrapped-cfg-test"
+    ) {}
+}
+EOF
 cat > "$airepo/crates/m/tests/it.rs" <<'EOF'
 fn t() { if inv_mutant!("enr/tests-dir") {} }
 EOF
@@ -1579,6 +1605,14 @@ echo "--- (ay2) traceability: a #[cfg(test)] item hides only itself, not the cod
 for m in after-test-mod after-cfg-use after-deref after-one-line after-field; do
     tsv_mutant "$m"
     expect_trace "ay2-$m" enr pass 'PASS (1 rows resolve)'
+done
+
+echo "--- (ay2b) traceability: a mutant call rustfmt wrapped after its ( counts; wrapped in a comment, in cfg(test) or around another call it does not"
+tsv_mutant wrapped
+expect_trace ay2b-wrapped enr pass 'PASS (1 rows resolve)'
+for m in wrapped-comment wrapped-other wrapped-cfg-test; do
+    tsv_mutant "$m"
+    expect_trace "ay2b-$m" enr fail "mutant 'enr/$m' not found as inv_mutant!(\"enr/$m\") in Rust"
 done
 
 echo "--- (ay3) traceability: a sut: path under tests/ fails"
