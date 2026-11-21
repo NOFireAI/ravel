@@ -268,14 +268,15 @@ impl HoldSource {
         })
     }
 
-    /// Delete batches whose hold re-read failed, so that deleted nothing,
-    /// since this source was made. The server adds these to its legal-hold
-    /// refresh-failure counter.
+    /// Hold re-reads that failed since this source was made: a delete batch
+    /// whose re-read failed deleted nothing, and an erasure-request pass whose
+    /// re-read failed kept every candidate request. The server adds these to
+    /// its legal-hold refresh-failure counter.
     pub fn reread_failures(&self) -> u64 {
         self.reread_failures.load(Ordering::Relaxed)
     }
 
-    fn note_reread_failure(&self) {
+    pub(crate) fn note_reread_failure(&self) {
         self.reread_failures.fetch_add(1, Ordering::Relaxed);
     }
 }

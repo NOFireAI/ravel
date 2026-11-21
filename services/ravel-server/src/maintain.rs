@@ -3243,8 +3243,9 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
         deleted += run_alert_retention(store, clock, compactor, &hold, tenant, safety).await;
     }
 
-    // Each delete batch whose hold re-read failed deleted nothing and counts
-    // as one refresh failure.
+    // Each failed hold re-read counts as one refresh failure: a delete batch
+    // that then deleted nothing, or an erasure-request pass that kept every
+    // candidate request.
     safety.record_legal_hold_refresh_failures(hold_source.reread_failures());
     assert_refresh_failure_never_sweeps(tenant, refresh_ok, deleted);
     total
