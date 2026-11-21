@@ -505,10 +505,12 @@
 #                                       ci_smoke's and measured_run's run.sh
 #                                       argv and MB_L1_MAX_PART_BYTES with
 #                                       RAVEL_ONLY and L1_MAX_PART_BYTES set,
-#                                       0 and unset
+#                                       0 and unset; SERIES_INDEX reaching
+#                                       the measured run alone
 #                                       launch.sh with an aws stub: each
-#                                       MB_RAVEL_ONLY and MB_L1_MAX_PART_BYTES
-#                                       refusal exits 64 before any aws call;
+#                                       MB_RAVEL_ONLY, MB_L1_MAX_PART_BYTES
+#                                       and MB_SERIES_INDEX refusal exits 64
+#                                       before any aws call;
 #                                       the history Ravel-only launch's user
 #                                       data, with and without a
 #                                       real-s3-prefix; the env block's keys
@@ -5206,11 +5208,13 @@ box_runs() {
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"${BOX_RUN_LOG}.argv"
 printf 'MB_L1_MAX_PART_BYTES=%s\n' "${MB_L1_MAX_PART_BYTES-<unset>}" >"${BOX_RUN_LOG}.env"
+printf 'MB_SERIES_INDEX=%s\n' "${MB_SERIES_INDEX-<unset>}" >>"${BOX_RUN_LOG}.env"
 STUB
   chmod +x "${BOX_RUNS}/deploy/metricsbench/run.sh"
   (
     cd "${BOX_RUNS}" || exit 1
-    unset RAVEL_ONLY L1_MAX_PART_BYTES STAGE1_ARMS CONTROL_IMAGE CONTROL_SOURCE_COMMIT MB_L1_MAX_PART_BYTES
+    unset RAVEL_ONLY L1_MAX_PART_BYTES STAGE1_ARMS CONTROL_IMAGE CONTROL_SOURCE_COMMIT MB_L1_MAX_PART_BYTES \
+      SERIES_INDEX MB_SERIES_INDEX
     export RAVEL_IMAGE=img RAVEL_SOURCE_COMMIT=src PROFILE=history ANCHOR_MS=1 RSS_BAND=rss OBJECTS_BAND=1:2
     [ "$#" -eq 0 ] || export "$@"
     . "${BOXRUN}"
@@ -5243,6 +5247,21 @@ for c in unset zero; do
     fail "box-run ${c}: measured '$(box_argv measured)', ci '$(box_argv ci)', out $(cat "${BOX_RUNS}.out")"
   fi
 done
+# SERIES_INDEX=1 reaches the measured run alone; unset, the measured run gets
+# MB_SERIES_INDEX empty, which run.sh reads as off.
+box_runs si SERIES_INDEX=1
+if grep -qxF 'MB_SERIES_INDEX=1' "${BOX_RUNS}/measured.env" && grep -qxF 'MB_SERIES_INDEX=<unset>' "${BOX_RUNS}/ci.env" &&
+  [ "$(box_argv ci)" = "${BOX_CI_ARGV}" ]; then
+  pass "box-run: SERIES_INDEX=1 reaches the measured run as MB_SERIES_INDEX=1 and not the ci smoke"
+else
+  fail "box-run si: measured env $(cat "${BOX_RUNS}/measured.env" 2>&1), ci env $(cat "${BOX_RUNS}/ci.env" 2>&1), out $(cat "${BOX_RUNS}.out")"
+fi
+box_runs si-unset
+if grep -qxF 'MB_SERIES_INDEX=' "${BOX_RUNS}/measured.env" && grep -qxF 'MB_SERIES_INDEX=<unset>' "${BOX_RUNS}/ci.env"; then
+  pass "box-run: without SERIES_INDEX the measured run gets MB_SERIES_INDEX empty"
+else
+  fail "box-run si-unset: measured env $(cat "${BOX_RUNS}/measured.env" 2>&1)"
+fi
 if grep -qxF 'ci_smoke ${ci_args[@]+"${ci_args[@]}"} || code=$?' "${BOXRUN}" &&
   grep -qxF 'measured_run ${store_args[@]+"${store_args[@]}"} || code=$?' "${BOXRUN}"; then
   pass "box-run: the box runs ci_smoke and measured_run"
@@ -5291,7 +5310,7 @@ launch() {
   rc=0
   (
     unset MB_PROFILE MB_STAGE1 MB_STAGE1_BANDS MB_STAGE1_ARMS MB_CONTROL_IMAGE MB_CONTROL_SOURCE_COMMIT \
-      MB_RAVEL_ONLY MB_L1_MAX_PART_BYTES MB_RSS_BAND MB_OBJECTS_BAND MB_REPO AWS_DEFAULT_REGION AWS_PROFILE
+      MB_RAVEL_ONLY MB_L1_MAX_PART_BYTES MB_SERIES_INDEX MB_RSS_BAND MB_OBJECTS_BAND MB_REPO AWS_DEFAULT_REGION AWS_PROFILE
     export LAUNCH_AWS_LOG LAUNCH_USER_DATA PATH="${LAUNCH_BIN}:${PATH}" AWS_REGION=eu-west-1 \
       MB_RESULTS_BUCKET=results MB_SUBNET_ID=subnet MB_SECURITY_GROUP_ID=sg MB_INSTANCE_PROFILE=role
     [ "${#vars[@]}" -eq 0 ] || export "${vars[@]}"
@@ -5370,6 +5389,30 @@ if [ "${rc}" -eq 0 ] && [ "$(launch_env | cut -d= -f1 | tr '\n' ' ')" = "${LAUNC
   pass "launch: MB_L1_MAX_PART_BYTES on ci reaches the user data alone, with no RAVEL_ONLY"
 else
   fail "launch l1-ci: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), env $(launch_env 2>&1)"
+fi
+# MB_SERIES_INDEX: refused before any aws call unless 1, 0 or unset, and 1
+# needs MB_STAGE1=1; 1 on a Stage 1 cardinality launch reaches the user data
+# as SERIES_INDEX=1 alone.
+SI_CARD=(MB_STAGE1=1 MB_STAGE1_BANDS=deploy/metricsbench/stage1-bands.series.cardinality.json)
+for v in 2 yes; do
+  launch "si-${v}" "${SI_CARD[@]}" "MB_SERIES_INDEX=${v}"
+  expect_launch_refused "MB_SERIES_INDEX=${v}" "MB_SERIES_INDEX must be 1, 0 or unset, not '${v}'"
+done
+launch si-no-stage1 MB_SERIES_INDEX=1
+expect_launch_refused "MB_SERIES_INDEX=1 without MB_STAGE1" "MB_SERIES_INDEX=1 puts the series index on in the Stage 1 passes and needs MB_STAGE1=1"
+launch si-card "${SI_CARD[@]}" MB_SERIES_INDEX=1 -- mbprefix
+if [ "${rc}" -eq 0 ] && grep -qF 'ec2 run-instances' "${LAUNCH_AWS_LOG}" &&
+  [ "$(launch_env | cut -d= -f1 | tr '\n' ' ')" = "${LAUNCH_KEYS}SERIES_INDEX " ] &&
+  launch_env | grep -qxF 'SERIES_INDEX=1' && launch_env | grep -qxF 'STAGE1=1' && launch_env | grep -qxF 'PROFILE=cardinality'; then
+  pass "launch: MB_SERIES_INDEX=1 on a Stage 1 cardinality launch reaches the user data as SERIES_INDEX=1"
+else
+  fail "launch si-card: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), env $(launch_env 2>&1)"
+fi
+launch si-zero "${SI_CARD[@]}" MB_SERIES_INDEX=0 -- mbprefix
+if [ "${rc}" -eq 0 ] && [ "$(launch_env | cut -d= -f1 | tr '\n' ' ')" = "${LAUNCH_KEYS}" ]; then
+  pass "launch: MB_SERIES_INDEX=0 writes no SERIES_INDEX key"
+else
+  fail "launch si-zero: rc ${rc}, stderr $(cat "${LAUNCH_ERR}"), env $(launch_env 2>&1)"
 fi
 # Unset or 0, the env block holds the keys it held before these variables.
 for c in unset zero; do
