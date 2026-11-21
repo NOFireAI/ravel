@@ -5936,13 +5936,15 @@ where
 }
 
 /// Version 1 compaction records dropped by the erasure dominance rule, summed
-/// over every call of [`erasure_dominated_compaction_records`]: one bucket in
-/// that state adds one per resolution that reads it. ravel-server renders it as
-/// `ravel_catalog_dominated_compaction_records_total`.
+/// over every call of [`erasure_dominated_compaction_records`]: each such
+/// record adds one per resolution that reads its bucket. The superseded-input
+/// sweep calls [`erasure_dominance`] and does not count. ravel-server renders
+/// it as `ravel_catalog_dominated_compaction_records_total`.
 static DOMINATED_VERSION_1_RECORDS: AtomicU64 = AtomicU64::new(0);
 
 /// Version 1 compaction records that share an input with a live rewrite record
-/// but that no one live rewrite covers, counted the same way. ravel-server
+/// but that no one live rewrite covers, counted the same way: each such record
+/// adds one per resolution, however many rewrites it overlaps. ravel-server
 /// renders it as `ravel_catalog_erasure_overlap_conflicts_total`.
 static ERASURE_OVERLAP_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 

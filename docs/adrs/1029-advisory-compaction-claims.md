@@ -1117,7 +1117,15 @@ for the overlap selection. Such a record is counted in
 `ravel_catalog_erasure_overlap_conflicts_total` and each such record and
 rewrite pair is logged at warn; each dominated version 1 record is counted
 in `ravel_catalog_dominated_compaction_records_total`. Both counters are on
-`/metrics` and count once per evaluation that finds the record.
+`/metrics` and count once per resolution that finds the record, so a record
+still present counts again on every later resolution; the superseded-input
+sweep's evaluation does not count.
+
+A bucket already in this state before the upgrade is read correctly wherever
+it is resolved from its commit records. An hour folded into the catalog
+snapshot while in this state keeps serving both records' parts until a fold
+reconciles that hour again, as for any record that lands in an already
+folded hour (ADR-0063 section 4).
 
 With this, between a compaction and an erasure rewrite a lost or late claim
 costs a wasted compaction, never a served erased row. The race the 2026-11-20
@@ -1140,6 +1148,7 @@ overlap;
 `crates/ravel-maintain/src/erasure_rewrite.rs` fails when
 `select_live_record` ignores dominance; and
 `sweep_reclaims_a_dominated_version_1_record_with_its_raw_rewrite`,
+`sweep_reclaims_a_dominated_version_1_record_with_its_predecessor_rewrite`,
 `sweep_holds_a_dominated_version_1_group_under_a_legal_hold` and
 `sweep_keeps_a_dominated_version_1_group_inside_its_horizon` in
 `crates/ravel-maintain/tests/superseding_compaction_record.rs` fail when the

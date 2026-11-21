@@ -980,6 +980,57 @@ async fn sweep_keeps_a_dominated_version_1_group_inside_its_horizon() {
     assert_eq!(bucket_keys(&store).await, before);
 }
 
+/// A rewrite R naming C1, and a version 1 C published beside R over C1's two
+/// raw inputs (#4449): C is dominated, and R's entry takes the predecessor
+/// arm, not the raw L0 arm. One pass reclaims R's chain group with C joined
+/// to it: C1, C, both parts and the raw inputs, each once, and R with its part
+/// stays.
+///
+/// Flipped line: `version_2.join_version_1(key, group, &compactions)?` in rule
+/// 2's predecessor rewrite arm (sweep.rs); without it C and its part survive
+/// (3, 3).
+#[tokio::test]
+async fn sweep_reclaims_a_dominated_version_1_record_with_its_predecessor_rewrite() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(&store, &[(0xF1, 1), (0xF2, 2)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0xF1, 1), input(0xF2, 2)],
+        0xff,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(&store, &c1).await;
+    let r = put_rewrite(
+        &store,
+        &b,
+        &c1_key,
+        Uuid::from_u128(0xd5),
+        part(0x5e, base, base + 10_000),
+    )
+    .await;
+    let c = version_1(&b, c1.inputs.clone(), 0x55, part(0xc5, base, base + 10_000));
+    let c_key = put_compaction(&store, &c).await;
+    let before = bucket_keys(&store).await;
+
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    // Two raw commits, C1 and C; two raw data objects and two parts.
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (4, 4));
+    let after = bucket_keys(&store).await;
+    let deleted: BTreeSet<String> = before.difference(&after).cloned().collect();
+    let mut expected: BTreeSet<String> = inputs
+        .iter()
+        .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+        .collect();
+    expected.extend([c1_key, part_key(&c1), c_key, part_key(&c)]);
+    assert_eq!(deleted, expected);
+    assert_eq!(
+        after,
+        BTreeSet::from([rewrite_key(&r), rewrite_part_key(&r)])
+    );
+}
+
 /// Seed one raw L0 input per `(writer, seq)` in the logs bucket, returning
 /// each one's commit key and data key.
 async fn seed_inputs(

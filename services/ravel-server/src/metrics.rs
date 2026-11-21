@@ -4819,13 +4819,14 @@ fn render_provisioning_family(
 ///
 /// `ravel_catalog_dominated_compaction_records_total` counts version 1
 /// compaction records dropped because one live erasure rewrite covers every
-/// input they name: a compaction that published beside the rewrite. Counted
-/// once per resolution that drops one, so a record still present is counted
-/// again by each later resolve until the sweep reclaims it.
+/// input they name: a compaction that published beside the rewrite. Each such
+/// record is counted once per resolution that drops it, so a record still
+/// present is counted again by each later resolve until the sweep reclaims it.
+/// The sweep's own dominance evaluation does not count.
 ///
 /// `ravel_catalog_erasure_overlap_conflicts_total` counts version 1 records
-/// that share inputs with a live rewrite that does not cover all of them, per
-/// resolution. Such a record is not dropped and the bucket may serve rows
+/// that share inputs with a live rewrite that does not cover all of them, each
+/// once per resolution however many rewrites it overlaps. Such a record is not dropped and the bucket may serve rows
 /// the rewrite erased or serve rows twice; each pair is logged at WARN with the
 /// bucket and both record keys, without repeating a recently logged pair.
 fn render_erasure_dominance_family(
@@ -4837,7 +4838,7 @@ fn render_erasure_dominance_family(
     write_header(
         out,
         "ravel_catalog_dominated_compaction_records_total",
-        "Version 1 compaction records a bucket resolution dropped because one live erasure rewrite covers every input they name (#4449), counted once per resolution that drops one.",
+        "Version 1 compaction records a bucket resolution dropped because one live erasure rewrite covers every input they name (#4449). Each record is counted once per resolution that drops it, so a record still present counts again on every later resolution.",
         "counter",
     );
     write_sample(
@@ -4849,7 +4850,7 @@ fn render_erasure_dominance_family(
     write_header(
         out,
         "ravel_catalog_erasure_overlap_conflicts_total",
-        "Version 1 compaction records a bucket resolution found sharing inputs with a live erasure rewrite that does not cover all of them, counted once per resolution. The record is not dropped; each pair is logged at WARN without repeating a recently logged pair.",
+        "Version 1 compaction records a bucket resolution found sharing inputs with a live erasure rewrite that does not cover all of them. Each record is counted once per resolution that finds it, so a record still present counts again on every later resolution. The record is not dropped; each pair is logged at WARN without repeating a recently logged pair.",
         "counter",
     );
     write_sample(
