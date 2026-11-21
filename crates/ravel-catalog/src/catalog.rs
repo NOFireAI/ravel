@@ -8008,6 +8008,167 @@ mod tests {
         assert!(dominated.contains(sibling_key.as_str()), "{dominated:?}");
     }
 
+    fn l0_input(seq: u64) -> ravel_proto::commit::v1::CompactionInputIdentity {
+        ravel_proto::commit::v1::CompactionInputIdentity {
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: seq,
+        }
+    }
+
+    /// A version 1 compaction record at hour 10 over the L0 inputs `seqs`.
+    fn version_1_over(hash_byte: u8, seqs: &[u64]) -> (String, CompactionRecord) {
+        let (_, mut record) = bare_compaction(hash_byte, "");
+        record.inputs = seqs.iter().copied().map(l0_input).collect();
+        let key = keys::compaction_record_key_for(&record).expect("record key");
+        (key, record)
+    }
+
+    /// A rewrite record over the raw L0 inputs `seqs`.
+    fn raw_rewrite_over(seqs: &[u64]) -> RewriteRecord {
+        let mut record = bare_superseding_rewrite("");
+        record.inputs = seqs.iter().copied().map(l0_input).collect();
+        record
+    }
+
+    const REWRITE_A: &str = "t/aa/m/c/0000/19700101T10/rw.aaaaaaaaaaaaaaaa.cmt";
+    const REWRITE_B: &str = "t/aa/m/c/0000/19700101T10/rw.bbbbbbbbbbbbbbbb.cmt";
+
+    /// A version 1 record whose inputs one live rewrite covers exactly, or as a
+    /// subset, is dominated and attributed to that rewrite; a version 1 record
+    /// sharing no input with it is neither dominated nor a conflict.
+    #[test]
+    fn a_version_1_record_one_rewrite_covers_is_dominated() {
+        let exact = version_1_over(0x10, &[1, 2]);
+        let subset = version_1_over(0x11, &[2]);
+        let disjoint = version_1_over(0x12, &[3]);
+        let compactions = vec![exact.clone(), subset.clone(), disjoint.clone()];
+        let rewrite = raw_rewrite_over(&[1, 2]);
+        let rewrites = [(REWRITE_A, &rewrite)];
+        let before = dominated_compaction_records_total();
+        let dominated = erasure_dominated_compaction_records(&compactions, &rewrites, "bucket")
+            .expect("dominance resolves");
+        assert_eq!(
+            dominated,
+            HashSet::from([exact.0.as_str(), subset.0.as_str()])
+        );
+        assert!(
+            dominated_compaction_records_total() >= before + 2,
+            "both coverage-dominated records are counted"
+        );
+        let outcome =
+            erasure_dominance(&compactions, &rewrites, "bucket").expect("dominance resolves");
+        assert_eq!(
+            outcome.version_1,
+            HashMap::from([
+                (exact.0.as_str(), REWRITE_A.to_string()),
+                (subset.0.as_str(), REWRITE_A.to_string()),
+            ])
+        );
+        assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    }
+
+    /// Coverage is per rewrite: a version 1 record whose inputs two live
+    /// rewrites cover only between them is not dominated, and both rewrites
+    /// are reported as conflicts.
+    ///
+    /// Flipped line: the `covering` search in `erasure_dominance`, replaced by
+    /// a check against the union of every live rewrite's inputs. The record
+    /// is then dominated and this test fails at the first assertion.
+    #[test]
+    fn coverage_spread_across_two_rewrites_is_not_dominance() {
+        let spread = version_1_over(0x20, &[1, 2]);
+        let compactions = vec![spread.clone()];
+        let first = raw_rewrite_over(&[1]);
+        let second = raw_rewrite_over(&[2]);
+        let rewrites = [(REWRITE_A, &first), (REWRITE_B, &second)];
+        let outcome =
+            erasure_dominance(&compactions, &rewrites, "bucket").expect("dominance resolves");
+        assert!(
+            outcome.dominated.is_empty(),
+            "union coverage dominated {:?}",
+            outcome.dominated
+        );
+        assert_eq!(
+            outcome.conflicts,
+            vec![
+                (spread.0.as_str(), REWRITE_A.to_string()),
+                (spread.0.as_str(), REWRITE_B.to_string()),
+            ]
+        );
+    }
+
+    /// A version 1 record that shares some but not all of its inputs with a
+    /// live rewrite is not dominated; the pair is a conflict, counted once per
+    /// record by the counting wrapper.
+    ///
+    /// Flipped line: `identities.iter().all(..)` in the `covering` search in
+    /// `erasure_dominance`, made `any`. The record is then dominated and this
+    /// test fails at the first assertion.
+    #[test]
+    fn partial_coverage_is_a_counted_conflict() {
+        let partial = version_1_over(0x30, &[1, 2]);
+        let compactions = vec![partial.clone()];
+        let rewrite = raw_rewrite_over(&[1]);
+        let rewrites = [(REWRITE_A, &rewrite)];
+        let before = erasure_overlap_conflicts_total();
+        let dominated = erasure_dominated_compaction_records(&compactions, &rewrites, "bucket")
+            .expect("dominance resolves");
+        assert!(
+            dominated.is_empty(),
+            "partial coverage dominated {dominated:?}"
+        );
+        assert!(
+            erasure_overlap_conflicts_total() > before,
+            "the conflict is counted"
+        );
+        let outcome =
+            erasure_dominance(&compactions, &rewrites, "bucket").expect("dominance resolves");
+        assert_eq!(
+            outcome.conflicts,
+            vec![(partial.0.as_str(), REWRITE_A.to_string())]
+        );
+    }
+
+    /// A version 1 record a rewrite's chain names is superseded by the chain,
+    /// not by coverage: it is neither in the dominated set nor a conflict.
+    #[test]
+    fn a_version_1_record_a_chain_names_is_unchanged() {
+        let named = version_1_over(0x40, &[1, 2]);
+        let compactions = vec![named.clone()];
+        let rewrite = bare_superseding_rewrite(&named.0);
+        let rewrites = [(REWRITE_A, &rewrite)];
+        let outcome =
+            erasure_dominance(&compactions, &rewrites, "bucket").expect("dominance resolves");
+        assert!(outcome.dominated.is_empty(), "{:?}", outcome.dominated);
+        assert!(outcome.version_1.is_empty(), "{:?}", outcome.version_1);
+        assert!(outcome.conflicts.is_empty(), "{:?}", outcome.conflicts);
+    }
+
+    /// A version 2 record whose predecessor is a coverage-dominated version 1
+    /// record is dominated too, and only the version 1 record is attributed to
+    /// the rewrite by coverage.
+    #[test]
+    fn a_version_2_record_on_a_dominated_version_1_record_is_dominated() {
+        let base = version_1_over(0x50, &[1, 2]);
+        let (_, mut successor) = bare_compaction(0x51, &base.0);
+        successor.inputs = base.1.inputs.clone();
+        let successor_key = keys::compaction_record_key_for(&successor).expect("record key");
+        let compactions = vec![base.clone(), (successor_key.clone(), successor)];
+        let rewrite = raw_rewrite_over(&[1, 2]);
+        let rewrites = [(REWRITE_A, &rewrite)];
+        let outcome =
+            erasure_dominance(&compactions, &rewrites, "bucket").expect("dominance resolves");
+        assert_eq!(
+            outcome.dominated,
+            HashSet::from([base.0.as_str(), successor_key.as_str()])
+        );
+        assert_eq!(
+            outcome.version_1,
+            HashMap::from([(base.0.as_str(), REWRITE_A.to_string())])
+        );
+    }
+
     async fn seed_provisioning_record(store: &MemoryStore, shard_count: u32) {
         use ravel_proto::sys::v1 as sysproto;
         let record = sysproto::ProvisioningRecord {
