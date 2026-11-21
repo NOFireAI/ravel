@@ -827,6 +827,210 @@ async fn sweep_holds_a_rewrite_group_while_a_head_names_a_dominated_part() {
     assert_eq!(bucket_keys(store.as_ref()).await, before);
 }
 
+/// PUT a rewrite record over the raw L0 `inputs`, applying `request_id`, plus
+/// an object at its part key, created at `created_ns`. Returns the record.
+async fn put_raw_rewrite(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    inputs: Vec<CompactionInputIdentity>,
+    request_id: Uuid,
+    part: CompactionPart,
+    created_ns: i64,
+) -> RewriteRecord {
+    let request_id = request_id.to_string();
+    let record = RewriteRecord {
+        format_version: 1,
+        tenant_hash: bucket.tenant_hash.0.to_vec(),
+        signal: signal::to_proto(bucket.signal) as i32,
+        shard: bucket.shard,
+        ingest_hour_bucket: bucket.ingest_hour_bucket,
+        input_set_hash: erasure::compute_rewrite_input_set_hash(
+            &inputs,
+            None,
+            std::slice::from_ref(&request_id),
+        )
+        .to_vec(),
+        inputs,
+        parts: vec![part],
+        drops: vec![RewriteDrop {
+            request_id,
+            dropped_count: 1,
+        }],
+        created_unix_ns: created_ns,
+        superseded_record_key: String::new(),
+    };
+    store
+        .put(
+            &rewrite_part_key(&record),
+            bytes::Bytes::from_static(b"rw-part"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put rewrite part");
+    store
+        .put(
+            &rewrite_key(&record),
+            erasure::encode_rewrite(&record),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put rewrite record");
+    record
+}
+
+/// Two raw L0 inputs, a raw L0 rewrite R over both, and a version 1 C that a
+/// compaction published beside R over the same two inputs (#4449): C is
+/// erasure-dominated. Returns the inputs, C and R.
+async fn seed_dominated_version_1(
+    store: &dyn ObjectStoreBackend,
+    c_created_ns: i64,
+) -> (Vec<(String, String)>, CompactionRecord, RewriteRecord) {
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(store, &[(0xE1, 1), (0xE2, 2)]).await;
+    let c = CompactionRecord {
+        created_unix_ns: c_created_ns,
+        ..version_1(
+            &b,
+            vec![input(0xE1, 1), input(0xE2, 2)],
+            0x44,
+            part(0xc4, base, base + 10_000),
+        )
+    };
+    put_compaction(store, &c).await;
+    let r = put_raw_rewrite(
+        store,
+        &b,
+        vec![input(0xE1, 1), input(0xE2, 2)],
+        Uuid::from_u128(0xd4),
+        part(0x4e, base, base + 10_000),
+        base + 5_000,
+    )
+    .await;
+    (inputs, c, r)
+}
+
+/// A dominated version 1 C, its part and R's two raw inputs are reclaimed in
+/// one pass as R's group: three records and three data objects, each once,
+/// and R with its part stays.
+///
+/// Fails on the code before the change, where C was not dominated: C and its
+/// part stayed, and R's raw inputs went in separate per-input groups. Flipped
+/// line: `version_2.join_version_1(key, &mut group, &compactions)?` in rule
+/// 2's raw L0 rewrite arm (sweep.rs); without it C and its part survive.
+#[tokio::test]
+async fn sweep_reclaims_a_dominated_version_1_record_with_its_raw_rewrite() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let (inputs, c, r) = seed_dominated_version_1(&store, hour_ns()).await;
+    let before = bucket_keys(&store).await;
+
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (3, 3));
+    let after = bucket_keys(&store).await;
+    let deleted: BTreeSet<String> = before.difference(&after).cloned().collect();
+    let mut expected: BTreeSet<String> = inputs
+        .iter()
+        .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+        .collect();
+    expected.extend([keys::compaction_record_key_for(&c).unwrap(), part_key(&c)]);
+    assert_eq!(deleted, expected);
+    assert_eq!(
+        after,
+        BTreeSet::from([rewrite_key(&r), rewrite_part_key(&r)])
+    );
+}
+
+/// A legal hold on the dominated C's part holds R's whole group: neither C nor
+/// R's raw inputs are deleted. Flipped line: as for
+/// [`sweep_reclaims_a_dominated_version_1_record_with_its_raw_rewrite`];
+/// without the join C's part is outside R's group, so the hold on it does not
+/// hold the raw inputs, and the pass deletes them (2, 2).
+#[tokio::test]
+async fn sweep_holds_a_dominated_version_1_group_under_a_legal_hold() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let (_, c, _) = seed_dominated_version_1(&store, hour_ns()).await;
+    let before = bucket_keys(&store).await;
+
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &HoldKey(part_key(&c))).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (0, 0));
+    assert_eq!(outcome.chain_groups_held_by_legal_hold, 1);
+    assert_eq!(bucket_keys(&store).await, before);
+}
+
+/// A dominated C written after R is gated on its own horizon: one nanosecond
+/// before it passes, nothing in R's group is deleted, although R's horizon
+/// passed. Flipped line: `version_2.newest_created(key, record, &compactions)`
+/// in rule 2's rewrite arm (sweep.rs), replaced by `record.created_unix_ns`;
+/// C and its part then go while a query pinned before C was written may still
+/// read them.
+#[tokio::test]
+async fn sweep_keeps_a_dominated_version_1_group_inside_its_horizon() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let c_created = hour_ns() + 10 * NS_PER_HOUR;
+    let (_, c, r) = seed_dominated_version_1(&store, c_created).await;
+    let before = bucket_keys(&store).await;
+    let now = c.created_unix_ns + cfg().protection_horizon_ns - 1;
+    assert!(now >= r.created_unix_ns + cfg().protection_horizon_ns);
+
+    let outcome = sweep_at(&store, &b, now, &NoLeases).await;
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (0, 0));
+    assert_eq!(bucket_keys(&store).await, before);
+}
+
+/// A rewrite R naming C1, and a version 1 C published beside R over C1's two
+/// raw inputs (#4449): C is dominated, and R's entry takes the predecessor
+/// arm, not the raw L0 arm. One pass reclaims R's chain group with C joined
+/// to it: C1, C, both parts and the raw inputs, each once, and R with its part
+/// stays.
+///
+/// Flipped line: `version_2.join_version_1(key, group, &compactions)?` in rule
+/// 2's predecessor rewrite arm (sweep.rs); without it C and its part survive
+/// (3, 3).
+#[tokio::test]
+async fn sweep_reclaims_a_dominated_version_1_record_with_its_predecessor_rewrite() {
+    let store = MemoryStore::new();
+    let b = logs_bucket();
+    let base = hour_ns();
+    let inputs = seed_inputs(&store, &[(0xF1, 1), (0xF2, 2)]).await;
+    let c1 = version_1(
+        &b,
+        vec![input(0xF1, 1), input(0xF2, 2)],
+        0xff,
+        part(0xc1, base, base + 10_000),
+    );
+    let c1_key = put_compaction(&store, &c1).await;
+    let r = put_rewrite(
+        &store,
+        &b,
+        &c1_key,
+        Uuid::from_u128(0xd5),
+        part(0x5e, base, base + 10_000),
+    )
+    .await;
+    let c = version_1(&b, c1.inputs.clone(), 0x55, part(0xc5, base, base + 10_000));
+    let c_key = put_compaction(&store, &c).await;
+    let before = bucket_keys(&store).await;
+
+    let outcome = sweep_at(&store, &b, past_horizon_ns(), &NoLeases).await;
+    // Two raw commits, C1 and C; two raw data objects and two parts.
+    assert_eq!((outcome.records_deleted, outcome.data_deleted), (4, 4));
+    let after = bucket_keys(&store).await;
+    let deleted: BTreeSet<String> = before.difference(&after).cloned().collect();
+    let mut expected: BTreeSet<String> = inputs
+        .iter()
+        .flat_map(|(commit, data)| [commit.clone(), data.clone()])
+        .collect();
+    expected.extend([c1_key, part_key(&c1), c_key, part_key(&c)]);
+    assert_eq!(deleted, expected);
+    assert_eq!(
+        after,
+        BTreeSet::from([rewrite_key(&r), rewrite_part_key(&r)])
+    );
+}
+
 /// Seed one raw L0 input per `(writer, seq)` in the logs bucket, returning
 /// each one's commit key and data key.
 async fn seed_inputs(

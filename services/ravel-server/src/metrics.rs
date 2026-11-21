@@ -4813,6 +4813,54 @@ fn render_provisioning_family(
     );
 }
 
+/// The erasure-dominance family (docs/catalog-and-mvcc.md step 3, #4449),
+/// read from the process-global counters in [`ravel_catalog`] that every
+/// bucket resolution in the process counts into.
+///
+/// `ravel_catalog_dominated_compaction_records_total` counts version 1
+/// compaction records dropped because one live erasure rewrite covers every
+/// input they name: a compaction that published beside the rewrite. Each such
+/// record is counted once per resolution that drops it, so a record still
+/// present is counted again by each later resolve until the sweep reclaims it.
+/// The sweep's own dominance evaluation does not count.
+///
+/// `ravel_catalog_erasure_overlap_conflicts_total` counts version 1 records
+/// that share inputs with a live rewrite that does not cover all of them, each
+/// once per resolution however many rewrites it overlaps. Such a record is not dropped and the bucket may serve rows
+/// the rewrite erased or serve rows twice; each pair is logged at WARN with the
+/// bucket and both record keys, without repeating a recently logged pair.
+fn render_erasure_dominance_family(
+    out: &mut String,
+    mode: Mode,
+    dominated_records: u64,
+    overlap_conflicts: u64,
+) {
+    write_header(
+        out,
+        "ravel_catalog_dominated_compaction_records_total",
+        "Version 1 compaction records a bucket resolution dropped because one live erasure rewrite covers every input they name (#4449). Each record is counted once per resolution that drops it, so a record still present counts again on every later resolution.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_dominated_compaction_records_total",
+        &[Label::Mode(mode)],
+        dominated_records,
+    );
+    write_header(
+        out,
+        "ravel_catalog_erasure_overlap_conflicts_total",
+        "Version 1 compaction records a bucket resolution found sharing inputs with a live erasure rewrite that does not cover all of them. Each record is counted once per resolution that finds it, so a record still present counts again on every later resolution. The record is not dropped; each pair is logged at WARN without repeating a recently logged pair.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_erasure_overlap_conflicts_total",
+        &[Label::Mode(mode)],
+        overlap_conflicts,
+    );
+}
+
 /// The ADR-1746 writer-policy family, one sample per format family under
 /// `{mode, family}`: the startup gauge of buckets whose recorded floor is
 /// above what this build writes, publishes refused below a floor, and
@@ -10092,6 +10140,12 @@ pub fn render(
         crate::provisioning::shard_count_mismatch_count(),
         ravel_catalog::shard_count_drift_count(),
     );
+    render_erasure_dominance_family(
+        &mut out,
+        mode,
+        ravel_catalog::dominated_compaction_records_total(),
+        ravel_catalog::erasure_overlap_conflicts_total(),
+    );
     render_format_floor_family(
         &mut out,
         mode,
@@ -11275,6 +11329,68 @@ mod tests {
         let mut store = String::new();
         render_store_family(&mut store, Mode::Query, &StoreMetricsSnapshot::default());
         assert!(!store.contains("control_plane"), "{store}");
+    }
+
+    /// The erasure-dominance family renders both counters under `{mode}` with
+    /// the values it is given, and the full exposition carries both, read
+    /// from the catalog's process-global counters.
+    #[test]
+    fn exposition_renders_the_erasure_dominance_counters() {
+        let mut out = String::new();
+        render_erasure_dominance_family(&mut out, Mode::Maintain, 3, 2);
+        assert!(
+            out.contains("ravel_catalog_dominated_compaction_records_total{mode=\"maintain\"} 3"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ravel_catalog_erasure_overlap_conflicts_total{mode=\"maintain\"} 2"),
+            "{out}"
+        );
+
+        let body = render(
+            Mode::All,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            true,
+        );
+        for name in [
+            "ravel_catalog_dominated_compaction_records_total",
+            "ravel_catalog_erasure_overlap_conflicts_total",
+        ] {
+            assert_eq!(
+                body.matches(&format!("{name}{{mode=\"all\"}} ")).count(),
+                1,
+                "{name} sample present exactly once:\n{body}"
+            );
+        }
     }
 
     /// The acceptance test for the exposition renderer. Proves both halves: a populated
