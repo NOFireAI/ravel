@@ -47,7 +47,8 @@ pub use cache::RecordCacheTotals;
 pub use catalog::Catalog;
 pub use catalog::resolve_rewrite_supersession;
 pub use catalog::{
-    AuthoritativeSelection, erasure_dominated_compaction_records,
+    AuthoritativeSelection, ErasureDominance, dominated_compaction_records_total,
+    erasure_dominance, erasure_dominated_compaction_records, erasure_overlap_conflicts_total,
     select_authoritative_compaction_records,
 };
 pub use charged::BudgetCatalogCharge;
