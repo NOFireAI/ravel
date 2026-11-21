@@ -744,8 +744,11 @@ impl Shared {
 
     /// Property 5 over every active hold: each baseline key still listed, or
     /// confirmed absent and judged by when it was last seen.
+    ///
+    /// Judged in place under the lock: `hold_set` and `hold_clear` read the
+    /// same vector, so it must never look empty while a check runs.
     fn check_holds(&self) {
-        let mut holds = std::mem::take(&mut *lock(&self.holds));
+        let mut holds = lock(&self.holds);
         for hold in holds.iter_mut().filter(|h| !h.clear_requested) {
             if !hold.baselined {
                 self.baseline(hold);
@@ -803,7 +806,6 @@ impl Shared {
             }
             assert_always!(deleted_after_grace.is_empty(), P5, &details);
         }
-        lock(&self.holds).extend(holds);
     }
 
     fn hold_clear(&self, signal: Signal, shard: u64) -> bool {

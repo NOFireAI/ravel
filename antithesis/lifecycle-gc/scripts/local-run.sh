@@ -188,6 +188,7 @@ while read -r _ st code <<< "$(container_state driver)" && [ "${st:-}" = running
     fi
     sleep 10
 done
+kill "$sampler" 2> /dev/null
 wait "$sampler" 2> /dev/null
 docker compose logs --no-color driver > "$OUT/driver.log" 2>&1
 read -r _ st code <<< "$(container_state driver)"
