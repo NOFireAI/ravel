@@ -584,7 +584,13 @@ compaction reasoning, and the sweeper's re-verify LIST.
       carries everything that a rebuilt record needs. Ingest completes the
       data PUT before it builds the record, so a record that lagged
       replication is recovered and is not a loss. The effective RPO is the
-      replication lag of the *data object*, not of the record pair.
+      replication lag of the *data object*, not of the record pair. A
+      rebuilt record is stamped when it is written, after its hour sealed,
+      so the late-commit fence leaves it out of every compaction
+      and migration. It is served all the same. To compact those hours, run
+      the shard's maintenance once with `--late-commit-fence off` after its
+      writers are gone (see
+      [operations/maintenance.md](operations/maintenance.md#commit-records-that-land-after-the-seal)).
    4. Run `ravel-cli catalog verify`. It classifies catalog staleness.
       Catalog objects are derived. The fold rebuilds them over the reconciled
       commit-record set.

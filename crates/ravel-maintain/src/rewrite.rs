@@ -399,16 +399,18 @@ pub(crate) enum UnwritableInputs {
     Fail,
 }
 
-/// Whether two listings of one bucket name the same record set: the same L0
-/// commit records, compaction records, rewrite records and tombstone,
-/// whatever order the store listed them in.
+/// Whether two listings of one bucket name the same record set: the same
+/// planning L0 commit records, compaction records, rewrite records and
+/// tombstone, whatever order the store listed them in. A late commit record is
+/// not a planning record (ADR-4561 R5), so one that arrived between the two
+/// listings leaves the sets equal.
 fn same_record_set(a: &BucketListing, b: &BucketListing) -> bool {
     fn sorted(keys: &[String]) -> Vec<&str> {
         let mut v: Vec<&str> = keys.iter().map(String::as_str).collect();
         v.sort_unstable();
         v
     }
-    sorted(&a.commit_keys) == sorted(&b.commit_keys)
+    sorted(&a.planning_commit_keys()) == sorted(&b.planning_commit_keys())
         && sorted(&a.compaction_record_keys) == sorted(&b.compaction_record_keys)
         && sorted(&a.rewrite_record_keys) == sorted(&b.rewrite_record_keys)
         && a.tombstone_key == b.tombstone_key
@@ -430,7 +432,8 @@ pub(crate) async fn relist_changed(
     planned: &BucketListing,
     ledger: Option<&RequestLedger>,
 ) -> Result<Option<BucketListing>> {
-    let now = list_bucket_with_ledger(store, bucket, ledger).await?;
+    let mut now = list_bucket_with_ledger(store, bucket, ledger).await?;
+    crate::late_commit::classify_like(planned, &mut now);
     if same_record_set(planned, &now) {
         return Ok(None);
     }
@@ -638,6 +641,10 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
             relist_changed(store, bucket, planned, config.request_ledger.as_ref()).await?
     {
         return Ok(FencedRewrite::RecordSetChanged(now));
+    }
+    if let Some(planned) = planned {
+        let named: Vec<&str> = inputs.iter().map(|i| i.commit_key.as_str()).collect();
+        crate::late_commit::assert_names_no_late_record(planned, &named, "compaction");
     }
 
     let publish = publish_identities_with_conservation(
@@ -863,16 +870,29 @@ async fn migrate_bucket_format_scoped(
 ) -> Result<MigrateOutcome> {
     crate::rlog::check_rlog_writer_config(config, bucket)?;
     let start_ns = clock.now_ns();
-    if !bucket.is_sealed(start_ns, config) {
+    if !crate::late_commit::may_list_to_plan(bucket, start_ns, config) {
         return Ok(MigrateOutcome::NotSealed);
     }
 
-    let listing =
+    let mut listing =
         list_bucket_strict_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
     if let Some(refused) = migrate_listing_gate(&listing) {
         return Ok(refused);
     }
-    if listing.commit_keys.is_empty() {
+    if !crate::late_commit::fence_planning_listing(
+        store,
+        bucket,
+        start_ns,
+        config,
+        &mut listing,
+        "migration",
+    ) {
+        return Ok(MigrateOutcome::NotSealed);
+    }
+    // ADR-4561 R4: a late commit record is neither an input nor a reason to
+    // rewrite; the walk reports it instead.
+    let planning_keys = listing.planning_commit_keys();
+    if planning_keys.is_empty() {
         return Ok(MigrateOutcome::UpToDate);
     }
 
@@ -884,7 +904,7 @@ async fn migrate_bucket_format_scoped(
     let inputs = load_inputs_with_ledger(
         store,
         bucket,
-        &listing.commit_keys,
+        &planning_keys,
         config.input_read_concurrency,
         config.request_ledger.as_ref(),
     )
@@ -1068,7 +1088,7 @@ async fn dispatch_rewrite(
     planned: &BucketListing,
     start_ns: i64,
 ) -> Result<FencedRewrite> {
-    let commit_keys = &planned.commit_keys;
+    let commit_keys = &planned.planning_commit_keys();
     match signal {
         Signal::Metrics => {
             load_then_rewrite::<RsegCodec>(

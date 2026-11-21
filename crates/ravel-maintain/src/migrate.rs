@@ -350,6 +350,36 @@ pub enum NotMigratedReason {
         /// Which of the two refusals this was.
         refusal: crate::error::PartIndexRefusalKind,
     },
+    /// `records` below-target commit records the bucket serves raw are late
+    /// (ADR-4561 R2), so the migration left them out of its plan and they stay
+    /// below the target, holding the floor down, for as long as they are
+    /// stored. Any on-time records were migrated. Only with the late-commit
+    /// fence on; a later walk names the bucket again.
+    LateCommitRecords { records: u64 },
+}
+
+/// How many of `keys`, commit records of `listing`, are late against
+/// `bucket`'s cutoff (ADR-4561 R2). Zero with the late-commit fence off.
+fn late_commit_count(
+    bucket: &Bucket,
+    listing: &BucketListing,
+    keys: &[String],
+    config: &CompactorConfig,
+) -> u64 {
+    if config.late_commit_fence == crate::config::LateCommitFence::Off {
+        return 0;
+    }
+    let cutoff_ns = bucket.late_commit_cutoff_ns(config);
+    keys.iter()
+        .filter(|key| {
+            listing
+                .commit_keys
+                .binary_search(key)
+                .ok()
+                .and_then(|i| listing.commit_last_modified_ms.get(i))
+                .is_some_and(|ms| crate::read::is_late_stamp(*ms, cutoff_ns))
+        })
+        .count() as u64
 }
 
 /// One bucket the walk dispatched a rewrite for that published nothing, named
@@ -2125,15 +2155,20 @@ pub async fn migrate_family(
             let listing = list_bucket_strict(store, &bucket).await?;
             if bucket.is_sealed(now, config) && listing.tombstone_key.is_none() {
                 let served = raw_served_commit_keys(store, &bucket, &listing).await?;
-                let l0_below = if served.keys.is_empty() {
-                    0
+                let below: Vec<String> = if served.keys.is_empty() {
+                    Vec::new()
                 } else {
                     load_inputs(store, &bucket, &served.keys, config.input_read_concurrency)
                         .await?
-                        .iter()
+                        .into_iter()
                         .filter(|i| i.record.segment_format_version < target_version)
-                        .count() as u64
+                        .map(|i| i.commit_key)
+                        .collect()
                 };
+                let l0_below = below.len() as u64;
+                // ADR-4561 R4: the migration leaves a late commit record raw and
+                // below the target, so the walk names the bucket for it.
+                let late_below = late_commit_count(&bucket, &listing, &below, config);
                 let not_migrated = |report: &mut FamilyMigrateReport, reason| {
                     report.not_migrated.push(NotMigratedBucket {
                         shard,
@@ -2249,8 +2284,16 @@ pub async fn migrate_family(
                             }
                             MigrateOutcome::Rewritten { .. } => {
                                 report.buckets_migrated += 1;
-                                report.records_migrated += l0_below;
+                                report.records_migrated += l0_below - late_below;
                                 spent += l0_below;
+                                if late_below > 0 {
+                                    not_migrated(
+                                        &mut report,
+                                        NotMigratedReason::LateCommitRecords {
+                                            records: late_below,
+                                        },
+                                    );
+                                }
                             }
                             // The rewrite primitive serves one record set per
                             // bucket, so it refuses a bucket that already carries
@@ -2287,6 +2330,16 @@ pub async fn migrate_family(
                                         reason: BlockedReason::LoserOnlyInputs,
                                     });
                                 }
+                            }
+                            // Every below-target record left is late: the
+                            // migration planned nothing, and the bucket is named.
+                            MigrateOutcome::UpToDate if late_below > 0 => {
+                                not_migrated(
+                                    &mut report,
+                                    NotMigratedReason::LateCommitRecords {
+                                        records: late_below,
+                                    },
+                                );
                             }
                             // A concurrent tombstone or a bucket already at the
                             // target: nothing to migrate and nothing to report.

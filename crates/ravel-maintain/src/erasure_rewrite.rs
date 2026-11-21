@@ -710,8 +710,14 @@ async fn resolve_live_inputs(
 ) -> Result<LiveInputs> {
     match resolve_live_record(store, bucket, listing).await? {
         LiveRecord::RawL0 => {
-            let inputs =
-                crate::read::load_inputs(store, bucket, &listing.commit_keys, concurrency).await?;
+            // ADR-4561 R4: a late commit record is not an input of the rewrite.
+            let inputs = crate::read::load_inputs(
+                store,
+                bucket,
+                &listing.planning_commit_keys(),
+                concurrency,
+            )
+            .await?;
             Ok(LiveInputs::RawL0(inputs))
         }
         LiveRecord::Existing { key, body } => Ok(LiveInputs::Existing { key, body }),
@@ -2240,8 +2246,9 @@ async fn resolve_already_exists_rewrite(
 /// so a driver scanning many buckets can treat them uniformly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErasureRewriteOutcome {
-    /// Not yet sealed: mirrors [`crate::bucket::Bucket::is_sealed`]'s gate in
-    /// [`crate::compact::compact_bucket`]. Later hours are also unsealed.
+    /// Not yet sealed: mirrors [`crate::compact::CompactionOutcome::NotSealed`],
+    /// the late-commit fence's store-clock wait included. Later hours are also
+    /// unsealed.
     NotSealed,
     /// A retention tombstone is present: the bucket contributes nothing, so
     /// there is nothing left to erase from it.
@@ -2482,19 +2489,29 @@ pub async fn erasure_rewrite_bucket(
 ) -> Result<ErasureRewriteOutcome> {
     crate::rlog::check_rlog_writer_config(config, bucket)?;
     let start_ns = clock.now_ns();
-    if !bucket.is_sealed(start_ns, config) {
+    if !crate::late_commit::may_list_to_plan(bucket, start_ns, config) {
         return Ok(ErasureRewriteOutcome::NotSealed);
     }
     if pending.is_empty() {
         return Ok(ErasureRewriteOutcome::NoApplicableRequests);
     }
 
-    let listing = crate::read::list_bucket(store, bucket).await?;
+    let mut listing = crate::read::list_bucket(store, bucket).await?;
     if listing.tombstone_key.is_some() {
         return Ok(ErasureRewriteOutcome::Tombstoned);
     }
     if bucket_is_held(&listing, lease) {
         return Ok(ErasureRewriteOutcome::Held);
+    }
+    if !crate::late_commit::fence_planning_listing(
+        store,
+        bucket,
+        start_ns,
+        config,
+        &mut listing,
+        "erasure rewrite",
+    ) {
+        return Ok(ErasureRewriteOutcome::NotSealed);
     }
 
     // Record-derived overlap check (ADR-0064 GDPR fix): this needs the live
@@ -2699,6 +2716,10 @@ async fn build_and_publish_rewrite(
     overlapping: &[&PendingErasureRequest],
     start_ns: i64,
 ) -> Result<(usize, PublishOutcome, Option<ErasureAbandon>)> {
+    let named_inputs: Vec<String> = match &live {
+        LiveInputs::RawL0(inputs) => inputs.iter().map(|i| i.commit_key.clone()).collect(),
+        LiveInputs::Existing { .. } => Vec::new(),
+    };
     let (supersession, build) = match bucket.signal {
         Signal::Metrics => {
             let applicable: Vec<ApplicableRequest> = overlapping
@@ -2828,6 +2849,8 @@ async fn build_and_publish_rewrite(
             Some(ErasureAbandon::RecordSetChanged),
         ));
     }
+    let named: Vec<&str> = named_inputs.iter().map(String::as_str).collect();
+    crate::late_commit::assert_names_no_late_record(planned, &named, "erasure rewrite");
     let parts = build.parts.len();
     // The written output's part keys, captured before `build` is consumed, so
     // the output-content invariant below re-reads exactly the objects this

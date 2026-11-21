@@ -1729,7 +1729,9 @@ async fn migrate_exits_zero_when_another_writer_resolved_a_not_migrated_bucket()
 
     let mem = MemoryStore::new();
     let wall_ms = ravel_cli::now_ns().expect("wall clock") / 1_000_000;
-    mem.set_clock_ms(u64::try_from(wall_ms).expect("positive wall clock"));
+    // The L0 records are stamped inside their hour, so the late-commit fence
+    // plans them; the claims that follow read expiry against the wall clock.
+    mem.set_clock_ms(u64::from(REENCODE_HOUR) * 3_600_000);
     let tenant_hash = TenantId::new(RESOLVED_TENANT).hash();
     ravel_catalog::validate_or_adopt(
         &mem,
@@ -1756,6 +1758,7 @@ async fn migrate_exits_zero_when_another_writer_resolved_a_not_migrated_bucket()
             .await
             .expect("overwrite the fixture record");
     }
+    mem.set_clock_ms(u64::try_from(wall_ms).expect("positive wall clock"));
 
     let faults = Arc::new(FaultStore::new(mem, FaultPlan::empty()));
     let part_gate = faults.hold(Op::Put, Some("/l1/".to_string()), Occurrence::Nth(1));

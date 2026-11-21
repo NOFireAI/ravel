@@ -6198,6 +6198,12 @@ pub struct MaintenanceSafetySnapshot {
     /// [`ravel_maintain::CompactionInputSkipReason::ALL`] member, signals
     /// outermost, in those orders.
     pub erasure_unwritable_objects: Vec<(Signal, ravel_maintain::CompactionInputSkipReason, u64)>,
+    /// [`ravel_maintain::late_commit_records_total`] for every maintained
+    /// signal, in [`crate::maintain::MAINTAINED_SIGNALS`] order (ADR-4561 R8).
+    pub late_commit_records: Vec<(Signal, u64)>,
+    /// [`ravel_maintain::store_clock_unobserved_total`] for every maintained
+    /// signal, in [`crate::maintain::MAINTAINED_SIGNALS`] order (ADR-4561 R3).
+    pub store_clock_unobserved: Vec<(Signal, u64)>,
     /// [`ravel_maintain::retention::held_out_of_window_objects_total`], read at
     /// scrape time. Not signal-scoped: ravel-maintain keeps one total.
     pub retention_held_out_of_window_objects: u64,
@@ -6255,6 +6261,14 @@ impl MaintenanceSafetySnapshot {
                 .collect(),
             compaction_inputs_skipped: compaction_inputs_skipped(),
             erasure_unwritable_objects: erasure_unwritable_objects(),
+            late_commit_records: crate::maintain::MAINTAINED_SIGNALS
+                .iter()
+                .map(|&signal| (signal, ravel_maintain::late_commit_records_total(signal)))
+                .collect(),
+            store_clock_unobserved: crate::maintain::MAINTAINED_SIGNALS
+                .iter()
+                .map(|&signal| (signal, ravel_maintain::store_clock_unobserved_total(signal)))
+                .collect(),
             retention_held_out_of_window_objects:
                 ravel_maintain::retention::held_out_of_window_objects_total(),
             retention_held_by_lease_buckets: ravel_maintain::retention::held_by_lease_buckets_total(
@@ -6559,6 +6573,46 @@ fn render_maintain_safety_family(
                 Label::Signal(signal),
                 Label::CompactionInputSkipReason(reason),
             ],
+            value,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_late_commit_records_total",
+        "Commit records a compaction, migration or erasure rewrite plan left out because the \
+         store stamped them at or after their bucket's late-commit cutoff (the hour's end plus \
+         the seal margin), by signal, counted once per plan that left each one out, since \
+         process start (ADR-4561). A record left out is still served, kept and swept as \
+         before, so a record that stays in its bucket is counted again by every pass that \
+         plans the bucket. A warn log line names its key. Nonzero means a writer's commit PUT \
+         reached the store after the seal margin: check writer flush times and clock skew.",
+        "counter",
+    );
+    for &(signal, value) in &snapshot.late_commit_records {
+        write_sample(
+            out,
+            "ravel_maintain_late_commit_records_total",
+            &[Label::Mode(mode), Label::Signal(signal)],
+            value,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_store_clock_unobserved_total",
+        "Compaction, migration and erasure rewrite plans that found no observation of the \
+         object store's clock and so waited out the late-commit cutoff on this process's \
+         clock alone, by signal, since process start (ADR-4561). Rising together with plans \
+         means the store answers without a Date header; the fence then rests on this \
+         process's clock not running ahead of the store's.",
+        "counter",
+    );
+    for &(signal, value) in &snapshot.store_clock_unobserved {
+        write_sample(
+            out,
+            "ravel_maintain_store_clock_unobserved_total",
+            &[Label::Mode(mode), Label::Signal(signal)],
             value,
         );
     }
@@ -16243,6 +16297,8 @@ mod tests {
             unmaintained_superseded: Vec::new(),
             compaction_inputs_skipped: Vec::new(),
             erasure_unwritable_objects: Vec::new(),
+            late_commit_records: vec![(Signal::Metrics, 37)],
+            store_clock_unobserved: vec![(Signal::Logs, 38)],
             retention_held_out_of_window_objects: 15,
             retention_held_by_lease_buckets: 16,
             retention_unaddressable_held_buckets: 36,
@@ -16363,6 +16419,18 @@ mod tests {
                 "ravel_maintain_retention_unaddressable_held_buckets_total{mode=\"maintain\"} 36\n"
             ),
             "missing retention_unaddressable_held_buckets sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_late_commit_records_total{mode=\"maintain\",signal=\"metrics\"} 37\n"
+            ),
+            "missing late_commit_records sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_store_clock_unobserved_total{mode=\"maintain\",signal=\"logs\"} 38\n"
+            ),
+            "missing store_clock_unobserved sample:\n{body}"
         );
         assert!(
             body.contains(
@@ -17979,6 +18047,8 @@ mod tests {
                 ravel_maintain::CompactionInputSkipReason::UnwritableStreamAttrs,
                 1,
             )],
+            late_commit_records: vec![(Signal::Logs, 1)],
+            store_clock_unobserved: vec![(Signal::Logs, 1)],
             retention_held_out_of_window_objects: 1,
             retention_held_by_lease_buckets: 1,
             retention_unaddressable_held_buckets: 1,
@@ -18069,6 +18139,8 @@ mod tests {
                 || line.starts_with("ravel_maintain_bytes_reclaimed_total")
                 || line.starts_with("ravel_maintain_retention_lag_seconds")
                 || line.starts_with("ravel_maintain_units_scan_failed")
+                || line.starts_with("ravel_maintain_late_commit_records_total")
+                || line.starts_with("ravel_maintain_store_clock_unobserved_total")
             {
                 vec!["mode", "signal"]
             } else if line.starts_with("ravel_maintain_superseded_inputs_held_total")
@@ -18262,6 +18334,69 @@ mod tests {
                     "{family}{{mode=\"maintain\",signal=\"logs\",reason=\"unwritable_stream_attrs\"}} {value}"
                 )]
             );
+        }
+    }
+
+    /// The two late-commit fence families (ADR-4561 R3, R8) each render one
+    /// sample per maintained signal carrying exactly `mode` and `signal`, with
+    /// the snapshot's own count, from zero. The values read from the process
+    /// are not pinned here: the fence tests move the same counters.
+    #[test]
+    fn late_commit_fence_families_render_each_maintained_signal() {
+        let from_process = MaintenanceSafetySnapshot::from_metrics(
+            &crate::maintain::MaintenanceSafetyMetrics::default(),
+        );
+        let signals = |pairs: &[(Signal, u64)]| pairs.iter().map(|&(s, _)| s).collect::<Vec<_>>();
+        assert_eq!(
+            signals(&from_process.late_commit_records),
+            crate::maintain::MAINTAINED_SIGNALS.to_vec()
+        );
+        assert_eq!(
+            signals(&from_process.store_clock_unobserved),
+            crate::maintain::MAINTAINED_SIGNALS.to_vec()
+        );
+        let snapshot = MaintenanceSafetySnapshot {
+            late_commit_records: vec![(Signal::Metrics, 0), (Signal::Logs, 4), (Signal::Spans, 0)],
+            store_clock_unobserved: vec![
+                (Signal::Metrics, 7),
+                (Signal::Logs, 0),
+                (Signal::Spans, 1),
+            ],
+            ..from_process.clone()
+        };
+        let mut body = String::new();
+        render_maintain_safety_family(&mut body, Mode::Maintain, &snapshot);
+        for (family, expected) in [
+            (
+                "ravel_maintain_late_commit_records_total",
+                [("metrics", 0), ("logs", 4), ("spans", 0)],
+            ),
+            (
+                "ravel_maintain_store_clock_unobserved_total",
+                [("metrics", 7), ("logs", 0), ("spans", 1)],
+            ),
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {family} counter\n")).count(),
+                1,
+                "{body}"
+            );
+            assert_eq!(
+                body.matches(&format!("# HELP {family} ")).count(),
+                1,
+                "{body}"
+            );
+            let samples: Vec<&str> = body
+                .lines()
+                .filter(|line| line.starts_with(&format!("{family}{{")))
+                .collect();
+            let want: Vec<String> = expected
+                .iter()
+                .map(|(signal, value)| {
+                    format!("{family}{{mode=\"maintain\",signal=\"{signal}\"}} {value}")
+                })
+                .collect();
+            assert_eq!(samples, want);
         }
     }
 
