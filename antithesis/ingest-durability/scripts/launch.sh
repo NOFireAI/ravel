@@ -16,6 +16,9 @@
 #   CONFIG=config-faults  the fault-switch variant (README.md, Fault-switch
 #       variant), as test ravel-ingest-durability-faults with
 #       attrs.variant=faults. Not with a mutant.
+#   CONFIG=config-perf  the perf variant (README.md, Perf variant), as test
+#       ravel-ingest-durability-perf with attrs.variant=perf. Not with a
+#       mutant.
 set -euo pipefail
 HOURS="${1:?max compute hours}"
 DESC="${2:-ravel ingest durability}"
@@ -48,8 +51,17 @@ case "$VARIANT_CONFIG" in
         VARIANT_PARAMS=(--param attrs.variant=faults)
         DESC="$DESC (fault-switch variant)"
         ;;
+    config-perf)
+        if [ -n "$MUTANT" ]; then
+            echo "refused: mutant runs use the base config; unset CONFIG or RAVEL_ANTITHESIS_MUTANT" >&2
+            exit 1
+        fi
+        TEST_NAME=ravel-ingest-durability-perf
+        VARIANT_PARAMS=(--param attrs.variant=perf)
+        DESC="$DESC (perf variant)"
+        ;;
     *)
-        echo "refused: CONFIG must be config, config-coverage or config-faults, not '$VARIANT_CONFIG'" >&2
+        echo "refused: CONFIG must be config, config-coverage, config-faults or config-perf, not '$VARIANT_CONFIG'" >&2
         exit 1 ;;
 esac
 CONFIG="$WL/$VARIANT_CONFIG"

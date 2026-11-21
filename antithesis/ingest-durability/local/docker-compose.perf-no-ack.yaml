@@ -1,0 +1,39 @@
+# Perf variant lever (scripts/local-run.sh with CONFIG=config-perf and
+# PERF_LEVER=no-ack; README.md, "Perf variant"), layered over
+# ../config-perf/docker-compose.yaml and docker-compose.local.yaml.
+# ravel1 and ravel2 run with --max-flush-delay 600s and
+# --max-flush-delay-idle 600s. A one-record probe write is then not expected
+# to reach a flush before the server's 10 s strict acknowledgement deadline,
+# so the run expects both TTFA samples to come out none (the gate checks it).
+#
+# Compose replaces a command list as a whole in an override, so this file
+# restates the full ravel-server command of ../config/docker-compose.yaml for
+# both services, with only those two values changed.
+x-perf-no-ack-command: &perf-no-ack-command
+  - "--mode"
+  - "all"
+  - "--store"
+  - "s3"
+  - "--listen-http"
+  - "0.0.0.0:4318"
+  - "--listen-grpc"
+  - "0.0.0.0:4317"
+  - "--shards"
+  - "4"
+  - "--tenant-token"
+  - "wl-token=wl-tenant"
+  - "--tenant-hash-unkeyed"
+  - "--startup-store-deadline"
+  - "300s"
+  - "--max-flush-delay"
+  - "600s"
+  - "--max-flush-delay-idle"
+  - "600s"
+  - "--min-flush-bytes"
+  - "262144"
+
+services:
+  ravel1:
+    command: *perf-no-ack-command
+  ravel2:
+    command: *perf-no-ack-command
