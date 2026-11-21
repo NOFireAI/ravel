@@ -1127,13 +1127,16 @@ marker (ADR-2993, erasure amendment):
   listing the observation already takes by the same stamp rule the planners
   use, whether or not the fence is on, and reads each late record's
   event-time span. It keeps a candidate `.dreq` past its horizon while any
-  bucket of the tenant and signal without a retention tombstone holds a late
-  record whose span the request's window may overlap (a request with no
-  window overlaps every such bucket), counts it in
+  bucket of the tenant and signal holds a late record whose span the
+  request's window may overlap (a request with no window overlaps every such
+  bucket), counts it in
   `ravel_maintain_dreq_held_by_superseded_inputs_total`, and logs one warn
-  line per kept request naming the bucket. Nothing records the keep: every
-  pass recomputes it, so the `.dreq` is released on the first pass after the
-  record is deleted or the bucket is tombstoned. A late record the store
+  line per kept request naming the bucket. A retention tombstone does not end
+  the keep: a bucket a HEAD already folded is served from that HEAD until the
+  fold that observes the tombstone, so the late rows stay readable until
+  retention deletes the record. Nothing records the keep: every pass
+  recomputes it, so the `.dreq` is released on the first pass after the
+  record is deleted. A late record the store
   applies after the pass's commit listing is not seen by that pass, and a
   request whose `.dreq` that pass deletes is not kept by it.
 
@@ -1156,8 +1159,8 @@ marker (ADR-2993, erasure amendment):
   bucket leaves it out, so it stays raw, served and unswept for the life of
   the bucket. Such a record does pin the filter of every request whose window
   may overlap it, through the late-commit keep (above), for as long as it is
-  served: that keep ends when an operator deletes the record, when retention
-  tombstones the bucket, or when a compaction run with
+  stored: that keep ends when an operator deletes the record, when retention
+  deletes the tombstoned bucket's records, or when a compaction run with
   `--late-commit-fence off` supersedes the record and rule 2 reclaims it.
   That last path carries the record's rows into the compaction's parts, which
   a completed request's rewrite never revisits, so it is safe only when no
