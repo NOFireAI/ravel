@@ -1092,6 +1092,27 @@ pub const NS_PER_HOUR: i64 = 3_600_000_000_000;
 pub const DEFAULT_MAX_FLUSH_LIFETIME_NS: i64 = NS_PER_HOUR;
 /// Default `clock_skew_allowance`: 5 minutes (matches ravel-catalog).
 pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 300_000_000_000;
+/// How far past a bucket's late-commit cutoff both the pass's clock and the
+/// store's clock must read before a plan may LIST it (ADR-4561 R3): 60 s,
+/// three times the store adapter's 20 s request timeout. A chosen allowance
+/// for the gap between the store stamping a commit record and listing it, not
+/// a derived bound.
+pub const LATE_COMMIT_SETTLE_NS: i64 = 60_000_000_000;
+
+/// Whether maintenance plans only from on-time commit records (ADR-4561 R7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LateCommitFence {
+    /// Plan from every listed commit record once the bucket is sealed, with no
+    /// store-clock check: the behaviour before ADR-4561. The library default,
+    /// because reconstructed commit records, benches and fixtures publish into
+    /// long-sealed hours with a fresh stamp on purpose.
+    #[default]
+    Off,
+    /// Apply rules R2 to R5 and R8: wait until both clocks pass the cutoff
+    /// plus [`LATE_COMMIT_SETTLE_NS`], then plan from the on-time commit
+    /// records only, leaving every late one in place and served.
+    Enforce,
+}
 /// Default `max_compaction_lifetime`: 1 hour. Mirrors the
 /// writer interlock so the sweeper's unreferenced-part rule is safe.
 pub const DEFAULT_MAX_COMPACTION_LIFETIME_NS: i64 = NS_PER_HOUR;
@@ -2080,8 +2101,15 @@ pub struct CompactorConfig {
     /// Longest a flush may stay open; a bucket is sealed only after its end
     /// plus this plus the skew allowance.
     pub max_flush_lifetime_ns: i64,
-    /// Extra seal margin for cross-host clock skew.
+    /// Extra seal margin: the allowance a writer's clock may lag the store's
+    /// clock and still flush. The seal holds no term for this process's own
+    /// clock; [`Self::late_commit_fence`]'s store-clock check is the one that
+    /// does.
     pub clock_skew_allowance_ns: i64,
+    /// Plan only from commit records stamped before the bucket's late-commit
+    /// cutoff (ADR-4561). The library default is [`LateCommitFence::Off`];
+    /// the server's maintenance loop and `ravel-cli maintain` set `Enforce`.
+    pub late_commit_fence: LateCommitFence,
     /// Deadline after which a compaction run must not publish its record
     /// measured from the run's start via the clock.
     pub max_compaction_lifetime_ns: i64,
@@ -2634,6 +2662,7 @@ impl Default for CompactorConfig {
         CompactorConfig {
             max_flush_lifetime_ns: DEFAULT_MAX_FLUSH_LIFETIME_NS,
             clock_skew_allowance_ns: DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+            late_commit_fence: LateCommitFence::Off,
             max_compaction_lifetime_ns: DEFAULT_MAX_COMPACTION_LIFETIME_NS,
             max_l1_part_bytes: DEFAULT_MAX_L1_PART_BYTES,
             l1_part_memory_target_bytes: DEFAULT_L1_PART_MEMORY_TARGET_BYTES,
@@ -2772,9 +2801,10 @@ impl CompactorConfig {
     }
 
     /// The seal margin: a bucket ending at `bucket_end_ns` is sealed once
-    /// `now_ns >= bucket_end_ns + this`. No new commit record can
-    /// appear in the bucket after that, so a single strongly consistent LIST
-    /// is a complete, repeatable input set.
+    /// `now_ns >= bucket_end_ns + this`. No writer issues a commit PUT for the
+    /// bucket after that, but one issued before can still land later, so a
+    /// LIST alone is not a repeatable input set; the late-commit fence
+    /// (ADR-4561) is what makes it one.
     pub fn seal_margin_ns(&self) -> i64 {
         self.max_flush_lifetime_ns
             .saturating_add(self.clock_skew_allowance_ns)

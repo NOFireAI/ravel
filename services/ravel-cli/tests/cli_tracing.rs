@@ -79,9 +79,13 @@ async fn run_binary(endpoint: &str, command: &[&str], rust_log: Option<&str>) ->
     out
 }
 
-const COMPACT_TENANT: [&str; 12] = [
+// The fake endpoint stamps every object in 2020, after `HOUR` sealed, so the
+// late-commit fence would leave both L0 records out of every plan.
+const COMPACT_TENANT: [&str; 14] = [
     "maintain",
     "compact-tenant",
+    "--late-commit-fence",
+    "off",
     "--tenant",
     TENANT,
     "--signal",
@@ -94,9 +98,11 @@ const COMPACT_TENANT: [&str; 12] = [
     "100",
 ];
 
-const COMPACT_BUCKET: [&str; 10] = [
+const COMPACT_BUCKET: [&str; 12] = [
     "maintain",
     "compact-bucket",
+    "--late-commit-fence",
+    "off",
     "--tenant",
     TENANT,
     "--signal",

@@ -123,7 +123,8 @@ record must be durable before any input record is removed.
    ADR-0010 §11 writer interlock (a flush older than max_flush_lifetime
    is abandoned and never published) is what makes a sealed bucket's
    commit-record set immutable, so one strongly consistent LIST of the
-   bucket is a complete, stable input set. Trigger: sealed and L0 record
+   bucket is a complete, stable input set (the on-time set, per the #4561
+   amendment below). Trigger: sealed and L0 record
    count >= `min_compaction_inputs` (default 2; 1 is legal config for v1
    retirement campaigns). Compaction across multiple hours (L2) is out of
    scope and gets its own ADR.
@@ -278,3 +279,25 @@ compaction record.
   historical buckets but does not reduce LIST-call counts across many
   buckets; that remains the ADR-0003 catalog-snapshot work, which must
   fold compaction records and tombstones when it lands.
+
+## Amendment (2026-11-21, #4561): the input set is the on-time commit records
+
+<!-- amendment-applies: sections="Decision" pointer="#4561 amendment" -->
+<!-- amendment-supersedes: phrase="complete, stable input set" pointer="#4561 amendment" -->
+
+Decision 1 rests on the writer interlock making a sealed bucket's
+commit-record set immutable. The interlock bounds when a writer issues its
+commit PUT, not when the store applies it: a PUT already sent can land after
+the seal, and the read-side paragraph of this ADR already allows "a late
+commit landing in a sealed bucket". Two maintenance passes over one bucket
+could therefore list different sets, and a compaction that took a late
+record could publish beside an erasure rewrite that did not, as a conflict
+no reader resolves (ADR-1029, #4560 amendment).
+
+Decision 1 now reads, with the late-commit fence on: the input set of a
+sealed bucket is its on-time commit records, those the store stamped before
+`C(H) = end(H) + max_flush_lifetime + clock_skew_allowance`, truncated to a
+whole second, and a pass plans the bucket only once its own clock and the
+store's observed clock are at least `C(H) + 60 s`. A later record is served
+and kept, never an input. The rule, its switch and its residuals are
+ADR-4561.

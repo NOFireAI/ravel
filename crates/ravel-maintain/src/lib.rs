@@ -53,6 +53,7 @@ pub mod erasure_rewrite;
 pub mod error;
 mod format_floor;
 pub mod gc_config;
+pub mod late_commit;
 pub mod late_writes;
 pub mod legal_hold;
 pub mod memo_snapshot;
@@ -105,14 +106,14 @@ pub use compat_policy::{
 };
 pub use config::{
     AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,
-    L1PartMemoryTargetBound, L1PartMemoryTargetSource, MEMORY_OVERHEAD_RESERVE_BYTES,
-    MergeLiveBytes, MergeMemoryTracker, MergePhasePeaks, RLOG_RUN_MEMORY_TARGET_BYTES,
-    ResolvedL1PartMemoryTarget, RetentionConfig, RetentionConfigError, RetentionPolicy,
-    RlogLevel2SettingError, RlogRunBlockTargetError, RlogZstdLevelError,
-    claim_lease_max_part_bytes, derive_l1_part_memory_target, derive_l1_part_memory_target_bytes,
-    detect_host_memory_total_bytes, host_memory_budget_bytes, merge_memory_budget_bytes,
-    validate_rlog_level2_settings, validate_rlog_run_block_target_records,
-    validate_rlog_zstd_level,
+    L1PartMemoryTargetBound, L1PartMemoryTargetSource, LATE_COMMIT_SETTLE_NS, LateCommitFence,
+    MEMORY_OVERHEAD_RESERVE_BYTES, MergeLiveBytes, MergeMemoryTracker, MergePhasePeaks,
+    RLOG_RUN_MEMORY_TARGET_BYTES, ResolvedL1PartMemoryTarget, RetentionConfig,
+    RetentionConfigError, RetentionPolicy, RlogLevel2SettingError, RlogRunBlockTargetError,
+    RlogZstdLevelError, claim_lease_max_part_bytes, derive_l1_part_memory_target,
+    derive_l1_part_memory_target_bytes, detect_host_memory_total_bytes, host_memory_budget_bytes,
+    merge_memory_budget_bytes, validate_rlog_level2_settings,
+    validate_rlog_run_block_target_records, validate_rlog_zstd_level,
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{
@@ -132,6 +133,7 @@ pub use gc_config::{
     validate_maintain, validate_maintain_compaction_lifetime, validate_maintain_skew,
     validate_query_deadline, validate_query_head_cache_ttl,
 };
+pub use late_commit::{late_commit_records_total, store_clock_unobserved_total};
 pub use late_writes::{LateWrite, LateWriteReport, late_write_pass};
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, HoldRecordCache, HoldSource, LegalHoldCheck, shard_hold_scopes,

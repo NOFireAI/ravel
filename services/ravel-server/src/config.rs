@@ -301,6 +301,28 @@ impl MaintainClaimsArg {
     }
 }
 
+/// The `--late-commit-fence` values (ADR-4561 R7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum LateCommitFenceArg {
+    /// Plan a bucket only from the commit records the store stamped before
+    /// its late-commit cutoff, once the store's clock is past it. The default.
+    #[default]
+    On,
+    /// Plan from every listed commit record as soon as the bucket seals, the
+    /// behaviour before ADR-4561.
+    Off,
+}
+
+impl LateCommitFenceArg {
+    /// The library-level setting this flag value selects.
+    pub fn mode(self) -> ravel_maintain::LateCommitFence {
+        match self {
+            LateCommitFenceArg::On => ravel_maintain::LateCommitFence::Enforce,
+            LateCommitFenceArg::Off => ravel_maintain::LateCommitFence::Off,
+        }
+    }
+}
+
 /// The `--logs-fetch-policy` values (ADR-0996 decision 2). The CLI-facing
 /// mirror of [`ravel_query::LogsFetchPolicy`], which lives in a crate that does
 /// not depend on clap. The spellings clap derives from these variant names are
@@ -1976,6 +1998,19 @@ pub struct MaintenanceArgs {
     /// migrate` and the re-encodes `migrate` runs always refuse below a floor.
     #[arg(long = "write-below-format-floor")]
     pub write_below_format_floor: bool,
+
+    /// Whether compaction, migration and erasure rewrites leave out the commit
+    /// records the store stamped at or after a bucket's late-commit cutoff
+    /// (its hour's end plus the seal margin), and wait for the store's clock
+    /// to pass that cutoff plus 60 s before planning (ADR-4561). With `on`,
+    /// the default, every plan of a bucket names the same inputs, so a
+    /// compaction and an erasure rewrite of it never cover it only in part.
+    /// A record left out is still served, kept and swept as before; each plan
+    /// that leaves one out logs it at warn and counts it under
+    /// `ravel_maintain_late_commit_records_total`. `off` plans from every
+    /// listed commit record once the bucket seals.
+    #[arg(long = "late-commit-fence", value_enum, default_value_t = LateCommitFenceArg::On)]
+    pub late_commit_fence: LateCommitFenceArg,
 }
 
 /// Retention windows: the defaults, per-tenant overrides, and the alert and
@@ -9424,6 +9459,7 @@ impl Cli {
                 self.maintenance.write_below_format_floor,
                 ravel_ingest::format_floor_metrics(),
             )),
+            late_commit_fence: self.maintenance.late_commit_fence.mode(),
             ..ravel_maintain::CompactorConfig::default()
         };
         let memory_target = self.resolve_l1_part_memory_target(
