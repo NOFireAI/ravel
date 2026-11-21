@@ -2005,10 +2005,13 @@ pub struct MaintenanceArgs {
     /// to pass that cutoff plus 60 s before planning (ADR-4561). With `on`,
     /// the default, every plan of a bucket names the same inputs, so a
     /// compaction and an erasure rewrite of it never cover it only in part.
-    /// A record left out is still served, kept and swept as before; each plan
-    /// that leaves one out logs it at warn and counts it under
-    /// `ravel_maintain_late_commit_records_total`. `off` plans from every
-    /// listed commit record once the bucket seals.
+    /// A record left out is still served, and the sweep keeps it: it is never
+    /// swept for being late. Each plan that leaves one out logs it at warn and
+    /// counts it under `ravel_maintain_late_commit_records_total`. The cutoff
+    /// is derived from `--gc-max-flush-lifetime` and the clock-skew allowance,
+    /// so while the fence is on every maintainer of a store must use the same
+    /// values. `off` plans from every listed commit record once the bucket
+    /// seals.
     #[arg(long = "late-commit-fence", value_enum, default_value_t = LateCommitFenceArg::On)]
     pub late_commit_fence: LateCommitFenceArg,
 }
