@@ -106,6 +106,11 @@ For a bucket of hour `H` under configuration `config`:
    `ravel-invariant` capture build: "maintain: a plan left a late commit
    record out" (sometimes) and "maintain: a published record names no late
    commit record" (always).
+9. **R9, the `.dreq` keep.** The erasure-request sweep (rule 6) keeps a
+   candidate `.dreq` past its horizon while a bucket of the request's tenant
+   and signal holds a late record (R2) whose event-time span the request's
+   window may overlap (`bucket_may_overlap`; a request with no window
+   overlaps every bucket). It does so whatever the fence setting.
 
 ### Why this removes the partial cover
 
@@ -147,6 +152,34 @@ nothing and exit zero, and the fixtures would change meaning. The two
 service entry points set `Enforce`, so the production maintainer and the
 Antithesis rigs, which run the real server, get the fence.
 
+### Why a late record keeps a completed request's `.dreq`
+
+No plan takes a late record (R4), so no rewrite erases it. The completion
+gate reads it (R6), but only if it is stored when the gate runs. A late
+record the store applies after the request's `.done` was written is an
+ordering the gate never sees: the request is complete, its `.dreq` passes
+its horizon, rule 6 deletes it, and the query-time filter that was hiding
+the late record's rows of the subject goes with it. The superseded-input
+hold does not cover the case either, since the late record is an input of
+no record and so of no chain.
+
+R9 closes it at rule 6. The sweep already lists the signal's commit
+keyspace once for its observing rule-2 pass; it classifies each commit
+record of that listing by R2 against its own bucket's cutoff, GETs each late
+one for its event-time span, and skips a bucket with a retention tombstone,
+which serves nothing. Only when there is a late record does it GET each
+candidate `.dreq` to compare windows. A kept request is counted in
+`ravel_maintain_dreq_held_by_superseded_inputs_total`, the counter every
+other rule-6 keep uses, and logged once at warn naming the bucket. The keep
+is recomputed every pass and never persisted, so the `.dreq` is released on
+the first pass after the late record is deleted or its bucket tombstoned.
+
+The classification is applied whatever the fence setting, because a stamp
+says what the store applied late whether or not this pass's planners fence
+it. With the fence off, a later compaction supersedes the late record and
+rule 2 reclaims it, which ends the keep; see the residual below on what that
+compaction carries.
+
 ## Options considered
 
 The design document compares each in full; in short:
@@ -182,6 +215,9 @@ The design document compares each in full; in short:
   down while it is stored. Both were already true of a late L0 that landed
   after a bucket's compaction; the fence extends them to one that lands
   between the seal and the first plan.
+- **A late record holds a completed request's `.dreq` while it is stored**
+  (R9), when its event times may overlap the request's window. The subject
+  identifier the `.dreq` carries is retained that much longer.
 - **No repair.** A conflicting compaction record already stored stays a
   conflict; the #4560 keep still protects its erased rows.
 - **`CompactorConfig` gains a field.** Every struct literal that spells the
@@ -200,6 +236,15 @@ Residuals of the fence itself:
   `Date` moves it. R3 also requires the pass's own clock, so a wrongly high
   observation gives the behaviour before this ADR and a wrongly low one
   gives `NotSealed` until the next response.
+- R9 sees the late records of the commit listing its pass took. A late
+  record the store applies after that LIST and before the same pass deletes
+  a `.dreq` is not seen by that pass.
+- A compaction run with `--late-commit-fence off` over a bucket holding a
+  late record carries the record's rows into its parts. A completed
+  request's rewrite never revisits them, so once rule 2 reclaims the late
+  record R9 releases the `.dreq` and those rows are served again. Before
+  such a run the operator checks that no completed request's window
+  overlaps the bucket's late records. Follow-up 2 removes the need.
 
 Follow-ups, in order:
 
@@ -243,6 +288,17 @@ In `crates/ravel-maintain/tests/late_commit_fence.rs`, with stamps set on
   `a_late_l0_outside_the_window_lets_the_request_complete` and
   `a_late_l0_keeps_a_windowless_request_blocked_whatever_it_holds`: the
   completion gate reads every record and decides on window overlap.
+- `a_late_l0_landing_after_completion_keeps_the_dreq` (R9): the request
+  completes with no late record present, its `.dreq` and `.done` are
+  written, and then a late record holding the subject inside the window
+  lands. Past the horizon, after rule 2 has removed the rewrite's
+  superseded inputs, rule 6 keeps the `.dreq` and counts it as held.
+  Without the keep it deletes it.
+  `a_late_l0_keeps_a_windowless_dreq_whatever_it_holds`,
+  `a_late_l0_outside_the_window_does_not_keep_the_dreq`,
+  `the_dreq_is_released_once_the_late_l0_is_gone` and
+  `a_late_l0_in_a_tombstoned_bucket_does_not_keep_the_dreq` pin the
+  window rule, the release and the tombstone skip.
 - `a_late_below_target_l0_is_named_and_the_walk_goes_on` (site 10).
 - `determinism::the_split_is_the_same_for_every_order_and_page_boundary`,
   a property test over insertion order and two-key listing pages, and
