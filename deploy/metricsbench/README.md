@@ -1482,7 +1482,9 @@ own step, as the run records it; a request the run does not count says so.
 14. `stage1-l1-compact` (row 6, issue #3818): once the last ingest hour is
     sealed (its end plus 6 minutes), ravel-server stopped and `ravel-cli
     maintain compact-tenant --tenant metricsbench --signal metrics --shards
-    4 --max-flush-lifetime 0s`, with `--max-l1-part-bytes N` appended when
+    4 --max-flush-lifetime 0s --late-commit-fence off` (the bench's writers
+    are stopped and it runs no erasure, so the late-commit fence, which
+    refuses a flush lifetime override, is off), with `--max-l1-part-bytes N` appended when
     `MB_L1_MAX_PART_BYTES=N` is set (case mp1), into
     `stage1-l1-compact.txt`; `stage1.l1_compact` stamps the command, `wall_ms` and every counter it
     prints (`compacted`, `already`, `not_sealed`, `parts_written`,

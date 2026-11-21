@@ -133,7 +133,9 @@ pub use gc_config::{
     validate_maintain, validate_maintain_compaction_lifetime, validate_maintain_skew,
     validate_query_deadline, validate_query_head_cache_ttl,
 };
-pub use late_commit::{late_commit_records_total, store_clock_unobserved_total};
+pub use late_commit::{
+    late_commit_records_total, may_judge_completion, store_clock_unobserved_total,
+};
 pub use late_writes::{LateWrite, LateWriteReport, late_write_pass};
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, HoldRecordCache, HoldSource, LegalHoldCheck, shard_hold_scopes,
