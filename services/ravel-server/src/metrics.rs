@@ -6880,8 +6880,9 @@ fn render_maintain_safety_family(
          naming the request, or held a chain it could not walk to the end anywhere in the \
          signal, which keeps every such .dreq. It also keeps a request applied by a live \
          rewrite that a compaction record conflicts with, and every .dreq of the signal while \
-         a conflict's rewrite chain is cut or a bucket's conflicts cannot be resolved (#4560). \
-         The query-time exclusion filter stays in force \
+         a conflict's rewrite chain is cut or a bucket's conflicts cannot be resolved (#4560), \
+         and a request while a commit record stamped after its bucket's late-commit cutoff \
+         may hold its subject (#4561). The query-time exclusion filter stays in force \
          meanwhile. This can grow while the superseded hold counters stay flat.",
         "counter",
     );
