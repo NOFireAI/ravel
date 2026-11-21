@@ -1113,10 +1113,11 @@ the key layout changed. The rule is stated normatively in
 docs/catalog-and-mvcc.md, step 3.
 
 A record whose inputs a live rewrite covers only in part stays a conflict
-for the overlap selection. Each such record and rewrite pair is counted in
-`ravel_catalog_erasure_overlap_conflicts_total` and logged once at warn;
-each dominated version 1 record is counted in
-`ravel_catalog_dominated_compaction_records_total`. Both are on `/metrics`.
+for the overlap selection. Such a record is counted in
+`ravel_catalog_erasure_overlap_conflicts_total` and each such record and
+rewrite pair is logged at warn; each dominated version 1 record is counted
+in `ravel_catalog_dominated_compaction_records_total`. Both counters are on
+`/metrics` and count once per evaluation that finds the record.
 
 With this, between a compaction and an erasure rewrite a lost or late claim
 costs a wasted compaction, never a served erased row. The race the 2026-11-20

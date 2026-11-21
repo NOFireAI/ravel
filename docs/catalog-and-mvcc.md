@@ -3496,12 +3496,14 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      dominated version 2 record, and a version 2 record whose predecessor
      is a dominated version 1 record is dominated too. A version 1 record
      whose inputs a live rewrite covers only in part is not dominated: it
-     stays an overlap conflict for the selection below, and each such
-     record-rewrite pair is counted in
-     `ravel_catalog_erasure_overlap_conflicts_total` and logged once at
-     WARN. Every dominated version 1 record is counted in
+     stays an overlap conflict for the selection below: it is counted in
+     `ravel_catalog_erasure_overlap_conflicts_total`, and each such
+     record-rewrite pair is logged at WARN, a recently logged pair not
+     again. A dominated version 1 record is counted in
      `ravel_catalog_dominated_compaction_records_total`. Both counters are
-     process-wide, labelled by `mode` on `/metrics`.
+     process-wide, labelled by `mode` on `/metrics`, and count once per
+     evaluation that finds the record, so a record still present is counted
+     again by each later resolution.
    - **Reclaiming superseded records.** The superseded-input sweep reclaims a
      record a present version 2 record supersedes, with its parts, as one
      chain group entered from the version 2 record at the head of the chain
