@@ -378,6 +378,11 @@ the compaction misses that writer's later-published object.
   `now >= hour_end + max_flush_lifetime + clock_skew_allowance`. A freshly
   finished load therefore waits over an hour before its final hours can be
   compacted. A lower value seals them at once.
+- With the late-commit fence on, the default, a value other than `1h` is
+  refused, because it moves the fence's cutoff away from the one every other
+  maintainer uses. Pass `--late-commit-fence off` with it; see
+  [Commit records that land after the seal](#commit-records-that-land-after-the-seal)
+  for what that requires first.
 
 ### Two-level merge scratch
 
@@ -833,6 +838,21 @@ and `migrate`:
   `Date` of a response it gets after its planning LIST. Before that the
   bucket reports `NotSealed`, so the first compaction of an hour starts about
   a minute later than it did before the fence.
+- An erasure request whose scope held the bucket when it was acknowledged
+  completes only after the same point: the completion check does not judge
+  the bucket while a pass could not yet plan it.
+
+Every maintainer of a store must use the same `max_flush_lifetime` and
+clock-skew allowance while the fence is on: for `ravel-server` that is
+`--gc-max-flush-lifetime` and the compiled clock-skew allowance, and for
+`ravel-cli maintain compact-bucket` and `compact-tenant` the default
+`--max-flush-lifetime` (they refuse another value with the fence on). The
+cutoff is derived from those values, so two maintainers with different ones
+disagree about which records are late, and a compaction can again publish
+next to an erasure rewrite that it only partly overlaps. To change either
+value on a running fleet, either switch the fence off on every maintainer
+first, or stop every maintainer on the old configuration before any
+maintainer starts on the new one.
 
 What you see:
 
@@ -879,11 +899,22 @@ all of its records as late. Run the affected shard's maintenance once with the
 flag, after the writers for those hours are gone, then go back to the
 default.
 
-Before you do, check that no completed erasure request's window overlaps the
-bucket's late records. The compaction carries their rows into its parts, and
-a completed request's rewrite never revisits them. Once the sweep reclaims
-the late records, the request's `.dreq` is deleted and those rows are served
-again.
+**Before you switch the fence off, check for completed erasure requests.**
+A run with the fence off over a bucket holding a late record copies that
+record's rows into L1 segments, and the rewrite of an erasure request that has
+already completed never reaches them there. Once the sweep reclaims the late
+record, the request's `.dreq` is deleted and those rows are served again.
+List the tenant's requests first:
+
+```sh
+ravel-cli erase status --tenant <name> --signal <signal>
+```
+
+For every request it reports `COMPLETED` whose window, as it was submitted,
+overlaps the hours you are about to maintain with the fence off (a request
+with no window overlaps every hour), resubmit it with `ravel-cli erase
+submit` and the same matchers and window after the run, so a new rewrite
+covers the L1 segments.
 
 ### A log object compaction cannot rewrite
 

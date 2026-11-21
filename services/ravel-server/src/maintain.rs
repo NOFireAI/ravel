@@ -4288,12 +4288,14 @@ pub(crate) async fn run_erasure_pass(
 
 /// The evidence for CompletionImpliesNoPreRewriteExposure (ADR-4326
 /// lifecycle), built apart from the pass that decided the completions: the
-/// tenant's hours listed again from the store, and for each sealed one the
-/// catalog resolver asked again whether it still serves each pending request's
-/// subject. Per request: `Some(true)` when no sealed bucket serves it,
-/// `Some(false)` when one does, and `None` when a listing, a resolve or a held
-/// bucket leaves that unknown. An unsealed bucket is left out:
-/// CompletionCoversEveryBucketOpenAtRequest owns that case.
+/// tenant's hours listed again from the store, and for each one the completion
+/// gate may judge ([`ravel_maintain::may_judge_completion`]: sealed, and under
+/// the late-commit fence plannable) the catalog resolver asked again whether it
+/// still serves each pending request's subject. Per request: `Some(true)` when
+/// no judged bucket serves it, `Some(false)` when one does, and `None` when a
+/// listing, a resolve or a held bucket leaves that unknown. A bucket the gate
+/// may not judge yet is left out: CompletionCoversEveryBucketOpenAtRequest owns
+/// that case.
 ///
 /// The listing is fresh, but each bucket is judged by the same
 /// [`ravel_maintain::bucket_erasure_completion`] the pass uses. This checks
@@ -4320,7 +4322,7 @@ async fn served_after_completion(
         };
         for hour in hours {
             let bucket = Bucket::new(*tenant, signal, shard, hour);
-            if !bucket.is_sealed(now_ns, compactor) {
+            if !ravel_maintain::may_judge_completion(store, &bucket, now_ns, compactor) {
                 continue;
             }
             match ravel_maintain::bucket_erasure_completion(
@@ -7154,6 +7156,101 @@ mod tests {
             store.get(&done_key, GetRange::Full).await.is_ok(),
             "every in-scope bucket now carries the request, so it completes exactly once"
         );
+    }
+
+    /// ADR-4561 R3 reaches completion: under the late-commit fence the server's
+    /// pass writes no `.done` for a request whose ack-open hour is sealed but
+    /// not yet plannable, and does not list that bucket for the completion
+    /// gate, because an on-time commit record stamped just before the cutoff
+    /// may not be listed yet. Once the pass's clock is `LATE_COMMIT_SETTLE_NS`
+    /// past the cutoff the bucket is judged and the request completes.
+    #[tokio::test]
+    async fn run_erasure_pass_completes_only_once_the_ack_hour_is_plannable() {
+        const ACK_HOUR: u32 = 10_000;
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let compactor = CompactorConfig {
+            late_commit_fence: ravel_maintain::LateCommitFence::Enforce,
+            ..CompactorConfig::default()
+        };
+        let bucket = Bucket::new(tenant, Signal::Metrics, 0, ACK_HOUR);
+        let sealed_ns = bucket.end_ns() + compactor.seal_margin_ns();
+        let settled_ns =
+            bucket.late_commit_cutoff_ns(&compactor) + ravel_maintain::LATE_COMMIT_SETTLE_NS;
+        assert!(bucket.is_sealed(sealed_ns, &compactor));
+        assert!(sealed_ns < settled_ns);
+
+        let prefix = keys::commit_shard_hour_prefix(&tenant, Signal::Metrics, 0, ACK_HOUR)
+            .expect("bucket prefix");
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Permanent("bucket listed".into()))
+                    .with_key_contains(prefix),
+            ),
+        );
+        let request_id = Uuid::from_u128(0x4561);
+        let dreq_key = submit_erasure_request(
+            store.inner(),
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        let faulted: &dyn ObjectStoreBackend = &store;
+        let plain: &dyn ObjectStoreBackend = store.inner();
+        for (backend, now_ns) in [
+            (faulted, sealed_ns),
+            (plain, sealed_ns),
+            (plain, settled_ns - 1),
+        ] {
+            run_erasure_pass(
+                backend,
+                &FixedClock::new(now_ns),
+                &compactor,
+                &hold,
+                &tenant,
+                Signal::Metrics,
+                1,
+                &mut memo,
+                &MaintenanceSafetyMetrics::default(),
+            )
+            .await;
+            assert!(
+                plain.get(&done_key, GetRange::Full).await.is_err(),
+                "at {now_ns} the ack hour is sealed but not plannable, so no .done is written"
+            );
+        }
+        assert_eq!(
+            store.fault_count(Op::List, ravel_object_store::fault::FaultKind::Permanent),
+            0,
+            "the completion gate does not list a bucket it may not judge yet"
+        );
+
+        run_erasure_pass(
+            plain,
+            &FixedClock::new(settled_ns),
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+            &MaintenanceSafetyMetrics::default(),
+        )
+        .await;
+        assert!(
+            plain.get(&done_key, GetRange::Full).await.is_ok(),
+            "once the ack hour is plannable and serves nothing, the request completes"
+        );
+        assert!(plain.get(&dreq_key, GetRange::Full).await.is_ok());
     }
 
     // --- Issue #2580: a log object whose stream_attrs blob the writer refuses ---
