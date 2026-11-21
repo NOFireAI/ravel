@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # investigations.test.sh -- the selective-investigations harness's cases
 # (issue #3699). No AWS, no ravel-server, no network; runs in about 11
-# minutes (the Box suite alone about 504 s). CI's doc-scripts job runs it
-# beside benchmarks/clickbench/kit/kit.test.sh.
+# minutes (the Box suite alone about 504 s). CI's doc-scripts-suite job runs
+# it on a runner of its own.
 #
 # It syntax-checks every shell script of the harness, then runs
 # investigations_cases.py: gen_corpus.py recounts, statements.toml and

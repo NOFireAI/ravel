@@ -22,7 +22,7 @@ env:
 # Every checkout below carries `persist-credentials: false` for the same
 # reason from the other side: no job here runs git against the remote after
 # checking out (the merge-base filters in `changes` and `docker-build`,
-# the changelog guard and budget raise-check in `doc-scripts`, and the
+# the changelog guard and budget raise-check in `doc-scripts-rest`, and the
 # base worktree in `supply-chain` read only what
 # fetch-depth: 0 already fetched), so the token must not sit in .git/config
 # where that build-script code could read it.
@@ -307,23 +307,18 @@ jobs:
   # doc-drift target it guards lives under docs/ -- a docs-only PR that edits
   # docs/query-engine.md must still be checked, which a docs_only skip would
   # miss. It is one lightweight runner, not a workspace compile.
-  doc-scripts:
+  #
+  # Split in three (issue #4375): this job, the doc-scripts-suite matrix for
+  # the three slow suites, and the required check `doc-scripts` after them.
+  doc-scripts-rest:
     # The guard only reads the checkout; nothing here needs write scope.
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    # The job took 7.5 to 9.5 minutes on main before the ClickBench kit's
-    # sampler cases were added, and the kit suite alone now runs over 5.
-    # Measured on 2026-11-03 over the last four main runs: 14.5 to 19.4
-    # minutes, and the investigations harness cases add about 100 s, so
-    # 20 was crossed on the first run that carried them. On 2026-11-09, ten
-    # consecutive runs took 23.7 to 30.3 minutes, and two (one on main) were
-    # cancelled at 30. On 2026-11-17 it took 34 to 39 minutes on merge-queue
-    # runs and 41 on the pull request run of #4366, and the merge-queue
-    # entries of #4359 and #4366 were cancelled at 45. Splitting the job is
-    # tracked on #4375.
-    # budget: p90 39 min on 2026-11-17
-    timeout-minutes: 60
+    # 7.0 to 9.4 minutes without the three suites in doc-scripts-suite,
+    # over 19 runs on 2026-11-21.
+    # budget: p90 9 min on 2026-11-21
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -340,8 +335,6 @@ jobs:
         run: deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
       - name: MetricsBench effective-config capture cases (epic #2821)
         run: bash deploy/metricsbench/tests/capture-effective-config.test.sh
-      - name: MetricsBench end-to-end driver cases (issue #940)
-        run: bash deploy/metricsbench/tests/run.test.sh
       - name: Walk-expiry launcher dry-run cases (issue #3779)
         run: bash deploy/walk-expiry/aws/launch.test.sh
       - name: MCP agent evaluation runner cases (issue #1385)
@@ -689,10 +682,6 @@ jobs:
       # stubbed curl, no network and no cache action needed.
       - name: Fetch-pinned-tool download retry cases (issue #4093)
         run: bash scripts/fetch-pinned-tool-download.test.sh
-      - name: ClickBench kit cases
-        run: bash benchmarks/clickbench/kit/kit.test.sh
-      - name: Investigations harness cases (issue #3699)
-        run: bash benchmarks/investigations/investigations.test.sh
       # And the check that keeps this list honest. Python suites are enrolled
       # by `unittest discover -p 'test_*.py'`, so they cannot be orphaned;
       # shell suites are enumerated by hand and a new one runs nowhere until
@@ -704,6 +693,57 @@ jobs:
         run: bash scripts/guards/check-test-suites-run.sh
       - name: Python script unit tests
         run: make test-python
+
+  # The three slow suites of the doc-scripts check, one runner each. They
+  # stub every tool and read no git history. One cap for all legs: the
+  # budget guard pools matrix legs under the job key.
+  doc-scripts-suite:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    # Slowest leg (metricsbench) took 10.8 to 16.9 minutes as a step of the
+    # old job, over 19 runs on 2026-11-21.
+    # budget: p90 17 min on 2026-11-21
+    timeout-minutes: 30
+    strategy:
+      # fail-fast would report the other legs as cancelled.
+      fail-fast: false
+      matrix:
+        suite: [metricsbench, clickbench-kit, investigations]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: MetricsBench end-to-end driver cases (issue #940)
+        if: matrix.suite == 'metricsbench'
+        run: bash deploy/metricsbench/tests/run.test.sh
+      - name: ClickBench kit cases
+        if: matrix.suite == 'clickbench-kit'
+        run: bash benchmarks/clickbench/kit/kit.test.sh
+      - name: Investigations harness cases (issue #3699)
+        if: matrix.suite == 'investigations'
+        run: bash benchmarks/investigations/investigations.test.sh
+
+  # The required check, under the name the protect-main ruleset lists. Same
+  # shape as `check`: a skipped required check passes, so it always runs.
+  doc-scripts:
+    needs: [doc-scripts-rest, doc-scripts-suite]
+    if: always()
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Decide the doc-scripts lane
+        env:
+          REST_RESULT: ${{ needs.doc-scripts-rest.result }}
+          SUITE_RESULT: ${{ needs.doc-scripts-suite.result }}
+        run: |
+          echo "doc-scripts-rest=$REST_RESULT doc-scripts-suite=$SUITE_RESULT"
+          if [ "$REST_RESULT" != "success" ] || [ "$SUITE_RESULT" != "success" ]; then
+            echo "::error::doc-scripts is not green"
+            exit 1
+          fi
 
   # TLA+ fast lane (ADR-1113). Runs only when formal_area is set: a change to
   # formal/ or scripts/check-tla.sh. Exhaustive checking is too slow for the

@@ -262,7 +262,7 @@ if ((orphans > 0)); then
   echo
   echo "${orphans} of ${total} shell test suite(s) run in no CI job." >&2
   echo "A suite that runs nowhere is green from the day it lands and proves nothing." >&2
-  echo "Add a step naming it (doc-scripts in ci.yml is where the bash-only suites" >&2
+  echo "Add a step naming it (doc-scripts-rest in ci.yml is where the bash-only suites" >&2
   echo "live), or add it to this script's 'excepted' list with a reason." >&2
   exit 1
 fi
