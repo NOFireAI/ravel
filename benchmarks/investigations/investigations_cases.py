@@ -6454,6 +6454,45 @@ FINISHED=1
         p = subprocess.run([BASH, driver], capture_output=True, text=True, timeout=120)
         return p.returncode, p.stdout + p.stderr, out
 
+    def test_compact_fence_off_follows_the_cli_help(self):
+        # compact-tenant gets --late-commit-fence off only from a ravel-cli
+        # whose maintain compact-tenant --help lists the flag: such a CLI
+        # refuses --max-flush-lifetime 0s with the fence on (ADR-4561), and
+        # an older one rejects the flag.
+        for listed, want in ((True, "--max-flush-lifetime 0s --late-commit-fence off --no-claim"),
+                             (False, "--max-flush-lifetime 0s --no-claim")):
+            out = self.path(f"out-fence-{int(listed)}")
+            stub = self.path(f"stub-help-{int(listed)}")
+            with open(stub, "w") as f:
+                f.write('#!/bin/sh\ncase " $* " in *" --help "*)\n')
+                if listed:
+                    f.write("  echo '      --late-commit-fence <LATE_COMMIT_FENCE>'\n")
+                f.write("  echo '      --max-flush-lifetime <MAX_FLUSH_LIFETIME>'\n  exit 0 ;;\nesac\n"
+                        'echo "argv: $*"\nexit 0\n')
+            os.chmod(stub, 0o755)
+            driver = self.path(f"driver-fence-{int(listed)}.sh")
+            with open(driver, "w") as f:
+                f.write(f"""set -u
+source {os.path.join(BOX, "run.sh")} --dry-run --lane local --run-toml {os.path.join(BOX, "run.local-smoke.toml")} --out {out}
+DRY_RUN=0
+load_config
+mkdir -p "$WORK"
+BIN={stub}
+CLI=({stub})
+compact_fence_flags || echo FENCE-PROBE-FAILED
+compact_child || echo COMPACT-CHILD-FAILED
+cat "$WORK/compact-spans.out" "$WORK/compact-logs.out"
+FINISHED=1
+""")
+            p = subprocess.run([BASH, driver], capture_output=True, text=True, timeout=120)
+            text = p.stdout + p.stderr
+            self.assertNotIn("FAILED", text, (listed, text))
+            argv = [line for line in text.splitlines() if line.startswith("argv: ")]
+            self.assertEqual(len(argv), 2, (listed, text))
+            for line in argv:
+                self.assertIn("maintain compact-tenant", line)
+                self.assertTrue(line.endswith(want), (listed, line))
+
     def test_failed_state_keeps_its_log_and_the_run_goes_on(self):
         # Items 1 and 2: each failed fold's log is copied to out/logs/ and
         # named by its failed_states line, and run_states returns after the

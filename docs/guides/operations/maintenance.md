@@ -926,11 +926,14 @@ List the tenant's requests first:
 ravel-cli erase status --tenant <name> --signal <signal>
 ```
 
-For every request it reports `COMPLETED` whose window, as it was submitted,
-overlaps the hours you are about to maintain with the fence off (a request
-with no window overlaps every hour), resubmit it with `ravel-cli erase
-submit` and the same matchers and window after the run, so a new rewrite
-covers the L1 segments.
+`erase status` prints the matchers and window of a `PENDING` request only.
+For a `COMPLETED` request it prints the request id, the times and the
+per-bucket dropped counts, so take the matchers and window from your own
+record of the original `erase submit`. After the run, resubmit every
+`COMPLETED` request with `ravel-cli erase submit` and those same matchers and
+window, so a new rewrite covers the L1 segments. If you have no record of a
+completed request's matchers, keep the fence on for that tenant: its late
+buckets stay uncompacted, which costs read performance, not correctness.
 
 ### A log object compaction cannot rewrite
 
