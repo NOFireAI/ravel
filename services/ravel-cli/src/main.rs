@@ -2541,6 +2541,16 @@ enum MaintainCommand {
         /// re-list and the record PUT.
         #[arg(long)]
         no_claim: bool,
+        /// Whether a plan leaves out the commit records the store stamped at
+        /// or after the bucket's late-commit cutoff (its hour's end plus the
+        /// seal margin, ADR-4561), and waits for the store's clock to pass
+        /// that cutoff plus 60 s. `on`, the default, makes every plan of a
+        /// bucket name the same inputs. `off` plans from every listed commit
+        /// record once the bucket seals: for a bucket whose commit records were
+        /// all written after it sealed, such as one `commit reconstruct`
+        /// rebuilt, which `on` leaves uncompacted.
+        #[arg(long, value_enum, default_value_t = maintain::LateCommitFenceArg::On)]
+        late_commit_fence: maintain::LateCommitFenceArg,
         /// Override the compactor's `max_flush_lifetime` (humantime duration,
         /// e.g. `30m`, `0s`; the same grammar and unit as ravel-server's
         /// `--gc-max-flush-lifetime`). A bucket seals only at its hour's end
@@ -2631,6 +2641,16 @@ enum MaintainCommand {
         /// re-list and the record PUT.
         #[arg(long)]
         no_claim: bool,
+        /// Whether a plan leaves out the commit records the store stamped at
+        /// or after the bucket's late-commit cutoff (its hour's end plus the
+        /// seal margin, ADR-4561), and waits for the store's clock to pass
+        /// that cutoff plus 60 s. `on`, the default, makes every plan of a
+        /// bucket name the same inputs. `off` plans from every listed commit
+        /// record once the bucket seals: for a bucket whose commit records were
+        /// all written after it sealed, such as one `commit reconstruct`
+        /// rebuilt, which `on` leaves uncompacted.
+        #[arg(long, value_enum, default_value_t = maintain::LateCommitFenceArg::On)]
+        late_commit_fence: maintain::LateCommitFenceArg,
         /// Override the compactor's `max_flush_lifetime` (humantime duration,
         /// e.g. `30m`, `0s`; the same grammar and unit as ravel-server's
         /// `--gc-max-flush-lifetime`). A bucket seals only at its hour's end
@@ -2799,6 +2819,16 @@ enum MaintainCommand {
         /// the record PUT.
         #[arg(long)]
         no_claim: bool,
+        /// Whether a plan leaves out the commit records the store stamped at
+        /// or after the bucket's late-commit cutoff (its hour's end plus the
+        /// seal margin, ADR-4561), and waits for the store's clock to pass
+        /// that cutoff plus 60 s. `on`, the default, makes every plan of a
+        /// bucket name the same inputs. `off` plans from every listed commit
+        /// record once the bucket seals: for a bucket whose commit records were
+        /// all written after it sealed, such as one `commit reconstruct`
+        /// rebuilt, which `on` leaves uncompacted.
+        #[arg(long, value_enum, default_value_t = maintain::LateCommitFenceArg::On)]
+        late_commit_fence: maintain::LateCommitFenceArg,
         /// Report what is below the target now, from a read-only re-audit, and
         /// write nothing: no migration, no re-encode, no claim, no cursor and
         /// no floor.
@@ -3713,6 +3743,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     hour,
                     dry_run,
                     no_claim,
+                    late_commit_fence,
                     max_flush_lifetime,
                     l1_part_memory_target_bytes,
                     max_l1_part_bytes,
@@ -3742,7 +3773,8 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 l1_part_memory_target_bytes,
                 max_l1_part_bytes,
                 compaction_zstd_level,
-                &maintain::ClaimOptions::for_invocation(no_claim),
+                &maintain::ClaimOptions::for_invocation(no_claim)
+                    .with_late_commit_fence(late_commit_fence.mode()),
                 &scratch,
             )
             .await
@@ -3757,6 +3789,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     to_hour,
                     dry_run,
                     no_claim,
+                    late_commit_fence,
                     max_flush_lifetime,
                     l1_part_memory_target_bytes,
                     max_l1_part_bytes,
@@ -3792,7 +3825,8 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 bucket_concurrency,
                 compaction_zstd_level,
                 now_ns()?,
-                &maintain::ClaimOptions::for_invocation(no_claim),
+                &maintain::ClaimOptions::for_invocation(no_claim)
+                    .with_late_commit_fence(late_commit_fence.mode()),
                 &scratch,
             )
             .await
@@ -3876,6 +3910,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     family,
                     budget_records,
                     no_claim,
+                    late_commit_fence,
                     dry_run,
                     reencode_compaction_parts,
                     tenant_kms,
@@ -3902,7 +3937,8 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     dry_run,
                     reencode_compaction_parts,
                 },
-                &maintain::ClaimOptions::for_invocation(no_claim),
+                &maintain::ClaimOptions::for_invocation(no_claim)
+                    .with_late_commit_fence(late_commit_fence.mode()),
             )
             .await
         }
@@ -9037,9 +9073,13 @@ mod tenant_kms_dispatch_tests {
         seed::two_l0_logs(plain_store(endpoint).as_ref(), TENANT, 0, HOUR).await;
     }
 
-    const COMPACT_BUCKET: [&str; 10] = [
+    // The fake endpoint stamps every object in 2020, after `HOUR` sealed, so
+    // the late-commit fence would leave both L0 records out of every plan.
+    const COMPACT_BUCKET: [&str; 12] = [
         "maintain",
         "compact-bucket",
+        "--late-commit-fence",
+        "off",
         "--tenant",
         TENANT,
         "--signal",
@@ -9049,9 +9089,11 @@ mod tenant_kms_dispatch_tests {
         "--hour",
         "100",
     ];
-    const COMPACT_TENANT: [&str; 12] = [
+    const COMPACT_TENANT: [&str; 14] = [
         "maintain",
         "compact-tenant",
+        "--late-commit-fence",
+        "off",
         "--tenant",
         TENANT,
         "--signal",

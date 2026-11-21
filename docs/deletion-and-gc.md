@@ -1126,7 +1126,11 @@ marker (ADR-2993, erasure amendment):
   nothing to hold. Second, an object that lands in an already-swept hour
   after the fact, a late L0 flush into a sealed bucket, is an input of no
   record that has passed its horizon: it forms no group, is held by nothing,
-  and cannot pin any request's filter, however long it sits there. So each
+  and cannot pin any request's filter, however long it sits there. With the
+  late-commit fence on (ADR-4561), a commit record stamped at or after its
+  bucket's maintain cutoff is an input of no later record either: every
+  compaction, migration and raw-L0 erasure rewrite of the bucket leaves it
+  out, so it stays raw, served and unswept for the life of the bucket. So each
   hold is discharged by the event that released the objects behind it, the
   fold reconciling the hour, an operator rebuilding HEAD, or a human clearing
   the legal hold, and no state pins a request forever. A conflicting

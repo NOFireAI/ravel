@@ -208,8 +208,8 @@ abandoned in the queue without a PUT and counted under a new reason. The
 bound sits inside the maintain seal, `end(H) + max_flush_lifetime +
 clock_skew_allowance` (65 minutes at defaults, the seal retention uses), and
 inside the fold seal (80 minutes); the 5-minute skew margin covers a commit
-PUT the store applies after the client gave up, since one attempt is bounded
-by the 20 s request timeout.
+PUT (withdrawn by the #4561 amendment below) the store applies after the
+client gave up, since one attempt is bounded by the 20 s request timeout.
 
 This reverses part of #1739 deliberately. #1739 re-derived the deadline at
 grant so a buffered flush queued behind a stall keeps its full lifetime and
@@ -592,3 +592,24 @@ latest transition, which ADR-4233 lists as a hazard rather than an accepted
 cost. `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`
 keeps its name and now counts only objects older than the window, the
 forward-bump case D6 was written for.
+
+## Amendment (2026-11-21, #4561): the skew margin does not cover an applied-late commit PUT
+
+<!-- amendment-applies: sections="D3. Flush permits: four per shard, a per-tenant share, and an hour-bounded deadline (#1921, C-01)" pointer="#4561 amendment" -->
+<!-- amendment-supersedes: phrase="the 5-minute skew margin covers a commit" pointer="#4561 amendment" -->
+
+D3 says the 5-minute skew margin covers a commit PUT the store applies after
+the client gave up, because one attempt is bounded by the 20 s request
+timeout. That sentence is withdrawn. The timeout bounds how long the client
+waits for one attempt (docs/object-store-contract.md), not when the store
+applies it, so nothing bounds how late an issued PUT can land. The same 5
+minutes is also already spent on the lag a writer may have behind the store
+and still pass its clock-lag check, so a writer near that lag has little of
+the margin left.
+
+The hour-bounded deadline is unchanged and still keeps every commit PUT a
+writer issues inside the maintain and fold seals. A PUT that lands after
+the maintain seal is handled on the maintenance side: with the late-commit
+fence on, compaction, the migrate primitive and the raw-L0 erasure rewrite
+leave a commit record stamped at or after the bucket's cutoff out of their
+plans and keep it (ADR-4561).

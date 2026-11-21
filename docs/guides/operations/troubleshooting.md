@@ -1246,6 +1246,36 @@ A count that grows without bound, or that does not fall after
 `ravel_maintain_units_stalled` clears, means that compaction does not keep
 pace with ingest. Follow [stalled unit](#stalled-unit).
 
+### Late commit records
+
+**Symptom.** `increase(ravel_maintain_late_commit_records_total[1h]) > 0`.
+
+**Cause.** The store stamped a commit record at or after its bucket's
+late-commit cutoff, `end(H) + max_flush_lifetime + clock_skew_allowance`. The
+cause is one of these:
+
+- a writer's commit PUT that reached the store after its flush gave up on
+  it;
+- a writer whose clock runs behind the store's;
+- a process paused while its PUT was in flight;
+- a bucket whose records were rebuilt or re-stamped after it sealed.
+
+Maintenance leaves each such record out of its plans and keeps it,
+so nothing is lost and queries still return its rows. A warn
+line names each record's key.
+
+**Confirm.** For one bucket, `ravel-cli maintain status --tenant <t> --signal
+<s> --shard <n> --hour <n>` prints `late_commit_records`. Every pass that
+plans the bucket counts its late records again, so a steady rise from a few
+buckets is one population being counted repeatedly, not new arrivals.
+
+**Action.** Check the writers' flush durations and their clock skew against
+the store (`ravel_ingest_abandoned_hour_bound_total`,
+`ravel_ingest_clock_lag_refused_total`). For a bucket rebuilt by `commit reconstruct` or a
+re-stamping restore, run maintenance for that shard once with
+`--late-commit-fence off` after its writers are gone. See
+[maintenance](maintenance.md#commit-records-that-land-after-the-seal).
+
 ### No objects deleted
 
 **Symptom.** `increase(ravel_maintain_objects_deleted_total[1h]) == 0` while

@@ -124,6 +124,12 @@ fn assert_other_tenant_untouched(fake: &FakeS3) {
     );
 }
 
+/// The fake endpoint stamps every object in 2020, after `HOUR` sealed, so the
+/// late-commit fence would leave both seeded L0 records out of every plan.
+fn late_records_planned() -> ClaimOptions {
+    ClaimOptions::fresh().with_late_commit_fence(ravel_maintain::LateCommitFence::Off)
+}
+
 async fn seed_two_l0_logs(store: &dyn ObjectStoreBackend) {
     seed::two_l0_logs(store, TENANT, SHARD, HOUR).await;
 }
@@ -191,7 +197,7 @@ async fn compact_bucket_writes_l1_parts_and_its_record_under_the_tenant_key() {
         false,
         None,
         None,
-        &ClaimOptions::fresh(),
+        &late_records_planned(),
     )
     .await
     .expect("compaction runs");
@@ -241,7 +247,7 @@ async fn compact_tenant_writes_l1_parts_and_its_records_under_the_tenant_key() {
         1,
         None,
         crate::now_ns().expect("wall clock"),
-        &ClaimOptions::fresh(),
+        &late_records_planned(),
         &maintain::ScratchOptions::default(),
     )
     .await

@@ -15,9 +15,9 @@ use ravel_ingest::Clock as _;
 use ravel_maintain::{
     BlockedBucket, BlockedReason, Bucket, ClaimParticipant, ClaimSkip, ClaimedCompaction,
     CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, GcConfigValues,
-    L1PartMemoryTargetSource, LegalHoldCheck, MaintainError, MergeMemoryTracker, MigrateBudget,
-    MigrateHeldBucket, MigrateHoldReason, MigrationPath, NotMigratedBucket, NotMigratedReason,
-    PublishOutcome, ReencodeBlockedBucket, ReencodeBlockedReason, RequestLedger,
+    L1PartMemoryTargetSource, LateCommitFence, LegalHoldCheck, MaintainError, MergeMemoryTracker,
+    MigrateBudget, MigrateHeldBucket, MigrateHoldReason, MigrationPath, NotMigratedBucket,
+    NotMigratedReason, PublishOutcome, ReencodeBlockedBucket, ReencodeBlockedReason, RequestLedger,
     ResolvedL1PartMemoryTarget, SweepReport, UnwritableBucket, Verification, census_family,
     compact_bucket_claimed, count_below_target, migrate_family, sweep_shard,
 };
@@ -43,6 +43,29 @@ impl SignalArg {
             SignalArg::Metrics => Signal::Metrics,
             SignalArg::Logs => Signal::Logs,
             SignalArg::Spans => Signal::Spans,
+        }
+    }
+}
+
+/// The `--late-commit-fence` values (ADR-4561 R7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum LateCommitFenceArg {
+    /// Plan a bucket only from the commit records the store stamped before
+    /// its late-commit cutoff, once the store's clock is past it. The default.
+    #[default]
+    On,
+    /// Plan from every listed commit record as soon as the bucket seals, the
+    /// behaviour before ADR-4561. For a bucket whose commit records were all
+    /// written after it sealed, such as one `commit reconstruct` rebuilt.
+    Off,
+}
+
+impl LateCommitFenceArg {
+    /// The library-level setting this flag value selects.
+    pub fn mode(self) -> LateCommitFence {
+        match self {
+            LateCommitFenceArg::On => LateCommitFence::Enforce,
+            LateCommitFenceArg::Off => LateCommitFence::Off,
         }
     }
 }
@@ -95,6 +118,11 @@ pub struct ClaimOptions {
     /// which is what makes a claim-timing test deterministic and free of any
     /// real sleep.
     pub clock: Option<Arc<dyn ravel_maintain::Clock>>,
+    /// `--late-commit-fence`: whether a plan leaves out the commit records
+    /// stamped at or after the bucket's cutoff (ADR-4561). It rides here
+    /// because every planning command installs its claims through
+    /// [`install_claims`].
+    pub late_commit_fence: LateCommitFence,
 }
 
 /// Hand-written because [`ravel_maintain::Clock`] is not `Debug`: the override
@@ -107,13 +135,15 @@ impl std::fmt::Debug for ClaimOptions {
             .field("min_input_bytes", &self.min_input_bytes)
             .field("lease_duration", &self.lease_duration)
             .field("clock_override", &self.clock.is_some())
+            .field("late_commit_fence", &self.late_commit_fence)
             .finish()
     }
 }
 
 impl ClaimOptions {
     /// One fresh process id for this invocation, the compactor's claim
-    /// defaults, the live clock, and claiming off when `no_claim` is set.
+    /// defaults, the live clock, the late-commit fence on, and claiming off
+    /// when `no_claim` is set.
     pub fn for_invocation(no_claim: bool) -> Self {
         ClaimOptions {
             no_claim,
@@ -121,7 +151,14 @@ impl ClaimOptions {
             min_input_bytes: None,
             lease_duration: None,
             clock: None,
+            late_commit_fence: LateCommitFence::Enforce,
         }
+    }
+
+    /// These options with the late-commit fence set to `fence`.
+    pub fn with_late_commit_fence(mut self, fence: LateCommitFence) -> Self {
+        self.late_commit_fence = fence;
+        self
     }
 
     /// [`Self::for_invocation`] with claiming on.
@@ -145,7 +182,8 @@ impl ClaimOptions {
 }
 
 /// Install `claims` on `config`, and return the `claims:` header line that
-/// says what was installed.
+/// says what was installed. The late-commit fence is installed whatever the
+/// claim mode.
 ///
 /// A dry run installs no participant: the claim protocol does not honour
 /// `dry_run` itself, so a participant on a dry run would write claim objects.
@@ -155,6 +193,7 @@ impl ClaimOptions {
 /// The participant's clock is [`ClaimOptions::clock`], which is [`LiveClock`]
 /// for the binary and an injected clock for a test that drives claim timing.
 fn install_claims(config: &mut CompactorConfig, dry_run: bool, claims: &ClaimOptions) -> String {
+    config.late_commit_fence = claims.late_commit_fence;
     if let Some(bytes) = claims.min_input_bytes {
         config.claim_min_input_bytes = bytes;
     }
@@ -1970,9 +2009,10 @@ pub async fn status(
     )
     .await?;
 
-    let listing = ravel_maintain::read::list_bucket(store.as_ref(), &bucket)
+    let mut listing = ravel_maintain::read::list_bucket(store.as_ref(), &bucket)
         .await
         .map_err(|err| anyhow::anyhow!("failed to list bucket: {err}"))?;
+    listing.classify_late(bucket.late_commit_cutoff_ns(&config));
 
     // Superseded-input count: the L0 inputs every compaction record names,
     // which the superseded sweep would delete once the horizon elapses. Also
@@ -2025,6 +2065,7 @@ pub async fn status(
         listing.compaction_record_keys.len()
     );
     println!("l0_commit_records: {}", listing.commit_keys.len());
+    println!("late_commit_records: {}", listing.late_commit_keys.len());
     println!("superseded_input_count: {superseded_inputs}");
     println!("l1_parts_present: {}", l1_objects.len());
     println!("unreferenced_part_count: {unreferenced_parts}");
@@ -2569,6 +2610,9 @@ fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -
             NotMigratedReason::PartIndexRefusal { refusal } => {
                 format!("part_index_refusal refusal={}", refusal.name())
             }
+            NotMigratedReason::LateCommitRecords { records } => {
+                format!("late_commit_records records={records}")
+            }
         };
         out.push_str(&format!(
             "not_migrated: shard={} hour={} path={path} reason={reason}\n",
@@ -2608,6 +2652,18 @@ fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -
              Re-running migrate is not the remedy: the bucket clears when retention ages it \
              out (subject to the format-version hold, which keeps an object this build cannot \
              read). That is not a command you run.\n",
+        );
+    }
+    if buckets
+        .iter()
+        .any(|b| matches!(b.reason, NotMigratedReason::LateCommitRecords { .. }))
+    {
+        out.push_str(
+            "# A late_commit_records bucket is the exception to the first sentence: the walk \
+             migrated its on-time commit records and left out the ones the store stamped at or \
+             after the bucket's late-commit cutoff (ADR-4561). Those stay raw, still served, and \
+             keep the floor from rising for as long as they are stored; every run names the \
+             bucket again. --late-commit-fence off migrates them, at the cost of the fence.\n",
         );
     }
     out

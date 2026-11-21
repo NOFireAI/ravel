@@ -33,8 +33,10 @@ use crate::rspan_codec::SpanCodec;
 /// cursor advancement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactionOutcome {
-    /// Not yet sealed: the writer interlock does not yet guarantee a complete
-    /// input set. Later hours are also unsealed.
+    /// Not yet sealed: writers may still issue commit PUTs into the bucket,
+    /// or, with the late-commit fence on, this pass's clock or the store's is
+    /// not yet past the cutoff plus the settle allowance (ADR-4561 R3). Later
+    /// hours are also unsealed.
     NotSealed,
     /// A retention tombstone is present: the bucket contributes nothing and is
     /// never compacted (ADR-0019).
@@ -682,18 +684,32 @@ async fn compact_bucket_scoped(
 ) -> Result<(ClaimedCompaction, Option<ClaimAcquisition>)> {
     crate::rlog::check_rlog_writer_config(config, bucket)?;
     let start_ns = clock.now_ns();
-    if !bucket.is_sealed(start_ns, config) {
+    if !crate::late_commit::may_list_to_plan(bucket, start_ns, config) {
         return Ok((ClaimedCompaction::Ran(CompactionOutcome::NotSealed), None));
     }
 
-    let listing = list_bucket_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
+    let mut listing =
+        list_bucket_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
     if let Some(refused) = listing_gate(&listing) {
         return Ok((ClaimedCompaction::Ran(refused), None));
     }
-    if listing.commit_keys.len() < config.min_compaction_inputs {
+    if !crate::late_commit::fence_planning_listing(
+        store,
+        bucket,
+        start_ns,
+        config,
+        &mut listing,
+        "compaction",
+    ) {
+        return Ok((ClaimedCompaction::Ran(CompactionOutcome::NotSealed), None));
+    }
+    // ADR-4561 R4: the on-time commit records are the whole L0 set, for the
+    // minimum, the load and the identities the record names.
+    let planning_keys = listing.planning_commit_keys();
+    if planning_keys.len() < config.min_compaction_inputs {
         return Ok((
             ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs {
-                count: listing.commit_keys.len(),
+                count: planning_keys.len(),
             }),
             None,
         ));
@@ -705,7 +721,7 @@ async fn compact_bucket_scoped(
     let inputs = crate::read::load_inputs_with_ledger(
         store,
         bucket,
-        &listing.commit_keys,
+        &planning_keys,
         config.input_read_concurrency,
         config.request_ledger.as_ref(),
     )

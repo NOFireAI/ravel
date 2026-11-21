@@ -414,6 +414,19 @@ ends one operation in practice.
   load-bearing here -- an age decision read from this field may be wrong
   under skew or granularity, so it may only cost duplicated work, never
   correctness.
+- Maintenance planning reads `last_modified` too (ADR-4561). With the
+  late-commit fence on, a compaction, a format migration or a raw-L0 erasure
+  rewrite of a sealed bucket plans only from the commit records stamped
+  before the bucket's cutoff `end(H) + max_flush_lifetime +
+  clock_skew_allowance`, and waits until the store's clock (the
+  `observed_store_time_ns` of a response read after the planning LIST) is 60
+  s past that cutoff. A record stamped at or after the cutoff stays in place,
+  served and kept; it is only left out of the plan. This use is advisory in
+  the same sense: a wrong stamp defers a compaction, or reopens the race the
+  fence closes, and never changes a query answer or deletes a write. A copy,
+  replication or restore that re-stamps a sealed hour's commit records makes
+  every one late, so maintenance plans nothing there until it runs with
+  `--late-commit-fence off`.
 
 ### Conditional reads (ADR-2040 decision 1)
 
