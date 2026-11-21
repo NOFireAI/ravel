@@ -9,7 +9,8 @@ An area whose directory holds `antithesis-mutants.tsv` is enrolled in
 Antithesis: its tables carry a sixth column, `Antithesis property`, and the
 `.tsv` maps each `negative/*.cfg` to a Rust mutant and a property the table
 carries (ADR-4326 decision 6; grammar in [README.md](README.md#the-antithesis-property-column)).
-No area is enrolled yet, so every area table is five-column.
+The common, commit, catalog and lifecycle areas are enrolled; the other
+area tables are five-column.
 
 | Area | Specification | Rows | Rust crates covered | Table |
 |---|---|---|---|---|
@@ -28,14 +29,6 @@ Total: 202 traceability rows across the suite.
 Every row still lacking a test, gathered from each area's `traceability.md`
 and tagged by area, the Rust path the row cites, and the reason no test
 covers it.
-
-### lifecycle (1 row, test gap)
-
-- `CompleteErasure / CompletionImpliesNoPreRewriteExposure` —
-  `services/ravel-server/src/maintain.rs::write_erasure_completion` — the
-  production symbol writes the completion object, but no test drives it
-  through the served-set branch end-to-end; only the gate
-  (`bucket_erasure_completion`) is unit-tested
 
 ### maintenance (3 rows, proposal with no shipped caller)
 
@@ -103,4 +96,4 @@ covers it.
   (`kernel.rs:1856`), but no test records a step after a cancel request and
   asserts whether `require_running` refuses it
 
-Total test-debt rows: 18 (lifecycle 1, maintenance 3, agents 14).
+Total test-debt rows: 17 (maintenance 3, agents 14).

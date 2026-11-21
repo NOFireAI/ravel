@@ -1,0 +1,5 @@
+# BuildKit reads this for driver/Dockerfile (context antithesis/lifecycle-gc/):
+# keep the local cargo target directory and run output out of the context.
+**/target
+**/.gate-logs
+out
