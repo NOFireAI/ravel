@@ -81,7 +81,7 @@ pub async fn write_memo_snapshot(
     bytes: Vec<u8>,
 ) -> Result<(), StoreError> {
     let key = memo_key(process_id);
-    store
+    let put = store
         .put(
             &key,
             bytes.into(),
@@ -90,7 +90,24 @@ pub async fn write_memo_snapshot(
                 checksum: None,
             },
         )
-        .await?;
+        .await;
+    // Judged from the store's answer: only a conditional write can be refused
+    // for a precondition or an existing object. A store-contract and
+    // reachability probe: false only if the store refuses an unconditional
+    // PUT.
+    ravel_invariant::inv_always!(
+        !matches!(
+            put,
+            Err(StoreError::PreconditionFailed | StoreError::AlreadyExists)
+        ),
+        "maintenance: a memo snapshot write is an overwrite, never refused as a CAS",
+        std::collections::BTreeMap::from([("key", key.clone()), ("result", format!("{put:?}")),])
+    );
+    put?;
+    ravel_invariant::inv_reachable!(
+        "maintenance: a memo snapshot was written",
+        std::collections::BTreeMap::from([("key", key)])
+    );
     Ok(())
 }
 
@@ -535,6 +552,69 @@ mod tests {
             vec![verified(id, &second)],
             "the second write's bytes are what's stored"
         );
+    }
+
+    /// HeartbeatAndMemoNeverCas, memo half: a first write and an overwrite of
+    /// the same key are both evaluated true from the store's answer, and
+    /// never false.
+    #[tokio::test]
+    async fn memo_never_cas_holds_over_an_overwrite() {
+        use crate::publish::tests::{capturing, evaluations};
+        if !capturing() {
+            return;
+        }
+        let store = MemoryStore::new();
+        let id = Uuid::from_u128(0x4D3);
+        write_memo_snapshot(&store, &id, frame(id, &empty_body(), 1))
+            .await
+            .expect("first write");
+        write_memo_snapshot(&store, &id, frame(id, &empty_body(), 2))
+            .await
+            .expect("overwrite");
+        let found = evaluations(
+            "maintenance: a memo snapshot write is an overwrite, never refused as a CAS",
+            &id.to_string(),
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().all(|(held, _)| *held), "{found:?}");
+        let written = evaluations("maintenance: a memo snapshot was written", &id.to_string());
+        assert_eq!(written.len(), 2, "{written:?}");
+    }
+
+    /// HeartbeatAndMemoNeverCas, memo half: a store that refuses the
+    /// unconditional PUT as a failed conditional write breaks the store
+    /// contract, and the property records false.
+    #[tokio::test]
+    async fn memo_never_cas_is_false_when_the_store_refuses_an_overwrite() {
+        use crate::publish::tests::{capturing, evaluations};
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite)
+                .with_key_contains(MEMO_PREFIX),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        let id = Uuid::from_u128(0x4D4);
+        let err = write_memo_snapshot(&store, &id, frame(id, &empty_body(), 1))
+            .await
+            .expect_err("the refused PUT surfaces");
+        assert!(matches!(err, StoreError::PreconditionFailed), "{err:?}");
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+            1
+        );
+        if !capturing() {
+            return;
+        }
+        let found = evaluations(
+            "maintenance: a memo snapshot write is an overwrite, never refused as a CAS",
+            &id.to_string(),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].0, "{found:?}");
+        let written = evaluations("maintenance: a memo snapshot was written", &id.to_string());
+        assert!(written.is_empty(), "{written:?}");
     }
 
     /// Byte limits small enough that a test object over the cap is a few
