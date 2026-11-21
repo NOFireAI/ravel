@@ -177,6 +177,20 @@ left behind.
   (queries, the fold, scrub, migrate and the erasure pass; the sweep does not
   count), so a record still present is counted again by every later
   resolution.
+- **An erasure request's `.dreq` is now kept while a compaction record that
+  conflicts with its rewrite is live.** When a compaction record (including a
+  migrate re-encode) shares inputs with a live erasure rewrite but is not
+  covered by it, both are served and the compaction's parts can still hold
+  the erased rows; the erasure-request sweep used to delete the `.dreq` once
+  its horizon passed, removing the query-time filter that hid them. It now
+  keeps the `.dreq`, counts it in
+  `ravel_maintain_dreq_held_by_superseded_inputs_total`, logs a warn line per
+  kept request, and releases it on the first pass after the record is deleted
+  or a later rewrite covers it. When a rewrite's supersession chain names a
+  record that has already been reclaimed, the conflict and the requests
+  behind it cannot be known, so while such a rewrite shares its bucket with
+  a served compaction record every `.dreq` for that tenant and signal is
+  kept the same way.
 - **A legal hold now stops the deletes of a maintenance pass that is already
   running.** Maintenance read the hold set once per tenant per tick, so a hold
   placed after that read was not honored until the next tick, up to one
