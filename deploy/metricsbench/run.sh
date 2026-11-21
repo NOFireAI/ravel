@@ -479,8 +479,9 @@
 # after the read-back with their deltas; ravel_only.l0.series_query_ms,
 # .verdict and the same under l1 repeat the two headline figures. A mismatch
 # or error fails the read-back step, and so does any of those figures missing
-# (a miss); refused (budget) and deadline go on to the next step. The sampler, mimir-readiness, objects, query, capture,
-# provenance, validate, memory, object-spans and folded steps do not run, so
+# (a miss); refused (budget) and deadline go on to the next step. The
+# sampler, mimir-readiness, objects, query, capture, provenance, validate,
+# memory, object-spans and folded steps do not run, so
 # no report.json, memory.jsonl or memory-summary.json is written; the query,
 # query_scrapes, mimir_readiness, ravel_objects, object_spans and
 # readback_folded stamps say skipped or not applicable with the reason.
@@ -1266,7 +1267,7 @@ elif op == "ravel-only-ingest":
         sys.exit(3)
     verdict, ms = grade_readback_error(err) if int(code) != 0 and isinstance(err, str) else ("error", None)
     if int(code) == 0 and isinstance(rb, dict) and rb.get("matches_expected") is True:
-        print(json.dumps({"exit_code": 0, "verdict": "matched", "error": None}))
+        print(json.dumps({"exit_code": 0, "verdict": "matched", "error": None, "series_query_ms": None}))
     elif verdict in ("refused (budget)", "deadline"):
         print(json.dumps({"exit_code": int(code), "verdict": verdict, "error": err, "series_query_ms": ms}))
     else:
