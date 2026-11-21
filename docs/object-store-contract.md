@@ -2423,6 +2423,13 @@ for the stores it reads tables' files through.
   `Corrupted` (data objects are created with CreateIfAbsent, so rewrites
   cannot produce differing content for one key).
 - Every caller passes a deadline; trait impls honor cancellation by drop.
+- `S3Store`'s CAS version is the content ETag, derived from the bytes: on
+  RustFS, and on AWS S3 for a single-part PUT, a key deleted and recreated
+  with identical bytes gets back the version it had, and a CAS holding the
+  pre-delete version succeeds. A CAS target must not be recreated
+  byte-identically while another writer may still hold an older version. A
+  target whose every write carries a per-write random field avoids this, as
+  the migrate cursor's nonce does.
 - Every read of an object Ravel did not write goes through `get_pinned`
   carrying the identity the catalog recorded for it. A plain `get` of such an
   object is a bug: the key is mutable from Ravel's point of view, so the

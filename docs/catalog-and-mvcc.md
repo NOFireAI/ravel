@@ -742,11 +742,17 @@ and the CAS read/write helpers.
   and format family: the last `(shard, hour)` bucket the walk finished. It
   sits on a path disjoint from the maint cursor (a shard segment is always
   numeric, `migrate` never is) and has the same CAS exemption; losing or
-  corrupting it costs a rescan from the start. Its payload is tag 1, then
-  the shard and the hour as little-endian u32s (9 bytes). The same key can
-  instead hold a drained stamp, tag 2, then the certificate version
-  (u32), the certified time (i64) and the late-write watermark (i64), all
-  little-endian (21 bytes). The server's background migrate writes it
+  corrupting it costs a rescan from the start. Its payload is tag 3, then
+  the shard and the hour as little-endian u32s, then a nonce: the writing
+  run's start time (i64) and a random u64, little-endian (25 bytes). The
+  nonce keeps a cursor deleted and recreated at the same position from
+  repeating its bytes, and so its version on a store whose version is the
+  content ETag. A tag-1 payload, the shard and the hour without a nonce
+  (9 bytes), is written by v0.34.0 and earlier builds and still
+  read as a position. The same key can instead hold a drained stamp, tag 2,
+  then the certificate version (u32), the certified time (i64), the
+  late-write watermark (i64) and the same nonce, all little-endian (37
+  bytes). The server's background migrate writes it
   `CreateIfAbsent` after the cursor is deleted, when a walk of a family
   whose `sys/compat` certificate is `contradicted` drains with no bucket
   held and no straggler left, and skips that family while the stamp matches
@@ -761,7 +767,10 @@ and the CAS read/write helpers.
   cannot resume a walk its budget stopped. A build before H9 (v0.31.1, for
   one) reads a position only from a 9-byte tag-1 payload, so it walks from
   the start and treats the stamp as a malformed cursor of its own, replaced
-  by CAS or deleted the same way.
+  by CAS or deleted the same way. Those builds read a tag-3 cursor as they
+  read a stamp: a build with H9 that writes tag 1 (v0.34.0) walks from the
+  start and leaves it in place, and a build before H9 replaces it by CAS or
+  deletes it.
 - The unnamed-since markers (`<signal>/maint/unn/...`, ADR-1133) record when
   a sweep first found a delete candidate past its protection horizon that the
   live HEAD does not name. The retention marker `retire.unn` is one per

@@ -107,10 +107,25 @@ use crate::sweep::superseded_input_commit_keys;
 /// [`crate::scan`]'s compaction cursor, this is not a frozen format: the tag
 /// only lets a future encoding change be recognized and treated as "no usable
 /// cursor" (rescan from the start), never silently misread.
-const MIGRATE_CURSOR_TAG: u8 = 1;
+///
+/// Tag 3 carries a [`CursorNonce`] after the position. `S3Store`'s CAS version
+/// is the content ETag, so a cursor deleted by a finished walk and recreated
+/// at the same position with the same bytes would hand back the version a
+/// stale run still holds, and that run's CAS would overwrite the recreated
+/// cursor (issue #4389). The nonce makes each write's bytes differ.
+const MIGRATE_CURSOR_TAG: u8 = 3;
 
-/// Length of a well-formed cursor payload: tag + shard (u32 LE) + hour (u32 LE).
-const MIGRATE_CURSOR_LEN: usize = 9;
+/// Length of a well-formed tag-3 cursor payload: tag + shard (u32 LE) + hour
+/// (u32 LE) + [`CursorNonce`].
+const MIGRATE_CURSOR_LEN: usize = 9 + CURSOR_NONCE_LEN;
+
+/// The cursor tag written by builds before issue #4389, without a nonce. Still
+/// read as a usable position; never written.
+const MIGRATE_CURSOR_TAG_V1: u8 = 1;
+
+/// Length of a well-formed tag-1 cursor payload: tag + shard (u32 LE) + hour
+/// (u32 LE).
+const MIGRATE_CURSOR_V1_LEN: usize = 9;
 
 /// Tag of the payload [`background_migrate_unit`] leaves at the cursor key
 /// after a contradicted family's walk drained clean: the [`ContradictionStamp`]
@@ -118,9 +133,14 @@ const MIGRATE_CURSOR_LEN: usize = 9;
 /// A build that does not know the tag leaves it in place and walks (H9).
 const MIGRATE_DRAINED_TAG: u8 = 2;
 
-/// Length of a well-formed drained payload: tag + certificate version (u32 LE)
-/// + certified time (i64 LE) + watermark (i64 LE).
-const MIGRATE_DRAINED_LEN: usize = 21;
+/// Length of a well-formed drained payload: tag, certificate version (u32 LE),
+/// certified time (i64 LE), watermark (i64 LE), then a [`CursorNonce`]. The
+/// nonce keeps two drains under the same stamp from writing identical bytes,
+/// for the same reason as [`MIGRATE_CURSOR_TAG`]'s.
+const MIGRATE_DRAINED_LEN: usize = 21 + CURSOR_NONCE_LEN;
+
+/// Length of an encoded [`CursorNonce`]: start time (i64 LE) + random (u64 LE).
+const CURSOR_NONCE_LEN: usize = 16;
 
 /// The per-invocation work budget for [`migrate_family`], counted in L0 records:
 /// those an L0 migration rewrote, and the inputs a re-encoded compaction record
@@ -775,16 +795,24 @@ async fn read_cursor(store: &dyn ObjectStoreBackend, key: &str) -> Result<Stored
                         version: got.version,
                     },
                 }),
-                Some(&tag) if tag != MIGRATE_CURSOR_TAG => Ok(StoredCursor::ForeignTag { tag }),
-                Some(_) if data.len() == MIGRATE_CURSOR_LEN => {
-                    let shard = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
-                    let hour = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
-                    Ok(StoredCursor::Usable {
-                        position: (shard, hour),
-                        version: got.version,
+                Some(&tag) if tag == MIGRATE_CURSOR_TAG || tag == MIGRATE_CURSOR_TAG_V1 => {
+                    let len = if tag == MIGRATE_CURSOR_TAG {
+                        MIGRATE_CURSOR_LEN
+                    } else {
+                        MIGRATE_CURSOR_V1_LEN
+                    };
+                    Ok(match decode_position(&data, len) {
+                        Some(position) => StoredCursor::Usable {
+                            position,
+                            version: got.version,
+                        },
+                        None => StoredCursor::Unrecognized {
+                            version: got.version,
+                        },
                     })
                 }
-                _ => Ok(StoredCursor::Unrecognized {
+                Some(&tag) => Ok(StoredCursor::ForeignTag { tag }),
+                None => Ok(StoredCursor::Unrecognized {
                     version: got.version,
                 }),
             }
@@ -794,9 +822,45 @@ async fn read_cursor(store: &dyn ObjectStoreBackend, key: &str) -> Result<Stored
     }
 }
 
+/// The `(shard, hour)` in a cursor payload of exactly `len` bytes.
+fn decode_position(data: &[u8], len: usize) -> Option<(u32, u32)> {
+    if data.len() != len {
+        return None;
+    }
+    let shard = u32::from_le_bytes(data.get(1..5)?.try_into().ok()?);
+    let hour = u32::from_le_bytes(data.get(5..9)?.try_into().ok()?);
+    Some((shard, hour))
+}
+
+/// Bytes that make one write at the cursor key differ from any other: the
+/// writing run's start time from the injected clock and a random `u64` drawn
+/// for that write. Every payload this build writes at the key carries one, the
+/// first `CreateIfAbsent` included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CursorNonce {
+    started_unix_ns: i64,
+    random: u64,
+}
+
+impl CursorNonce {
+    fn new(started_unix_ns: i64) -> Self {
+        let (hi, lo) = uuid::Uuid::new_v4().as_u64_pair();
+        CursorNonce {
+            started_unix_ns,
+            random: hi ^ lo,
+        }
+    }
+
+    fn encode_into(&self, payload: &mut Vec<u8>) {
+        payload.extend_from_slice(&self.started_unix_ns.to_le_bytes());
+        payload.extend_from_slice(&self.random.to_le_bytes());
+    }
+}
+
 /// Persist the advisory migrate cursor at `(shard, hour)`. First write is
 /// `CreateIfAbsent`; a subsequent write CAS-updates against the version read.
-/// A lost race (`AlreadyExists`/`PreconditionFailed`) is not an error: the
+/// A lost race is not an error: `AlreadyExists`, `PreconditionFailed`, or
+/// `NotFound` when a finished walk deleted the cursor after it was read. The
 /// cursor is advisory and a concurrent migrator's update is equally valid, so
 /// the loser simply proceeds (and re-reads the cursor on its next invocation).
 async fn write_cursor(
@@ -805,11 +869,13 @@ async fn write_cursor(
     shard: u32,
     hour: u32,
     prev_version: Option<Version>,
+    nonce: CursorNonce,
 ) -> Result<()> {
     let mut payload = Vec::with_capacity(MIGRATE_CURSOR_LEN);
     payload.push(MIGRATE_CURSOR_TAG);
     payload.extend_from_slice(&shard.to_le_bytes());
     payload.extend_from_slice(&hour.to_le_bytes());
+    nonce.encode_into(&mut payload);
     let mode = match prev_version {
         Some(v) => PutMode::CasVersion(v),
         None => PutMode::CreateIfAbsent,
@@ -819,7 +885,10 @@ async fn write_cursor(
         checksum: Some(UploadChecksum::Crc32c(crc32c::crc32c(&payload))),
     };
     match store.put(key, payload.into(), opts).await {
-        Ok(_) | Err(StoreError::AlreadyExists) | Err(StoreError::PreconditionFailed) => Ok(()),
+        Ok(_)
+        | Err(StoreError::AlreadyExists)
+        | Err(StoreError::PreconditionFailed)
+        | Err(StoreError::NotFound) => Ok(()),
         Err(e) => Err(MaintainError::Store(e)),
     }
 }
@@ -835,12 +904,13 @@ struct ContradictionStamp {
 }
 
 impl ContradictionStamp {
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self, nonce: CursorNonce) -> Vec<u8> {
         let mut payload = Vec::with_capacity(MIGRATE_DRAINED_LEN);
         payload.push(MIGRATE_DRAINED_TAG);
         payload.extend_from_slice(&self.certificate_version.to_le_bytes());
         payload.extend_from_slice(&self.certified_unix_ns.to_le_bytes());
         payload.extend_from_slice(&self.watermark_unix_ns.to_le_bytes());
+        nonce.encode_into(&mut payload);
         payload
     }
 
@@ -863,8 +933,9 @@ async fn write_drained_stamp(
     store: &dyn ObjectStoreBackend,
     key: &str,
     stamp: ContradictionStamp,
+    nonce: CursorNonce,
 ) -> Result<()> {
-    let payload = stamp.encode();
+    let payload = stamp.encode(nonce);
     let opts = PutOptions {
         mode: PutMode::CreateIfAbsent,
         checksum: Some(UploadChecksum::Crc32c(crc32c::crc32c(&payload))),
@@ -2348,7 +2419,8 @@ pub async fn migrate_family(
         };
         report.cursor_advanced_to = to_persist;
         if let Some((shard, hour)) = to_persist.filter(|_| cursor_writable) {
-            write_cursor(store, &cursor_key, shard, hour, cursor_version).await?;
+            let nonce = CursorNonce::new(now);
+            write_cursor(store, &cursor_key, shard, hour, cursor_version, nonce).await?;
         }
         return held_or(report, held);
     }
@@ -2571,7 +2643,9 @@ pub async fn background_migrate_unit(
             // found no straggler.
             if let Some(stamp) = contradiction
                 && matches!(report.verification, Some(Verification::FloorRaised { .. }))
-                && let Err(err) = write_drained_stamp(store, &cursor_key, stamp).await
+                && let Err(err) =
+                    write_drained_stamp(store, &cursor_key, stamp, CursorNonce::new(clock.now_ns()))
+                        .await
             {
                 tracing::warn!(
                     tenant = %tenant_hash.to_hex(),
@@ -6710,6 +6784,257 @@ mod tests {
         assert!(second.walk_complete, "{second:?}");
         assert_eq!(compaction_record_count(&store, 0, 101).await, 1);
         assert_eq!(stored().await, foreign, "the drain deleted no cursor");
+    }
+
+    fn content_version(data: &[u8]) -> Version {
+        Version(blake3::hash(data).to_hex().to_string())
+    }
+
+    /// A backend whose CAS version is derived from the object's bytes, as
+    /// `S3Store`'s ETag is: recreating a deleted key with the same bytes hands
+    /// back the version the deleted object had. `MemoryStore` mints versions
+    /// from a counter, so it cannot show issue #4389. A CAS on an absent key
+    /// is `NotFound`, as S3 answers it. With `delete_before_cas` set, the
+    /// first CAS on that key deletes it first: a finished walk's delete
+    /// landing between a run's cursor read and its cursor write.
+    struct ContentVersionStore {
+        inner: Arc<MemoryStore>,
+        delete_before_cas: Option<String>,
+        fired: AtomicBool,
+    }
+
+    impl ContentVersionStore {
+        fn new(delete_before_cas: Option<String>) -> Self {
+            ContentVersionStore {
+                inner: Arc::new(MemoryStore::new()),
+                delete_before_cas,
+                fired: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for ContentVersionStore {
+        async fn put(&self, key: &str, data: Bytes, opts: PutOptions) -> StoreResult<PutOutcome> {
+            let version = content_version(&data);
+            let mode = match opts.mode {
+                PutMode::CasVersion(expected) => {
+                    if self.delete_before_cas.as_deref() == Some(key)
+                        && !self.fired.swap(true, Ordering::SeqCst)
+                    {
+                        self.inner.delete(key).await?;
+                    }
+                    let current = self.inner.get(key, GetRange::Full).await?;
+                    if content_version(&current.data) != expected {
+                        return Err(StoreError::PreconditionFailed);
+                    }
+                    PutMode::CasVersion(current.version)
+                }
+                other => other,
+            };
+            let opts = PutOptions {
+                mode,
+                checksum: opts.checksum,
+            };
+            self.inner.put(key, data, opts).await?;
+            Ok(PutOutcome {
+                etag: ravel_object_store::Etag(version.0.clone()),
+                version,
+            })
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> StoreResult<GetOutcome> {
+            let full = matches!(range, GetRange::Full);
+            let mut got = self.inner.get(key, range).await?;
+            if full {
+                got.version = content_version(&got.data);
+            }
+            Ok(got)
+        }
+
+        async fn head(&self, key: &str) -> StoreResult<ObjectMeta> {
+            let mut meta = self.inner.head(key).await?;
+            let got = self.inner.get(key, GetRange::Full).await?;
+            meta.version = content_version(&got.data);
+            Ok(meta)
+        }
+
+        async fn list(&self, prefix: &str, page: Option<PageToken>) -> StoreResult<ListPage> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> StoreResult<DelimitedList> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> StoreResult<()> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                multipart: false,
+                ..self.inner.capabilities()
+            }
+        }
+    }
+
+    /// Issue #4389, on a store whose version is content-derived. Run W creates
+    /// the cursor at hour 100 and run A reads it. A finished walk (B) deletes
+    /// it. Run C, starting over in the same process at the same clock reading,
+    /// migrates hour 100 and its budget stops it there, recreating the cursor.
+    /// A then CAS-writes hour 103 with the version it read: the CAS is refused
+    /// and C's hour 100 survives, so the next run examines 101 to 103.
+    ///
+    /// W's and C's writes are both a first `CreateIfAbsent` through
+    /// `write_cursor` with a `CursorNonce::new` at one clock reading. Without
+    /// a nonce, with a nonce constant per process, or with a nonce left out of
+    /// the create, C's bytes equal W's, A's stale version matches C's cursor,
+    /// and the final assertion reads hour 103.
+    #[tokio::test]
+    async fn a_stale_cas_does_not_overwrite_a_cursor_recreated_at_the_same_position() {
+        let store = ContentVersionStore::new(None);
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        seed_at(&store, 0, 101, 2, "beta", target - 1).await;
+        seed_at(&store, 0, 102, 3, "gamma", target - 1).await;
+        seed_at(&store, 0, 103, 4, "delta", target - 1).await;
+        let cursor_key = migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY);
+
+        let now = sealed_now_ns_for(103);
+        write_cursor(&store, &cursor_key, 0, 100, None, CursorNonce::new(now))
+            .await
+            .expect("run W");
+        let StoredCursor::Usable {
+            position,
+            version: stale,
+        } = read_cursor(&store, &cursor_key).await.expect("run A reads")
+        else {
+            panic!("expected W's cursor");
+        };
+        assert_eq!(position, (0, 100));
+
+        store
+            .delete(&cursor_key)
+            .await
+            .expect("run B's drained delete");
+        let c = run_migrate(&store, 103, target, MigrateBudget::records(1))
+            .await
+            .expect("run C");
+        assert_eq!(c.buckets_migrated, 1, "{c:?}");
+        assert_eq!(c.cursor_advanced_to, Some((0, 100)), "{c:?}");
+
+        write_cursor(
+            &store,
+            &cursor_key,
+            0,
+            103,
+            Some(stale),
+            CursorNonce::new(now),
+        )
+        .await
+        .expect("a lost race is not an error");
+        match read_cursor(&store, &cursor_key).await.expect("read cursor") {
+            StoredCursor::Usable { position, .. } => assert_eq!(
+                position,
+                (0, 100),
+                "run A's stale CAS overwrote run C's recreated cursor"
+            ),
+            other => panic!("expected C's cursor, got {other:?}"),
+        }
+    }
+
+    /// A tag-1 cursor written by a build before issue #4389 is still a usable
+    /// position: the run resumes after hour 100, and its budget stop
+    /// CAS-replaces the old payload with a tag-3 one at hour 101.
+    #[tokio::test]
+    async fn a_tag_one_cursor_from_an_older_build_is_a_usable_position() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        seed_at(&store, 0, 101, 2, "beta", target - 1).await;
+        seed_at(&store, 0, 102, 3, "gamma", target - 1).await;
+        let cursor_key = migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY);
+        let old = Bytes::from_static(&[MIGRATE_CURSOR_TAG_V1, 0, 0, 0, 0, 100, 0, 0, 0]);
+        store
+            .put(&cursor_key, old, PutOptions::default())
+            .await
+            .expect("put tag-1 cursor");
+        assert!(matches!(
+            read_cursor(&store, &cursor_key).await.expect("read cursor"),
+            StoredCursor::Usable {
+                position: (0, 100),
+                ..
+            }
+        ));
+
+        let report = run_migrate(&store, 102, target, MigrateBudget::records(1))
+            .await
+            .expect("budget stop");
+        assert_eq!(report.cursor_advanced_to, Some((0, 101)), "{report:?}");
+        assert_eq!(compaction_record_count(&store, 0, 100).await, 0);
+        assert_eq!(compaction_record_count(&store, 0, 101).await, 1);
+        let stored = store
+            .get(&cursor_key, GetRange::Full)
+            .await
+            .expect("cursor")
+            .data;
+        assert_eq!(stored.len(), MIGRATE_CURSOR_LEN);
+        assert_eq!(stored.first(), Some(&MIGRATE_CURSOR_TAG));
+        assert_eq!(decode_position(&stored, MIGRATE_CURSOR_LEN), Some((0, 101)));
+    }
+
+    /// A budget stop whose cursor CAS finds the cursor deleted (`NotFound`,
+    /// as S3 answers a CAS on an absent key) lost a race to a finished walk:
+    /// the run returns its report, and the next run walks from the start.
+    #[tokio::test]
+    async fn a_cas_on_a_deleted_cursor_is_a_lost_race() {
+        let cursor_key = migrate_cursor_key(&tenant_hash(), Signal::Metrics, FAMILY);
+        let store = ContentVersionStore::new(Some(cursor_key.clone()));
+        provision(&store, 1).await;
+        let target = VERSION_V7 as u32;
+        seed_at(&store, 0, 100, 1, "alpha", target - 1).await;
+        seed_at(&store, 0, 101, 2, "beta", target - 1).await;
+        seed_at(&store, 0, 102, 3, "gamma", target - 1).await;
+
+        run_migrate(&store, 102, target, MigrateBudget::records(1))
+            .await
+            .expect("first run creates the cursor");
+        let second = run_migrate(&store, 102, target, MigrateBudget::records(1))
+            .await
+            .expect("a CAS on a deleted cursor is not an error");
+        assert!(store.fired.load(Ordering::SeqCst), "the delete ran");
+        assert_eq!(second.buckets_migrated, 1, "{second:?}");
+        assert_eq!(second.cursor_advanced_to, Some((0, 101)), "{second:?}");
+        assert!(matches!(
+            read_cursor(&store, &cursor_key).await.expect("read cursor"),
+            StoredCursor::Absent
+        ));
+
+        let third = run_migrate(&store, 102, target, MigrateBudget::unlimited())
+            .await
+            .expect("the next run proceeds");
+        assert!(third.walk_complete, "{third:?}");
+        assert_eq!(compaction_record_count(&store, 0, 102).await, 1);
+    }
+
+    /// Two drains under one stamp write different bytes, and each decodes to
+    /// the stamp.
+    #[test]
+    fn drained_payloads_under_one_stamp_differ() {
+        let stamp = ContradictionStamp {
+            certificate_version: 7,
+            certified_unix_ns: 11,
+            watermark_unix_ns: 13,
+        };
+        let first = stamp.encode(CursorNonce::new(5));
+        let second = stamp.encode(CursorNonce::new(5));
+        assert_ne!(first, second);
+        assert_eq!(first.len(), MIGRATE_DRAINED_LEN);
+        assert_eq!(ContradictionStamp::decode(&first), Some(stamp));
+        assert_eq!(ContradictionStamp::decode(&second), Some(stamp));
     }
 
     /// Every object in the store with its bytes' hash, for before/after
