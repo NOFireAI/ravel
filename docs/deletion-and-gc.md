@@ -1109,7 +1109,10 @@ marker (ADR-2993, erasure amendment):
   reported, with the same count and warn line. The two cases cannot be told
   apart from the records present, so this keep also covers a served record
   that shares nothing with the rewrite, and lasts until that record is
-  deleted or dominated or retention removes the bucket.
+  deleted or dominated or retention removes the bucket. A bucket whose
+  dominance pass fails (a version 2 record whose present predecessor names a
+  different input set, or a supersession chain past its depth bound) is
+  reported the same way, since its conflicts are unknown.
 
 - **Why the hold terminates.** Apart from a refused chain, the cut-chain hold
   counts only objects the superseded-input sweep actually held on this pass,

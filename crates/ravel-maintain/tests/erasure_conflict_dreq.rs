@@ -613,6 +613,58 @@ async fn rule_6_keeps_a_conflict_dreq_when_the_bucket_selection_fails() {
     assert!(!after.contains(&s.u_dreq), "U's .dreq was kept");
 }
 
+/// The third-stall conflict in a bucket where `erasure_dominance` itself
+/// fails: a version 2 record names a version 1 record over E but carries a
+/// different input set, which the catalog refuses
+/// (`CompactionSupersessionInputMismatch`). The bucket's conflicts are then
+/// unknown, so rule 2 reports it as truncated and rule 6 keeps every `.dreq`.
+///
+/// Fails with the `conflict_truncated` insert in the dominance error arm of
+/// the superseded-input sweep (sweep.rs) removed: the truncated-bucket
+/// assertion finds an empty set, and rule 6 returns `(2, 0, 0)`.
+#[tokio::test]
+async fn rule_6_keeps_every_dreq_when_the_bucket_dominance_fails() {
+    let store = MemoryStore::new();
+    let s = seed_conflict(&store).await;
+    let base = version_1(&s.b, vec![input(0xA5, 5)], 0x71, 0xe1, hour_ns() + 7_000);
+    let (named, _) = put_compaction(&store, &base).await;
+    let other_inputs = vec![input(0xA6, 6)];
+    let link = CompactionRecord {
+        format_version: 2,
+        input_set_hash: erasure::compute_superseding_compaction_input_set_hash(
+            &other_inputs,
+            &named,
+        )
+        .to_vec(),
+        inputs: other_inputs,
+        parts: vec![part(0x72, hour_ns(), hour_ns() + 10_000)],
+        created_unix_ns: base.created_unix_ns + 1,
+        superseded_record_key: named.clone(),
+        ..base.clone()
+    };
+    put_compaction(&store, &link).await;
+
+    let outcome = rule_2(&store, &s.b).await;
+    assert_eq!(
+        outcome.conflict_truncated_buckets,
+        BTreeSet::from([HeldBucket {
+            shard: s.b.shard,
+            ingest_hour_bucket: s.b.ingest_hour_bucket,
+        }]),
+        "{outcome:?}"
+    );
+    let after_rule_2 = all_keys(&store).await;
+    for key in [&s.c_keys.0, &s.c_keys.1, &s.rewrite.0, &s.rewrite.1] {
+        assert!(after_rule_2.contains(key), "{key} was deleted");
+    }
+
+    assert_eq!(rule_6(&store, &s.b).await, (0, 2, 2));
+    let after = all_keys(&store).await;
+    for key in [&s.q_dreq, &s.u_dreq] {
+        assert!(after.contains(key), "{key} was deleted");
+    }
+}
+
 /// PUT a rewrite record superseding the record at `superseded` and applying
 /// `request_id`, and an object at its part key. Returns the record key and
 /// the part key.
