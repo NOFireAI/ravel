@@ -223,9 +223,10 @@ pub enum BlockedReason {
     /// all at the target is named this way when its losers qualify); a record
     /// a present rewrite record supersedes, which `sweep` deletes with its
     /// parts as that rewrite's chain group, and whose parts count in `l1`
-    /// until then without naming the bucket; and a record a present version 2
-    /// record supersedes or a version 2 record a live rewrite dominates, which
-    /// nothing in this build reclaims either.
+    /// until then without naming the bucket; a record a present version 2
+    /// record supersedes, which nothing in this build reclaims either; and a
+    /// compaction record a live rewrite dominates, which `sweep` deletes with
+    /// that rewrite's group.
     ///
     /// A loser may also name raw L0 inputs that only it covers; those count in
     /// [`BelowTargetReport::l0`], and when the walk named the bucket
@@ -1402,7 +1403,7 @@ async fn read_shard_family(
     // inputs as superseded. An input a loser alone names has no live successor
     // -- the loser's parts are ignored -- so it is still served raw and still
     // counts as live. The same holds for a record a present version 2 record
-    // supersedes and for a version 2 record a live rewrite dominates.
+    // supersedes and for a compaction record a live rewrite dominates.
     let mut compaction_authority = BTreeMap::new();
     for (hour, bucket_records) in &compaction_by_bucket {
         let bucket = Bucket::new(*tenant_hash, signal, shard, *hour);
@@ -1448,8 +1449,9 @@ async fn read_shard_family(
 
 /// One bucket's compaction records as [`authoritative_compaction_records`]
 /// resolved them. A record in neither list is one a present version 2 record
-/// supersedes, or a version 2 record a live rewrite dominates: neither is an
-/// overlap loser, and nothing in this build reclaims them either.
+/// supersedes, which nothing in this build reclaims either, or a compaction
+/// record a live rewrite dominates, which `sweep` deletes with that rewrite's
+/// group: neither is an overlap loser.
 struct BucketAuthority<'a> {
     /// The records whose parts are served and whose inputs are superseded.
     authoritative: Vec<&'a (String, CompactionRecord)>,
@@ -1467,7 +1469,7 @@ struct BucketAuthority<'a> {
 }
 
 /// The compaction records of one bucket whose inputs the resolver treats as
-/// superseded: a version 2 record a live rewrite dominates is dropped
+/// superseded: a compaction record a live rewrite dominates is dropped
 /// ([`ravel_catalog::erasure_dominated_compaction_records`]), and the selector
 /// then excludes every record a present version 2 record supersedes and every
 /// overlap loser. The overlap losers are returned apart, so the re-audit can
@@ -4931,12 +4933,14 @@ mod tests {
         .expect("migrate")
     }
 
-    /// Seed four below-target L0 inputs at `(0, 100)` and two overlapping
-    /// compaction records over them: the winner names all four with one part
-    /// per entry of `winner_part_versions`, the loser names `{2, 3}` with three
-    /// parts, two below [`FUTURE_VERSION`] and one at it. The winner names every
-    /// input, so nothing is served raw and the walk has nothing to migrate.
-    /// Returns the winner's key.
+    /// Seed four below-target L0 inputs and a fifth at [`FUTURE_VERSION`] at
+    /// `(0, 100)`, and two overlapping compaction records over them: the
+    /// winner names the first four with one part per entry of
+    /// `winner_part_versions`, the loser names `{3, 5}` with three parts, two
+    /// below [`FUTURE_VERSION`] and one at it. Every below-target input is the
+    /// winner's, so the walk has nothing to migrate. Input 5 is outside the
+    /// winner, so a rewrite over the winner does not cover the loser and the
+    /// loser is not erasure-dominated. Returns the winner's key.
     async fn seed_losing_parts_bucket(
         store: &dyn ObjectStoreBackend,
         winner_part_versions: &[u32],
@@ -4944,6 +4948,7 @@ mod tests {
         for (seq, metric) in [(1u64, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
             seed_at(store, 0, 100, seq, metric, VERSION_V7 as u32).await;
         }
+        seed_at(store, 0, 100, 5, "epsilon", FUTURE_VERSION).await;
         let winner = put_compaction_fixture(
             store,
             CompactionFixture {
@@ -4961,7 +4966,7 @@ mod tests {
             CompactionFixture {
                 shard: 0,
                 hour: 100,
-                input_seqs: &[2, 3],
+                input_seqs: &[3, 5],
                 hash_seed: 0x22,
                 part_versions: &[VERSION_V7 as u32, VERSION_V7 as u32, FUTURE_VERSION],
                 supersedes: "",
@@ -5299,9 +5304,10 @@ mod tests {
     /// authoritative record that has not converged and does not suppress the
     /// line. C2 is the winner over `{1, 2, 3, 4}` with one below-target part,
     /// superseded by rewrite R whose two parts are at the target; C1 is the
-    /// overlap loser over `{2, 3}` with two below-target parts, superseded by
-    /// nothing. C1's two below-target parts name the bucket; C2's one and C1's
-    /// two all count in `l1`, R's count nowhere.
+    /// overlap loser over `{3, 5}` with two below-target parts, superseded by
+    /// nothing and not erasure-dominated, since input 5 is outside R's inputs
+    /// (input 5 is at the target). C1's two below-target parts name the
+    /// bucket; C2's one and C1's two all count in `l1`, R's count nowhere.
     ///
     /// Prove-the-test: remove the `.filter(|(key, _)|
     /// !authority.rewrite_superseded.contains(key.as_str()))` from the
@@ -5318,6 +5324,7 @@ mod tests {
         for (seq, metric) in [(1u64, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
             seed_at(&store, 0, 100, seq, metric, VERSION_V7 as u32).await;
         }
+        seed_at(&store, 0, 100, 5, "epsilon", FUTURE_VERSION).await;
         let winner = put_compaction_fixture(
             &store,
             CompactionFixture {
@@ -5335,7 +5342,7 @@ mod tests {
             CompactionFixture {
                 shard: 0,
                 hour: 100,
-                input_seqs: &[2, 3],
+                input_seqs: &[3, 5],
                 hash_seed: 0x22,
                 part_versions: &[VERSION_V7 as u32, VERSION_V7 as u32, FUTURE_VERSION],
                 supersedes: "",

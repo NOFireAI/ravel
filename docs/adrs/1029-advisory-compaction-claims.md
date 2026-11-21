@@ -1073,8 +1073,8 @@ stalled inside the client's timeout. A claim renewal immediately before the
 PUT narrows it and cannot close it, because the stall can land after any
 client-side check and the store conditions a write on its own key only.
 
-The closure decided here, planned for 0.35.0 and not yet implemented, is on
-the read side, applied identically by every bucket resolution: a version 1
+The closure decided here (it has landed, as the 2026-11-21 amendment below
+records) is on the read side, applied identically by every bucket resolution: a version 1
 compaction record that is not in a live rewrite's chain and whose every
 input is among that rewrite's effective inputs is dominated by the rewrite.
 Readers will drop its parts, the superseded-input sweep will reclaim it and
@@ -1090,3 +1090,67 @@ erasure rewrite a lost or late claim costs a wasted compaction, never a
 served erased row. Making the two record kinds collide at one create-only
 key per bucket, which point 6 rejected as a key-layout change, remains the
 store-side closure; the owner declined an ADR for it on 2026-11-20.
+
+## Amendment (2026-11-21, #4449): erasure dominance of version 1 records has landed
+
+<!-- amendment-applies: sections="Amendment (2026-11-20, #4449): what the residual publish window does, and how it closes" pointer="2026-11-21 amendment" -->
+<!-- amendment-supersedes: phrase="planned for 0.35.0 and not yet implemented" pointer="2026-11-21 amendment" -->
+
+The read-side closure the 2026-11-20 amendment decided is implemented. A
+version 1 compaction record that no live rewrite's chain names is dominated
+when the effective inputs of one live rewrite contain every input it names
+(`ravel_catalog::erasure_dominance`). Coverage is per rewrite: a record two
+rewrites cover only between them is not dominated. A version 2 record whose
+predecessor is a dominated version 1 record is dominated too. Every bucket
+resolution, the token fallback, the index fold, scrub, the erasure
+completion gate and `migrate` drop a dominated record's parts; the erasure
+pass treats it as superseded when it picks the bucket's live record
+(`select_live_record`); and the superseded-input sweep reclaims it with its
+parts in the covering rewrite's group, under that group's horizon,
+reachability and legal-hold gates. The cycle and depth errors and the
+version 2 input-equality check are unchanged, and nothing in the formats or
+the key layout changed. The rule is stated normatively in
+docs/catalog-and-mvcc.md, step 3.
+
+A record whose inputs a live rewrite covers only in part stays a conflict
+for the overlap selection. Such a record is counted in
+`ravel_catalog_erasure_overlap_conflicts_total` and each such record and
+rewrite pair is logged at warn; each dominated version 1 record is counted
+in `ravel_catalog_dominated_compaction_records_total`. Both counters are on
+`/metrics` and count once per resolution that finds the record, so a record
+still present counts again on every later resolution; the superseded-input
+sweep's evaluation does not count.
+
+A bucket already in this state before the upgrade is read correctly wherever
+it is resolved from its commit records. An hour folded into the catalog
+snapshot while in this state keeps serving both records' parts until a fold
+reconciles that hour again, as for any record that lands in an already
+folded hour (ADR-0063 section 4).
+
+With this, between a compaction and an erasure rewrite a lost or late claim
+costs a wasted compaction, never a served erased row. The race the 2026-11-20
+amendment reproduced still publishes both records, since the store-side
+closure stays declined, but readers serve only the rewrite's parts, the
+erasure rerun reports `AlreadyApplied` rather than `MultipleLiveRecords`,
+and the sweep reclaims the compaction's record and parts.
+
+Tests, each shown failing against a mutation of the code it pins:
+`a_compaction_paused_inside_its_record_put_publishes_beside_the_erasure_rewrite`
+in `crates/ravel-maintain/tests/erasure_claim_pause.rs`, no longer ignored,
+fails when no rewrite covers the record (the erased series is served, the
+kept rows are served twice, and the rerun fails with `MultipleLiveRecords`);
+in `crates/ravel-catalog/src/catalog.rs`,
+`coverage_spread_across_two_rewrites_is_not_dominance` fails when coverage
+is taken as any overlap or as the union of rewrites, and
+`partial_coverage_is_a_counted_conflict` fails when it is taken as any
+overlap;
+`a_version_1_record_a_rewrite_covers_is_not_live` in
+`crates/ravel-maintain/src/erasure_rewrite.rs` fails when
+`select_live_record` ignores dominance; and
+`sweep_reclaims_a_dominated_version_1_record_with_its_raw_rewrite`,
+`sweep_reclaims_a_dominated_version_1_record_with_its_predecessor_rewrite`,
+`sweep_holds_a_dominated_version_1_group_under_a_legal_hold` and
+`sweep_keeps_a_dominated_version_1_group_inside_its_horizon` in
+`crates/ravel-maintain/tests/superseding_compaction_record.rs` fail when the
+sweep leaves the record out of the rewrite's group or times the group's
+horizon from the rewrite alone.

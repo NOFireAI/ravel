@@ -115,9 +115,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
-use ravel_catalog::{
-    erasure_dominated_compaction_records, select_authoritative_compaction_records,
-};
+use ravel_catalog::{erasure_dominance, select_authoritative_compaction_records};
 use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
 use ravel_commit::record;
 use ravel_object_store::{
@@ -1193,8 +1191,8 @@ pub struct SupersededSweepOutcome {
     /// are not in `held_request_ids`, because no surviving record names them,
     /// so rule 6 falls back to the bucket.
     pub held_truncated_buckets: BTreeSet<HeldBucket>,
-    /// Erasure-dominated version 2 compaction records kept this pass because
-    /// no rewrite's chain group took them, in buckets with no rewrite still
+    /// Erasure-dominated compaction records, of either version, kept this
+    /// pass because no rewrite's group took them, in buckets with no rewrite still
     /// inside its protection horizon. Each one holds parts that re-encode a
     /// pre-erasure record, so a nonzero value is an operator signal. Counted
     /// by a deleting pass only.
@@ -1519,10 +1517,13 @@ async fn sweep_superseded_impl(
                 // horizon is the case where a stale HEAD is MOST likely to
                 // resolve the chain's inputs, so the erasure filter's hold has
                 // to see it.
+                // A version 1 record this rewrite dominates is deleted with the
+                // rewrite's group, so the group also waits for that record's
+                // own horizon.
                 if deleting
                     && now
-                        < record
-                            .created_unix_ns
+                        < version_2
+                            .newest_created(key, record, &compactions)
                             .saturating_add(config.protection_horizon_ns)
                 {
                     young_rewrite_buckets.insert(record.ingest_hour_bucket);
@@ -1536,11 +1537,31 @@ async fn sweep_superseded_impl(
                     .collect();
                 if !record.inputs.is_empty() {
                     // RawL0 rewrite: the same L0 commit records + data objects
-                    // a compaction over the same inputs would supersede.
-                    (
-                        gather_l0_inputs(store, tenant, signal, shard, record).await?,
-                        applied,
-                    )
+                    // a compaction over the same inputs would supersede. With a
+                    // dominated version 1 record they are one group with it.
+                    let inputs = gather_l0_inputs(store, tenant, signal, shard, record).await?;
+                    match version_2
+                        .version_1_by_rewrite
+                        .get(key)
+                        .and_then(|v| v.first())
+                    {
+                        Some(oldest) => {
+                            let mut group = SupersededGroup::over_raw_l0_inputs(
+                                record.ingest_hour_bucket,
+                                oldest,
+                                inputs,
+                            );
+                            version_2.join_version_1(key, &mut group, &compactions)?;
+                            version_2.join_dominated(&mut group, &compactions)?;
+                            let gathered = if group.object_count() > 0 {
+                                vec![group]
+                            } else {
+                                Vec::new()
+                            };
+                            (gathered, applied)
+                        }
+                        None => (inputs, applied),
+                    }
                 } else {
                     // Predecessor rewrite: the whole supersession chain behind
                     // it, down to the raw L0 inputs the oldest generation
@@ -1590,6 +1611,7 @@ async fn sweep_superseded_impl(
                         ));
                     }
                     for group in &mut gathered {
+                        version_2.join_version_1(key, group, &compactions)?;
                         version_2.join_dominated(group, &compactions)?;
                     }
                     gathered.retain(|group| group.object_count() > 0);
@@ -1823,20 +1845,23 @@ async fn sweep_superseded_impl(
     // by.
     //
     // Groups of distinct identity can still share a key: a dominated version
-    // 2 record naming an absent record joins every group that ended there. A
-    // key is deleted and counted once per pass.
+    // 2 record naming an absent record joins every group that ended there,
+    // and a raw L0 rewrite's group that took a dominated version 1 record
+    // holds the rewrite's inputs, which a conflicting compaction record's
+    // group may also hold. A key is deleted and counted once per pass.
     //
     // A delete the store refuses ([`delete_refused`]) stops only the group it
     // belongs to: that group deletes none of its later keys this pass, in any
     // of the three loops, so its own deletes stop where a crash at that key
     // would stop them. A group that meets a key another group's delete was
     // refused on stops there too. Another group can still delete a key in a
-    // stopped group's tail when the two share it, and that is safe: the only
-    // keys groups of distinct identity share are a joined dominated version 2
-    // record and its parts, which `join_dominated` adds to every such group
+    // stopped group's tail when the two share it, and that is safe. A joined
+    // dominated version 2 record and its parts are added to every such group
     // together, so a group that deletes them deletes the record's parts in the
     // data loop and the record itself in the chain loop, and no record left
-    // in the stopped group names a key the other group removed. Every stopped
+    // in the stopped group names a key the other group removed. A shared L0
+    // input is superseded by both groups' records, and dominance is decided
+    // by input identities alone, so deleting it changes no record's standing. Every stopped
     // group is reported held, since objects it superseded may still be
     // present.
     //
@@ -2149,10 +2174,13 @@ async fn load_compaction_records(
 /// A record a present version 2 record supersedes is excluded by the selector
 /// like a loser, but it is not kept like one: it and its parts are reclaimed
 /// as a chain group entered from the version 2 record, and an
-/// erasure-dominated version 2 record goes with its rewrite's chain group
-/// ([`Version2Groups`]). Neither group holds a raw L0 input that only this
-/// rule's compaction arm would otherwise decide on, so the input view here is
-/// unchanged by them.
+/// erasure-dominated record of either version goes with its rewrite's group
+/// ([`Version2Groups`]). Dominance is not applied here, so a dominated
+/// version 1 record can still win an overlap component in this view, and a
+/// record the resolver reads as authoritative then reads as a loser here and
+/// keeps its inputs. That errs toward keeping: every input the dominated
+/// record names is one its rewrite supersedes, so this view marks no input
+/// superseded that the resolver serves raw.
 #[derive(Default)]
 struct AuthoritativeInputs {
     by_bucket: HashMap<u32, HashSet<(String, u64, u64)>>,
@@ -2269,18 +2297,22 @@ impl AuthoritativeInputs {
     }
 }
 
-/// What version 2 compaction records mean for rule 2's chain groups, per
-/// ingest-hour bucket, derived through the catalog's shared rules
-/// ([`erasure_dominated_compaction_records`], then
-/// [`select_authoritative_compaction_records`] over the records left).
+/// What version 2 compaction records, and erasure-dominated records of either
+/// version, mean for rule 2's chain groups, per ingest-hour bucket, derived
+/// through the catalog's shared rules ([`erasure_dominance`],
+/// then [`select_authoritative_compaction_records`] over the records left).
 ///
 /// A version 2 record that no present version 2 record supersedes and no
 /// rewrite dominates enters a chain group of its own ([`ChainEntry::Version2`])
-/// that holds the records below it and their parts. A dominated version 2
-/// record joins the chain group of the rewrite whose chain reaches the record
-/// it names ([`Self::join_dominated`]): a walk down a rewrite's chain follows
-/// what each record supersedes, so it reaches a dominated record only when a
-/// record on the chain names it.
+/// that holds the records below it and their parts. A dominated version 1
+/// record joins the group of the live rewrite whose effective inputs cover it
+/// ([`Self::join_version_1`]); for a rewrite over raw L0 inputs that group is
+/// those inputs, gathered as one group instead of one per input. A dominated
+/// version 2 record joins the chain group of the rewrite whose chain reaches
+/// the record it names ([`Self::join_dominated`]): a walk down a rewrite's
+/// chain follows what each record supersedes, so it reaches a dominated record
+/// only when a record on the chain, or a dominated version 1 record joined to
+/// the group, names it.
 ///
 /// A bucket whose supersession does not resolve (a cycle, a chain past the
 /// depth bound, a version 2 record whose inputs differ from the record it
@@ -2296,16 +2328,19 @@ struct Version2Groups {
     /// The version 2 records that enter a chain group of their own.
     heads: HashSet<String>,
     /// Records that belong to a present rewrite's chain group although the
-    /// rewrite may not name them: every dominated version 2 record, and every
-    /// record one of those names down its chain. A deleting pass does not
+    /// rewrite may not name them: every dominated record, and every record a
+    /// dominated version 2 record names down its chain. A deleting pass does not
     /// process them from their own listing entry, for the reason it skips a
     /// record a rewrite names. The `(4, 4)` counts in
     /// `sweep_reclaims_an_erasure_dominated_version_2_record_with_its_rewrite`
     /// fail without the skip: the dominated record's own entry gathers the raw
     /// inputs a second time.
     rewrite_members: HashSet<String>,
-    /// Each bucket's dominated version 2 records.
+    /// Each bucket's dominated records, of either version.
     dominated: HashMap<u32, Vec<String>>,
+    /// Per live rewrite record key, the dominated version 1 records it covers,
+    /// sorted.
+    version_1_by_rewrite: HashMap<String, Vec<String>>,
     /// The buckets whose version 2 supersession does not resolve.
     unresolved: HashSet<u32>,
 }
@@ -2335,9 +2370,10 @@ impl Version2Groups {
         }
         let mut out = Self::default();
         for (bucket, in_bucket) in compactions_by_bucket {
-            if in_bucket
-                .iter()
-                .all(|(_, record)| record.superseded_record_key.is_empty())
+            if !rewrites_by_bucket.contains_key(&bucket)
+                && in_bucket
+                    .iter()
+                    .all(|(_, record)| record.superseded_record_key.is_empty())
             {
                 continue;
             }
@@ -2352,15 +2388,15 @@ impl Version2Groups {
                      reclaimed on account of this bucket's version 2 records"
                 );
             };
-            let dominated =
-                match erasure_dominated_compaction_records(&in_bucket, &bucket_rewrites, &prefix) {
-                    Ok(dominated) => dominated,
-                    Err(error) => {
-                        unresolvable(error);
-                        out.unresolved.insert(bucket);
-                        continue;
-                    }
-                };
+            let dominance = match erasure_dominance(&in_bucket, &bucket_rewrites, &prefix) {
+                Ok(dominance) => dominance,
+                Err(error) => {
+                    unresolvable(error);
+                    out.unresolved.insert(bucket);
+                    continue;
+                }
+            };
+            let dominated = dominance.dominated;
             let candidates: Vec<(&str, &CompactionRecord)> = in_bucket
                 .iter()
                 .copied()
@@ -2399,8 +2435,74 @@ impl Version2Groups {
             }
             bucket_dominated.sort();
             out.dominated.insert(bucket, bucket_dominated);
+            for (record_key, rewrite_key) in dominance.version_1 {
+                out.version_1_by_rewrite
+                    .entry(rewrite_key)
+                    .or_default()
+                    .push(record_key.to_string());
+            }
+        }
+        for keys in out.version_1_by_rewrite.values_mut() {
+            keys.sort();
         }
         out
+    }
+
+    /// The newest `created_unix_ns` among `rewrite` and the version 1 records
+    /// it dominates: the rewrite's group holds their parts too, so it waits
+    /// for the youngest of them to pass the protection horizon.
+    fn newest_created(
+        &self,
+        rewrite_key: &str,
+        rewrite: &RewriteRecord,
+        compactions: &HashMap<String, CompactionRecord>,
+    ) -> i64 {
+        self.version_1_by_rewrite
+            .get(rewrite_key)
+            .into_iter()
+            .flatten()
+            .filter_map(|key| compactions.get(key))
+            .map(|record| record.created_unix_ns)
+            .fold(rewrite.created_unix_ns, i64::max)
+    }
+
+    /// Add to `group`, the group of the live rewrite at `rewrite_key`, every
+    /// version 1 record that rewrite dominates, with its parts. The records go
+    /// ahead of the chain's own: a version 1 record is dominated only while the
+    /// rewrite's effective inputs cover it, and those are read through the
+    /// chain's records, so deleting a chain record first could leave the
+    /// version 1 record undominated and served. Call this before
+    /// [`Self::join_dominated`], which puts a version 2 record naming one of
+    /// them ahead of it in turn.
+    fn join_version_1(
+        &self,
+        rewrite_key: &str,
+        group: &mut SupersededGroup,
+        compactions: &HashMap<String, CompactionRecord>,
+    ) -> Result<()> {
+        let Some(keys) = self.version_1_by_rewrite.get(rewrite_key) else {
+            return Ok(());
+        };
+        let mut joined: Vec<String> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(record) = compactions.get(key) else {
+                continue;
+            };
+            if group.chain_record_keys.contains(key) {
+                continue;
+            }
+            let mut record_part_bytes = 0u64;
+            for (part_key, object, size) in ChainLink::Compaction(record.clone()).part_targets()? {
+                record_part_bytes = record_part_bytes.saturating_add(size);
+                group.data_keys.push(part_key);
+                group.objects.push(object);
+            }
+            group.part_bytes.insert(key.clone(), record_part_bytes);
+            joined.push(key.clone());
+        }
+        joined.append(&mut group.chain_record_keys);
+        group.chain_record_keys = joined;
+        Ok(())
     }
 
     /// Add to a rewrite's chain group every dominated version 2 record whose
@@ -2493,7 +2595,7 @@ impl Version2Groups {
                     shard,
                     ingest_hour_bucket = *bucket,
                     record_key = %key,
-                    "superseded-input sweep: an erasure-dominated version 2 record is in no \
+                    "superseded-input sweep: an erasure-dominated compaction record is in no \
                      rewrite's chain group, so it is kept this pass"
                 );
                 unattached += 1;
@@ -2592,6 +2694,43 @@ impl SupersededGroup {
             absent_end: Some(absent_key.to_string()),
             identity: absent_key.to_string(),
         }
+    }
+
+    /// One group over every raw L0 input group a rewrite's entry gathered, for
+    /// a rewrite that dominates a version 1 compaction record: that record and
+    /// its parts join it ([`Version2Groups::join_version_1`]), and the whole
+    /// set is gated and deleted as one unit. `identity` is the oldest record
+    /// the group deletes, the first dominated record. A deleting pass skips
+    /// the dominated records' own entries, so another entry gathers one of
+    /// these inputs only when a compaction record that is not dominated names
+    /// it too; the two groups then share that input's keys.
+    fn over_raw_l0_inputs(
+        ingest_hour_bucket: u32,
+        identity: &str,
+        inputs: Vec<SupersededGroup>,
+    ) -> Self {
+        let mut group = Self {
+            ingest_hour_bucket,
+            record_keys: Vec::new(),
+            data_keys: Vec::new(),
+            data_sizes: HashMap::new(),
+            part_bytes: HashMap::new(),
+            chain_record_keys: Vec::new(),
+            objects: Vec::new(),
+            request_ids: BTreeSet::new(),
+            truncated: false,
+            absent_end: None,
+            identity: identity.to_string(),
+        };
+        for input in inputs {
+            group.record_keys.extend(input.record_keys);
+            group.data_keys.extend(input.data_keys);
+            group.data_sizes.extend(input.data_sizes);
+            group.objects.extend(input.objects);
+            group.request_ids.extend(input.request_ids);
+            group.truncated |= input.truncated;
+        }
+        group
     }
 
     /// Objects this group would delete, for the held counters.
