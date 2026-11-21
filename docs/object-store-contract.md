@@ -112,8 +112,13 @@ error, because a host whose clock is still being stepped
 by time sync is rejected by the store for the first seconds after boot, and
 the refusal after the deadline names clock skew and time sync, not a missing
 grant. A HEAD response has no body, so a skewed `head` or `pin_of` cannot be
-told apart and stays `AccessDenied`; a startup check that issues a HEAD still
-refuses on it at once.
+told apart and stays `AccessDenied`. At startup, the retired-reader gate's
+HEADs of `sys/compat` and `sys/tenancy` (the only startup reads that use
+HEAD, sent only by a build that retires a reader) classify such an `AccessDenied` by one GET of the same key through the
+same store: a `ClockSkewed` GET retries the HEAD as a clock-skew refusal under
+the same deadline; any other outcome of the GET, success and `NotFound`
+included, leaves the HEAD's `AccessDenied` to refuse at once. The GET only
+classifies; the gate decides from the HEAD's result alone.
 A 404 is not always `NotFound`. On the S3 adapter a 404 whose error body
 names `NoSuchBucket` is `Permanent` on get, list, put, delete and multipart,
 because a missing bucket is not a missing object and a delete must never
