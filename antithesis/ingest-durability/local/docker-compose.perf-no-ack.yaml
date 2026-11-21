@@ -1,0 +1,23 @@
+# Perf variant lever (scripts/local-run.sh with CONFIG=config-perf and
+# PERF_LEVER=no-ack; README.md, "Perf variant"), layered over
+# ../config-perf/docker-compose.yaml and docker-compose.local.yaml.
+# ravel1 and ravel2 start with the fault switch ingest/data-put-refused at
+# rate 1 (the switch config-faults sets at 0.05): every data PUT is
+# abandoned, so no flush commits, no strict write can be acknowledged, and
+# the server answers a strict write 503.
+#
+# A flush delay cannot do this: the server refuses a --max-flush-delay at or
+# above 2500ms at startup (validate_strict_visibility_budget, a 3 s budget
+# with a 500 ms reserve), so a buffer still flushes, and acks, within 2.5 s.
+# The run expects both TTFA samples to come out none and no ack probe to run
+# (the gate checks it).
+#
+# Compose merges an environment mapping key by key, so this file adds the one
+# variable and restates nothing else.
+services:
+  ravel1:
+    environment:
+      RAVEL_ANTITHESIS_FAULTS: "ingest/data-put-refused=1"
+  ravel2:
+    environment:
+      RAVEL_ANTITHESIS_FAULTS: "ingest/data-put-refused=1"

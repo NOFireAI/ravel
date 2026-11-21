@@ -1,0 +1,32 @@
+# The perf variant's local gate (scripts/local-run.sh with CONFIG=config-perf;
+# README.md, "Perf variant"). One assertion message per line, after its class
+# and a tab:
+#   required           clean run: hit with its condition true at least once
+#   reported           printed, not gated
+#   slow-ack-never     PERF_LEVER=slow-ack run: never hit with its condition true
+#   slow-ack-required  PERF_LEVER=slow-ack run: hit with its condition true at least once
+#   no-ack-never       PERF_LEVER=no-ack run: never hit with its condition true
+required	the perf probes ran in an eventually
+required	a node's first strict ack came within 5 s of faults stopping
+required	a node's first strict ack came within 15 s of faults stopping
+required	a node's first strict ack came within 30 s of faults stopping
+required	a node's first strict ack came within 60 s of faults stopping
+required	a node's first strict ack came within 120 s of faults stopping
+required	a node's first strict ack came within 300 s of faults stopping
+required	a strict write after recovery was acknowledged within 2 s
+required	a strict write after recovery was acknowledged within 5 s
+required	a strict write after recovery was acknowledged within 10 s
+required	a strict write after recovery was answered within the client timeout
+required	a node's median strict-ack latency after recovery is within 2 s
+required	a node's median strict-ack latency after recovery is within 5 s
+required	a node's median strict-ack latency after recovery is within 8 s
+reported	a strict write after recovery was acknowledged within 1 s
+reported	a node's median strict-ack latency after recovery is within 1 s
+reported	a perf interval saw the wall and monotonic clocks disagree by more than 1 s
+slow-ack-never	a strict write after recovery was acknowledged within 1 s
+slow-ack-never	a strict write after recovery was acknowledged within 2 s
+slow-ack-never	a node's median strict-ack latency after recovery is within 1 s
+slow-ack-never	a node's median strict-ack latency after recovery is within 2 s
+slow-ack-required	a strict write after recovery was acknowledged within 5 s
+slow-ack-required	a node's median strict-ack latency after recovery is within 5 s
+no-ack-never	a node's first strict ack came within 300 s of faults stopping
