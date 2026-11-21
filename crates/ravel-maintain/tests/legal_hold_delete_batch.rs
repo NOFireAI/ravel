@@ -3,7 +3,8 @@
 //! amendment, #4501). These tests drive the superseded-input sweep, whose batch
 //! is one chain group, and the retention physical sweep, whose batch is one
 //! bucket, with a hold written between the pass's snapshot and a batch, and
-//! with a hold re-read that fails.
+//! with a hold re-read that fails. The erasure-request sweep's chain-hold
+//! observation, which re-reads once per pass, is driven the same way.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;

@@ -1015,9 +1015,10 @@ marker (ADR-2993, erasure amendment):
   observation is therefore always whole-signal: one listing of the commit
   keyspace enumerates the signal's shards, and every shard is observed across
   every hour. A shard with no commit key holds nothing, so that scope costs
-  listing, never correctness. Beyond the sweep's requests and the completions
-  it must read anyway, the rule issues only its one hold re-read (below); it
-  reads a verdict that sweep produced while doing its own work.
+  listing, never correctness. The rule issues no GET of its own beyond the
+  sweep's, the completions it must read anyway, and its one hold re-read
+  (below), whose record GETs the hold record cache serves after their first
+  read; it reads a verdict that sweep produced while doing its own work.
 
 - **An erasure request's `.dreq` outlives every input any rewrite in its
   supersession chain superseded.** The hold does not look only for the record
