@@ -1,0 +1,14 @@
+# negative cfg stem	mutant (inv_mutant! in crates/ or services/)	property it must make false
+compaction-ignores-rewrite	none: ADR-4326 decision 3 ships no lifecycle mutant for AtMostOneLiveRecordSetServed; the compaction's rewrite guard and the bucket claim are crate-tested
+complete-ignores-served-set	lifecycle/complete-ignores-served-set	erasure: a completion is written only when no pre-rewrite object is still served
+completion-ignores-open-bucket	none: ADR-4326 decision 3 ships no mutant for CompletionCoversEveryBucketOpenAtRequest; crate tests own the open-hour union
+delete-before-horizon	lifecycle/delete-before-horizon	gc: no object is deleted inside its protection window
+dreq-ignores-held-inputs	none: ADR-4326 decision 3 ships no mutant for DreqSweepRespectsLegalHold; crate tests own rule 6's chain-hold observation
+marker-ignores-anchor	none: ADR-4326 decision 3 ships no mutant for the marker anchor; the workload's jumps pass each window whole, so no run replaces a tombstone or record under a marker
+pinned-query-ungated	none: the pinned-query window protects pinned readers, which the driver does not hold (ADR-4326 decision 2)
+refresh-failure-is-no-hold	lifecycle/refresh-failure-is-no-hold	gc: a failed hold refresh sweeps nothing
+rewrite-identity-omits-requests	none: IdenticalInputSetsDoNotCollide is a pure function of the request ids, unit tested (ADR-4326 decision 3 ships no mutant for it)
+rewrite-keeps-erased-records	lifecycle/rewrite-keeps-erased-records	erasure: a rewrite's output is its inputs minus the erased records
+superseded-sweep-ungated	none: the catalog area's catalog/sweep-superseded-no-head-gate mutant switches off the same gate and breaks the property this area's row carries
+window-no-cache-delay	none: a pinned-query window term; the driver holds no pinned reader (ADR-4326 decision 2), and crate tests pin each term to the nanosecond
+window-three-skew	none: a pinned-query window term; the driver holds no pinned reader (ADR-4326 decision 2), and crate tests pin each term to the nanosecond

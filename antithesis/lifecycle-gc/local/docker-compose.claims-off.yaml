@@ -1,0 +1,33 @@
+# The claims-off profile for local loops (scripts/local-run.sh with
+# PROFILE=claims-off): maint2 runs with `--maintain-claims off`, supported
+# and known unsafe (#4449). scripts/launch.sh renders the same change into
+# the config image from config/docker-compose.yaml's
+# x-maintain-claims-off-command.
+services:
+  maint2:
+    command:
+      - "--mode"
+      - "maintain"
+      - "--store"
+      - "s3"
+      - "--startup-store-deadline"
+      - "300s"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      - "--shards"
+      - "4"
+      - "--maintain-tenant"
+      - "lc-tenant"
+      - "--maintain-tenant"
+      - "lc-retire"
+      - "--retention-tenant"
+      - "lc-retire=246m"
+      - "--tenant-hash-unkeyed"
+      - "--maintain-key-file"
+      - "/etc/ravel/maintain.key"
+      - "--maintain-interval-secs"
+      - "20"
+      - "--fold-interval-secs"
+      - "15"
+      - "--maintain-claims"
+      - "off"

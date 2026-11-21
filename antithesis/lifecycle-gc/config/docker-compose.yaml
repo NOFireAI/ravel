@@ -1,0 +1,251 @@
+# Ravel lifecycle-gc workload for Antithesis (antithesis/lifecycle-gc/README.md):
+# selective subject erasure, legal holds and the GC that removes superseded
+# objects, judged by a driver whose oracle never calls a Ravel matcher.
+#
+# The topology is the catalog-maintenance workload's, on its server image
+# (ravel-server with `sql,antithesis`, libfaketime and its scripts, the
+# maintain key), retagged ravel-antithesis-server:lifecycle-gc by
+# scripts/build.sh. faketime puts libfaketime, the run wrapper and the offset
+# file (+0) on the shared volume and exits; every other container starts
+# through /faketime/run, so all of them read one wall-clock offset, which the
+# driver alone moves: once to seal the hours the erasure requests cover, then
+# past the protection horizon as often as the `.dreq` removal needs.
+# Monotonic clocks stay real.
+#
+# rustfs is the one durable component. init creates and qualifies the bucket.
+# The driver writes the ready marker the server entrypoints wait on
+# (SEED_MARKER), so no server starts before the driver has checked the bucket
+# is fresh. ravel1/ravel2 are `--mode all` (ingest, SQL, scheduled fold);
+# maint1/maint2 are `--mode maintain` (fold, compaction, the erasure rewrite,
+# completion and `.dreq` sweep, the superseded-input sweep) every 20 s, with
+# bucket claims on (the default). The claims-off profile (scripts/launch.sh
+# --profile claims-off, local/docker-compose.claims-off.yaml) switches maint2
+# to `--maintain-claims off`: supported, and known unsafe (#4449).
+#
+# No service has a restart policy: Antithesis restarts what it kills.
+
+x-ravel-store: &ravel-store
+  RAVEL_S3_ENDPOINT: http://rustfs:9000
+  RAVEL_S3_ALLOW_HTTP: "true"
+  RAVEL_S3_BUCKET: ravel
+  RAVEL_S3_REGION: us-east-1
+  RAVEL_S3_ACCESS_KEY: ravel
+  RAVEL_S3_SECRET_KEY: ravel-dev-secret
+
+x-faketime-env: &faketime-env
+  LD_PRELOAD: /faketime/libfaketimeMT.so.1
+  FAKETIME_TIMESTAMP_FILE: /faketime/offset
+  FAKETIME_CACHE_DURATION: "2"
+  FAKETIME_DONT_FAKE_MONOTONIC: "1"
+
+x-faketime-done: &faketime-done
+  condition: service_completed_successfully
+
+x-ravel-server: &ravel-server
+  image: ravel-antithesis-server:lifecycle-gc
+  platform: linux/amd64
+  init: true
+  entrypoint: ["/faketime/run", "/usr/local/bin/ravel-antithesis-entrypoint"]
+  environment:
+    <<: [*ravel-store, *faketime-env]
+    FAKETIME_CHECK_BINARY: /usr/local/bin/ravel-server
+    SEED_MARKER: antithesis/lifecycle-gc/ready
+    RUST_LOG: info
+    # Empty selects no mutant. scripts/mutant-config.sh writes a copy of this
+    # file that names one, over the lifecycle-gc-mutants images (README.md,
+    # "Mutants").
+    RAVEL_ANTITHESIS_MUTANT: ""
+  volumes: ["faketime:/faketime:ro"]
+  depends_on:
+    faketime: *faketime-done
+    init:
+      condition: service_completed_successfully
+
+x-maintain-command: &maintain-command
+  - "--mode"
+  - "maintain"
+  - "--store"
+  - "s3"
+  - "--startup-store-deadline"
+  - "300s"
+  - "--listen-http"
+  - "0.0.0.0:4318"
+  - "--shards"
+  - "4"
+  - "--maintain-tenant"
+  - "lc-tenant"
+  - "--maintain-tenant"
+  - "lc-retire"
+  - "--retention-tenant"
+  - "lc-retire=246m"
+  - "--tenant-hash-unkeyed"
+  - "--maintain-key-file"
+  - "/etc/ravel/maintain.key"
+  - "--maintain-interval-secs"
+  - "20"
+  - "--fold-interval-secs"
+  - "15"
+
+# The claims-off profile's maint2 command (see the header). Unused by the
+# default profile.
+x-maintain-claims-off-command: &maintain-claims-off-command
+  - "--mode"
+  - "maintain"
+  - "--store"
+  - "s3"
+  - "--startup-store-deadline"
+  - "300s"
+  - "--listen-http"
+  - "0.0.0.0:4318"
+  - "--shards"
+  - "4"
+  - "--maintain-tenant"
+  - "lc-tenant"
+  - "--maintain-tenant"
+  - "lc-retire"
+  - "--retention-tenant"
+  - "lc-retire=246m"
+  - "--tenant-hash-unkeyed"
+  - "--maintain-key-file"
+  - "/etc/ravel/maintain.key"
+  - "--maintain-interval-secs"
+  - "20"
+  - "--fold-interval-secs"
+  - "15"
+  - "--maintain-claims"
+  - "off"
+
+services:
+  faketime:
+    container_name: faketime
+    hostname: faketime
+    image: ravel-antithesis-server:lifecycle-gc
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/ravel-antithesis-faketime-setup"]
+    volumes: ["faketime:/faketime"]
+
+  rustfs:
+    container_name: rustfs
+    hostname: rustfs
+    # RustFS 1.0.0 in its glibc build, so libfaketime reaches it (see the
+    # catalog-maintenance workload's compose file).
+    image: ghcr.io/rustfs/rustfs:1.0.0-glibc@sha256:bffcab0c9d647aab0055d1c69d340b202d0909966b385932d4ead1aeb7602858
+    platform: linux/amd64
+    entrypoint: ["/faketime/run", "/entrypoint.sh"]
+    command: ["/data"]
+    user: "0:0"
+    environment:
+      <<: *faketime-env
+      FAKETIME_CHECK_BINARY: /usr/bin/rustfs
+      RUSTFS_ACCESS_KEY: ravel
+      RUSTFS_SECRET_KEY: ravel-dev-secret
+      RUSTFS_DURABILITY_MODE: strict
+      RUSTFS_DRIVE_SYNC_ENABLE: "true"
+    volumes: ["faketime:/faketime:ro"]
+    depends_on:
+      faketime: *faketime-done
+
+  init:
+    container_name: init
+    hostname: init
+    image: ravel-antithesis-server:lifecycle-gc
+    platform: linux/amd64
+    entrypoint: ["/faketime/run", "/usr/local/bin/ravel-antithesis-init"]
+    environment:
+      <<: [*ravel-store, *faketime-env]
+      FAKETIME_CHECK_BINARY: /usr/local/bin/ravel-cli
+    volumes: ["faketime:/faketime:ro"]
+    depends_on:
+      faketime: *faketime-done
+      rustfs:
+        condition: service_started
+
+  ravel1:
+    <<: *ravel-server
+    container_name: ravel1
+    hostname: ravel1
+    command: &all-command
+      - "--mode"
+      - "all"
+      - "--store"
+      - "s3"
+      - "--startup-store-deadline"
+      - "300s"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      - "--listen-grpc"
+      - "0.0.0.0:4317"
+      - "--shards"
+      - "4"
+      - "--tenant-token"
+      - "lc-token=lc-tenant"
+      - "--tenant-token"
+      - "lc-retire-token=lc-retire"
+      - "--tenant-hash-unkeyed"
+      - "--max-flush-delay"
+      - "500ms"
+      - "--max-flush-delay-idle"
+      - "5s"
+      - "--min-flush-bytes"
+      - "262144"
+      - "--fold-interval-secs"
+      - "15"
+
+  ravel2:
+    <<: *ravel-server
+    container_name: ravel2
+    hostname: ravel2
+    command: *all-command
+
+  maint1:
+    <<: *ravel-server
+    container_name: maint1
+    hostname: maint1
+    command: *maintain-command
+
+  maint2:
+    <<: *ravel-server
+    container_name: maint2
+    hostname: maint2
+    command: *maintain-command
+
+  driver:
+    container_name: driver
+    hostname: driver
+    image: ravel-antithesis-driver:lifecycle-gc
+    platform: linux/amd64
+    entrypoint: ["/faketime/run"]
+    command: ["/usr/local/bin/driver"]
+    environment:
+      <<: [*ravel-store, *faketime-env]
+      FAKETIME_CHECK_BINARY: /usr/local/bin/driver
+      RAVEL_NODES: http://ravel1:4318,http://ravel2:4318
+      RAVEL_MAINTAIN_NODES: http://maint1:4318,http://maint2:4318
+      RAVEL_TOKEN: lc-token
+      RAVEL_TENANT: lc-tenant
+      # The retention tenant: the maintain nodes retire its hours after
+      # 246 minutes, the shortest window the ADR-0019 floor allows
+      # (max_ingest_lag + max_flush_lifetime + clock_skew_allowance + 1 h).
+      RAVEL_RETIRE_TOKEN: lc-retire-token
+      READY_MARKER: antithesis/lifecycle-gc/ready
+      WORKLOAD_MAX_WRITES: "500"
+      WORKLOAD_PLACEMENTS: record,resource,scope
+      MAINTAIN_INTERVAL_SECS: "20"
+      # The driver alone writes the offset file: 9000 s seals every hour
+      # acknowledged before the jump; each horizon jump passes the default
+      # protection horizon (90300 s), and with it the pinned-query window
+      # and the six-hour full-sweep cadence.
+      CLOCK_JUMP_FILE: /faketime/offset
+      CLOCK_SEAL_JUMP_SECS: "9000"
+      CLOCK_HORIZON_JUMP_SECS: "91200"
+      # Each of the two retention jumps passes the pinned-query window
+      # (4830 s) and stays far inside the protection horizon.
+      CLOCK_RETENTION_JUMP_SECS: "9000"
+    volumes: ["faketime:/faketime"]
+    depends_on:
+      faketime: *faketime-done
+      init:
+        condition: service_completed_successfully
+
+volumes:
+  faketime: {}
