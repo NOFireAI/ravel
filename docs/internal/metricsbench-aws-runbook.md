@@ -200,9 +200,10 @@ function of the anchor and the seed.
   otherwise, and any value that is not a positive integer, with exit 64.
 - `MB_SERIES_INDEX`, `1` to run the measured run with run.sh's
   `MB_SERIES_INDEX=1`, which puts the metrics series index (ADR-4146) on
-  wherever Stage 1 puts the label index on. It needs `MB_STAGE1=1`;
-  `launch.sh` refuses it otherwise, and any value other than `1`, `0` or
-  unset, with exit 64. The ci smoke runs without it, since its band file
+  wherever Stage 1 puts the label index on. It needs `MB_STAGE1=1` and
+  `MB_STAGE1_BANDS`, even on `ci`, whose default band file describes the
+  label-value route; `launch.sh` refuses it without them, and any value
+  other than `1`, `0` or unset, with exit 64. The ci smoke runs without it, since its band file
   describes the label-value route. The ADR-4146 M1 run sets it with
   `MB_STAGE1_BANDS=deploy/metricsbench/stage1-bands.series.cardinality.json`.
 

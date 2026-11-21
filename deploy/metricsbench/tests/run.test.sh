@@ -5400,6 +5400,14 @@ for v in 2 yes; do
 done
 launch si-no-stage1 MB_SERIES_INDEX=1
 expect_launch_refused "MB_SERIES_INDEX=1 without MB_STAGE1" "MB_SERIES_INDEX=1 puts the series index on in the Stage 1 passes and needs MB_STAGE1=1"
+launch si-ci-no-bands MB_PROFILE=ci MB_RSS_BAND=x:1:2 MB_OBJECTS_BAND=1:2 MB_STAGE1=1 MB_SERIES_INDEX=1
+expect_launch_refused "MB_SERIES_INDEX=1 on ci without MB_STAGE1_BANDS" "MB_SERIES_INDEX=1 needs MB_STAGE1_BANDS, a band file pre-registered for the series index; the ci default describes the label-value route"
+launch si-ci-bands MB_PROFILE=ci MB_RSS_BAND=x:1:2 MB_OBJECTS_BAND=1:2 MB_STAGE1=1 MB_SERIES_INDEX=1 MB_STAGE1_BANDS=deploy/metricsbench/stage1-bands.ci.json
+if [ "${rc}" -eq 0 ] && launch_env | grep -qxF 'SERIES_INDEX=1'; then
+  pass "launch: MB_SERIES_INDEX=1 on ci with its own MB_STAGE1_BANDS is accepted"
+else
+  fail "launch si-ci-bands: rc ${rc}, stderr $(cat "${LAUNCH_ERR}")"
+fi
 launch si-card "${SI_CARD[@]}" MB_SERIES_INDEX=1 -- mbprefix
 if [ "${rc}" -eq 0 ] && grep -qF 'ec2 run-instances' "${LAUNCH_AWS_LOG}" &&
   [ "$(launch_env | cut -d= -f1 | tr '\n' ' ')" = "${LAUNCH_KEYS}SERIES_INDEX " ] &&

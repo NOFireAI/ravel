@@ -127,7 +127,9 @@ fi
 series_index=${MB_SERIES_INDEX:-}
 case "$series_index" in
   ''|0) series_index="" ;;
-  1) [ -n "$stage1" ] || { echo "MB_SERIES_INDEX=1 puts the series index on in the Stage 1 passes and needs MB_STAGE1=1" >&2; exit 64; } ;;
+  1) [ -n "$stage1" ] || { echo "MB_SERIES_INDEX=1 puts the series index on in the Stage 1 passes and needs MB_STAGE1=1" >&2; exit 64; }
+     # The shipped ci band file, ci's default, describes the label-value route.
+     [ -n "$stage1_bands" ] || { echo "MB_SERIES_INDEX=1 needs MB_STAGE1_BANDS, a band file pre-registered for the series index; the ci default describes the label-value route" >&2; exit 64; } ;;
   *) echo "MB_SERIES_INDEX must be 1, 0 or unset, not '$series_index'" >&2; exit 64;;
 esac
 rss_band=${MB_RSS_BAND:-prometheus:2147483648:6442450944}
