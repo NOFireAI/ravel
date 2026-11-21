@@ -315,7 +315,7 @@ fn signal_name(s: Signal) -> &'static str {
 
 /// Even probes are logs, odd ones metrics.
 pub fn ack_signal(i: u32) -> Signal {
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         Signal::Logs
     } else {
         Signal::Metrics
