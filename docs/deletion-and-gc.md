@@ -1037,10 +1037,13 @@ marker (ADR-2993, erasure amendment):
   observation is therefore always whole-signal: one listing of the commit
   keyspace enumerates the signal's shards, and every shard is observed across
   every hour. A shard with no commit key holds nothing, so that scope costs
-  listing, never correctness. The rule issues no GET of its own beyond the
-  sweep's, the completions it must read anyway, and its one hold re-read
-  (below), whose record GETs the hold record cache serves after their first
-  read; it reads a verdict that sweep produced while doing its own work.
+  listing, never correctness. For the holds, the rule issues no GET of its
+  own beyond the sweep's, the completions it must read anyway, and its one
+  hold re-read (below), whose record GETs the hold record cache serves after
+  their first read; it reads a verdict that sweep produced while doing its
+  own work. The late-commit keep (below) adds one GET per commit record that
+  same listing classifies as late and, only when there is one, one GET per
+  candidate `.dreq`.
 
 - **An erasure request's `.dreq` outlives every input any rewrite in its
   supersession chain superseded.** The hold does not look only for the record
@@ -1114,6 +1117,26 @@ marker (ADR-2993, erasure amendment):
   different input set, or a supersession chain past its depth bound) is
   reported the same way, since its conflicts are unknown.
 
+- **A late commit record keeps the `.dreq`.** A commit record the store
+  stamped at or after its bucket's late-commit cutoff (ADR-4561) is served,
+  but no compaction, migration or raw-L0 erasure rewrite plans from it, so no
+  rewrite erased it. The completion gate reads it, but a record the store
+  applies after the request's `.done` was written was never seen by that
+  gate, and the query-time filter is then all that hides a subject it
+  holds. The erasure rule classifies the records of the commit-keyspace
+  listing the observation already takes by the same stamp rule the planners
+  use, whether or not the fence is on, and reads each late record's
+  event-time span. It keeps a candidate `.dreq` past its horizon while any
+  bucket of the tenant and signal without a retention tombstone holds a late
+  record whose span the request's window may overlap (a request with no
+  window overlaps every such bucket), counts it in
+  `ravel_maintain_dreq_held_by_superseded_inputs_total`, and logs one warn
+  line per kept request naming the bucket. Nothing records the keep: every
+  pass recomputes it, so the `.dreq` is released on the first pass after the
+  record is deleted or the bucket is tombstoned. A late record the store
+  applies after the pass's commit listing is not seen by that pass, and a
+  request whose `.dreq` that pass deletes is not kept by it.
+
 - **Why the hold terminates.** Apart from a refused chain, the cut-chain hold
   counts only objects the superseded-input sweep actually held on this pass,
   never the bare presence of a commit record in the bucket: a bucket with a cut chain and no held
@@ -1125,15 +1148,23 @@ marker (ADR-2993, erasure amendment):
   predecessor record is absent forms no delete group at all, so it has
   nothing to hold. Second, an object that lands in an already-swept hour
   after the fact, a late L0 flush into a sealed bucket, is an input of no
-  record that has passed its horizon: it forms no group, is held by nothing,
-  and cannot pin any request's filter, however long it sits there. With the
-  late-commit fence on (ADR-4561), a commit record stamped at or after its
-  bucket's maintain cutoff is an input of no later record either: every
-  compaction, migration and raw-L0 erasure rewrite of the bucket leaves it
-  out, so it stays raw, served and unswept for the life of the bucket. So each
-  hold is discharged by the event that released the objects behind it, the
-  fold reconciling the hour, an operator rebuilding HEAD, or a human clearing
-  the legal hold, and no state pins a request forever. A conflicting
+  record that has passed its horizon: it forms no group and is held by
+  nothing, so it pins no request's filter through the superseded-input
+  hold. With the late-commit fence on (ADR-4561), a commit record stamped at
+  or after its bucket's maintain cutoff is an input of no later record
+  either: every compaction, migration and raw-L0 erasure rewrite of the
+  bucket leaves it out, so it stays raw, served and unswept for the life of
+  the bucket. Such a record does pin the filter of every request whose window
+  may overlap it, through the late-commit keep (above), for as long as it is
+  served: that keep ends when an operator deletes the record, when retention
+  tombstones the bucket, or when a compaction run with
+  `--late-commit-fence off` supersedes the record and rule 2 reclaims it.
+  That last path carries the record's rows into the compaction's parts, which
+  a completed request's rewrite never revisits, so it is safe only when no
+  completed request's window overlaps the record (ADR-4561, residuals). So
+  each hold is discharged by the event that released the objects behind it,
+  the fold reconciling the hour, an operator rebuilding HEAD, or a human
+  clearing the legal hold, and no state pins a request forever. A conflicting
   compaction record (above) keeps a `.dreq` only while the conflict is live,
   and ends when the record is deleted or dominated; a bucket whose conflicts
   are unknown keeps every `.dreq` while its served compaction record lives,
