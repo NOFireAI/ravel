@@ -24,7 +24,25 @@ Terms used throughout:
 
 ## 0. Decision in five lines
 
-<!-- section 0 -->
+1. Ship option (b1) before the tag: compaction, migrate and the RawL0
+   erasure rewrite plan only from commit records whose store `last_modified`
+   is before `end(H) + max_flush_lifetime + clock_skew_allowance`, and wait
+   for the store's own clock to pass that instant plus 60 s before planning.
+2. A late record is left in place, served and kept exactly as today. Nothing
+   is deleted, quarantined or hidden, so no acknowledged write can be lost;
+   that matters because a buffered ack, and a strict ack under a broken
+   clock or a pause, can belong to a record that lands after the seal.
+3. Every plan of a sealed bucket then has the same input set (given the two
+   store properties section 7 could not verify), so a compaction that
+   publishes beside a rewrite is fully covered and dominated by the #4449
+   rule; a late L0 can no longer make a partial cover.
+4. No format, key or proto change. One new ADR (4561), amendment markers in
+   ADR-0018, ADR-1029 and ADR-2708, about 300 lines in `ravel-maintain`, 90
+   in the services, 650 of tests; the cost is that a re-stamped store or a
+   reconstructed shard needs `--late-commit-fence off`.
+5. It prevents new partial covers and repairs none. Existing conflicts, the
+   stuck erasure of a subject held in a late L0, and the false "cannot land
+   after the seal" claims (section 6) need the follow-ups in section 5.
 
 ## 1. The durability premise
 
@@ -32,16 +50,19 @@ Question: can a commit record that lands after the maintain seal belong to a
 write that was acknowledged to the client?
 
 Short answer. **Buffered mode: yes, with every clock inside its contract.
-Strict mode and an idempotency-keyed replay: yes, but only outside the clock
-contract (a writer clock far behind the store with the lag check not
-enforcing, or a process suspension the timers do not count).** In every mode
+Strict mode and an idempotency-keyed replay: yes, but only with a clock or a
+pause far outside anything the documents allow (a writer clock about an
+hour behind the store with the lag check not enforcing, a process suspension
+the timers do not count, or a maintainer clock about an hour ahead of the
+store).** In every mode
 the fence therefore cannot delete or hide a late record on the theory that
 nobody was told it was durable.
 
 ### 1.1 The writer path, all three signals
 
-The three shard actors run the same sequence. Lines are metrics / logs /
-spans.
+The three shard actors run the same sequence. The columns are the metrics,
+logs and spans shards, all under `crates/ravel-ingest/src/`; each cell is a
+line or range in that column's file.
 
 | Step | `shard.rs` | `log_shard.rs` | `span_shard.rs` |
 |---|---|---|---|
@@ -55,7 +76,8 @@ spans.
 Facts that follow from those lines:
 
 1. **The ack is sent after the commit PUT's response, never before.** The
-   only earlier `Ok` is a test mutant (`shard.rs:661-670`). So a strict
+   only earlier `Ok` is a test mutant
+   (`crates/ravel-ingest/src/shard.rs:661-670`). So a strict
    waiter is told `Ok` only when the store answered the create-if-absent PUT
    of the commit record (`crates/ravel-commit/src/publish.rs:120-131`), or
    answered `AlreadyExists` and the stored record carried this flush's
@@ -143,7 +165,9 @@ after its rows were enqueued, and the hour `H` was pinned from the writer's
 wall clock inside that same window. For that record to carry a store stamp
 at or past `end(H) + 65 min`, the store's clock has to be 65 minutes or more
 ahead of the instant the writer's wall clock named, with only 10 s of
-counted time in between. Three ways exist, none inside the clock contract:
+counted time in between. Two ways exist for the stamp itself to be that
+late, and a third for the record to be late against a maintainer's listing
+while its stamp is on time. None is inside the clock contract:
 
 - The writer's clock lags the store by more than the seal margin and the
   lag check does not refuse. It refuses a lag over 5 minutes
@@ -158,12 +182,17 @@ counted time in between. Three ways exist, none inside the clock contract:
   suspension; only ADR-4233 does, for format activation: "A process paused
   between its last check and a PUT is not bounded by any timer"
   (`docs/adrs/4233-retained-data-compatibility-contract.md:254-256`).
-- The wall clock is stepped forward between the pin and the PUT. The sleep
-  is a duration fixed before the step, so the PUT can still win and be
-  acked. The logs and spans shards say so in their own words: a flush "still
-  in flight when a write times out could land past the seal on correct code"
-  under forward jumps of 9000 s
-  (`crates/ravel-ingest/src/log_shard.rs:1283-1287`).
+- The maintainer's clock is ahead of the store's by about an hour, by a
+  step or by drift. It seals and lists `H` while in-contract strict flushes
+  are still landing. Such a record is on time by the store's stamp and late
+  only by that maintainer's listing. The logs and spans shards describe
+  this case in their own words: under forward jumps of 9000 s a flush
+  "still in flight when a write times out could land past the seal on
+  correct code" (`crates/ravel-ingest/src/log_shard.rs:1283-1287`). No
+  document bounds the maintainer's clock (section 6, item 9). For a
+  buffered flush, which may run to its hour bound, a maintainer a few
+  minutes fast and a writer a few minutes slow are enough, and both are
+  inside the allowance.
 
 A strict write whose ack round timed out is not acknowledged: the client got
 a retryable error and "each shard's flush keeps running and may commit
@@ -543,7 +572,33 @@ late.
 Not before the tag: a persistent format addition with the full procedure.
 It is the fallback if `last_modified` proves unusable on a supported store.
 
-### 3.6 Side by side
+### 3.6 Option (d3): readers resolve a partial cover
+
+Rule: extend the #4449 read-side dominance from "the rewrite holds every
+input the compaction record names" (`crates/ravel-catalog/src/catalog.rs:6134-6139`)
+to "and every input it does not hold is still listed as a raw L0": readers
+drop the compaction record's parts and serve those inputs raw.
+
+- This is not a fence. A partial cover still forms in the store; it stops
+  being harmful, whatever caused it, with no clock and no stamp involved.
+- **Reads that change:** every bucket resolution, through the shared
+  function, as the #4449 rule did
+  (`docs/adrs/1029-advisory-compaction-claims.md:1102-1108`).
+- **Acknowledged write lost:** not by the read rule. The sweep is the loss
+  surface: today a conflicting record's group can delete the inputs it names
+  (`crates/ravel-maintain/src/sweep.rs:1847-1851`,
+  `crates/ravel-maintain/src/sweep.rs:2273-2276`), and under this rule it
+  must never delete an input the rewrite does not hold, including during a
+  rolling upgrade with an older sweeper still running.
+- **Existing store:** this is the one option that repairs a conflicting
+  record already present, as long as its uncovered inputs have not been
+  swept.
+- **Needs:** an ADR-1029 amendment; no format change.
+
+Not before the tag: it changes reads and the sweep's delete groups together.
+Section 5.3 proposes it as the repair and as the backstop behind (b1).
+
+### 3.7 Side by side
 
 | | Reads change | Acked write can be lost | Prevents partial cover | Format or key change | Before the tag |
 |---|---|---|---|---|---|
@@ -553,6 +608,7 @@ It is the fallback if `last_modified` proves unusable on a supported store.
 | (c) expiring commit PUT | none | no | narrows, does not close | no | no |
 | (d1) ack on store evidence | none | no | no | no | no |
 | (d2) seal object | none | no | yes | yes | no |
+| (d3) readers resolve a partial cover | all | not by reads; the sweep must change | no, makes it harmless | no | no |
 
 ## 4. Decision
 
@@ -675,7 +731,7 @@ call (`crates/ravel-object-store/src/fault.rs:685`), and the injected
    its data object are still present, a token resolve and a listing resolve
    both return its rows exactly once, and the fold's classifier includes it.
    Second half in `crates/ravel-compat-tests/tests/e2e.rs` (which already
-   drives `set_clock_ms`, `:555-557`): a strict write through a real router
+   drives `set_clock_ms`, `:555-558`): a strict write through a real router
    whose commit PUT is stamped past `C(H)` returns `Ok` with a token, and a
    read with that token returns the rows before and after compaction and
    sweep.
@@ -703,8 +759,8 @@ call (`crates/ravel-object-store/src/fault.rs:685`), and the injected
     (`crates/ravel-maintain/src/publish.rs:495`, beside the existing one):
     "maintain: a published record names no late commit record", and an
     `inv_sometimes!`: "maintain: a plan left a late commit record out". The
-    catalog-maintenance rig jumps clocks forward
-    (`antithesis/catalog-maintenance/README.md:442-446`), so one run of it is
+    catalog-maintenance rig jumps clocks forward by 9000 s and more
+    (`crates/ravel-ingest/src/log_shard.rs:1283-1287`), so one run of it is
     part of the gate for this change: R3 makes a maintainer whose clock
     jumped ahead wait for the store.
 
@@ -717,8 +773,9 @@ fresh store stamp, on purpose:
   objects (`services/ravel-cli/src/reconstruct.rs:1-11`), each a new
   create-if-absent PUT (`services/ravel-cli/src/reconstruct.rs:31-35`). Every
   one is late by R2.
-- Benches seed old hours and then compact them, for example
-  `crates/ravel-bench/src/bin/compaction_bench.rs:272`.
+- Benches seed a synthetic hour decades in the past and then compact it,
+  for example `crates/ravel-bench/src/bin/compaction_bench.rs:55` (the hour)
+  and `:272` (the publish).
 - Many maintenance tests seed inputs after moving the store's clock; 19
   files under `crates/ravel-maintain` and `crates/ravel-compat-tests` call
   `set_clock_ms`.
@@ -796,12 +853,211 @@ Risk, stated plainly:
 
 ## 5. What the decision does not close, and the follow-ups
 
-<!-- section 5 -->
+### 5.1 Residuals of the fence itself
+
+- **Stamp-to-visible gap longer than `SETTLE`**, or a maintainer on a store
+  that gives no clock observation and whose own clock is more than `SETTLE`
+  ahead of the store. An on-time record can then appear after a plan's LIST.
+  The pre-publish re-list still catches it up to the record PUT
+  (`crates/ravel-maintain/src/rewrite.rs:636-641`); past that it is today's
+  window, and the conflict counter still reports it
+  (`crates/ravel-catalog/src/catalog.rs:6142-6146`).
+- **A wrong observation.** The observation is "not monotonic: the latest
+  observation wins", so one wrong `Date` from a proxy moves it
+  (`crates/ravel-object-store/src/lib.rs:953-956`). R3 requires the pass's
+  own clock as well, so a wrong-high observation gives today's behaviour and
+  a wrong-low one gives `NotSealed` until the next response.
+- **A stray is still a stray.** A late L0 stays raw for the life of its
+  bucket. If it holds an erasure subject, that request stays blocked
+  (`crates/ravel-maintain/src/erasure_rewrite.rs:3333-3337`) and raises the
+  deadline alarm at 72 h (`crates/ravel-maintain/src/erasure_rewrite.rs:3112`).
+  If it is below a format floor, the floor stays down. Both are true today
+  for a late L0 that lands after a compaction record (section 2.2); the
+  fence extends them to one that lands between the seal and the first plan.
+- **Another source of unequal inputs.** Compaction leaves out an input its
+  codec cannot rewrite (`crates/ravel-maintain/src/rewrite.rs:387-395`).
+  That makes the compaction's set smaller than the rewrite's, which is the
+  dominated direction, so it does not produce a partial cover; it is named
+  here because it is the other place two plans of one bucket differ.
+
+### 5.2 Follow-ups, in order
+
+1. **Ack on store evidence (3.4).** After it, a strict `Ok` implies an
+   on-time record, for every writer that has it. This is what lets anything
+   ever be removed.
+2. **Dispose of strays without loss.** A maintenance step that takes late
+   L0s into the bucket's live record, so an erasure and a format floor can
+   complete. The rewrite record cannot express "these inputs plus that
+   predecessor" today: exactly one of `inputs` or `superseded_record_key` is
+   set (`proto/ravel/commit.proto:324-328`). So this is a format decision
+   with its own ADR.
+3. **Store-side bound on the commit PUT (3.3)**, if the residuals of 5.1 are
+   ever observed.
+4. **Readers ignore late records (3.1)**, only behind a compatibility
+   certificate that no writer without follow-up 1 remains, on the model of
+   ADR-4233's late-write pass
+   (`crates/ravel-maintain/src/late_writes.rs:9-12`).
+
+### 5.3 A store that already holds a late L0 or a conflicting record
+
+- **A late L0 already present.** Nothing to do for correctness. It is served
+  as an extra segment (`docs/adrs/0018-l0-l1-compaction.md:185-189`) and the
+  sweep keeps it (`crates/ravel-maintain/tests/superseded_head_gate.rs:1791-1796`).
+  After the upgrade the new counter and `ravel-cli catalog verify`
+  (`docs/catalog-and-mvcc.md:2817-2820`) find it.
+- **A conflicting compaction record already present.** The fence does not
+  repair it. It stays served beside the rewrite and counted
+  (`crates/ravel-catalog/src/catalog.rs:6026-6033`), every erasure pass over
+  the bucket fails with `MultipleLiveRecords`
+  (`crates/ravel-maintain/src/erasure_rewrite.rs:648-651`), and #4560 is
+  what keeps the erased subject unserved (not on this checkout; taken from
+  the task statement). By reading, not by reproduction: the conflicting
+  record is a winner among compaction records, so the sweep's superseded
+  view is "its whole input set" (`crates/ravel-maintain/src/sweep.rs:2273-2276`)
+  and its group can delete the inputs it names
+  (`crates/ravel-maintain/src/sweep.rs:1847-1851`), after which the late
+  input's rows exist only in that record's parts.
+- **The repair that fits the existing design** is a second read-side
+  dominance case, shaped like the one that landed for #4449: a version 1
+  record a live rewrite covers in part is dominated when every input it
+  names that the rewrite does not hold is still listed as a raw L0 in the
+  bucket; readers drop its parts and serve those inputs raw, as they
+  already do for a losing compaction record's loser-only inputs
+  (`crates/ravel-maintain/src/migrate.rs:2121-2124`), and the sweep must then
+  never count those inputs as superseded. It needs no format change, it
+  needs an ADR-1029 amendment, it changes every bucket resolution, and it
+  has a loss surface in the sweep that the fence does not have. It is not
+  proposed for the tag. It should be its own ticket, and it is also the
+  backstop for the residuals in 5.1.
 
 ## 6. Claims in the ADRs, docs and properties that this reading shows false
 
-<!-- section 6 -->
+Each of these states or needs "a dropped PUT cannot land later". None of
+them is fixed by this document; they are reported per the repository rule on
+contradictions between specs and code.
+
+1. **The Antithesis property "commit: an abandoned flush's commit record
+   never lands past the fold's seal margin"**
+   (`crates/ravel-ingest/src/shard.rs:1005-1007`). Three problems.
+   - Nothing in the code makes it true. The writer bounds when it stops
+     waiting (`crates/ravel-ingest/src/shard.rs:1229-1232`); no code bounds
+     when the store applies a request already sent.
+   - It measures against the fold seal, `end(H) + 80 min`
+     (`crates/ravel-ingest/src/config.rs:873-881`,
+     `crates/ravel-ingest/src/shard.rs:932`), which is 15 minutes after the
+     maintain seal. A record that lands in between satisfies the property
+     and is exactly the late L0 of #4561. The property cannot see the
+     failure this issue is about.
+   - The logs and spans shards decline to evaluate it because it "could
+     land past the seal on correct code"
+     (`crates/ravel-ingest/src/log_shard.rs:1283-1287`,
+     `crates/ravel-ingest/src/span_shard.rs:537-540`). A property that is
+     false on correct code for two signals is not an invariant of the
+     design for the third; it holds on the metrics shard only because that
+     rig does not jump clocks under it.
+   After the fence, the property worth asserting is the one in test 10 of
+   section 4.3, on the maintenance side.
+2. **The maintain seal comments.** "the writer interlock then guarantees no
+   further commit record can ever appear, making one strongly consistent
+   LIST a complete input set" (`crates/ravel-maintain/src/bucket.rs:47-49`)
+   and "No new commit record can appear in the bucket after that"
+   (`crates/ravel-maintain/src/config.rs:2774-2777`). False; contradicted
+   in the same crate by
+   `crates/ravel-maintain/tests/superseded_head_gate.rs:1756-1758`.
+3. **The seal lemma's proof sketch.** "a flush older than
+   `max_flush_lifetime` is abandoned and MUST NOT be published afterward ...
+   so the last possible publish for bucket H happens before
+   `end(H) + max_flush_lifetime` on the writer's clock"
+   (`docs/catalog-and-mvcc.md:2804-2810`). The step from "must not publish
+   afterward" to "the last possible publish happens before" assumes a
+   request lands when it is issued. The same step is in
+   `docs/catalog-and-mvcc.md:2786-2788`.
+4. **"That keeps every publish inside the catalog's seal of `H`"**
+   (`docs/consistency-model.md:104-108`) and **"so a late flush cannot
+   publish into an hour the catalog has already sealed"**
+   (`docs/ingest.md:1046-1049`). Both describe the bound on starting a PUT.
+5. **ADR-2708 D3**: "the 5-minute skew margin covers a commit PUT the store
+   applies after the client gave up, since one attempt is bounded by the
+   20 s request timeout" (`docs/adrs/2708-due-diligence-p1-fixes.md:209-212`).
+   Two errors. The 20 s timeout bounds the client's wait for one attempt
+   (`docs/object-store-contract.md:250-254`), not the store's application of
+   it. And the same 5 minutes is already spent: it is the lag a writer may
+   have behind the store and still pass its check
+   (`crates/ravel-ingest/src/config.rs:237-238`). A writer 4 min 50 s behind
+   has 10 s of that margin left, not 5 minutes.
+6. **ADR-0018 decision 1**: the interlock "is what makes a sealed bucket's
+   commit-record set immutable, so one strongly consistent LIST of the
+   bucket is a complete, stable input set"
+   (`docs/adrs/0018-l0-l1-compaction.md:120-126`). The same ADR's read-side
+   paragraph already allows "a late commit landing in a sealed bucket"
+   (`docs/adrs/0018-l0-l1-compaction.md:185-189`); only the read side was
+   built for it. The same immutability claim is in ADR-0020
+   (`docs/adrs/0020-metric-index.md:80-85`) and rests on ADR-0010 §11's
+   "never publish it afterward"
+   (`docs/adrs/0010-spec-amendments-review-1.md:83-85`).
+7. **The TLA+ invariant `NoPublishAfterAbandon`** holds by construction, not
+   by the protocol: `PutCommit` is one atomic action guarded by
+   `~Expired(f)` (`formal/tla/commit/CommitProtocol.tla:306-311`, `:232`),
+   and no action models a request issued before the deadline and applied
+   after it. Its own comment says "No store write is issued after the
+   deadline" (`formal/tla/commit/CommitProtocol.tla:636-640`), which is the
+   weaker, true claim; the Antithesis message in item 1 states the stronger,
+   false one.
+8. **ADR-1685 decision 3**: "the seal margin is sixteen times the allowance,
+   so an undetected lag cannot reach a sealed hour"
+   (`docs/adrs/1685-writer-clock-skew-refusal-against-store-time.md:105-107`).
+   True of the fold seal, 80 minutes. The maintain seal is one allowance
+   past the writer's bound (`crates/ravel-maintain/src/config.rs:2778-2781`),
+   so a lag just over the allowance, which the ADR says can pass undetected
+   by up to the observation's age, reaches it for a flush that runs to its
+   hour bound.
+9. **The maintain seal has no term for the maintainer's own clock.** The
+   fold has one, `fold_safety_margin`, and says so
+   (`docs/catalog-and-mvcc.md:2810-2811`, `:2817-2818`). The maintain seal
+   is `max_flush_lifetime + clock_skew_allowance` and nothing else
+   (`crates/ravel-maintain/src/config.rs:2778-2781`), and its one margin is
+   described as "for cross-host clock skew"
+   (`crates/ravel-maintain/src/config.rs:2083`) while the documents assign
+   the same figure to the writer's error against true time
+   (`docs/catalog-and-mvcc.md:2808-2810`). A maintainer that is fast and a
+   writer that is slow, each inside the allowance, overlap. R3 is the first
+   place the maintain side checks a clock other than its own.
+10. **Erasure completion**, by reading and not reproduced: "Every record
+    that existed when the request was acknowledged is gone from every live
+    commit-record segment a snapshot resolves" (`docs/consistency-model.md:897`),
+    with the wait bounded by the seal of the bucket open at the ack
+    (`docs/adrs/0064-selective-subject-erasure.md:553-559`). A flush that
+    held the subject's rows before the ack and whose commit record lands
+    after the bucket's rewrite and the request's `.done` is in no rewrite
+    and is served as a raw L0 wherever a late L0 is served (section 2.1).
+    The fence does not close this; follow-ups 1 and 4 of section 5.2 do.
 
 ## 7. What this document could not verify
 
-<!-- section 7 -->
+- **The issue text and the analysis comment.** `gh` is not installed on the
+  executor, so issue #4561 and the #4542 comment were not read. The problem
+  statement used here is the one in the task, checked against the code.
+- **#4560** is not on this checkout. What it does is taken from the task.
+- **[external] When S3 stamps `LastModified`** relative to when the object
+  becomes listable, and the size of that gap. The design needs only "the
+  stamp is not after visibility by more than `SETTLE`".
+- **[external] Whether a given copy, replication or restore path preserves
+  `LastModified`.** The design assumes some do not and gives the switch.
+- **[external] The 15-minute signature window and presigned expiry** in 3.3.
+  The checkout shows only that the store refuses a request whose signing
+  time is too far from its clock
+  (`crates/ravel-object-store/src/lib.rs:712-718`).
+- **Whether tokio's timer counts a given kind of suspension.** Section 1.2
+  says a suspension the timers do not count defeats the bound; it does not
+  claim which platforms have one.
+- **Nothing here was run.** No test, no reproduction, no measurement. The
+  partial-cover sequence in 2.3, the sweep reading in 5.3 and item 10 of
+  section 6 are readings of the cited code. The first implementation step is
+  test 2 of section 4.3 with the fence `Off`, which must show the conflict
+  before the fence is trusted to remove it.
+- **The line counts in 4.6** are estimates from the sites listed, not from a
+  prototype.
+- **How many existing fixtures stamp a sealed hour's inputs past its
+  cutoff.** 19 files call `set_clock_ms`; they were counted, not audited.
+  The library default of `Off` is what makes the audit unnecessary for the
+  tag.
