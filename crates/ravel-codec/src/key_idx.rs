@@ -752,7 +752,7 @@ impl<'a> KeyIdxPrefix<'a> {
         }
         let mut ends = Vec::with_capacity(n);
         let mut previous = 0u32;
-        for chunk in dir[..4 * n].chunks_exact(4) {
+        for chunk in dir[..4 * n].as_chunks::<4>().0 {
             let end = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             if end < previous {
                 return Err(corrupted(format_args!(
@@ -925,7 +925,7 @@ fn decode_frame(
         )));
     }
     let mut entries: Vec<(Key8, u32)> = Vec::with_capacity(count as usize);
-    for chunk in raw.chunks_exact(KEY_IDX_ENTRY_LEN) {
+    for chunk in raw.as_chunks::<KEY_IDX_ENTRY_LEN>().0 {
         let mut key8 = [0u8; 8];
         key8.copy_from_slice(&chunk[..8]);
         let block = u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);

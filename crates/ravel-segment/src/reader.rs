@@ -906,9 +906,8 @@ fn decode_raw_f64_into(bytes: &[u8], count: usize, out: &mut Vec<f64>) -> Result
         return Err(SegmentError::Truncated);
     }
     out.reserve(count);
-    for chunk in bytes.chunks_exact(8) {
-        let arr: [u8; 8] = chunk.try_into().map_err(|_| SegmentError::Truncated)?;
-        out.push(f64::from_le_bytes(arr));
+    for chunk in bytes.as_chunks::<8>().0 {
+        out.push(f64::from_le_bytes(*chunk));
     }
     Ok(())
 }

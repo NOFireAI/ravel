@@ -467,9 +467,8 @@ impl ValueCodec for RawF64 {
             });
         }
         let mut out = Vec::with_capacity(count);
-        for chunk in bytes.chunks_exact(8) {
-            let arr: [u8; 8] = chunk.try_into().map_err(|_| CodecError::Truncated)?;
-            out.push(f64::from_bits(u64::from_le_bytes(arr)));
+        for chunk in bytes.as_chunks::<8>().0 {
+            out.push(f64::from_bits(u64::from_le_bytes(*chunk)));
         }
         Ok(out)
     }
@@ -832,9 +831,8 @@ impl ValueCodec for GcdDeltaFor {
                     });
                 }
                 let mut out = Vec::with_capacity(count);
-                for chunk in body.chunks_exact(8) {
-                    let arr: [u8; 8] = chunk.try_into().map_err(|_| CodecError::Truncated)?;
-                    out.push(f64::from_bits(u64::from_le_bytes(arr)));
+                for chunk in body.as_chunks::<8>().0 {
+                    out.push(f64::from_bits(u64::from_le_bytes(*chunk)));
                 }
                 Ok(out)
             }

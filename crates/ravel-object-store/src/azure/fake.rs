@@ -1024,7 +1024,9 @@ fn decode_token(token: &str) -> Option<String> {
         return None;
     }
     let bytes = digits
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Some(hex_digit(pair[0])? << 4 | hex_digit(pair[1])?))
         .collect::<Option<Vec<u8>>>()?;
     String::from_utf8(bytes).ok()

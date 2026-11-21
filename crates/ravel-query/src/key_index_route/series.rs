@@ -297,6 +297,10 @@ impl MetricRouting {
 /// part. With no series ref on any part a snapshot segment comes from, the
 /// result is [`route_values`](super::route_values)'s. Nothing is routed while
 /// the snapshot carries a pending erasure.
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 pub async fn route_metric_statement(
     input: ValueRouteInput<'_>,
     plans: &[Vec<(&str, &str)>],
@@ -305,6 +309,10 @@ pub async fn route_metric_statement(
     route_metric_statement_under(input, plans, options, &ROUTE_TOTALS).await
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 pub(super) async fn route_metric_statement_under(
     input: ValueRouteInput<'_>,
     plans: &[Vec<(&str, &str)>],
@@ -514,6 +522,10 @@ struct SeriesCtx<'a, 'b> {
     charges: [&'a QueryAccounting; 3],
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn route_series(
     input: &ValueRouteInput<'_>,
     plans: &[Vec<(&str, &str)>],
@@ -713,6 +725,10 @@ fn intersect(postings: &[&[u64]]) -> Vec<u64> {
     out
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn route_series_part(
     ctx: &SeriesCtx<'_, '_>,
     part: usize,
@@ -1010,6 +1026,10 @@ impl PassDecoder<'_> {
 /// admission of the offered plans (ascending own bytes, ties in plan order)
 /// while the admitted union's runs stay within `allowance`, then the
 /// admitted union's runs, decoded.
+#[expect(
+    clippy::result_large_err,
+    reason = "RouteError carries CatalogError by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn run_pass(
     ctx: &SeriesCtx<'_, '_>,
     handle: &SnapshotPartHandle,
