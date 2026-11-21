@@ -91,6 +91,13 @@ For a bucket of hour `H` under configuration `config`:
    migrate's raw-served set and straggler audit, the legal-hold check,
    retention, the sweep and every read path keep using the full listing. A
    late record is served, kept, held, expired and counted exactly as before.
+   Under `Enforce` the completion gate judges a bucket only once it is
+   plannable by R3, with the store's observed clock, the same test the
+   raw-L0 erasure rewrite plans under (`may_judge_completion`); before then
+   it blocks every request whose scope held the bucket at acknowledgement,
+   as it blocks for an unsealed bucket. A sealed bucket is not enough: up to
+   `SETTLE` past the cutoff an on-time record stamped just before it may not
+   be listed yet, and a `.done` written then would never be revisited.
 7. **R7, switch.** `CompactorConfig::late_commit_fence` is `Off` or
    `Enforce`. The library default is `Off`, the behaviour before this ADR.
    `ravel-server`'s maintenance configuration and `ravel-cli maintain
@@ -119,7 +126,12 @@ past `C(H) + SETTLE`. Every commit record stamped before `C(H)` is visible
 to that LIST, given the settle allowance and the list-after-write guarantee
 the seal lemma already relies on. Every commit record stamped at or after
 `C(H)` is excluded by R2 whenever it arrives. So every plan of the bucket,
-by any pass at any later time, has the same L0 set. A compaction that
+by any pass at any later time, has the same L0 set, provided every pass
+derives `C(H)` from the same seal margin. The margin is each process's own
+configuration (R1), so this needs every maintainer of the store to run the
+same `max_flush_lifetime` and `clock_skew_allowance` while the fence is on:
+two passes with different margins draw different cutoffs, disagree on which
+records are late, and can again plan different sets. A compaction that
 publishes beside a rewrite names inputs the rewrite holds in full, and
 `erasure_dominance` resolves it as dominated. No stall length changes this,
 because the argument uses no time after the LIST.
@@ -177,8 +189,14 @@ the first pass after the late record is deleted or its bucket tombstoned.
 The classification is applied whatever the fence setting, because a stamp
 says what the store applied late whether or not this pass's planners fence
 it. With the fence off, a later compaction supersedes the late record and
-rule 2 reclaims it, which ends the keep; see the residual below on what that
-compaction carries.
+rule 2 reclaims it, which ends the keep. That compaction copies the late
+record's rows into L1, where the rewrite of an already completed erasure
+request never reaches them, so once the keep ends those rows are served
+again. Before running with the fence off over a bucket holding a late
+record, the operator lists the tenant's erasure requests (`ravel-cli erase
+status --tenant <t> --signal <s>`) and resubmits, after the run, every
+completed one whose window overlaps the affected hours; see the residual
+below.
 
 ## Options considered
 
@@ -240,11 +258,33 @@ Residuals of the fence itself:
   record the store applies after that LIST and before the same pass deletes
   a `.dreq` is not seen by that pass.
 - A compaction run with `--late-commit-fence off` over a bucket holding a
-  late record carries the record's rows into its parts. A completed
-  request's rewrite never revisits them, so once rule 2 reclaims the late
-  record R9 releases the `.dreq` and those rows are served again. Before
-  such a run the operator checks that no completed request's window
-  overlaps the bucket's late records. Follow-up 2 removes the need.
+  late record copies the record's rows into L1. A completed request's
+  rewrite never reaches them there, so once rule 2 reclaims the late record
+  R9 releases the `.dreq` and those rows are served again. Before such a run
+  the operator lists the tenant's erasure requests with `ravel-cli erase
+  status --tenant <t> --signal <s>` and resubmits, after the run, every
+  completed request whose window overlaps the affected hours, so a new
+  rewrite covers the L1 segments. Follow-up 2 removes the need.
+- The cutoff derives from each process's seal margin (R1). Every maintainer
+  of a store, `ravel-server`'s maintenance (`--gc-max-flush-lifetime` and
+  the clock-skew allowance) and every `ravel-cli maintain` run, must use the
+  same `max_flush_lifetime` and `clock_skew_allowance` while the fence is
+  on, or two passes disagree on which records are late and can rebuild the
+  partial cover. `ravel-cli maintain compact-bucket` and `compact-tenant`
+  refuse `--max-flush-lifetime` other than the default unless
+  `--late-commit-fence off` is given. Nothing checks the server's setting
+  against its peers: a rolling change of either value is done with the
+  fence off on every maintainer, or by draining every maintainer on the old
+  configuration before any starts on the new one.
+- A maintainer of a release before this ADR plans without the fence. During
+  a rolling upgrade, a pre-fence maintainer running beside a fenced one can
+  take a late record into a compaction that a fenced rewrite does not cover,
+  which is the partial cover this ADR removes. The fence holds for a store
+  only once every maintainer of it, `ravel-server` maintenance and every
+  `ravel-cli maintain` run, is on a release with the fence on.
+- A store already holding a partial cover, or a late record holding an
+  erased subject from before this ADR, is not repaired. The #4560 keep stops
+  the subject being served; the liveness cost remains until follow-up 2.
 
 Follow-ups, in order:
 
@@ -288,6 +328,16 @@ In `crates/ravel-maintain/tests/late_commit_fence.rs`, with stamps set on
   `a_late_l0_outside_the_window_lets_the_request_complete` and
   `a_late_l0_keeps_a_windowless_request_blocked_whatever_it_holds`: the
   completion gate reads every record and decides on window overlap.
+- `completion_waits_until_the_bucket_is_plannable` (R3, R6): under the
+  fence a sealed bucket that is not yet plannable, by the pass's clock or
+  the store's, keeps an in-scope request blocked and is not listed; once
+  plannable it is judged. With the fence off it is judged at the seal. In
+  `ravel-server`,
+  `run_erasure_pass_completes_only_once_the_ack_hour_is_plannable` shows no
+  `.done` is written before then.
+- `a_fenced_run_refuses_a_flush_lifetime_override` and
+  `compact_binaries_refuse_a_flush_lifetime_override_under_the_fence`
+  (`ravel-cli`): the seal-margin residual's refusal.
 - `a_late_l0_landing_after_completion_keeps_the_dreq` (R9): the request
   completes with no late record present, its `.dreq` and `.done` are
   written, and then a late record holding the subject inside the window

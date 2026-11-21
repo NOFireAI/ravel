@@ -2783,6 +2783,55 @@ fn compact_bucket_binary_refuses_zero_part_split_flags() {
     }
 }
 
+/// ADR-4561: with the late-commit fence on (the default), both compaction
+/// commands refuse a `--max-flush-lifetime` that moves the cutoff, naming both
+/// flags, before reading the store. With `--late-commit-fence off` the same
+/// override is accepted.
+#[test]
+fn compact_binaries_refuse_a_flush_lifetime_override_under_the_fence() {
+    let commands: [&[&str]; 2] = [
+        &["compact-bucket", "--shard", "0", "--hour", "1"],
+        &["compact-tenant", "--shards", "1"],
+    ];
+    for command in commands {
+        let run = |extra: &[&str]| {
+            std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
+                .args(["--store", "memory", "maintain"])
+                .args(command)
+                .args(["--tenant", TENANT, "--signal", "logs", "--dry-run"])
+                .args(["--max-flush-lifetime", "0s"])
+                .args(extra)
+                .output()
+                .expect("ravel-cli runs")
+        };
+        for extra in [&[][..], &["--late-commit-fence", "on"][..]] {
+            let output = run(extra);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "{command:?} {extra:?} must fail: {stderr}"
+            );
+            assert!(
+                stderr.contains(
+                    "--late-commit-fence on (the default) cannot be combined with \
+                     --max-flush-lifetime 0s"
+                ),
+                "{command:?} {extra:?}: {stderr}"
+            );
+        }
+        let output = run(&["--late-commit-fence", "off"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("--late-commit-fence on"),
+            "{command:?} with the fence off: {stderr}"
+        );
+        assert!(
+            output.status.success(),
+            "{command:?} with the fence off: {stderr}"
+        );
+    }
+}
+
 /// ADR-1746 decision 4: `maintain compact-bucket` checks the bucket's recorded
 /// format floor. With the tenant's RLOG floor one above the newest version
 /// the build writes, the compaction of a sealed two-input bucket is refused

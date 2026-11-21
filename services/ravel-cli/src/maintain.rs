@@ -70,6 +70,45 @@ impl LateCommitFenceArg {
     }
 }
 
+/// A `--max-flush-lifetime` that moves the late-commit cutoff while the fence
+/// is on.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "--late-commit-fence on (the default) cannot be combined with --max-flush-lifetime {given} \
+     (the default is {default}): an hour's late-commit cutoff is its end plus max_flush_lifetime \
+     plus clock_skew_allowance, so a pass with a flush lifetime other than the store's other \
+     maintainers classifies a different set of commit records as late, and two plans of one \
+     bucket can name different inputs, which is the partial cover the fence exists to prevent \
+     (ADR-4561). Pass --late-commit-fence off together with --max-flush-lifetime"
+)]
+pub struct FencedFlushLifetimeError {
+    pub given: String,
+    pub default: String,
+}
+
+/// Refuse `--late-commit-fence on` with a `--max-flush-lifetime` other than
+/// the compactor's default. Every maintainer of a store must share the seal
+/// margin while the fence is on, because the cutoff is derived from it
+/// (ADR-4561 R1); `off` takes any override.
+pub fn check_fence_flush_lifetime(
+    fence: LateCommitFenceArg,
+    max_flush_lifetime_ns: Option<i64>,
+) -> Result<(), FencedFlushLifetimeError> {
+    let default_ns = CompactorConfig::default().max_flush_lifetime_ns;
+    match (fence, max_flush_lifetime_ns) {
+        (LateCommitFenceArg::On, Some(ns)) if ns != default_ns => Err(FencedFlushLifetimeError {
+            given: humantime_ns(ns),
+            default: humantime_ns(default_ns),
+        }),
+        _ => Ok(()),
+    }
+}
+
+fn humantime_ns(ns: i64) -> String {
+    let duration = std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(0));
+    humantime::format_duration(duration).to_string()
+}
+
 /// A wall clock snapshot for a one-shot CLI invocation: the whole command runs
 /// at a single `now`, which is exactly what the compactor's seal check and the
 /// sweep/retention horizon gates need (a moving clock matters only for a
@@ -3859,6 +3898,45 @@ mod tests {
     /// These fixtures build their own `MemoryStore`, which is the explicit
     /// `--store memory` case (issue #1024): an empty result stays a success.
     const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
+
+    /// With the fence on, a `--max-flush-lifetime` other than the default is
+    /// refused, naming both flags and the cutoff it would move. The default
+    /// spelled out, no override, and any override with the fence off pass.
+    #[test]
+    fn a_fenced_run_refuses_a_flush_lifetime_override() {
+        const HOUR_NS: i64 = 3_600_000_000_000;
+        let err = check_fence_flush_lifetime(LateCommitFenceArg::On, Some(0))
+            .expect_err("the fence with --max-flush-lifetime 0s is refused");
+        assert_eq!(
+            err,
+            FencedFlushLifetimeError {
+                given: "0s".to_string(),
+                default: "1h".to_string(),
+            }
+        );
+        let message = err.to_string();
+        for needle in [
+            "--late-commit-fence on",
+            "--max-flush-lifetime 0s",
+            "late-commit cutoff",
+            "--late-commit-fence off",
+        ] {
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+        assert!(check_fence_flush_lifetime(LateCommitFenceArg::On, Some(2 * HOUR_NS)).is_err());
+        assert_eq!(
+            check_fence_flush_lifetime(LateCommitFenceArg::On, Some(HOUR_NS)),
+            Ok(())
+        );
+        assert_eq!(
+            check_fence_flush_lifetime(LateCommitFenceArg::On, None),
+            Ok(())
+        );
+        assert_eq!(
+            check_fence_flush_lifetime(LateCommitFenceArg::Off, Some(0)),
+            Ok(())
+        );
+    }
 
     /// Each hold reason prints as its `name()` followed by what it names,
     /// one `held:` line per bucket in the walk's order.
