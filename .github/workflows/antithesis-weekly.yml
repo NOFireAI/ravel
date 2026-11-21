@@ -1,0 +1,211 @@
+name: antithesis-weekly
+
+# Weekly Antithesis run of the ingest-durability workload
+# (antithesis/ingest-durability, antithesis/README.md). It builds the
+# instrumented ravel-server and driver images on this runner, then
+# scripts/launch.sh validates the config and launches the run with snouty,
+# which pushes the images to the tenant's registry itself. Antithesis posts the
+# result to this commit as the `continuous-testing/antithesis
+# (ravel-ingest-durability)` status and emails the triage report. A job that
+# fails before the run is launched files or updates a tracking issue.
+#
+# snouty in place of antithesis-trigger-action: the action takes no compute
+# budget and does not push images, while `snouty launch --max-compute-hours`
+# caps the run's spend exactly and pushes what the compose file names.
+#
+# Needs, set once in the repository settings:
+#   secrets.ANTITHESIS_API_KEY       Antithesis API key for the tenant.
+#   secrets.ANTITHESIS_GITHUB_TOKEN  fine-grained PAT on this repository with
+#                                    commit statuses read/write. Antithesis
+#                                    posts the result after this job has ended,
+#                                    when GITHUB_TOKEN has already expired.
+#   secrets.ANTITHESIS_REGISTRY_KEY  the tenant registry's service-account key
+#                                    (the JSON key file Antithesis issues), for
+#                                    `docker login -u _json_key`.
+#   vars.ANTITHESIS_TENANT           taffy-sheep
+#   vars.ANTITHESIS_REPOSITORY       us-central1-docker.pkg.dev/molten-verve-216720/taffy-psheep-repository
+on:
+  schedule:
+    # Tuesday 03:07 UTC. Off the :00/:30 mark and distinct from every other
+    # nightly/weekly cron in this directory (0 3, 9 6, 11 6, 13 2, 17 3, 17 4,
+    # 19 7, 21 5, 29 6, 37 4, 43 and 47 past the hour).
+    - cron: '7 3 * * 2'
+  workflow_dispatch:
+    inputs:
+      compute_hours:
+        description: 'Compute hours for the run (12 to 240)'
+        required: false
+        default: '240'
+
+# Floor for every job (scripts/guards/check-workflow-permissions.sh). The
+# launch job only reads the repository; the commit status is written by
+# Antithesis with its own token. The report job widens to issues: write on
+# itself only.
+permissions:
+  contents: read
+
+env:
+  ISSUE_LABEL: antithesis-weekly
+
+jobs:
+  # Its own job so a refused manual input fails here, leaves `launch` skipped,
+  # and files no tracking issue (the report job only fires on a launch failure).
+  hours:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MAX_COMPUTE_HOURS: '240'
+    outputs:
+      value: ${{ steps.hours.outputs.value }}
+    steps:
+      - name: Resolve compute hours
+        id: hours
+        env:
+          REQUESTED: ${{ inputs.compute_hours || '240' }}
+        run: |
+          # One to three digits with no leading zero, so the number compared
+          # below is the same decimal number the run is launched with.
+          case "$REQUESTED" in
+            ''|*[!0-9]*|0*|????*)
+              echo "compute_hours must be a whole number from 12 to $MAX_COMPUTE_HOURS, got '$REQUESTED'" >&2
+              exit 1 ;;
+          esac
+          if [ "$REQUESTED" -lt 12 ] || [ "$REQUESTED" -gt "$MAX_COMPUTE_HOURS" ]; then
+            echo "compute_hours must be from 12 to $MAX_COMPUTE_HOURS, got $REQUESTED" >&2
+            exit 1
+          fi
+          echo "value=$REQUESTED" >> "$GITHUB_OUTPUT"
+
+  launch:
+    needs: hours
+    runs-on: ubuntu-latest
+    # The instrumented ravel-server build dominates; the launch returns as soon
+    # as the run is accepted, so the run's own hours are not spent here.
+    timeout-minutes: 180
+    # One launch at a time: a manual dispatch while the scheduled job is still
+    # building waits instead of launching a second run.
+    concurrency:
+      group: antithesis-weekly-launch
+      cancel-in-progress: false
+    env:
+      WORKLOAD: antithesis/ingest-durability
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/free-disk-space
+
+      - name: Check the workload is present
+        run: |
+          for f in "$WORKLOAD/scripts/build.sh" "$WORKLOAD/scripts/launch.sh" "$WORKLOAD/config/docker-compose.yaml"; do
+            [ -f "$f" ] || { echo "missing $f: the ingest-durability workload has not landed on this ref" >&2; exit 1; }
+          done
+
+      - name: Fetch snouty
+        uses: ./.github/actions/fetch-pinned-tool
+        with:
+          name: snouty
+          version: v0.10.0
+          url: https://github.com/antithesishq/snouty/releases/download/v0.10.0/snouty-x86_64-unknown-linux-musl.tar.xz
+          sha256: d9a2cfe404cbbd82a5658dffaed3fddffb80773498b4eaac7bedb0d22cf1b7bc
+          dest: .tools/snouty-x86_64-unknown-linux-musl.tar.xz
+
+      - name: Install snouty
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/snouty"
+          mkdir -p "$dir"
+          tar -xJf .tools/snouty-x86_64-unknown-linux-musl.tar.xz -C "$dir"
+          find "$dir" -type f -name snouty -exec install -m 0755 {} "$dir/bin-snouty" \;
+          [ -x "$dir/bin-snouty" ] || { echo "no snouty binary in the archive" >&2; exit 1; }
+          mkdir -p "$dir/bin"
+          mv "$dir/bin-snouty" "$dir/bin/snouty"
+          echo "$dir/bin" >> "$GITHUB_PATH"
+
+      - name: Build the instrumented images
+        run: '"$WORKLOAD/scripts/build.sh" all'
+
+      # Every other image the compose file names (the object store) is pulled
+      # through compose, at the digest the compose file pins, unless it is
+      # already in the local store.
+      - name: Pull the remaining compose images
+        run: |
+          set -euo pipefail
+          cfg="$WORKLOAD/config/docker-compose.yaml"
+          docker compose -f "$cfg" config --format json \
+            | jq -r '.services | to_entries[] | "\(.key) \(.value.image)"' > services.txt
+          while read -r svc image; do
+            if ! docker image inspect "$image" > /dev/null 2>&1; then
+              docker compose -f "$cfg" pull "$svc"
+            fi
+          done < services.txt
+
+      # The tenant registry is an Artifact Registry repository; snouty pushes
+      # the workload images and the config image there with this login.
+      - name: Log in to the tenant registry
+        env:
+          REGISTRY_KEY: ${{ secrets.ANTITHESIS_REGISTRY_KEY }}
+          ANTITHESIS_REPOSITORY: ${{ vars.ANTITHESIS_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          [ -n "$REGISTRY_KEY" ] || { echo "secrets.ANTITHESIS_REGISTRY_KEY is not set" >&2; exit 1; }
+          host="${ANTITHESIS_REPOSITORY%%/*}"
+          printf '%s' "$REGISTRY_KEY" | docker login -u _json_key --password-stdin "https://$host"
+
+      - name: Launch
+        env:
+          ANTITHESIS_API_KEY: ${{ secrets.ANTITHESIS_API_KEY }}
+          ANTITHESIS_GITHUB_TOKEN: ${{ secrets.ANTITHESIS_GITHUB_TOKEN }}
+          ANTITHESIS_TENANT: ${{ vars.ANTITHESIS_TENANT }}
+          ANTITHESIS_REPOSITORY: ${{ vars.ANTITHESIS_REPOSITORY }}
+          HOURS: ${{ needs.hours.outputs.value }}
+        run: |
+          "$WORKLOAD/scripts/launch.sh" "$HOURS" "weekly ingest durability, ${GITHUB_SHA::12}"
+
+  report:
+    needs: launch
+    # Explicit status function: without one, `needs` skips this job when
+    # launch fails. Not on 'cancelled', which is human-initiated.
+    if: ${{ always() && needs.launch.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    concurrency:
+      group: antithesis-weekly-report
+      cancel-in-progress: false
+    steps:
+      - name: File or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MARKER: "Weekly Antithesis launch failed"
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh label create "$ISSUE_LABEL" \
+            --color BFD4F2 \
+            --description "Weekly Antithesis launch failures (antithesis-weekly.yml)" \
+            2>/dev/null || true
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty') || existing=""
+          body=$(cat <<EOF
+          The weekly Antithesis job failed before the run was launched.
+
+          - Run: $run_url
+
+          Likely causes: the workload is missing on this ref, a secret or
+          variable is unset, the instrumented image build failed or ran out of
+          disk or time, or snouty refused the config or the launch. A run that
+          launched and then found failures reports through the
+          \`continuous-testing/antithesis (ravel-ingest-durability)\` commit
+          status and the emailed triage report, not here.
+          EOF
+          )
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "commented on existing issue #$existing"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+          fi
