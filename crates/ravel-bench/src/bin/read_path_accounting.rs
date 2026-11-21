@@ -295,9 +295,8 @@ async fn rseg_store(
     bytes: &[u8],
     key: &str,
 ) -> (Arc<dyn ObjectStoreBackend>, CountingHandle, u64) {
-    let counting: Arc<dyn ObjectStoreBackend>;
     let handle: CountingHandle;
-    match backend {
+    let counting = match backend {
         Backend::InProcess => {
             let store = CountingBackend::new(MemoryStore::new());
             handle = CountingHandle::Backend(store.counters());
@@ -307,7 +306,7 @@ async fn rseg_store(
                 .await
                 .expect("put rseg object");
             store.reset();
-            counting = store;
+            store as Arc<dyn ObjectStoreBackend>
         }
         Backend::RustFs(config) => {
             let inner = ravel_object_store::s3::S3Store::new(config.as_ref().clone())
@@ -320,9 +319,9 @@ async fn rseg_store(
                 .await
                 .expect("put rseg object");
             store.reset();
-            counting = store;
+            store as Arc<dyn ObjectStoreBackend>
         }
-    }
+    };
     (counting, handle, bytes.len() as u64)
 }
 
