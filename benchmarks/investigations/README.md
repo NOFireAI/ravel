@@ -270,7 +270,11 @@ its keyIndex GETs at 2 x that count.
   background children, runs the statement set while they run (temp `inflight`,
   against one restarted server), waits for the child, and stamps
   `compaction.jsonl`. `compaction_done` runs the same set after it. The
-  oracle of both passes is the unfolded state's own answer.
+  oracle of both passes is the unfolded state's own answer. The compaction
+  runs with `--max-flush-lifetime 0s`, and adds `--late-commit-fence off`
+  when the binary's `maintain compact-tenant --help` lists that flag: a
+  ravel-cli with the late-commit fence refuses the shorter lifetime while
+  the fence is on (ADR-4561), and an older one rejects the flag.
 - `erasure_in_flight`: `erase submit` on the erasure victim's request id,
   `erase status` before and after (the run fails unless it reads pending),
   then the statement set against the pre-erasure answer, except
