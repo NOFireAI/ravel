@@ -2813,6 +2813,24 @@ store contract's list-after-write guarantee (the same one orphan GC relies
 on, docs/consistency-model.md "Deletion and GC"), observes the full and
 final set.
 
+What the interlock bounds is when a writer *issues* its commit PUT, not
+when the store applies it (ADR-4561). A PUT issued before the bound can land
+later: one the client stopped waiting for, a request held by a paused
+process, or one from a writer whose clock runs behind the store. Such a
+record is a late L0. The fold does not see it past its own seal, as the
+step-4 paragraph on records that land in an already folded hour says, and
+readers serve it as an extra segment wherever a bucket is resolved from its
+commit records. Maintenance does not take it as an input: with the
+late-commit fence on, a compaction, a format migration or a raw-L0 erasure
+rewrite plans only from the commit records the store stamped before the
+maintain cutoff `C(H) = end(H) + max_flush_lifetime +
+clock_skew_allowance`, truncated to a whole second, and only once the
+store's clock is `C(H) + 60 s` or later. Every plan of a sealed bucket
+then names the same input set, given that the store's stamp is stable and
+precedes visibility by less than 60 s. The late record is never deleted,
+hidden or moved; the erasure completion gate, retention, legal holds, the
+sweep and every read path see it.
+
 Clock assumption, stated plainly: the folder's clock error must be smaller
 than `fold_safety_margin`. This is the same class of assumption the system
 already makes about writer clocks (`clock_skew_allowance`) and it fails

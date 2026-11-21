@@ -65,8 +65,19 @@ const EXEMPLARS: u32 = 10;
 /// error surfaced by [`list_bucket`], never silently dropped.
 #[derive(Debug, Default)]
 pub struct BucketListing {
-    /// L0 commit record keys (the compaction inputs).
+    /// Every listed L0 commit record key, on time or late (ADR-4561 R6). A
+    /// planner takes its inputs from [`Self::planning_commit_keys`] instead.
     pub commit_keys: Vec<String>,
+    /// The store's `last_modified` stamp of each of [`Self::commit_keys`], in
+    /// unix milliseconds, index for index.
+    pub commit_last_modified_ms: Vec<i64>,
+    /// The commit records [`Self::classify_late`] found stamped at or after
+    /// the bucket's late-commit cutoff (ADR-4561 R2), sorted. Empty until the
+    /// listing is classified.
+    pub late_commit_keys: Vec<String>,
+    /// The cutoff the listing was classified under, in unix nanoseconds;
+    /// `None` when it was not classified (the fence is off).
+    pub late_commit_cutoff_ns: Option<i64>,
     /// Compaction record keys already present in the bucket.
     pub compaction_record_keys: Vec<String>,
     /// Selective-erasure rewrite record keys (`rw.<hash16>.cmt`, ADR-0064
@@ -77,6 +88,43 @@ pub struct BucketListing {
     pub rewrite_record_keys: Vec<String>,
     /// The retention tombstone key, if the bucket is tombstoned.
     pub tombstone_key: Option<String>,
+}
+
+impl BucketListing {
+    /// Split the commit records at `cutoff_ns` (ADR-4561 R2): a record whose
+    /// stamp, in nanoseconds, is at or after the cutoff is late. Only commit
+    /// records are classified. The split depends on the stamps alone, not on
+    /// listing order or page boundaries.
+    pub fn classify_late(&mut self, cutoff_ns: i64) {
+        self.late_commit_keys = self
+            .commit_keys
+            .iter()
+            .zip(&self.commit_last_modified_ms)
+            .filter(|(_, ms)| is_late_stamp(**ms, cutoff_ns))
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.late_commit_cutoff_ns = Some(cutoff_ns);
+    }
+
+    /// The commit records a plan takes as its whole L0 set (ADR-4561 R4): every
+    /// listed commit record less the late ones. On an unclassified listing this
+    /// is [`Self::commit_keys`].
+    pub fn planning_commit_keys(&self) -> Vec<String> {
+        if self.late_commit_keys.is_empty() {
+            return self.commit_keys.clone();
+        }
+        self.commit_keys
+            .iter()
+            .filter(|key| self.late_commit_keys.binary_search(key).is_err())
+            .cloned()
+            .collect()
+    }
+}
+
+/// Whether a commit record stamped `last_modified_ms` is late against
+/// `cutoff_ns` (ADR-4561 R2).
+pub fn is_late_stamp(last_modified_ms: i64, cutoff_ns: i64) -> bool {
+    last_modified_ms.saturating_mul(1_000_000) >= cutoff_ns
 }
 
 /// List one bucket and classify every object by key shape.
@@ -165,9 +213,12 @@ pub(crate) fn refuse_unaddressable(prefix: &str, unaddressable: &Unaddressable) 
 
 fn partition_bucket_listing(metas: Vec<ObjectMeta>) -> Result<BucketListing> {
     let mut listing = BucketListing::default();
+    let mut commits: Vec<(String, i64)> = Vec::new();
     for meta in metas {
         match keys::partition_bucket_entry(&meta.key) {
-            Ok(BucketEntry::CommitRecord(_)) => listing.commit_keys.push(meta.key),
+            Ok(BucketEntry::CommitRecord(_)) => {
+                commits.push((meta.key, meta.last_modified_unix_ms));
+            }
             Ok(BucketEntry::CompactionRecord(_)) => listing.compaction_record_keys.push(meta.key),
             Ok(BucketEntry::RewriteRecord(_)) => listing.rewrite_record_keys.push(meta.key),
             Ok(BucketEntry::Tombstone(_)) => listing.tombstone_key = Some(meta.key),
@@ -178,7 +229,8 @@ fn partition_bucket_listing(metas: Vec<ObjectMeta>) -> Result<BucketListing> {
         }
     }
     // Deterministic order regardless of how the store paginated the listing.
-    listing.commit_keys.sort();
+    commits.sort();
+    (listing.commit_keys, listing.commit_last_modified_ms) = commits.into_iter().unzip();
     listing.compaction_record_keys.sort();
     listing.rewrite_record_keys.sort();
     Ok(listing)
