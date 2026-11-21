@@ -4,7 +4,7 @@
 # narrows that context to the files the build reads.
 # Built with Antithesis's compile-time coverage flags (the driver has no LTO).
 
-FROM rust:1.97.1-trixie AS build
+FROM rust:1.100.0-trixie AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked \

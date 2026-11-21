@@ -1258,7 +1258,9 @@ fn validate_prefix(
         return Err(corrupted("directory crc32c mismatch"));
     }
     let ends: Vec<u32> = dir
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     if ends.windows(2).any(|w| w[0] > w[1]) {

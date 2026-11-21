@@ -374,7 +374,7 @@ fn resolve_label_refs(
         });
     }
     let mut labels = Vec::with_capacity(labels_refs.len() / 2);
-    for (pair_index, pair) in labels_refs.chunks_exact(2).enumerate() {
+    for (pair_index, pair) in labels_refs.as_chunks::<2>().0.iter().enumerate() {
         let name_position = pair_index * 2;
         let name_ref = pair[0];
         let value_ref = pair[1];
@@ -482,7 +482,7 @@ fn resolve_exemplar_label_refs(
     // whole budget's worth of allocation for every dropped exemplar, and the
     // wire cost of another dropped exemplar is a handful of varints.
     let mut tentative_bytes = *resolved_label_bytes;
-    for (pair_index, pair) in labels_refs.chunks_exact(2).enumerate() {
+    for (pair_index, pair) in labels_refs.as_chunks::<2>().0.iter().enumerate() {
         let name_position = pair_index * 2;
         let name = resolve(name_position, pair[0])?;
         let value = resolve(name_position + 1, pair[1])?;
@@ -493,7 +493,7 @@ fn resolve_exemplar_label_refs(
     }
 
     let mut labels = Vec::with_capacity(labels_refs.len() / 2);
-    for (pair_index, pair) in labels_refs.chunks_exact(2).enumerate() {
+    for (pair_index, pair) in labels_refs.as_chunks::<2>().0.iter().enumerate() {
         let name_position = pair_index * 2;
         labels.push(Label {
             name: resolve(name_position, pair[0])?.clone(),

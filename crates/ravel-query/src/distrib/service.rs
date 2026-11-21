@@ -882,6 +882,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         }
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "SliceFailure carries the attempt accounting by value; boxing it is a type change outside the toolchain bump"
+    )]
     async fn run_slice_inner(
         &self,
         request: pb::FetchRequest,
@@ -1078,6 +1082,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     /// worker's [`RecordGetObserver`] before the result is returned, whether
     /// the resolve succeeded or refused partway, so the process exports the
     /// requests and bytes its resolve phase spent.
+    #[expect(
+        clippy::result_large_err,
+        reason = "SliceFailure carries the attempt accounting by value; boxing it is a type change outside the toolchain bump"
+    )]
     async fn resolve_pinned(
         &self,
         identities: &[pb::SegmentIdentity],
@@ -1117,6 +1125,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     /// runs and streams one [`pb::PartialAggregate`] per series instead of every
     /// series frame (ADR-0103 decision 2). The branch is per request, not per
     /// series, so one slice returns all partials or all raw frames, never a mix.
+    #[expect(
+        clippy::result_large_err,
+        reason = "SliceFailure carries the attempt accounting by value; boxing it is a type change outside the toolchain bump"
+    )]
     async fn run_slice_metrics(
         &self,
         scope: Option<pb::fetch_request::Scope>,
@@ -1356,6 +1368,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     /// never dedups (logs have no query-time dedup); this path never assumes a
     /// stream maps to one slice.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "SliceFailure carries the attempt accounting by value; boxing it is a type change outside the toolchain bump"
+    )]
     async fn run_slice_logs(
         &self,
         scope: Option<pb::fetch_request::Scope>,
@@ -1487,6 +1503,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
     /// order but never dedups (spans have no query-time dedup); this path never
     /// assumes a trace maps to one slice.
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "SliceFailure carries the attempt accounting by value; boxing it is a type change outside the toolchain bump"
+    )]
     async fn run_slice_spans(
         &self,
         scope: Option<pb::fetch_request::Scope>,

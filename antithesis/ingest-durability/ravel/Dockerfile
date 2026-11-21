@@ -16,7 +16,7 @@
 # ingest-durability-mutants tag (ADR-4326 decision 3); every other build keeps
 # the default. ravel-cli never builds the mutants.
 
-FROM rust:1.97.1-trixie AS server
+FROM rust:1.100.0-trixie AS server
 ARG SERVER_FEATURES=sql,antithesis
 WORKDIR /src
 # The two build stages run in parallel; each takes half of a 16-core box.
@@ -33,7 +33,7 @@ RUN cargo build --release --locked -p ravel-server --features "$SERVER_FEATURES"
 # ravel-cli qualifies the bucket in the init container. Its `antithesis`
 # feature links the runtime shim, without which an instrumented binary would
 # not link at all.
-FROM rust:1.97.1-trixie AS cli
+FROM rust:1.100.0-trixie AS cli
 WORKDIR /src
 ENV CARGO_BUILD_JOBS=8
 COPY . .

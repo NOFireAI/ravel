@@ -334,7 +334,7 @@ impl WarmProgress {
     /// take the whole-part warm past `limit`.
     fn reserve_whole_part(&self, limit: u64, bytes: u64) -> bool {
         self.whole_part_bytes_reserved
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved.checked_add(bytes).filter(|after| *after <= limit)
             })
             .is_ok()
@@ -343,7 +343,7 @@ impl WarmProgress {
     /// Replaces a completed fetch's `reserved` bytes with the bytes it read
     /// from the store, which is what it added to the cache.
     fn settle_whole_part(&self, reserved: u64, fetched: u64) {
-        let _ = self.whole_part_bytes_reserved.fetch_update(
+        let _ = self.whole_part_bytes_reserved.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |held| Some(held.saturating_sub(reserved).saturating_add(fetched)),

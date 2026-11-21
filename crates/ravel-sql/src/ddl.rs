@@ -573,6 +573,10 @@ enum ProbeObject {
 /// single HEAD and never falls through to a listing, which -- scoped to the
 /// exact object key as a string prefix -- would also match an unrelated
 /// sibling like `<key>.bak`.
+#[expect(
+    clippy::result_large_err,
+    reason = "DdlExecuteError carries its source errors by value; boxing it is a type change outside the toolchain bump"
+)]
 async fn one_object_under(
     store: &dyn ObjectStoreBackend,
     grant: &Grant,
@@ -692,6 +696,10 @@ impl SqlExecutor {
     /// `tokio::time::timeout`. `deadline` is threaded through unchanged to
     /// [`snapshot_location`]'s own inner bound; see [`Self::execute_ddl`]'s
     /// doc comment for how the two compose.
+    #[expect(
+        clippy::result_large_err,
+        reason = "DdlExecuteError carries its source errors by value; boxing it is a type change outside the toolchain bump"
+    )]
     async fn execute_ddl_within_deadline(
         &self,
         recorder: &DdlCostRecorder,

@@ -1171,7 +1171,7 @@ impl<V> DecodedCache<V> {
     fn track_reserved(&self, before: u64, after: u64) {
         let _ = self
             .reserved_total
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
                 Some(if after >= before {
                     total.saturating_add(after - before)
                 } else {

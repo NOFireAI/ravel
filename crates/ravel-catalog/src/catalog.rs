@@ -4167,7 +4167,7 @@ impl Catalog {
                 // one atomic step, so concurrent shards can never both take the
                 // last slot (the request bound).
                 if let Err(reserved) =
-                    lists_reserved.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    lists_reserved.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                         if n < cap { Some(n + 1) } else { None }
                     })
                 {

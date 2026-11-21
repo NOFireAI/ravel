@@ -393,7 +393,7 @@ impl FragmentMetrics {
     fn dec_inflight(&self, class: AdmissionClass) {
         // Saturating: an underflow would only happen on a double-drop, which the
         // permit guard's ownership prevents, but clamp rather than wrap.
-        let _ = self.fragment_inflight[class.index()].fetch_update(
+        let _ = self.fragment_inflight[class.index()].try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |v| Some(v.saturating_sub(1)),
