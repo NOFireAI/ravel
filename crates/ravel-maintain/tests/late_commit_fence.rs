@@ -23,18 +23,19 @@ use prost::Message;
 use ravel_commit::{keys, signal};
 use ravel_maintain::migrate::{MigrationPath, NotMigratedBucket, NotMigratedReason, Verification};
 use ravel_maintain::{
-    CompactionOutcome, CompactorConfig, Coordination, ErasureRewriteOutcome, FixedClock,
-    LATE_COMMIT_SETTLE_NS, LateCommitFence, MaintainError, MaintainMemo, MigrateBudget,
-    MigrateOutcome, NoLeases, PendingErasureRequest, PublishOutcome, RequestLedger,
-    bucket_erasure_completion, compact_bucket, erasure_rewrite_bucket, late_commit_records_total,
-    migrate_bucket_format, migrate_family, read, store_clock_unobserved_total, sweep_shard,
+    CompactionOutcome, CompactorConfig, Coordination, ErasureRequestSweepOutcome,
+    ErasureRewriteOutcome, FixedClock, LATE_COMMIT_SETTLE_NS, LateCommitFence, MaintainError,
+    MaintainMemo, MigrateBudget, MigrateOutcome, NoLeases, PendingErasureRequest, PublishOutcome,
+    RequestLedger, bucket_erasure_completion, compact_bucket, erasure_rewrite_bucket,
+    late_commit_records_total, migrate_bucket_format, migrate_family, read,
+    store_clock_unobserved_total, sweep_erasure_requests, sweep_shard, sweep_superseded,
 };
 use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_proto::commit::v1::{
-    CommitRecord, CompactionInputIdentity, CompactionRecord, ErasurePredicateMatcher,
-    ErasureRequest, RewriteRecord,
+    CommitRecord, CompactionInputIdentity, CompactionRecord, ErasureCompletion,
+    ErasurePredicateMatcher, ErasureRequest, RetentionTombstone, RewriteRecord,
 };
 use ravel_types::{CommitToken, Signal, TimeRange};
 use uuid::Uuid;
@@ -1019,6 +1020,23 @@ async fn an_on_time_arrival_still_aborts_a_publish() {
 /// Two on-time inputs, `victim` in the first, and one late input holding
 /// `late_series` at `late_ts`, relative to the hour.
 async fn erasure_fixture(late_series: &str, late_ts: i64) -> (MemoryStore, Vec<InputSpec>) {
+    let (store, on_time) = erasure_fixture_without_late().await;
+    let b = base_ns();
+    let late = input(
+        3,
+        3,
+        vec![raw_series(
+            late_series,
+            &[("k", "c")],
+            &[(b + late_ts, 4.0)],
+        )],
+    );
+    seed_at(&store, &store, late_ms(), &late).await;
+    (store, on_time)
+}
+
+/// The on-time inputs of [`erasure_fixture`] alone.
+async fn erasure_fixture_without_late() -> (MemoryStore, Vec<InputSpec>) {
     let store = MemoryStore::new();
     let b = base_ns();
     let on_time = vec![
@@ -1039,16 +1057,6 @@ async fn erasure_fixture(late_series: &str, late_ts: i64) -> (MemoryStore, Vec<I
     for spec in &on_time {
         seed_at(&store, &store, on_time_ms(), spec).await;
     }
-    let late = input(
-        3,
-        3,
-        vec![raw_series(
-            late_series,
-            &[("k", "c")],
-            &[(b + late_ts, 4.0)],
-        )],
-    );
-    seed_at(&store, &store, late_ms(), &late).await;
     (store, on_time)
 }
 
@@ -1130,6 +1138,223 @@ async fn a_late_l0_keeps_a_windowless_request_blocked_whatever_it_holds() {
             .into_iter()
             .collect()
     );
+}
+
+/// The pinned-query window (ADR-1133) zeroed, so the sweep's observing rule-2
+/// pass sees its other rules alone.
+fn sweep_config() -> CompactorConfig {
+    CompactorConfig {
+        max_query_duration_ns: 0,
+        head_cache_ttl_ns: 0,
+        clock_skew_allowance_ns: 0,
+        ..fenced(FENCE, CompactorConfig::default())
+    }
+}
+
+/// When the requests the hole fixture completes are marked complete.
+fn completed_ns() -> i64 {
+    sealed_now_ns()
+}
+
+/// A stamp one minute after the completion: late, and applied after the
+/// completion gate ran.
+fn after_completion_ms() -> u64 {
+    ms(completed_ns() + 60 * NS_PER_SECOND)
+}
+
+/// The hole ordering: the request is erased from the on-time records, the
+/// completion gate finds nothing blocking it, its `.dreq` and `.done` are
+/// written, and only then does the store apply a late L0 holding `late_series`
+/// at `late_ts`, relative to the hour. Returns the store and the late commit
+/// key.
+async fn completed_before_a_late_l0(
+    pending: &[PendingErasureRequest],
+    late_series: &str,
+    late_ts: i64,
+) -> (MemoryStore, String) {
+    let (store, on_time) = erasure_fixture_without_late().await;
+    let completion = erase_then_complete(&store, &on_time, pending).await;
+    assert!(completion.blocked.is_empty(), "{:?}", completion.blocked);
+    assert!(!completion.unresolved);
+    for p in pending {
+        let request_id = Uuid::parse_str(&p.request.request_id).expect("request id");
+        store
+            .put(
+                &p.request_key,
+                ravel_commit::erasure::encode_request(&p.request),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put .dreq");
+        let completion = ErasureCompletion {
+            format_version: 1,
+            tenant_hash: tenant_hash().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            request_id: p.request.request_id.clone(),
+            predicate_hash: vec![0x11; 32],
+            bucket_drops: Vec::new(),
+            requested_unix_ns: 0,
+            completed_unix_ns: completed_ns(),
+            deferral_cause: 0,
+        };
+        store
+            .put(
+                &keys::erasure_completion_key(&tenant_hash(), Signal::Metrics, request_id)
+                    .expect("done key"),
+                ravel_commit::erasure::encode_completion(&completion),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put .done");
+    }
+    let late = input(
+        3,
+        3,
+        vec![raw_series(
+            late_series,
+            &[("k", "c")],
+            &[(base_ns() + late_ts, 4.0)],
+        )],
+    );
+    let late_key = seed_at(&store, &store, after_completion_ms(), &late).await;
+    let stamp = store
+        .head(&late_key)
+        .await
+        .expect("late record")
+        .last_modified_unix_ms;
+    assert!(read::is_late_stamp(stamp, cutoff_ns()), "{stamp}");
+    (store, late_key)
+}
+
+/// Rule 2's deleting pass, which removes the inputs the rewrite superseded and
+/// so releases rule 6's hold on them, then rule 6, both past the completion's
+/// protection horizon.
+async fn sweep_requests(store: &dyn ObjectStoreBackend) -> ErasureRequestSweepOutcome {
+    let config = sweep_config();
+    let clock = FixedClock::new(completed_ns() + config.protection_horizon_ns + NS_PER_HOUR);
+    let b = bucket();
+    sweep_superseded(
+        store,
+        &clock,
+        &config,
+        &NoLeases,
+        &b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await
+    .expect("rule 2");
+    sweep_erasure_requests(
+        store,
+        &clock,
+        &config,
+        &NoLeases,
+        &tenant_hash(),
+        Signal::Metrics,
+    )
+    .await
+    .expect("rule 6")
+}
+
+fn windowed_victim() -> Vec<PendingErasureRequest> {
+    let b = base_ns();
+    request("victim", Some((b, b + 5_000)), 0x4564)
+}
+
+/// Commit 2, test (a): a late L0 the store applied after the request completed
+/// holds the subject inside the window. No rewrite planned it and the
+/// completion gate never saw it, so the `.dreq` stays past its horizon and the
+/// keep is counted as held.
+#[tokio::test]
+async fn a_late_l0_landing_after_completion_keeps_the_dreq() {
+    let _serial = SERIAL.lock().await;
+    let pending = windowed_victim();
+    let (store, _late) = completed_before_a_late_l0(&pending, "victim", 4_000).await;
+    let outcome = sweep_requests(&store).await;
+    assert_eq!(
+        outcome,
+        ErasureRequestSweepOutcome {
+            deleted: 0,
+            kept: 1,
+            held_by_superseded_inputs: 1,
+        }
+    );
+    assert!(exists(&store, &pending[0].request_key).await);
+}
+
+/// Commit 2: a request with no window overlaps every late bucket, so a late L0
+/// holding only another series still keeps its `.dreq`.
+#[tokio::test]
+async fn a_late_l0_keeps_a_windowless_dreq_whatever_it_holds() {
+    let _serial = SERIAL.lock().await;
+    let pending = request("victim", None, 0x4565);
+    let (store, _late) = completed_before_a_late_l0(&pending, "other", 4_000).await;
+    let outcome = sweep_requests(&store).await;
+    assert_eq!((outcome.deleted, outcome.held_by_superseded_inputs), (0, 1));
+    assert!(exists(&store, &pending[0].request_key).await);
+}
+
+/// Commit 2, test (b): a late L0 whose event times fall outside the request's
+/// window cannot hold the subject, so the `.dreq` is deleted.
+#[tokio::test]
+async fn a_late_l0_outside_the_window_does_not_keep_the_dreq() {
+    let _serial = SERIAL.lock().await;
+    let pending = windowed_victim();
+    let (store, _late) = completed_before_a_late_l0(&pending, "victim", 10_000_000).await;
+    let outcome = sweep_requests(&store).await;
+    assert_eq!(
+        outcome,
+        ErasureRequestSweepOutcome {
+            deleted: 1,
+            kept: 0,
+            held_by_superseded_inputs: 0,
+        }
+    );
+    assert!(!exists(&store, &pending[0].request_key).await);
+}
+
+/// Commit 2, test (c): nothing persists the keep. Once the late L0 is deleted
+/// the next pass deletes the `.dreq`.
+#[tokio::test]
+async fn the_dreq_is_released_once_the_late_l0_is_gone() {
+    let _serial = SERIAL.lock().await;
+    let pending = windowed_victim();
+    let (store, late) = completed_before_a_late_l0(&pending, "victim", 4_000).await;
+    assert_eq!(sweep_requests(&store).await.held_by_superseded_inputs, 1);
+    store.delete(&late).await.expect("delete late record");
+    let outcome = sweep_requests(&store).await;
+    assert_eq!((outcome.deleted, outcome.kept), (1, 0));
+    assert!(!exists(&store, &pending[0].request_key).await);
+}
+
+/// Commit 2: a bucket under a retention tombstone serves nothing, so its late
+/// L0 does not keep the `.dreq`.
+#[tokio::test]
+async fn a_late_l0_in_a_tombstoned_bucket_does_not_keep_the_dreq() {
+    let _serial = SERIAL.lock().await;
+    let pending = windowed_victim();
+    let (store, _late) = completed_before_a_late_l0(&pending, "victim", 4_000).await;
+    let b = bucket();
+    let tombstone = RetentionTombstone {
+        format_version: 1,
+        tenant_hash: b.tenant_hash.0.to_vec(),
+        signal: signal::to_proto(b.signal) as i32,
+        shard: b.shard,
+        ingest_hour_bucket: b.ingest_hour_bucket,
+        retired_at_ns: 0,
+        retention_window_ns: 0,
+        record_count_observed: 0,
+    };
+    store
+        .put(
+            &keys::retention_tombstone_key_for(&tombstone).expect("tombstone key"),
+            tombstone.encode_to_vec().into(),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put tombstone");
+    let outcome = sweep_requests(&store).await;
+    assert_eq!((outcome.deleted, outcome.held_by_superseded_inputs), (1, 0));
 }
 
 /// Test 7 (site 10): a bucket whose remaining below-target L0 is late is named
