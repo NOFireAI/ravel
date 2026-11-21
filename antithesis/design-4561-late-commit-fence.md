@@ -556,7 +556,243 @@ It is the fallback if `last_modified` proves unusable on a supported store.
 
 ## 4. Decision
 
-<!-- section 4 -->
+**Implement (b1) before the v0.35.0 tag: maintenance plans only from on-time
+commit records, judged by the store's own stamp against a fixed per-hour
+cutoff, and leaves late records exactly where and as they are.** A fence can
+be made safe before the tag, because this one deletes nothing, hides nothing
+and changes no read.
+
+### 4.1 The exact rule
+
+For a bucket of hour `H` with configuration `config`:
+
+- **R1, cutoff.** `C(H) = end(H) + config.seal_margin_ns()`, truncated down
+  to a whole second. Same arithmetic as today's seal
+  (`crates/ravel-maintain/src/bucket.rs:50-51`).
+- **R2, late.** A listed commit record is late when
+  `last_modified_unix_ms * 1_000_000 >= C(H)`. Every other listed commit
+  record is on time. Compaction records, rewrite records and tombstones are
+  never classified.
+- **R3, plannable.** A pass may plan the bucket from raw L0 only when both
+  hold: its own clock reads `now >= C(H) + SETTLE`; and, read after its
+  planning LIST returned, `store.observed_store_time_ns()` is either `None`
+  or `>= C(H) + SETTLE`. Otherwise the outcome is the existing `NotSealed`.
+  `SETTLE` is a new constant of 60 s, three times the adapter's 20 s request
+  timeout (`crates/ravel-object-store/src/s3.rs:271`). It is a chosen
+  allowance for the stamp-to-visible gap, not a derived bound (section 7).
+  A `None` observation is counted, as the writer counts it
+  (`crates/ravel-ingest/src/shard.rs:2514`).
+- **R4, inputs.** Compaction, the migrate primitive and a RawL0 erasure
+  rewrite take the on-time commit records as their whole L0 set: for the
+  minimum-input count, for the inputs they load, and for the input identities
+  the published record names.
+- **R5, re-list.** The pre-publish re-list compares on-time commit records
+  (plus the three other record kinds, as today). A late arrival between plan
+  and publish does not abort the pass; an on-time arrival still does.
+- **R6, everything else sees every commit record.** The erasure completion
+  gate, migrate's raw-served set, the legal-hold check, retention, the sweep
+  and every read path keep using the full listing. A late record is served,
+  kept, held, expired and counted exactly as today.
+- **R7, switch.** `CompactorConfig` gains `late_commit_fence`, `Off` or
+  `Enforce`. The library default is `Off`, which is today's behaviour byte
+  for byte; the server's maintenance configuration and `ravel-cli maintain`
+  set `Enforce` unless `--late-commit-fence off` is given. Section 4.4 says
+  why the default sits there.
+- **R8, visibility.** Each plan that leaves a late record out logs its key
+  at warn and counts it in a new
+  `ravel_maintain_late_commit_records_total{signal}`; `ravel-cli maintain`'s
+  bucket report prints the late count beside `l0_commit_records`.
+
+Why this prevents the partial cover. Under R1 to R3, a LIST that a plan is
+allowed to use runs when the store's clock is past `C(H) + SETTLE`. Every
+commit record stamped before `C(H)` is visible to it, given the settle
+allowance and the store's list-after-write guarantee the seal lemma already
+leans on (`docs/catalog-and-mvcc.md:2812-2815`). Every commit record stamped
+at or after `C(H)` is excluded by R2 whenever it arrives. So every plan of
+the bucket, by any pass at any later time, has the same L0 set. A compaction
+that publishes beside a rewrite then names inputs the rewrite holds in full,
+which `erasure_dominance` resolves as dominated
+(`crates/ravel-catalog/src/catalog.rs:6134-6139`). No stall length changes
+that, because the argument does not use time after the LIST.
+
+Why no acknowledged write is dropped. R6: no code path deletes, moves or
+stops serving a commit record because it is late.
+
+### 4.2 Code sites
+
+All in `ravel-maintain` and its two service entry points. No change in
+`ravel-ingest`, `ravel-catalog`, `ravel-commit`, `ravel-object-store`,
+`proto/`.
+
+| # | Site | Change |
+|---|---|---|
+| 1 | `crates/ravel-maintain/src/read.rs:66-80` | `BucketListing` keeps each commit key's `last_modified_unix_ms`, gains `late_commit_keys` and the cutoff it was classified under, and a `planning_commit_keys()` accessor. `commit_keys` stays the full set (R6). |
+| 2 | `crates/ravel-maintain/src/read.rs:166-185` | `partition_bucket_listing` records the stamp it discards today at `:170`. |
+| 3 | `crates/ravel-maintain/src/bucket.rs:47-52` | Add `late_commit_cutoff_ns(config)` and `is_plannable(now_ns, observed_store_ns, config)`. `is_sealed` is unchanged and keeps its other callers. Rewrite the doc comment (section 6, item 2). |
+| 4 | `crates/ravel-maintain/src/config.rs:1088-1097`, `:2081-2084`, `:2774-2781` | `LATE_COMMIT_SETTLE_NS`; the `late_commit_fence` field; rewrite the `seal_margin_ns` doc comment. |
+| 5 | `crates/ravel-maintain/src/compact.rs:684-712` | R3 around the LIST at `:689`; R4 at the count (`:693-699`) and the load (`:705-712`). |
+| 6 | `crates/ravel-maintain/src/rewrite.rs:405-415`, `:428-436` | R5: `same_record_set` compares `planning_commit_keys()`, and `relist_changed` classifies the new listing under the planned listing's cutoff. |
+| 7 | `crates/ravel-maintain/src/rewrite.rs:865-891` | R3 and R4 for the migrate primitive. |
+| 8 | `crates/ravel-maintain/src/erasure_rewrite.rs:2484-2492`, `:714-715` | R3 for the rewrite pass; R4 for its RawL0 inputs. |
+| 9 | `crates/ravel-maintain/src/erasure_rewrite.rs:3305-3310` | No change. A test pins that the completion gate still reads every commit record. |
+| 10 | `crates/ravel-maintain/src/migrate.rs:324`, `:2125-2146` | A `NotMigratedReason` for a bucket whose remaining below-target raw L0 is late, so the walk names it and the floor stays down for a stated reason. |
+| 11 | `services/ravel-server/src/maintain.rs:1386`, `services/ravel-cli/src/maintain.rs:401`, `:2027` | Set `Enforce`; the `--late-commit-fence` flag; the late count in the bucket report. |
+| 12 | `services/ravel-server/src/metrics.rs:6540` (beside the other maintain counters) | Render the new counter and the store-clock-unobserved counter. |
+
+### 4.3 Tests
+
+Each test names the claim it pins. Fixtures: `MemoryStore::set_clock_ms`
+sets the stamp of the next PUT
+(`crates/ravel-object-store/src/memory.rs:79-82`, `:366`),
+`set_observed_store_time_ns` sets the store-clock observation
+(`crates/ravel-object-store/src/memory.rs:94`), `FaultStore::hold` parks a
+call (`crates/ravel-object-store/src/fault.rs:685`), and the injected
+`FixedClock` is the pass's own clock. New file
+`crates/ravel-maintain/tests/late_commit_fence.rs` unless noted.
+
+1. **A late L0 never enters a compaction, migrate or rewrite listing.**
+   `a_commit_record_stamped_at_the_cutoff_is_left_out_of_every_plan`: three
+   inputs, stamps `C(H) - 1 ms`, `C(H)` and `C(H) + 1 h`. Compaction, the
+   migrate primitive and a RawL0 erasure rewrite each publish a record whose
+   `inputs` are exactly the first identity's set; assert the exact identity
+   list, not a count. Shown failing with the fence `Off`.
+2. **A late L0 never turns the #4449 race into a partial cover.**
+   `a_late_l0_between_the_two_listings_is_a_full_cover`, built on
+   `a_compaction_paused_inside_its_record_put_publishes_beside_the_erasure_rewrite`
+   (`crates/ravel-maintain/tests/erasure_claim_pause.rs:348`): the rewrite
+   plans and re-lists, a late L0 lands, the compaction plans and is parked in
+   its record PUT, the rewrite publishes, the gate releases. Assert:
+   `erasure_dominance` reports the compaction record dominated and
+   `conflicts` empty; a resolve returns every surviving row exactly once and
+   no erased row; the erasure rerun is `AlreadyApplied`, not
+   `MultipleLiveRecords`. The same script with the fence `Off` must produce
+   the conflict, which is the negative control.
+3. **An acknowledged write is never dropped.**
+   `an_acknowledged_write_that_lands_late_is_served_and_never_swept`: seed
+   one late L0, run compaction, a full sweep with the clock aged past
+   `grace + max_flush_lifetime` and past the protection horizon, and an
+   erasure pass for an unrelated subject. Assert the late commit record and
+   its data object are still present, a token resolve and a listing resolve
+   both return its rows exactly once, and the fold's classifier includes it.
+   Second half in `crates/ravel-compat-tests/tests/e2e.rs` (which already
+   drives `set_clock_ms`, `:555-557`): a strict write through a real router
+   whose commit PUT is stamped past `C(H)` returns `Ok` with a token, and a
+   read with that token returns the rows before and after compaction and
+   sweep.
+4. **The planner waits on the store's clock.**
+   `a_plan_waits_until_the_store_clock_passes_the_cutoff`: own clock sealed,
+   observation at `C(H) + SETTLE - 1 s` gives `NotSealed`; at
+   `C(H) + SETTLE` the pass runs; `None` runs and increments the unobserved
+   counter by exactly one.
+5. **The re-list.** `a_late_arrival_does_not_abort_a_publish` and
+   `an_on_time_arrival_still_aborts_a_publish`, beside
+   `the_pre_publish_relist_aborts_when_the_record_set_changed`
+   (`crates/ravel-maintain/tests/erasure_compaction_fence.rs:492`).
+6. **Erasure and a late L0.** A late L0 holding the subject: the rewrite's
+   record does not name it and the request stays blocked with no `.done`. A
+   late L0 not holding the subject: the request completes.
+7. **Migrate.** A late below-target L0 is reported under the new
+   `NotMigratedReason`, and the walk goes on.
+8. **Determinism.** A proptest over arbitrary stamps and listing orders,
+   with `MemoryStore::with_page_size(2)`: the on-time and late split is the
+   same for every permutation and page boundary, and equals the split
+   computed from the stamps directly. Check in its regression seed file.
+9. **`Off` is today.** With the fence off, the listing and every outcome in
+   an existing compaction test are unchanged.
+10. **Antithesis.** A new `inv_always!` at the record publish
+    (`crates/ravel-maintain/src/publish.rs:495`, beside the existing one):
+    "maintain: a published record names no late commit record", and an
+    `inv_sometimes!`: "maintain: a plan left a late commit record out". The
+    catalog-maintenance rig jumps clocks forward
+    (`antithesis/catalog-maintenance/README.md:442-446`), so one run of it is
+    part of the gate for this change: R3 makes a maintainer whose clock
+    jumped ahead wait for the store.
+
+### 4.4 Why the library default is `Off`
+
+Three callers publish commit records into hours that sealed long ago, with a
+fresh store stamp, on purpose:
+
+- `ravel-cli commit reconstruct` rebuilds lost commit records from data
+  objects (`services/ravel-cli/src/reconstruct.rs:1-11`), each a new
+  create-if-absent PUT (`services/ravel-cli/src/reconstruct.rs:31-35`). Every
+  one is late by R2.
+- Benches seed old hours and then compact them, for example
+  `crates/ravel-bench/src/bin/compaction_bench.rs:272`.
+- Many maintenance tests seed inputs after moving the store's clock; 19
+  files under `crates/ravel-maintain` and `crates/ravel-compat-tests` call
+  `set_clock_ms`.
+
+With `Enforce` as the library default, the benches would compact nothing
+and exit zero, and an unknown number of fixtures would change meaning. With
+the default `Off` and the two service entry points setting `Enforce`, the
+production maintainer and the Antithesis rigs (which run the real server)
+get the fence and nothing else moves. Reconstructed records then need the
+operator to run maintenance for that shard with `--late-commit-fence off`
+once its writers for those hours are known gone; the reconstruct guide gains
+that step. This is the fence's real operating cost and it is stated in the
+ADR, not hidden.
+
+### 4.5 ADR and document changes, in the same commits as the code
+
+- **New `docs/adrs/4561-late-commit-fence.md`.** The rule R1 to R8, the
+  premise of section 1, the options, the residuals of section 5, and the
+  statement that no persistent format, key or proto changes.
+- **Amendment markers** (`docs/adrs/README.md:234-238`): ADR-0018 decision 1
+  (`docs/adrs/0018-l0-l1-compaction.md:120-126`), whose "complete, stable
+  input set" becomes "the on-time set"; ADR-1029's 2026-11-21 amendment
+  (`docs/adrs/1029-advisory-compaction-claims.md:1112-1113`), which gains
+  "and a late L0 can no longer produce one"; ADR-2708 D3
+  (`docs/adrs/2708-due-diligence-p1-fixes.md:209-212`), whose sentence about
+  the skew margin covering an in-flight PUT is withdrawn.
+- **`docs/object-store-contract.md:409-416`.** Add the planning exclusion to
+  the uses of `last_modified`, with the argument that a wrong stamp costs a
+  deferred compaction or the old race and never a wrong answer.
+- **`docs/catalog-and-mvcc.md:2804-2815`.** Restate the seal lemma as what
+  it is: a writer does not *issue* a PUT past its bound; a PUT already
+  issued can land later; maintenance excludes such a record by R2 and the
+  fold does not see it past its own seal (already said at `:2921-2926`).
+- **`docs/consistency-model.md:104-108`, `docs/ingest.md:1046-1049`.**
+  Replace "keeps every publish inside the catalog's seal" and "cannot
+  publish into an hour the catalog has already sealed".
+- **`docs/deletion-and-gc.md:1090-1093`**, which already names "a late L0
+  flush into a sealed bucket": point it at the rule.
+- **Operations guide and the reconstruct guide.** The counter, what a
+  non-zero value means, the switch, the re-stamp failure mode.
+- **Code comments**: `crates/ravel-maintain/src/bucket.rs:47-49`,
+  `crates/ravel-maintain/src/config.rs:2774-2777`.
+- **`changelog.d/4561.fixed.md`**, and the 0.34.0 known-issue note for #4449
+  gains the pointer.
+
+### 4.6 Size and risk
+
+| | Files | Lines |
+|---|---|---|
+| `ravel-maintain` source (sites 1 to 10) | 7 | about 300 |
+| Service wiring and metrics (sites 11, 12) | 3 | about 90 |
+| New tests | 2 new, 2 extended | about 650 |
+| ADR, docs, changelog | 9 | about 350 |
+
+About two days for one person who knows `ravel-maintain`, plus one
+catalog-maintenance Antithesis run.
+
+Risk, stated plainly:
+
+- **Data loss: none by construction.** The change removes inputs from
+  plans; it adds no delete and no read filter.
+- **Liveness: real.** A store whose stamps are wrong or re-assigned stops
+  planning for the affected buckets until the switch is thrown. It is loud
+  (counter, warn per key) and reversible.
+- **`CompactorConfig` gains a field**, and it is built by struct literal in
+  at least a dozen places in the services
+  (`services/ravel-server/src/compat_maintain.rs:402`, `:1308`, `:1364`;
+  `services/ravel-server/src/maintain.rs:5099`, `:5255`); the
+  struct-literal guard exists for exactly this.
+- **Exact-boundary tests of the planners' seal** may move by `SETTLE` when
+  they run with `Enforce`; with the library default `Off` they do not.
+- **Effectiveness depends on two store properties** that this checkout
+  cannot prove (section 7). When either fails, the result is today's
+  behaviour for that bucket, which the dominance counter still reports.
 
 ## 5. What the decision does not close, and the follow-ups
 
