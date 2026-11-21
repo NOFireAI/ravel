@@ -447,7 +447,11 @@
 #                                       (issue #4481); ro3: no l1 listing
 #                                       time and ro3b: no GET byte counter
 #                                       are misses (70); ro4: a 422 stamped
-#                                       refused (budget), exit 0; ro5: a
+#                                       refused (budget), exit 0; ro4b: a
+#                                       504 query deadline on the ingest
+#                                       read-back stamped deadline, exit 0;
+#                                       ro4c: a 504 there without the
+#                                       deadline message exit 70; ro5: a
 #                                       mismatch and ro5b: an error other
 #                                       than a 422 exit 70; ro6: an L0
 #                                       catalog that does not cover the
@@ -4074,7 +4078,7 @@ expect_no_log "ro3b: no compaction after the miss" "compact-tenant"
 # (budget) with the time the error names, and the run passes.
 STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_422=ravel STUB_READBACK_ONLY_SEQ="0 422" run_stage1 ro4 history --ravel-only
 expect_rc ro4 0
-check "ro4: refused (budget) at ingest and on L1, matched on L0" 'j("stamps.json")["ravel_only"]["ingest_readback"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l0"]["verdict"] == "matched" and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 4321 and j("stamps.json")["status"] == "passed"'
+check "ro4: refused (budget) at ingest and on L1, matched on L0" 'j("stamps.json")["ravel_only"]["ingest_readback"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["ingest_readback"]["series_query_ms"] == 4321 and j("stamps.json")["ravel_only"]["l0"]["verdict"] == "matched" and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "refused (budget)" and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 4321 and j("stamps.json")["status"] == "passed"'
 # ro4b: a 504 query deadline on the ingest read-back is stamped deadline with
 # its elapsed ms and the run goes on through readback-l0.
 STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_INGEST_READBACK_504=ravel STUB_READBACK_ONLY_SEQ="0" run_stage1 ro4b history --ravel-only

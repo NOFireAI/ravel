@@ -2108,7 +2108,13 @@ Steps, in order, stopping at the first failure (case ro1):
    `--ravel-endpoint` and `--no-in-process-row` and no other row's
    endpoint, into `ingest.json`. A Ravel read-back that answered 422 is
    stamped `refused (budget)` in `ravel_only.ingest_readback` and the run
-   goes on (case ro4). Any other failed or extra row fails the step.
+   goes on (case ro4). One whose series listing answered 504 with the
+   server's query-deadline message is stamped `deadline` there and the run
+   goes on too (case ro4b); on `history` this read-back reads the unfolded
+   catalog under the same 120 s deadline. Either stamp carries `error` and
+   `series_query_ms`, graded as for the read-back verdict below. Any other
+   failed or extra row fails the step, a 504 without that message included
+   (case ro4c).
 5. `stage1-l0-fold`: ravel-server stopped (the writers), then a wait
    through `METRICSBENCH_SLEEP` until the last ingest hour seals (its end
    plus the 5 minute clock-skew allowance and a minute, the same wait
