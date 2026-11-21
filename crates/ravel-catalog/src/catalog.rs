@@ -62,6 +62,10 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// [`Catalog::list_window_bounded`].
 type ShardBuckets = HashMap<(u32, u32), Vec<ListedKey>>;
 
+/// A rewrite record's key with its effective input identities, as
+/// [`erasure_dominance`] tests a version 1 record's coverage against them.
+type RewriteInputs<'a> = (&'a str, HashSet<(String, u64, u64)>);
+
 /// One listed commit-bucket key, carrying the shape its listing parse already
 /// established so no later pass of the same resolve parses it again, and, for
 /// an L0 key, the record cache hit
@@ -6085,8 +6089,7 @@ where
         .map(|(key, record)| (key.as_ref(), record.borrow()))
         .collect();
     let mut rewrite_superseded: HashSet<String> = HashSet::new();
-    let mut effective: Vec<(&str, HashSet<(String, u64, u64)>)> =
-        Vec::with_capacity(rewrite_records.len());
+    let mut effective: Vec<RewriteInputs<'_>> = Vec::with_capacity(rewrite_records.len());
     for (key, record) in rewrite_records {
         let mut inputs: HashSet<(String, u64, u64)> = HashSet::new();
         resolve_rewrite_supersession(
@@ -6100,7 +6103,7 @@ where
         )?;
         effective.push((key.as_ref(), inputs));
     }
-    let mut live_rewrites: Vec<(&str, HashSet<(String, u64, u64)>)> = effective
+    let mut live_rewrites: Vec<RewriteInputs<'_>> = effective
         .into_iter()
         .filter(|(key, _)| !rewrite_superseded.contains(*key))
         .collect();
