@@ -22,8 +22,8 @@ use std::collections::BTreeSet;
 use common::*;
 use ravel_commit::{erasure, keys, record, signal};
 use ravel_maintain::{
-    Bucket, CompactorConfig, FixedClock, NoLeases, SupersededSweepOutcome, sweep_erasure_requests,
-    sweep_superseded,
+    Bucket, CompactorConfig, FixedClock, HeldBucket, NoLeases, SupersededSweepOutcome,
+    sweep_erasure_requests, sweep_superseded,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
@@ -496,4 +496,174 @@ async fn rule_6_keeps_a_dreq_while_a_conflicting_version_2_record_is_live() {
     let after = all_keys(&store).await;
     assert!(after.contains(&s.q_dreq), "Q's .dreq was deleted");
     assert!(!after.contains(&s.u_dreq), "U's .dreq was kept");
+}
+
+/// An erasure request Z applied by a rewrite over R.
+const Z: u128 = 0x5a;
+
+/// The reclaimed-predecessor ordering: R (over {A, B}, applying Q) is
+/// superseded by a live R2 that applies only Z, and C over {A, B, X}
+/// conflicts with R2 through R's inputs. Rule 2 reclaims R's record and part
+/// under R2's group once R's horizon passes; the fixture deletes them as that
+/// pass would. R2 now resolves to no inputs at all, so C is reported as
+/// neither dominated nor conflicting, yet its parts still carry Q's and Z's
+/// erased rows. Rule 6 keeps every candidate while the bucket stands, and
+/// releases all three once C is gone.
+///
+/// Fails without the truncated-chain check in `Version2Groups::from_records`
+/// (sweep.rs): the `conflict_truncated_buckets` assertion finds an empty set,
+/// and rule 6 then returns `(3, 0, 0)`, deleting Q's `.dreq` while C's parts
+/// are served.
+#[tokio::test]
+async fn rule_6_keeps_every_dreq_while_a_conflicting_rewrite_chain_is_truncated() {
+    let store = MemoryStore::new();
+    let s = seed_conflict(&store).await;
+    let r2 = put_superseding_rewrite(
+        &store,
+        &s.b,
+        &s.rewrite.0,
+        Uuid::from_u128(Z),
+        0x4d,
+        hour_ns() + 5_500,
+    )
+    .await;
+    let z_dreq = put_completed_request(&store, &s.b, Uuid::from_u128(Z)).await;
+    store.delete(&s.rewrite.1).await.expect("delete R's part");
+    store.delete(&s.rewrite.0).await.expect("delete R's record");
+
+    let outcome = rule_2(&store, &s.b).await;
+    assert_eq!(
+        outcome.conflict_truncated_buckets,
+        BTreeSet::from([HeldBucket {
+            shard: s.b.shard,
+            ingest_hour_bucket: s.b.ingest_hour_bucket,
+        }]),
+        "{outcome:?}"
+    );
+    assert!(outcome.conflict_request_ids.is_empty(), "{outcome:?}");
+    assert!(outcome.held_request_ids.is_empty(), "{outcome:?}");
+    assert!(outcome.held_truncated_buckets.is_empty(), "{outcome:?}");
+    let after_rule_2 = all_keys(&store).await;
+    for key in [&s.c_keys.0, &s.c_keys.1, &r2.0, &r2.1] {
+        assert!(after_rule_2.contains(key), "{key} was deleted");
+    }
+
+    assert_eq!(rule_6(&store, &s.b).await, (0, 3, 3));
+    let after = all_keys(&store).await;
+    for key in [&s.q_dreq, &z_dreq, &s.u_dreq] {
+        assert!(after.contains(key), "{key} was deleted");
+    }
+
+    store.delete(&s.c_keys.1).await.expect("delete C's part");
+    store.delete(&s.c_keys.0).await.expect("delete C's record");
+    let outcome = rule_2(&store, &s.b).await;
+    assert!(outcome.conflict_truncated_buckets.is_empty(), "{outcome:?}");
+    assert_eq!(rule_6(&store, &s.b).await, (3, 0, 0));
+}
+
+/// The third-stall conflict in a bucket whose version 2 supersession does
+/// not resolve: a chain of 65 version 2 records over an unrelated input E,
+/// one past the catalog's supersession depth bound, so
+/// `select_authoritative_compaction_records` fails for the bucket after
+/// `erasure_dominance` has already reported C's conflict with R. (A cycle
+/// cannot be written: a version 2 record's key hashes the key it names.)
+/// Rule 6 keeps Q's `.dreq` and retires U's.
+///
+/// Fails with the conflict loop placed after the selection's error arm in
+/// `Version2Groups::from_records` (sweep.rs): the arm continues past it, the
+/// `conflict_request_ids` assertion finds an empty set, and rule 6 returns
+/// `(2, 0, 0)`.
+#[tokio::test]
+async fn rule_6_keeps_a_conflict_dreq_when_the_bucket_selection_fails() {
+    let store = MemoryStore::new();
+    let s = seed_conflict(&store).await;
+    let base = version_1(&s.b, vec![input(0xA5, 5)], 0x71, 0xe1, hour_ns() + 7_000);
+    let (mut named, _) = put_compaction(&store, &base).await;
+    for i in 0..65u8 {
+        let link = CompactionRecord {
+            format_version: 2,
+            input_set_hash: erasure::compute_superseding_compaction_input_set_hash(
+                &base.inputs,
+                &named,
+            )
+            .to_vec(),
+            parts: vec![part(i, hour_ns(), hour_ns() + 10_000)],
+            created_unix_ns: base.created_unix_ns + 1 + i64::from(i),
+            superseded_record_key: named.clone(),
+            ..base.clone()
+        };
+        named = put_compaction(&store, &link).await.0;
+    }
+
+    let outcome = rule_2(&store, &s.b).await;
+    assert_eq!(
+        outcome.conflict_request_ids,
+        BTreeSet::from([Uuid::from_u128(Q).to_string()]),
+        "{outcome:?}"
+    );
+    assert!(outcome.conflict_truncated_buckets.is_empty(), "{outcome:?}");
+    let after_rule_2 = all_keys(&store).await;
+    for key in [&s.c_keys.0, &s.c_keys.1, &s.rewrite.0, &s.rewrite.1] {
+        assert!(after_rule_2.contains(key), "{key} was deleted");
+    }
+
+    assert_eq!(rule_6(&store, &s.b).await, (1, 1, 1));
+    let after = all_keys(&store).await;
+    assert!(after.contains(&s.q_dreq), "Q's .dreq was deleted");
+    assert!(!after.contains(&s.u_dreq), "U's .dreq was kept");
+}
+
+/// PUT a rewrite record superseding the record at `superseded` and applying
+/// `request_id`, and an object at its part key. Returns the record key and
+/// the part key.
+async fn put_superseding_rewrite(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    superseded: &str,
+    request_id: Uuid,
+    seed: u8,
+    created_ns: i64,
+) -> (String, String) {
+    let base = hour_ns();
+    let request_id = request_id.to_string();
+    let record = RewriteRecord {
+        format_version: 1,
+        tenant_hash: bucket.tenant_hash.0.to_vec(),
+        signal: signal::to_proto(bucket.signal) as i32,
+        shard: bucket.shard,
+        ingest_hour_bucket: bucket.ingest_hour_bucket,
+        input_set_hash: erasure::compute_rewrite_input_set_hash(
+            &[],
+            Some(superseded),
+            std::slice::from_ref(&request_id),
+        )
+        .to_vec(),
+        inputs: Vec::new(),
+        parts: vec![part(seed, base, base + 10_000)],
+        drops: vec![RewriteDrop {
+            request_id,
+            dropped_count: 1,
+        }],
+        created_unix_ns: created_ns,
+        superseded_record_key: superseded.to_string(),
+    };
+    let part_key = keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part");
+    store
+        .put(
+            &part_key,
+            bytes::Bytes::from_static(b"rw-part"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put rewrite part");
+    let key = keys::rewrite_record_key_for(&record).expect("rewrite key");
+    store
+        .put(
+            &key,
+            erasure::encode_rewrite(&record),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put rewrite record");
+    (key, part_key)
 }

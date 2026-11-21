@@ -1203,6 +1203,15 @@ pub struct SupersededSweepOutcome {
     /// records present on every pass, in either mode, so it empties once the
     /// conflicting record is deleted or dominated.
     pub conflict_request_ids: BTreeSet<String>,
+    /// The buckets in which a conflict's requests, or whether a conflict
+    /// exists at all, cannot be known: a conflicting rewrite's chain names a
+    /// record that is not present, or a rewrite whose chain does sits beside
+    /// a served compaction record. A rewrite resolved past a missing record
+    /// has lost that record's inputs and requests, so a compaction record over
+    /// them is not reported in [`Self::conflict_request_ids`]. Rule 6 keeps
+    /// every candidate while any bucket is here. Recomputed on every pass like
+    /// `conflict_request_ids`.
+    pub conflict_truncated_buckets: BTreeSet<HeldBucket>,
     /// Erasure-dominated compaction records, of either version, kept this
     /// pass because no rewrite's group took them, in buckets with no rewrite still
     /// inside its protection horizon. Each one holds parts that re-encode a
@@ -1265,6 +1274,9 @@ pub struct SupersededHolds {
     pub truncated_buckets: BTreeSet<HeldBucket>,
     /// [`SupersededSweepOutcome::conflict_request_ids`], unioned across shards.
     pub conflict_request_ids: BTreeSet<String>,
+    /// [`SupersededSweepOutcome::conflict_truncated_buckets`], unioned across
+    /// shards.
+    pub conflict_truncated_buckets: BTreeSet<HeldBucket>,
 }
 
 impl SupersededHolds {
@@ -1276,6 +1288,8 @@ impl SupersededHolds {
             .extend(outcome.held_truncated_buckets.iter().copied());
         self.conflict_request_ids
             .extend(outcome.conflict_request_ids.iter().cloned());
+        self.conflict_truncated_buckets
+            .extend(outcome.conflict_truncated_buckets.iter().copied());
     }
 
     /// `true` when nothing was held: every `.dreq` past its horizon is
@@ -1284,6 +1298,7 @@ impl SupersededHolds {
         self.request_ids.is_empty()
             && self.truncated_buckets.is_empty()
             && self.conflict_request_ids.is_empty()
+            && self.conflict_truncated_buckets.is_empty()
     }
 }
 
@@ -1683,6 +1698,17 @@ async fn sweep_superseded_impl(
     outcome
         .conflict_request_ids
         .extend(version_2.conflict_request_ids.iter().cloned());
+    outcome
+        .conflict_truncated_buckets
+        .extend(
+            version_2
+                .conflict_truncated
+                .iter()
+                .map(|&ingest_hour_bucket| HeldBucket {
+                    shard,
+                    ingest_hour_bucket,
+                }),
+        );
     outcome
         .held_truncated_buckets
         .extend(
@@ -2367,6 +2393,9 @@ struct Version2Groups {
     /// The erasure requests applied by each live rewrite a compaction record
     /// conflicts with ([`SupersededSweepOutcome::conflict_request_ids`]).
     conflict_request_ids: BTreeSet<String>,
+    /// The buckets whose conflicts or conflicting requests cannot be known
+    /// ([`SupersededSweepOutcome::conflict_truncated_buckets`]).
+    conflict_truncated: BTreeSet<u32>,
 }
 
 impl Version2Groups {
@@ -2420,6 +2449,39 @@ impl Version2Groups {
                     continue;
                 }
             };
+            for (_, rewrite_key) in &dominance.conflicts {
+                if !chain_request_ids(
+                    rewrite_key,
+                    rewrites,
+                    compactions,
+                    &mut out.conflict_request_ids,
+                ) {
+                    out.conflict_truncated.insert(bucket);
+                }
+            }
+            // A rewrite whose chain names a record that is gone resolves to
+            // fewer inputs than it superseded, so a served compaction record
+            // can share one of the missing inputs without being reported as a
+            // conflict. Neither the conflict nor its requests can be known.
+            let named: HashSet<&str> = in_bucket
+                .iter()
+                .map(|(_, record)| record.superseded_record_key.as_str())
+                .chain(
+                    bucket_rewrites
+                        .iter()
+                        .map(|(_, record)| record.superseded_record_key.as_str()),
+                )
+                .collect();
+            let served_compaction = in_bucket
+                .iter()
+                .any(|(key, _)| !dominance.dominated.contains(key) && !named.contains(key));
+            if served_compaction
+                && bucket_rewrites.iter().any(|(key, _)| {
+                    !chain_request_ids(key, rewrites, compactions, &mut BTreeSet::new())
+                })
+            {
+                out.conflict_truncated.insert(bucket);
+            }
             let dominated = dominance.dominated;
             let candidates: Vec<(&str, &CompactionRecord)> = in_bucket
                 .iter()
@@ -2459,14 +2521,6 @@ impl Version2Groups {
             }
             bucket_dominated.sort();
             out.dominated.insert(bucket, bucket_dominated);
-            for (_, rewrite_key) in &dominance.conflicts {
-                chain_request_ids(
-                    rewrite_key,
-                    rewrites,
-                    compactions,
-                    &mut out.conflict_request_ids,
-                );
-            }
             for (record_key, rewrite_key) in dominance.version_1 {
                 out.version_1_by_rewrite
                     .entry(rewrite_key)
@@ -3492,17 +3546,20 @@ async fn walk_superseded_chain(
 /// stepping through version 2 compaction links. The chain was resolved by
 /// [`erasure_dominance`] already; `seen` only bounds a walk over a map that
 /// changed shape.
+///
+/// Returns `false` when the chain names a record that is not present: the
+/// requests that record and anything below it applied are then unknown.
 fn chain_request_ids(
     rewrite_key: &str,
     rewrites: &HashMap<String, RewriteRecord>,
     compactions: &HashMap<String, CompactionRecord>,
     out: &mut BTreeSet<String>,
-) {
+) -> bool {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut cursor = Some(rewrite_key);
     while let Some(key) = cursor {
         if !seen.insert(key) {
-            return;
+            return false;
         }
         let named = if let Some(rewrite) = rewrites.get(key) {
             for drop in &rewrite.drops {
@@ -3514,10 +3571,11 @@ fn chain_request_ids(
         } else if let Some(compaction) = compactions.get(key) {
             compaction.superseded_record_key.as_str()
         } else {
-            return;
+            return false;
         };
         cursor = Some(named).filter(|named| !named.is_empty());
     }
+    true
 }
 
 /// A record's `input_set_hash` as the 32-byte array a level-1 snapshot entry
@@ -4326,7 +4384,9 @@ pub struct ErasureRequestSweepOutcome {
     /// chain is held would let a snapshot that still resolves it serve the
     /// erased subject again. Also counts a request kept because that pass
     /// found a compaction record conflicting with a live rewrite that applies
-    /// it ([`SupersededHolds::conflict_request_ids`]); its WARN line names
+    /// it ([`SupersededHolds::conflict_request_ids`]), or any request while a
+    /// bucket's conflicts cannot be known
+    /// ([`SupersededHolds::conflict_truncated_buckets`]); its WARN line names
     /// that reason. The server's maintain loop sums it into
     /// `ravel_maintain_dreq_held_by_superseded_inputs_total`.
     pub held_by_superseded_inputs: usize,
@@ -4382,6 +4442,10 @@ pub struct ErasureRequestSweepOutcome {
 ///   can carry rows the rewrite erased, so the filter stays while the record
 ///   is live. Nothing persists the keep: once the record is deleted or a later
 ///   rewrite dominates it, the next observation no longer reports the request.
+///   A bucket where a conflict, or the requests behind one, cannot be known
+///   because a rewrite's chain names a record that is gone
+///   ([`SupersededHolds::conflict_truncated_buckets`]) keeps every candidate
+///   the same way.
 /// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
 ///   request exactly as it pins any other object.
 ///
@@ -4515,13 +4579,17 @@ pub async fn sweep_erasure_requests(
         // it touched. Narrowing on a list that may be partial would release a
         // filter over a bucket the request did touch.
         let request_id_s = request_id.to_string();
-        if holds.conflict_request_ids.contains(&request_id_s) {
+        if holds.conflict_request_ids.contains(&request_id_s)
+            || !holds.conflict_truncated_buckets.is_empty()
+        {
             tracing::warn!(
                 tenant_hash = %tenant.to_hex(),
                 signal = signal.key_prefix(),
                 request_id = %request_id,
+                conflict_truncated_buckets = holds.conflict_truncated_buckets.len(),
                 "erasure-request sweep: keeping a .dreq past its horizon because a compaction \
-                 record that conflicts with a live erasure rewrite applying it is live; its \
+                 record that conflicts with a live erasure rewrite applying it is live, or a \
+                 bucket's conflicts cannot be known (conflict_truncated_buckets > 0); its \
                  parts can hold rows the rewrite erased, and the query-time exclusion filter \
                  is what hides them (#4560)"
             );
