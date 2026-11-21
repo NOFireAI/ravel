@@ -6,7 +6,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.35.0] - 2026-11-21
+## [0.35.0] - 2026-11-22
 
 **Upgrade: scripts that run the preview `ravel-cli compat` commands must
 change.** A refused `compat` command now exits 5, not 2, and `compat
