@@ -365,7 +365,7 @@
 #               routed flags
 #   stage1-l1-compact  (row 6) once the newest ingest hour is sealed,
 #               ravel-server stopped and ravel-cli maintain compact-tenant
-#               --signal metrics --max-flush-lifetime 0s into
+#               --signal metrics --max-flush-lifetime 0s --late-commit-fence off into
 #               <out>/stage1-l1-compact.txt (stage1.l1_compact), with
 #               --max-l1-part-bytes N when MB_L1_MAX_PART_BYTES=N is set
 #               (stage1.l1_max_part_bytes: N, or default when it is not)
@@ -4688,13 +4688,13 @@ stage1_extra_hour_step() {
 # with stage1-routed's.
 stage1_l1_step() {
   local code=0 t0 t1 line
-  local cmd="ravel-cli maintain compact-tenant --tenant ${RAVEL_TENANT} --signal metrics --shards ${RAVEL_SHARDS} --max-flush-lifetime 0s${l1_max_part_bytes:+ --max-l1-part-bytes ${l1_max_part_bytes}}"
+  local cmd="ravel-cli maintain compact-tenant --tenant ${RAVEL_TENANT} --signal metrics --shards ${RAVEL_SHARDS} --max-flush-lifetime 0s --late-commit-fence off${l1_max_part_bytes:+ --max-l1-part-bytes ${l1_max_part_bytes}}"
   stage1_seal_wait stage1-l1-compact "compaction takes only hours sealed past the 5 minute clock-skew allowance"
   stage1_stop stage1-l1-compact
   t0="$(now_ms)"
   RAVEL_IMAGE="$ravel_image" compose run --rm --no-deps -T ravel-qualify \
     --store s3 --tenant-hash-unkeyed maintain compact-tenant \
-    --tenant "$RAVEL_TENANT" --signal metrics --shards "$RAVEL_SHARDS" --max-flush-lifetime 0s \
+    --tenant "$RAVEL_TENANT" --signal metrics --shards "$RAVEL_SHARDS" --max-flush-lifetime 0s --late-commit-fence off \
     ${l1_max_part_bytes:+--max-l1-part-bytes "$l1_max_part_bytes"} \
     >"${out_dir}/stage1-l1-compact.txt" 2>"${out_dir}/stage1-l1-compact.log" || code=$?
   t1="$(now_ms)"

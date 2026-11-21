@@ -7,7 +7,8 @@
 //! and a plan that did not would name different input sets for one bucket,
 //! which is how a compaction record and an erasure rewrite record end up
 //! covering it only in part. Classifying by the store's stamp against a fixed
-//! cutoff gives every plan of a bucket, at any time, the same L0 set.
+//! cutoff gives every plan of a bucket, at any time, the same L0 set, provided
+//! every maintainer of the store derives the cutoff from the same seal margin.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
@@ -57,6 +58,27 @@ pub(crate) fn may_list_to_plan(bucket: &Bucket, now_ns: i64, config: &CompactorC
     match config.late_commit_fence {
         LateCommitFence::Off => bucket.is_sealed(now_ns, config),
         LateCommitFence::Enforce => bucket.is_plannable(now_ns, None, config),
+    }
+}
+
+/// Whether the erasure completion gate may judge `bucket` at `now_ns`
+/// ([`crate::bucket_erasure_completion`]). Under [`LateCommitFence::Enforce`]
+/// this is the test a raw-L0 erasure rewrite plans under,
+/// [`Bucket::is_plannable`] with the store's observed clock, so completion
+/// never judges a bucket before the first rewrite of it could plan: an on-time
+/// record stamped just before the cutoff may not be visible to a LIST until
+/// then. With the fence off it is [`Bucket::is_sealed`].
+pub fn may_judge_completion(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    now_ns: i64,
+    config: &CompactorConfig,
+) -> bool {
+    match config.late_commit_fence {
+        LateCommitFence::Off => bucket.is_sealed(now_ns, config),
+        LateCommitFence::Enforce => {
+            bucket.is_plannable(now_ns, store.observed_store_time_ns(), config)
+        }
     }
 }
 

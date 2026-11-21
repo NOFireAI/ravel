@@ -3163,9 +3163,11 @@ pub const ERASURE_REWRITE_DEADLINE_NS: i64 = 72 * NS_PER_HOUR;
 /// A request whose window overlaps nothing live here is not blocked. A `.done`
 /// is safe for a request only when NO in-scope bucket blocks it.
 ///
-/// An unsealed bucket is handled before any of that, and it blocks rather than
-/// passes. ADR-0064 decision 3 point 1 defers an unsealed bucket to the NEXT
-/// pass, which is a deferral of the rewrite, not a licence to complete: a
+/// A bucket the gate may not judge yet ([`crate::may_judge_completion`]: not
+/// sealed, or under the late-commit fence not yet plannable) is handled before
+/// any of that, and it blocks rather than passes. ADR-0064 decision 3 point 1
+/// defers such a bucket to the NEXT pass, which is a deferral of the rewrite,
+/// not a licence to complete: a
 /// request marked `.done` is no longer pending, so no later pass revisits it,
 /// and the records the bucket seals with are served again the moment the
 /// `.dreq` is swept and the query-time filter stops applying. Completion
@@ -3192,15 +3194,18 @@ pub async fn bucket_erasure_completion(
     if pending.is_empty() {
         return Ok(out);
     }
-    // Unsealed: `erasure_rewrite_bucket` defers the REWRITE to a later pass
-    // (ADR-0064 decision 3 point 1), so completion must not run ahead of it.
-    // Every request whose scope covered this bucket at acknowledgement stays
-    // pending until the bucket seals and a later pass rewrites it. Nothing here
+    // Not yet judgeable: `erasure_rewrite_bucket` defers the REWRITE to a later
+    // pass (ADR-0064 decision 3 point 1), so completion must not run ahead of
+    // it. Every request whose scope covered this bucket at acknowledgement stays
+    // pending until a pass may plan the bucket and rewrites it. Nothing here
     // reads the bucket: an unsealed bucket's listing is incomplete by
     // construction (a flush open at the ack has up to `max_flush_lifetime` to
-    // publish its commit record), so "it currently serves nothing" is not a
-    // proof about the records it will seal with.
-    if !bucket.is_sealed(clock.now_ns(), config) {
+    // publish its commit record), and under the late-commit fence a sealed one
+    // is too until the store's clock is `LATE_COMMIT_SETTLE_NS` past the cutoff
+    // (ADR-4561 R3), since an on-time record stamped just before the cutoff may
+    // not be listed yet. Either way "it currently serves nothing" is not a proof
+    // about the records the rewrite will plan from.
+    if !crate::late_commit::may_judge_completion(store, bucket, clock.now_ns(), config) {
         for pending_request in pending {
             if bucket_in_scope_at_ack(bucket, &pending_request.request, config) {
                 out.blocked
