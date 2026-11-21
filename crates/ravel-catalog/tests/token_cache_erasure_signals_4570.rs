@@ -15,13 +15,16 @@
 //! under a compaction record whose inputs name R's output by the identity the
 //! resolver gives a rewrite part (nil writer id, epoch 0, seq 0: a rewrite
 //! part has no writer identity of its own), folds a HEAD naming P2 and deletes
-//! R and P, then resolves T.
+//! R and P, then resolves T. The rewrite-chain case instead publishes R2,
+//! which supersedes R as a whole (the successor a second erasure writes),
+//! folds a HEAD naming R2's part, deletes R and P, then resolves T.
 //!
 //! ravel-catalog has no helper that turns a resolved set into rows, so set
 //! membership is the evidence: A in the set means S's row is served. Every
-//! final resolve also asserts it issued no GET of A's commit key, which
-//! proves the token step took the record-cache hit in `probe_min_token`
-//! rather than the swept-record fallback.
+//! final resolve also asserts it issued exactly two GETs of A's commit key:
+//! the record-cache hit is re-validated against the store, and the record is
+//! absent after the one NotFound retry, so the token takes the swept-record
+//! fallback.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -29,8 +32,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ravel_catalog::{
-    Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
-    DEFAULT_MAX_FLUSH_LIFETIME_NS, Snapshot,
+    Catalog, CatalogConfig, CatalogError, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+    DEFAULT_FOLD_SAFETY_MARGIN_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, Snapshot,
 };
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::{erasure, keys, signal};
@@ -60,6 +63,9 @@ const SURVIVING_ROWS: u64 = 1;
 /// Matching GETs of A's commit key the probe sequence counts before it stops
 /// counting; far above what any resolve here issues.
 const PROBE_STEPS: usize = 64;
+/// GETs of A's commit key a token read issues once A's record is swept: the
+/// re-validation of the cached record and its one NotFound retry.
+const SWEPT_RECORD_GETS: u64 = 2;
 
 #[derive(Default)]
 struct ManualMonoClock(AtomicU64);
@@ -273,6 +279,32 @@ fn compaction_of_rewrite_output(signal: Signal) -> CompactionRecord {
     }
 }
 
+/// R2: a second erasure rewrite superseding R as a whole, with part P3.
+fn superseding_rewrite(signal: Signal, r_key: &str, request_id: Uuid) -> RewriteRecord {
+    let request_id = request_id.to_string();
+    RewriteRecord {
+        format_version: 1,
+        tenant_hash: tenant().0.to_vec(),
+        signal: signal::to_proto(signal) as i32,
+        shard: 0,
+        ingest_hour_bucket: HOUR,
+        input_set_hash: erasure::compute_rewrite_input_set_hash(
+            &[],
+            Some(r_key),
+            std::slice::from_ref(&request_id),
+        )
+        .to_vec(),
+        inputs: Vec::new(),
+        parts: vec![part(0xe3, SURVIVING_ROWS)],
+        drops: vec![RewriteDrop {
+            request_id,
+            dropped_count: 0,
+        }],
+        created_unix_ns: hour_start() + 7_000,
+        superseded_record_key: r_key.to_string(),
+    }
+}
+
 /// The warm query node and the store it reads, which counts every GET of A's
 /// commit key.
 struct Node {
@@ -306,15 +338,15 @@ impl Node {
     }
 
     /// Resolve T on the warm node, after its HEAD cache has expired, and
-    /// assert the token step took the record-cache hit: no GET of A's commit
-    /// key.
-    async fn warm_token_resolve(&self) -> Snapshot {
+    /// assert the token step re-validated A's cached record against the
+    /// store: the GET and its one NotFound retry.
+    async fn warm_token_resolve_result(&self) -> Result<Snapshot, CatalogError> {
         self.clock.0.fetch_add(
             u64::try_from(NS_PER_HOUR).expect("positive"),
             Ordering::SeqCst,
         );
         let before = self.a_record_gets();
-        let snapshot = self
+        let answer = self
             .catalog
             .resolve(
                 &tenant(),
@@ -323,14 +355,19 @@ impl Node {
                 &[token(&self.a)],
                 after_horizon_now(),
             )
-            .await
-            .expect("warm token resolve");
+            .await;
         assert_eq!(
             self.a_record_gets(),
-            before,
-            "the token step served A's record from the record cache"
+            before + SWEPT_RECORD_GETS,
+            "the token step re-validated A's cached record and found it swept"
         );
-        snapshot
+        answer
+    }
+
+    async fn warm_token_resolve(&self) -> Snapshot {
+        self.warm_token_resolve_result()
+            .await
+            .expect("warm token resolve")
     }
 }
 
@@ -470,24 +507,66 @@ async fn x2_rewrite_output_compacted(signal: Signal) {
         "HEAD names P2 alone"
     );
 
-    let snapshot = node.warm_token_resolve().await;
-    assert!(
-        snapshot.pending_erasure.is_empty(),
-        "no predicate would filter S"
+    // No production writer creates this state: compaction refuses a bucket
+    // with a live rewrite record, so only "A is not served" is asserted.
+    match node.warm_token_resolve_result().await {
+        Ok(snapshot) => {
+            let keys = sorted_keys(&snapshot);
+            assert!(
+                !keys.contains(&l0_key(&node.a)),
+                "A, which holds S's erased row, is not served: {keys:?}"
+            );
+        }
+        Err(CatalogError::UnsatisfiableToken { writer_id, seq, .. }) => {
+            assert_eq!(
+                (writer_id, seq),
+                (node.a.writer_id.clone(), node.a.writer_seq)
+            );
+        }
+        Err(other) => panic!("resolve failed for another reason: {other}"),
+    }
+}
+
+async fn rewrite_chain(signal: Signal) {
+    let node = erased_and_swept(signal).await;
+    let r_key = keys::rewrite_record_key_for(&node.r).expect("rewrite key");
+    let r2 = superseding_rewrite(signal, &r_key, Uuid::from_u128(0x4570_d0e6));
+    put(
+        node.inner.as_ref(),
+        &keys::rewrite_record_key_for(&r2).expect("rewrite key"),
+        erasure::encode_rewrite(&r2).to_vec(),
+    )
+    .await;
+    put(
+        node.inner.as_ref(),
+        &rewrite_part_key(&r2),
+        b"P3: row not of S".to_vec(),
+    )
+    .await;
+    node.fold(after_horizon_now()).await;
+    delete(node.inner.as_ref(), &r_key).await;
+    delete(node.inner.as_ref(), &rewrite_part_key(&node.r)).await;
+
+    let plain = node.cold_plain_resolve(after_horizon_now()).await;
+    assert_eq!(
+        sorted_keys(&plain),
+        vec![rewrite_part_key(&r2)],
+        "HEAD names R2's part alone"
     );
+
+    let snapshot = node.warm_token_resolve().await;
     let keys = sorted_keys(&snapshot);
     assert!(
-        keys.contains(&part_key(&c)),
-        "P2 serves T's surviving row: {keys:?}"
-    );
-    assert!(
         !keys.contains(&l0_key(&node.a)),
-        "A, which holds S's erased row, is served from the cached pre-erasure record: {keys:?}"
+        "A, which holds S's erased row, is not served: {keys:?}"
+    );
+    assert_eq!(
+        keys,
+        vec![rewrite_part_key(&r2)],
+        "R2's part serves T's surviving row"
     );
 }
 
-/// `token_input_replacement` returns `None` for metrics whatever the bucket
-/// holds, so the cached A is added beside P.
 #[tokio::test]
 async fn metrics_x1_record_cache_hit_after_horizon() {
     x1_record_cache_hit_after_horizon(Signal::Metrics).await;
@@ -508,8 +587,6 @@ async fn metrics_x2_rewrite_output_compacted() {
     x2_rewrite_output_compacted(Signal::Metrics).await;
 }
 
-/// With R gone, no record in the bucket names A's identity, so the cached A
-/// is added beside P2.
 #[tokio::test]
 async fn logs_x2_rewrite_output_compacted() {
     x2_rewrite_output_compacted(Signal::Logs).await;
@@ -518,4 +595,19 @@ async fn logs_x2_rewrite_output_compacted() {
 #[tokio::test]
 async fn spans_x2_rewrite_output_compacted() {
     x2_rewrite_output_compacted(Signal::Spans).await;
+}
+
+#[tokio::test]
+async fn metrics_rewrite_chain() {
+    rewrite_chain(Signal::Metrics).await;
+}
+
+#[tokio::test]
+async fn logs_rewrite_chain() {
+    rewrite_chain(Signal::Logs).await;
+}
+
+#[tokio::test]
+async fn spans_rewrite_chain() {
+    rewrite_chain(Signal::Spans).await;
 }

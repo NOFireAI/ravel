@@ -3079,10 +3079,7 @@ impl Catalog {
             any_completed: erasure_completed,
         } = match pending_erasure {
             Some(state) => state,
-            None => {
-                self.list_erasure_state(tenant, signal, accounting)
-                    .await?
-            }
+            None => self.list_erasure_state(tenant, signal, accounting).await?,
         };
 
         // Record-absent tokens run first: their fallback adds a replacement's
