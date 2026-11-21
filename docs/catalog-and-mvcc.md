@@ -3485,6 +3485,23 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      chain, no present version 2 record and no dominance excludes. A cycle
      or an over-deep chain fails the pass with an invariant error carrying
      the catalog's error as text, not with an error type of its own.
+     A version 1 compaction record (empty `superseded_record_key`) that no
+     live rewrite's chain names is dominated when the effective inputs of
+     ONE live rewrite contain every input it names. Coverage is checked per
+     rewrite, never against the union of several rewrites' inputs: a record
+     two rewrites cover only between them is not dominated. Such a record is
+     a compaction that ran over the pre-erasure L0 inputs after the rewrite
+     claimed them (a lost or late advisory claim, ADR-1029), so its parts
+     may hold an erased subject; the rewrite wins exactly as it does over a
+     dominated version 2 record, and a version 2 record whose predecessor
+     is a dominated version 1 record is dominated too. A version 1 record
+     whose inputs a live rewrite covers only in part is not dominated: it
+     stays an overlap conflict for the selection below, and each such
+     record-rewrite pair is counted in
+     `ravel_catalog_erasure_overlap_conflicts_total` and logged once at
+     WARN. Every dominated version 1 record is counted in
+     `ravel_catalog_dominated_compaction_records_total`. Both counters are
+     process-wide, labelled by `mode` on `/metrics`.
    - **Reclaiming superseded records.** The superseded-input sweep reclaims a
      record a present version 2 record supersedes, with its parts, as one
      chain group entered from the version 2 record at the head of the chain
@@ -3501,7 +3518,13 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      group of the rewrite whose chain ends at that same absent key, even
      when nothing else of that chain is left; a dominated record no group
      takes is logged and counted, never skipped silently. A version 2
-     record naming a key that is not present reclaims nothing.
+     record naming a key that is not present reclaims nothing. A dominated
+     version 1 record joins the group of the rewrite that covers it (the
+     rewrite's chain group, or the group over a raw-L0 rewrite's own
+     inputs) and is deleted with its parts under that group's reachability
+     and hold rules. Its records go ahead of the chain's own, since its
+     dominance is read through the chain's inputs, and the group's horizon
+     runs from the newest record it holds, the dominated ones included.
      The sweep treats an input as superseded only where an authoritative
      record names it both with and without version 2 supersession applied:
      while a predecessor is present, excluding it can hand its overlap
