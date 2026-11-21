@@ -3025,7 +3025,9 @@ enum CatalogCommand {
         /// erasure request is pending, no series leaf is built. With
         /// `--rebuild-key-index` it attaches the three fields to every part
         /// that lacks them (`series_index_parts_over_cap`). Off by default.
-        /// Refused with `--no-metrics-label-index`.
+        /// Refused with `--no-metrics-label-index`. Refused before the fold
+        /// or rebuild starts on a store that holds `sys/compat`, since no
+        /// active version there admits leaf format version 3 (issue #4545).
         #[arg(long, conflicts_with = "no_metrics_label_index")]
         metrics_series_index: bool,
         /// Instead of folding, attach key-index leaves to the parts already in
@@ -3574,23 +3576,34 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant_kms,
                     ..
                 },
-        } => catalog::rebuild_key_index_with_series_index(
-            store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
+        } => {
+            refuse_series_index_before_tenant_kms(&cli.store, &tenant_kms, metrics_series_index)
+                .await?;
+            catalog::rebuild_key_index_with_series_index(
+                store::build_tenant_data_store(
+                    &cli.store,
+                    &tenant_kms,
+                    &tenant,
+                    false,
+                    now_ns()?,
+                    log,
+                )
                 .await?,
-            cli.store.selection(),
-            &tenant,
-            shards,
-            signal,
-            field,
-            batch_entries,
-            key_index_build_max_pairs,
-            key_index_repair_hold_bytes,
-            !no_metrics_label_index,
-            metrics_series_index,
-            json,
-        )
-        .await
-        .map(|_report| ()),
+                cli.store.selection(),
+                &tenant,
+                shards,
+                signal,
+                field,
+                batch_entries,
+                key_index_build_max_pairs,
+                key_index_repair_hold_bytes,
+                !no_metrics_label_index,
+                metrics_series_index,
+                json,
+            )
+            .await
+            .map(|_report| ())
+        }
         Command::Catalog {
             command:
                 CatalogCommand::Fold {
@@ -3609,29 +3622,42 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant_kms,
                     ..
                 },
-        } => catalog::fold_with_metrics_series_index(
-            store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
+        } => {
+            refuse_series_index_before_tenant_kms(&cli.store, &tenant_kms, metrics_series_index)
+                .await?;
+            catalog::fold_with_metrics_series_index(
+                store::build_tenant_data_store(
+                    &cli.store,
+                    &tenant_kms,
+                    &tenant,
+                    false,
+                    now_ns()?,
+                    log,
+                )
                 .await?,
-            cli.store.selection(),
-            &tenant,
-            shards,
-            signal,
-            max_flush_lifetime,
-            writers_stopped,
-            key_index_leaves,
-            key_index_build_max_pairs,
-            !no_metrics_label_index,
-            metrics_series_index,
-            snapshot_part_max_entries
-                .map(usize::try_from)
-                .transpose()
-                .map_err(|_| anyhow::anyhow!("--snapshot-part-max-entries does not fit usize"))?,
-            retention_default,
-            now_ns()?,
-            json,
-        )
-        .await
-        .map(|_report| ()),
+                cli.store.selection(),
+                &tenant,
+                shards,
+                signal,
+                max_flush_lifetime,
+                writers_stopped,
+                key_index_leaves,
+                key_index_build_max_pairs,
+                !no_metrics_label_index,
+                metrics_series_index,
+                snapshot_part_max_entries
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        anyhow::anyhow!("--snapshot-part-max-entries does not fit usize")
+                    })?,
+                retention_default,
+                now_ns()?,
+                json,
+            )
+            .await
+            .map(|_report| ())
+        }
         Command::Inspect {
             command: InspectCommand::Cstat { key },
         } => {
@@ -5598,6 +5624,25 @@ fn catalog_list_json_line(seg: &ravel_catalog::SegmentRef) -> serde_json::Value 
         "min_event_ts_ns": seg.min_event_ts_ns,
         "max_event_ts_ns": seg.max_event_ts_ns,
     })
+}
+
+/// `catalog fold --metrics-series-index` with `--tenant-kms-config`: building
+/// the tenant's store can write its key-epoch record, so the `sys/compat`
+/// refusal is checked on the plain store first. Without that file the store
+/// build writes nothing and the fold or rebuild runs the same check itself.
+async fn refuse_series_index_before_tenant_kms(
+    store_args: &store::StoreArgs,
+    tenant_kms: &store::TenantKmsArgs,
+    metrics_series_index: bool,
+) -> anyhow::Result<()> {
+    if metrics_series_index && tenant_kms.tenant_kms_config.is_some() {
+        catalog::refuse_series_index_on_compat_store(
+            store::build_store(store_args)?.as_ref(),
+            true,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn catalog_list(

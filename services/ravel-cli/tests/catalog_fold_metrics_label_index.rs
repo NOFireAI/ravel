@@ -5,7 +5,8 @@
 //! refused and builds nothing, and a metrics rebuild with the opt-out
 //! is refused. Each case maps the opt-out to the catalog switch as
 //! `catalog fold` does, as its negation. `--metrics-series-index` (ADR-4146)
-//! reaches the fold and the rebuild the same way.
+//! reaches the fold and the rebuild the same way, and both refuse it on a
+//! store holding `sys/compat` (#4546).
 //!
 //! Driven in-process against one `MemoryStore` per case, for the reason
 //! `tests/catalog_signal.rs` gives.
@@ -20,8 +21,9 @@ use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, list_all};
+use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantId};
 use uuid::Uuid;
@@ -372,4 +374,222 @@ async fn the_metrics_series_index_flag_reaches_the_fold_and_the_rebuild() {
         "{printed}"
     );
     assert_eq!(kidx_objects(&off).await, 4);
+}
+
+/// Every object in the store, with its size and etag, so "writes nothing"
+/// compares the whole store and not one prefix.
+async fn store_objects(store: &dyn ObjectStoreBackend) -> Vec<(String, u64, String)> {
+    list_all(store, "")
+        .await
+        .expect("list the whole store")
+        .into_iter()
+        .map(|meta| (meta.key, meta.size, format!("{:?}", meta.etag)))
+        .collect()
+}
+
+/// Puts an object at `sys/compat`. Its bytes are not a valid record: the
+/// refusal keys on the object existing, not on what it says.
+async fn put_compat(store: &MemoryStore) {
+    store
+        .put(
+            ravel_catalog::COMPAT_KEY,
+            bytes::Bytes::from_static(b"not decoded"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put sys/compat");
+}
+
+/// `catalog fold --metrics-series-index`, label index on, leaves on unless
+/// `key_index_leaves` is false.
+async fn series_fold(
+    store: Arc<dyn ObjectStoreBackend>,
+    key_index_leaves: bool,
+    series: bool,
+) -> anyhow::Result<(ravel_catalog::FoldReport, String)> {
+    catalog::fold_with_metrics_series_index(
+        store,
+        MEMORY,
+        TENANT,
+        1,
+        SignalArg::Metrics,
+        None,
+        false,
+        key_index_leaves,
+        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        true,
+        series,
+        None,
+        None,
+        now_ns(),
+        false,
+    )
+    .await
+}
+
+/// `catalog fold --rebuild-key-index`, label index on, `--metrics-series-index`
+/// when `series`.
+async fn series_rebuild(
+    store: Arc<dyn ObjectStoreBackend>,
+    series: bool,
+) -> anyhow::Result<(ravel_catalog::KeyIndexRebuildReport, String)> {
+    catalog::rebuild_key_index_with_series_index(
+        store,
+        MEMORY,
+        TENANT,
+        1,
+        SignalArg::Metrics,
+        None,
+        250_000,
+        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        None,
+        true,
+        series,
+        false,
+    )
+    .await
+}
+
+fn assert_compat_present(err: &anyhow::Error) {
+    assert!(
+        matches!(
+            err.downcast_ref::<catalog::SeriesIndexRefusal>(),
+            Some(catalog::SeriesIndexRefusal::CompatPresent)
+        ),
+        "{err:#}"
+    );
+    let message = err.to_string();
+    for needle in [
+        "sys/compat exists",
+        "--metrics-series-index writes key-index leaves at version 3",
+        "no active version on this store admits",
+        "issue #4545",
+    ] {
+        assert!(
+            message.contains(needle),
+            "{needle:?} missing from {message:?}"
+        );
+    }
+}
+
+/// On a store holding `sys/compat`, `catalog fold --metrics-series-index`
+/// is refused with `CompatPresent` and writes nothing: the store's whole
+/// object list is the same before and after.
+#[tokio::test]
+async fn a_series_index_fold_on_a_store_with_sys_compat_is_refused_and_writes_nothing() {
+    let store = Arc::new(MemoryStore::new());
+    publish_series_fixture(&store).await;
+    put_compat(&store).await;
+    let before = store_objects(store.as_ref()).await;
+
+    let err = series_fold(store.clone(), true, true)
+        .await
+        .expect_err("refused on a store with sys/compat");
+    assert_compat_present(&err);
+    assert_eq!(store_objects(store.as_ref()).await, before);
+}
+
+/// On a store holding `sys/compat`, the key-index rebuild with
+/// `--metrics-series-index` is refused with `CompatPresent` and writes
+/// nothing, on a HEAD whose part lacks the three series fields the rebuild
+/// would otherwise attach.
+#[tokio::test]
+async fn a_series_index_rebuild_on_a_store_with_sys_compat_is_refused_and_writes_nothing() {
+    let store = Arc::new(MemoryStore::new());
+    publish_series_fixture(&store).await;
+    series_fold(store.clone(), true, false)
+        .await
+        .expect("fold without the series index");
+    assert_eq!(kidx_objects(&store).await, 1);
+    put_compat(&store).await;
+    let before = store_objects(store.as_ref()).await;
+
+    let err = series_rebuild(store.clone(), true)
+        .await
+        .expect_err("refused on a store with sys/compat");
+    assert_compat_present(&err);
+    assert_eq!(store_objects(store.as_ref()).await, before);
+    assert_eq!(kidx_objects(&store).await, 1);
+}
+
+/// Without `--metrics-series-index`, a store holding `sys/compat` folds and
+/// rebuilds as before, and neither asks for `sys/compat`: every HEAD of it
+/// fails here, and the fault never fires.
+#[tokio::test]
+async fn without_the_series_index_a_store_with_sys_compat_folds_and_rebuilds_as_before() {
+    let inner = Arc::new(MemoryStore::new());
+    publish_series_fixture(&inner).await;
+    put_compat(&inner).await;
+    let faulty = Arc::new(FaultStore::new(
+        Arc::clone(&inner),
+        FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Head,
+                ScriptedFault::Permanent("head refused".to_string()),
+            )
+            .with_key_contains(ravel_catalog::COMPAT_KEY),
+        ),
+    ));
+
+    let (report, _) = series_fold(faulty.clone(), false, false)
+        .await
+        .expect("fold without leaves");
+    assert_eq!(report.key_index_leaves_written, 0, "{report:?}");
+    assert_eq!(kidx_objects(&inner).await, 0);
+
+    let (report, _) = series_rebuild(faulty.clone(), false)
+        .await
+        .expect("rebuild without the series index");
+    assert_eq!(report.fields, vec!["label_value".to_string()]);
+    assert_eq!(report.parts_rebuilt, 1, "{report:?}");
+    assert_eq!(report.leaves_written, 1, "{report:?}");
+    assert_eq!(kidx_objects(&inner).await, 1);
+
+    assert_eq!(faulty.fault_count(Op::Head, FaultKind::Permanent), 0);
+}
+
+/// A HEAD of `sys/compat` that fails with anything but `NotFound` refuses
+/// `--metrics-series-index` on both paths with `CompatUnknown`: could not
+/// ask is not absent. The fault fires once per path and nothing is written.
+#[tokio::test]
+async fn a_failed_sys_compat_check_refuses_the_series_index_fold_and_rebuild() {
+    let inner = Arc::new(MemoryStore::new());
+    publish_series_fixture(&inner).await;
+    series_fold(inner.clone(), true, false)
+        .await
+        .expect("fold without the series index");
+    let faulty = Arc::new(FaultStore::new(
+        Arc::clone(&inner),
+        FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Head,
+                ScriptedFault::Permanent("head refused".to_string()),
+            )
+            .with_key_contains(ravel_catalog::COMPAT_KEY),
+        ),
+    ));
+    let before = store_objects(inner.as_ref()).await;
+
+    let fold_err = series_fold(faulty.clone(), true, true)
+        .await
+        .expect_err("fold refused when sys/compat cannot be checked");
+    let rebuild_err = series_rebuild(faulty.clone(), true)
+        .await
+        .expect_err("rebuild refused when sys/compat cannot be checked");
+    for err in [&fold_err, &rebuild_err] {
+        assert!(
+            matches!(
+                err.downcast_ref::<catalog::SeriesIndexRefusal>(),
+                Some(catalog::SeriesIndexRefusal::CompatUnknown(_))
+            ),
+            "{err:#}"
+        );
+        assert!(
+            err.to_string()
+                .contains("could not check whether sys/compat exists"),
+            "{err:#}"
+        );
+    }
+    assert_eq!(faulty.fault_count(Op::Head, FaultKind::Permanent), 2);
+    assert_eq!(store_objects(inner.as_ref()).await, before);
 }
