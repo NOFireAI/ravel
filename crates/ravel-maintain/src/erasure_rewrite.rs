@@ -525,7 +525,7 @@ impl LiveRecordBody {
 /// present record supersedes. A rewrite pass only ever needs that generation's
 /// own parts to decode. Supersession is the resolver's: a record a rewrite
 /// supersedes, directly or down its chain, a record a present version 2
-/// compaction record supersedes, and a version 2 record a rewrite dominates are
+/// compaction record supersedes, and a compaction record a rewrite dominates are
 /// all out ([`select_live_record`]).
 #[derive(Debug, Clone)]
 enum LiveRecord {

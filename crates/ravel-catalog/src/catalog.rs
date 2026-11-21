@@ -3931,7 +3931,7 @@ impl Catalog {
         // to one authoritative record above (issue #1070). Either way this is
         // an interlock anomaly worth alarming on loudly (docs/catalog-and-mvcc.md
         // step 3, §3.6 row 11). A record a present version 2 record supersedes,
-        // and a version 2 record a live rewrite dominates, are expected state
+        // and a compaction record a live rewrite dominates, are expected state
         // until a sweep removes them, not a second input set.
         let input_set_hashes: HashSet<&[u8]> = candidates
             .iter()

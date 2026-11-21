@@ -2174,10 +2174,13 @@ async fn load_compaction_records(
 /// A record a present version 2 record supersedes is excluded by the selector
 /// like a loser, but it is not kept like one: it and its parts are reclaimed
 /// as a chain group entered from the version 2 record, and an
-/// erasure-dominated version 2 record goes with its rewrite's chain group
-/// ([`Version2Groups`]). Neither group holds a raw L0 input that only this
-/// rule's compaction arm would otherwise decide on, so the input view here is
-/// unchanged by them.
+/// erasure-dominated record of either version goes with its rewrite's group
+/// ([`Version2Groups`]). Dominance is not applied here, so a dominated
+/// version 1 record can still win an overlap component in this view, and a
+/// record the resolver reads as authoritative then reads as a loser here and
+/// keeps its inputs. That errs toward keeping: every input the dominated
+/// record names is one its rewrite supersedes, so this view marks no input
+/// superseded that the resolver serves raw.
 #[derive(Default)]
 struct AuthoritativeInputs {
     by_bucket: HashMap<u32, HashSet<(String, u64, u64)>>,

@@ -1910,7 +1910,7 @@ async fn unit_targets(store: &dyn ObjectStoreBackend, unit: &Unit) -> UnitOutcom
                 .get(hour)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            // A version 2 record a live rewrite dominates is dropped before
+            // A compaction record a live rewrite dominates is dropped before
             // the selection, and the selection also excludes every record a
             // present version 2 record supersedes. A supersession the resolver
             // refuses (a cycle, a chain past the depth bound, or a version 2
