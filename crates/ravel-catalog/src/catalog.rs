@@ -5942,9 +5942,9 @@ where
 /// it as `ravel_catalog_dominated_compaction_records_total`.
 static DOMINATED_VERSION_1_RECORDS: AtomicU64 = AtomicU64::new(0);
 
-/// Version 1 compaction records that share an input with a live rewrite record
-/// but that no one live rewrite covers, counted the same way: each such record
-/// adds one per resolution, however many rewrites it overlaps. ravel-server
+/// Compaction records [`ErasureDominance::conflicts`] reports, counted the same
+/// way: each such record adds one per resolution, however many rewrites it
+/// overlaps. ravel-server
 /// renders it as `ravel_catalog_erasure_overlap_conflicts_total`.
 static ERASURE_OVERLAP_CONFLICTS: AtomicU64 = AtomicU64::new(0);
 
@@ -5974,8 +5974,10 @@ pub struct ErasureDominance<'a> {
     /// rewrite record that covers it: the lexicographically smallest one when
     /// several do.
     pub version_1: HashMap<&'a str, String>,
-    /// `(compaction record, rewrite record)` for each version 1 record not
-    /// dominated that shares at least one input with that live rewrite.
+    /// `(compaction record, rewrite record)` for each compaction record, of
+    /// either version, that no rewrite's chain names, that is not dominated,
+    /// and that shares at least one input with that live rewrite: version 1
+    /// records first, then version 2.
     pub conflicts: Vec<(&'a str, String)>,
 }
 
@@ -6027,7 +6029,7 @@ fn note_erasure_dominance(outcome: &ErasureDominance<'_>, bucket_prefix: &str) {
             bucket = %bucket_prefix,
             compaction_record_key = %compaction_key,
             rewrite_record_key = %rewrite_key,
-            "a version 1 compaction record shares inputs with a live erasure rewrite that does \
+            "a compaction record shares inputs with a live erasure rewrite that does \
              not cover all of them; it is not dropped, and the bucket may serve rows the \
              rewrite erased or serve rows twice (#4449)"
         );
@@ -6053,9 +6055,12 @@ fn note_erasure_dominance(outcome: &ErasureDominance<'_>, bucket_prefix: &str) {
 ///   dominated. Its parts are a re-encode of the pre-erasure predecessor and
 ///   may still hold an erased subject.
 ///
-/// A version 1 record that no rewrite's chain names, that is not dominated,
-/// and that shares an input with a live rewrite is a conflict, reported in
-/// [`ErasureDominance::conflicts`] and otherwise left to the selector.
+/// A record of either version that no rewrite's chain names, that is not
+/// dominated, and that shares an input with a live rewrite is a conflict,
+/// reported in [`ErasureDominance::conflicts`] and otherwise left to the
+/// selector. A version 2 record carries its predecessor's inputs, so one that
+/// re-encodes a conflicting version 1 record conflicts too, and goes on
+/// conflicting once a sweep has removed that predecessor.
 ///
 /// The predecessor need not be present: once a sweep has removed it, the
 /// rewrite still names it, and the version 2 record stays dominated. The
@@ -6161,9 +6166,37 @@ where
             }
         }
         if outcome.dominated.len() == before {
-            return Ok(outcome);
+            break;
         }
     }
+
+    for (key, record) in compaction_records {
+        let key = key.as_ref();
+        let record = record.borrow();
+        if record.superseded_record_key.is_empty()
+            || outcome.dominated.contains(key)
+            || rewrite_superseded.contains(key)
+        {
+            continue;
+        }
+        let identities: Vec<(String, u64, u64)> = record
+            .inputs
+            .iter()
+            .map(|input| {
+                (
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                )
+            })
+            .collect();
+        for (rewrite_key, inputs) in &live_rewrites {
+            if identities.iter().any(|id| inputs.contains(id)) {
+                outcome.conflicts.push((key, (*rewrite_key).to_string()));
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 /// Select one authoritative compaction record per *overlap component* of a
@@ -8171,6 +8204,44 @@ mod tests {
         assert_eq!(
             outcome.version_1,
             HashMap::from([(base.0.as_str(), REWRITE_A.to_string())])
+        );
+    }
+
+    /// A version 2 record that re-encodes a conflicting version 1 record
+    /// shares the same inputs with the live rewrite and is not dominated, so
+    /// it is a conflict too, and stays one once its predecessor is gone. The
+    /// dominated and version 1 outputs are unchanged.
+    ///
+    /// Flipped line: the version 2 conflict loop at the end of
+    /// `erasure_dominance` removed. Both `conflicts` assertions then fail: the
+    /// first finds only the version 1 pair, the second an empty list.
+    #[test]
+    fn a_version_2_record_over_a_conflicting_record_is_a_conflict() {
+        let base = version_1_over(0x60, &[1, 2, 3]);
+        let (_, mut successor) = bare_compaction(0x61, &base.0);
+        successor.inputs = base.1.inputs.clone();
+        let successor_key = keys::compaction_record_key_for(&successor).expect("record key");
+        let rewrite = raw_rewrite_over(&[1, 2]);
+        let rewrites = [(REWRITE_A, &rewrite)];
+
+        let both = vec![base.clone(), (successor_key.clone(), successor.clone())];
+        let outcome = erasure_dominance(&both, &rewrites, "bucket").expect("dominance resolves");
+        assert!(outcome.dominated.is_empty(), "{:?}", outcome.dominated);
+        assert!(outcome.version_1.is_empty(), "{:?}", outcome.version_1);
+        assert_eq!(
+            outcome.conflicts,
+            vec![
+                (base.0.as_str(), REWRITE_A.to_string()),
+                (successor_key.as_str(), REWRITE_A.to_string()),
+            ]
+        );
+
+        let alone = vec![(successor_key.clone(), successor)];
+        let outcome = erasure_dominance(&alone, &rewrites, "bucket").expect("dominance resolves");
+        assert!(outcome.dominated.is_empty(), "{:?}", outcome.dominated);
+        assert_eq!(
+            outcome.conflicts,
+            vec![(successor_key.as_str(), REWRITE_A.to_string())]
         );
     }
 

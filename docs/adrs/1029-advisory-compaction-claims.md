@@ -1087,7 +1087,8 @@ inputs are not all covered is a genuine conflict and stays served as
 today, counted and warned. Decision 2's statement that a claim bug cannot
 corrupt data is then restored in this form: between a compaction and an
 erasure rewrite a lost or late claim costs a wasted compaction, never a
-served erased row. Making the two record kinds collide at one create-only
+served erased row (narrowed to records over the same inputs by the #4560
+amendment below). Making the two record kinds collide at one create-only
 key per bucket, which point 6 rejected as a key-layout change, remains the
 store-side closure; the owner declined an ADR for it on 2026-11-20.
 
@@ -1128,11 +1129,13 @@ reconciles that hour again, as for any record that lands in an already
 folded hour (ADR-0063 section 4).
 
 With this, between a compaction and an erasure rewrite a lost or late claim
-costs a wasted compaction, never a served erased row. The race the 2026-11-20
-amendment reproduced still publishes both records, since the store-side
-closure stays declined, but readers serve only the rewrite's parts, the
-erasure rerun reports `AlreadyApplied` rather than `MultipleLiveRecords`,
-and the sweep reclaims the compaction's record and parts.
+costs a wasted compaction, never a served erased row (true only for records
+over the same inputs; the #4560 amendment below corrects it). The race the
+2026-11-20 amendment reproduced still publishes both records, since the
+store-side closure stays declined, but readers serve only the rewrite's
+parts, the erasure rerun reports `AlreadyApplied` rather than
+`MultipleLiveRecords`, and the sweep reclaims the compaction's record and
+parts.
 
 Tests, each shown failing against a mutation of the code it pins:
 `a_compaction_paused_inside_its_record_put_publishes_beside_the_erasure_rewrite`
@@ -1154,3 +1157,76 @@ overlap;
 `crates/ravel-maintain/tests/superseding_compaction_record.rs` fail when the
 sweep leaves the record out of the rewrite's group or times the group's
 horizon from the rewrite alone.
+
+## Amendment (2026-11-21, #4560): a conflicting compaction record keeps the erasure request's `.dreq`
+
+<!-- amendment-applies: sections="Amendment (2026-11-20, #4449): what the residual publish window does, and how it closes|Amendment (2026-11-21, #4449): erasure dominance of version 1 records has landed" pointer="#4560 amendment" -->
+<!-- amendment-supersedes: phrase="never a served erased row" pointer="#4560 amendment" -->
+
+The two #4449 amendments above end on "a lost or late claim costs a wasted
+compaction, never a served erased row". That holds only when the compaction
+and the erasure rewrite plan the same inputs, the race both reproduced: one
+live rewrite then covers every input of the compaction's version 1 record,
+the record is dominated, and readers serve the rewrite's parts alone.
+
+It does not hold when a late L0 lands after the maintain seal and the
+compaction's listing takes it while the rewrite's did not (the third-stall
+ordering in #4542). The compaction record then names more inputs than any
+one live rewrite covers, so it is not dominated: it is a conflict
+(`ErasureDominance::conflicts`), served beside the rewrite. The bucket can
+return the surviving rows of the shared inputs twice, an erasure pass over
+the bucket fails with `MultipleLiveRecords`, so later erasures for that
+tenant and signal whose window reaches the bucket stop completing, and the
+catalog counts the record in `ravel_catalog_erasure_overlap_conflicts_total`
+and logs each record and rewrite pair at warn. The record's parts can carry
+the rows the rewrite erased. While the request's `.dreq` exists, the
+query-time filter hides them; if the compaction's record PUT lands after
+the erasure's completion gate, the request gets its `.done`, and before
+this amendment the erasure-request sweep (rule 6) deleted the `.dreq` once
+the protection horizon passed, after which the erased rows were served from
+the compaction's parts.
+
+Decided and implemented: rule 6 keeps a request's `.dreq` while a
+compaction record that conflicts with a live rewrite applying the request
+is live. The superseded-input sweep, which already calls
+`erasure_dominance` per bucket in its deleting and its observing mode,
+reports every request applied by a live rewrite that has a conflicting
+record in its bucket: the rewrite's own drops and those of every rewrite
+record still present on its supersession chain
+(`SupersededSweepOutcome::conflict_request_ids`). Rule 6 reads them off
+its own observing pass, keeps each such candidate, counts it in
+`ravel_maintain_dreq_held_by_superseded_inputs_total`, and logs one warn
+line naming the tenant, signal and request id. Nothing persists the keep:
+the set is recomputed from the records present on every pass, so the
+`.dreq` is released by the ordinary rule once the conflicting record is
+deleted or a later live rewrite dominates it.
+
+`ErasureDominance::conflicts` now also reports a version 2 record (a
+`migrate` re-encode) that no rewrite's chain names, that is not dominated
+and that shares an input with a live rewrite. A version 2 record carries
+its predecessor's inputs, so a re-encode of a conflicting version 1 record
+conflicts the same way, and before this it dropped out of the conflict set
+as soon as the sweep removed the predecessor. The dominated set and the
+version 1 attribution are unchanged; the conflict counter and warn line
+now include such records.
+
+What remains: the erased subject stays filtered while the conflict is
+live, at the liveness cost above (rows served twice, erasures over the
+bucket not completing) until an operator removes the conflicting record or
+a later rewrite dominates it. An hour folded into the catalog snapshot
+while the conflict was live behaves as the 2026-11-21 #4449 amendment
+describes. The fold-side fence against a late commit landing after the
+seal is #4561.
+
+Tests, each shown failing against a mutation of the code it pins, in
+`crates/ravel-maintain/tests/erasure_conflict_dreq.rs`:
+`rule_6_keeps_a_dreq_while_a_conflicting_compaction_record_is_live` fails
+when rule 6 ignores the conflict set (the `.dreq` is deleted);
+`a_kept_dreq_is_released_once_the_conflicting_record_is_deleted` and
+`a_kept_dreq_is_released_once_a_later_rewrite_dominates_the_record` fail
+when the keep follows every live rewrite in the bucket instead of the
+conflicts (the `.dreq` is kept after the conflict is gone); and
+`rule_6_keeps_a_dreq_while_a_conflicting_version_2_record_is_live`, with
+`a_version_2_record_over_a_conflicting_record_is_a_conflict` in
+`crates/ravel-catalog/src/catalog.rs`, fails when version 2 records are
+left out of the conflicts.
