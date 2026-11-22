@@ -67,9 +67,6 @@ ravel-agents-core = { path = "crates/ravel-agents-core", version = "0.35.0" }
 ravel-agents-store = { path = "crates/ravel-agents-store", version = "0.35.0" }
 ravel-agents-runtime = { path = "crates/ravel-agents-runtime", version = "0.35.0" }
 ravel-agents-client = { path = "crates/ravel-agents-client", version = "0.35.0" }
-# Dev-only (ADR-3331 decision 1): no workspace crate may depend on it, which
-# ravel-agents-core's sim_crate test checks.
-ravel-agents-sim = { path = "crates/ravel-agents-sim", version = "0.35.0" }
 # Dev-only test scaffolding (ADR-1702). Every consumer takes it as a
 # dev-dependency; no shipping crate may depend on it.
 ravel-test-support = { path = "crates/ravel-test-support", version = "0.35.0" }
