@@ -1540,6 +1540,109 @@ mod tests {
         );
     }
 
+    /// FNV-1a over `text`: a digest of a result's projection that is stable
+    /// across builds, so an expected value captured from one build pins the
+    /// result of another.
+    fn fnv(text: &str) -> u64 {
+        text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    fn scalar_digest(series: Vec<SeriesData>) -> u64 {
+        fnv(&format!("{:?}", project_scalar(series)))
+    }
+
+    /// A histogram fold shape: 50 series, 12 calls, call `k` holding one run
+    /// per series over slots `3k..3k+6` under prefix `(k % 4, 1, 1)`, so a
+    /// slot is written by two calls whose priorities sometimes tie and whose
+    /// values differ.
+    fn histogram_shape() -> Vec<Vec<FetchedHistogramSeries>> {
+        (0..12i64)
+            .map(|k| {
+                (0..50u8)
+                    .map(|s| {
+                        let slots = 3 * k..3 * k + 6;
+                        FetchedHistogramSeries {
+                            series_id: SeriesId([s; 16]),
+                            labels: labels(s),
+                            timestamps: slots.clone().collect(),
+                            values: slots
+                                .map(|t| {
+                                    histogram_value(
+                                        f64::from(s) + t as f64 * 0.25 + k as f64,
+                                        (t + k) as u64,
+                                    )
+                                })
+                                .collect(),
+                            created_unix_ns: k % 4,
+                            writer_epoch: 1,
+                            writer_seq: 1,
+                            per_sample_priorities: None,
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Digests of the scalar fold's output on shapes A, B and C and of the
+    /// histogram fold's on [`histogram_shape`], captured from main's code
+    /// (c9ef663) before the R5 step 2 change. The fold must return exactly
+    /// these results.
+    #[test]
+    fn fold_outputs_are_bit_identical_to_main() {
+        let want = vec![
+            ("A", 0x6d85_8021_ceff_5993u64),
+            ("B", 0xcda8_6cf8_badf_d242),
+            ("C", 0x4974_8c5d_63fc_83d6),
+            ("histogram", 0xf9cb_a304_30a1_9ce4),
+        ];
+        let mut got = Vec::new();
+        for (shape, calls) in [
+            ("A", support::shape_a().expect("shape A")),
+            ("B", support::shape_b().expect("shape B")),
+            ("C", support::shape_c().expect("shape C")),
+        ] {
+            got.push((shape, scalar_digest(plain_fold(calls))));
+        }
+        let mut fold = HistogramFold::new(unlimited(), usize::MAX);
+        for call in histogram_shape() {
+            fold.absorb(call).expect("absorb");
+        }
+        let histograms = project_histograms(fold.into_series(usize::MAX).expect("finish"));
+        got.push(("histogram", fnv(&format!("{histograms:?}"))));
+        for (shape, digest) in &got {
+            println!("R5 digest shape={shape} {digest:#018x}");
+        }
+        assert_eq!(got, want);
+    }
+
+    /// Issue #4118: the fold never holds more than it has reserved. After
+    /// every absorb of shapes A, B and C, the bytes its containers hold, by
+    /// step 1's definition ([`live_bytes`]), are at most
+    /// [`RunFold::charged`].
+    #[test]
+    fn the_fold_holds_no_more_than_it_charged_after_every_absorb() {
+        let shapes = [
+            ("A", support::shape_a().expect("shape A")),
+            ("B", support::shape_b().expect("shape B")),
+            ("C", support::shape_c().expect("shape C")),
+        ];
+        for (shape, calls) in shapes {
+            let mut fold = ScalarFold::new(unlimited(), usize::MAX);
+            for (call, runs) in calls.into_iter().enumerate() {
+                fold.absorb(runs).expect("absorb");
+                let live = live_bytes(&fold).total();
+                assert!(
+                    live <= fold.charged(),
+                    "shape {shape}, call {call}: live {live} B > charged {} B",
+                    fold.charged()
+                );
+            }
+        }
+    }
+
     /// `table_bytes`' bucket count inverts hashbrown's capacity exactly: for
     /// every table size up to 10,000 entries, the capacity a `HashMap`
     /// reports is exactly the capacity of the bucket count recovered from

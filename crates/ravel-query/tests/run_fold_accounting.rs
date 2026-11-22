@@ -367,6 +367,23 @@ fn r5_table_bound_is_jemalloc_size_class_spacing() {
     assert!(!within_size_class(299_024, 290_000, 4_096));
 }
 
+/// The digest of shape D's answer captured from main's code (c9ef663) before
+/// the R5 step 2 change (issue #4530): the answer must not change.
+const SHAPE_D_DIGEST: u64 = 0x5979_357e_63c2_980e;
+
+/// FNV-1a over the matrix's `Debug` text with its series sorted by labels.
+/// `Debug` prints each float in its shortest round-trip form, so two answers
+/// with the same digest hold the same values.
+fn matrix_digest(matrix: &ravel_promql::HistogramAwareMatrix) -> u64 {
+    let mut sorted: Vec<_> = matrix.iter().collect();
+    sorted.sort_by(|a, b| a.0.iter().cmp(b.0.iter()));
+    format!("{sorted:?}")
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
 #[test]
 fn r5_shape_d_fold_charge_against_jemalloc() {
     tokio::runtime::Builder::new_current_thread()
@@ -423,6 +440,9 @@ fn r5_shape_d_fold_charge_against_jemalloc() {
                     "points for {labels:?} over 1 h at a {STEP_MS} ms step"
                 );
             }
+            let digest = matrix_digest(&matrix);
+            println!("R5 digest shape=D {digest:#018x}");
+            assert_eq!(digest, SHAPE_D_DIGEST, "shape D's answer changed");
 
             let baseline = BASELINE.load(Ordering::Acquire);
             let peak = *PEAK
