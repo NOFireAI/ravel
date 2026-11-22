@@ -686,6 +686,22 @@ there.
 | `catalog/compaction-loser-overwrites` | a publisher that loses the record's create-only PUT writes its own payload over the winner's | `catalog: a published compaction record is never replaced` | `crates/ravel-maintain/src/publish.rs` |
 | `catalog/compaction-swaps-record` | compaction moves its last input identity to a writer id no writer is issued, before building the parts | `catalog: compaction preserves the acked multiset` | the driver (`driver/src/main.rs`) |
 
+The workload's scripts also select the mutants of two more areas, so the
+same images run them (ADR-4326 decision 3). `scripts/mutant-tsv.sh` lists the
+three areas, `catalog`, `resharding` and `maintenance`, and reads each one's
+names from `formal/tla/<area>/antithesis-mutants.tsv`, column 2 of a line
+whose column 2 starts with `<area>/` (a `none:` line names no mutant):
+
+| Area | Mutants |
+|---|---|
+| `catalog` | the five above |
+| `resharding` | `resharding/no-writer-fence`, `resharding/token-validated-against-count` |
+| `maintenance` | `maintenance/mo-diverge-overwrites-record`, `maintenance/mo-missing-part-reports-converged` |
+
+A name `<area>/<stem>` selects its area by the part before `/`: the scripts
+accept it when that area's `.tsv` lists it, and `local-run.sh` reads its
+property from that same `.tsv`.
+
 The corrupt-HEAD mutant switches off the HEAD guard of both delete passes,
 and each pass asserts `CorruptHeadFailsClosedOnDeletePaths` under its own
 literal, so either literal going false counts. The `.tsv` names the first.
@@ -707,18 +723,20 @@ built with `--features sql,antithesis,antithesis-mutants` (the Dockerfile's
 `ravel-antithesis-driver:catalog-maintenance-mutants`, built over it. Both
 carry the `org.ravel.antithesis.ref` label, and the server image also
 `org.ravel.antithesis.features`. Besides the instrumentation check, the build
-checks that the server binary registers the five catalog mutant names. The
-default build (no `MUTANTS`) is unchanged: features `sql,antithesis`, tag
+checks that the server binary registers every mutant name of the three areas
+and refuses unless the per-area counts are exactly catalog 5, resharding 2 and
+maintenance 2, the mutants ADR-4326 decision 3 ships. The default build (no `MUTANTS`) is unchanged: features `sql,antithesis`, tag
 `catalog-maintenance`.
 
-`RAVEL_ANTITHESIS_MUTANT=catalog/<stem>` selects a mutant for `local-run.sh`
+`RAVEL_ANTITHESIS_MUTANT=<area>/<stem>` selects a mutant for `local-run.sh`
 and `launch.sh`. Both pass it to `scripts/mutant-config.sh`, which writes a
 copy of `config/` where every workload image names its `-mutants` tag and the
 ravel-server environment's `RAVEL_ANTITHESIS_MUTANT: ""` names the mutant.
 It refuses, and so both scripts refuse:
 
-- a name that is not one of the five `catalog/` mutants in the `.tsv` (the
-  message lists them);
+- a name that is not one of the nine mutants the three areas' `.tsv` files
+  list, including a `none:` stem and a name of another area such as
+  `lifecycle/` or `commit/` (the message lists the nine);
 - a copy whose rewrite did not move every image line and set exactly one
   selector.
 
@@ -848,7 +866,7 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   token read returns each acked record of its write exactly once` must
   appear in `violated.tsv`, and no other assertion may. The other gates still
   apply. The two self-checks and a mutant run are separate runs.
-- `RAVEL_ANTITHESIS_MUTANT=catalog/<stem> scripts/local-run.sh <out-dir>
+- `RAVEL_ANTITHESIS_MUTANT=<area>/<stem> scripts/local-run.sh <out-dir>
   [seconds]` is a mutant control run over the `-mutants` images (see
   "Mutants"); it exits 0 only when that mutant's property was violated.
 - `scripts/clock-spike.sh <out-dir> [seconds]` (above).
@@ -866,7 +884,7 @@ machine:
 # build host (x86_64, Docker)
 antithesis/catalog-maintenance/scripts/build.sh
 MUTANTS=1 antithesis/catalog-maintenance/scripts/build.sh
-# ok ravel-antithesis-server:catalog-maintenance-mutants: /symbols/ravel-server registers the 5 catalog mutants
+# ok ravel-antithesis-server:catalog-maintenance-mutants: /symbols/ravel-server registers the 9 mutants (catalog 5, resharding 2, maintenance 2)
 
 antithesis/catalog-maintenance/scripts/local-run.sh out/plain
 # OK: no always-type assertion violated or unhit, ...
