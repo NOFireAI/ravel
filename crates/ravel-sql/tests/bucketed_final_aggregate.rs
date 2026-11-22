@@ -144,6 +144,12 @@ fn rlog_writer(tenant: &TenantId) -> RlogWriter {
 }
 
 async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId, records: &[LogRecord]) {
+    let (bytes, span) = logs_rlog(tenant, records);
+    publish_rlog(store, tenant, bytes, records.len() as u64, span).await;
+}
+
+/// `records` written as one RLOG object, with the span of their timestamps.
+fn logs_rlog(tenant: &TenantId, records: &[LogRecord]) -> (bytes::Bytes, (i64, i64)) {
     let mut writer = rlog_writer(tenant);
     for r in records {
         writer.push(r.clone()).expect("push record");
@@ -151,14 +157,7 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId, records
     let bytes = writer.finish().expect("finish rlog");
     let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
     let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
-    publish_rlog(
-        store,
-        tenant,
-        bytes::Bytes::from(bytes),
-        records.len() as u64,
-        (min, max),
-    )
-    .await;
+    (bytes::Bytes::from(bytes), (min, max))
 }
 
 /// Put `bytes`, an RLOG object of `rows` rows whose timestamps span
@@ -261,22 +260,38 @@ fn executor_over(
 /// of its peak derives a tuning of at least one bit at 2, 4 and 16.
 const BIG_ROWS: i64 = 3_000_000;
 
-/// The large fixture's RLOG object, written once per test binary.
+/// Where [`big_rlog`] and [`str_rlog`] keep their bytes for the other
+/// processes of this test binary.
+fn fixture_cache_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("bucketed-final-aggregate-fixtures")
+}
+
+/// An RLOG object of [`log_record`]'s rows `0..rows`, each passed through
+/// `edit`.
+fn rlog_of_rows(rows: i64, edit: impl Fn(i64, &mut LogRecord)) -> Vec<u8> {
+    let first = log_record(0);
+    let mut writer = rlog_writer(&tenant());
+    for i in 0..rows {
+        let mut record = log_record_in(first.stream_id, first.stream_attrs.clone(), i);
+        edit(i, &mut record);
+        writer.push(record).expect("push record");
+    }
+    writer.finish().expect("finish rlog")
+}
+
+/// The large fixture's RLOG object. [`util::fixture_cache`] keeps it in a
+/// file under the target directory, so under nextest, which runs each test
+/// in its own process, one process per build of the test binary builds it
+/// and the rest read it; within one process (`cargo test`) the `OnceLock`
+/// keeps it after the first call.
 fn big_rlog() -> bytes::Bytes {
     static RLOG: std::sync::OnceLock<bytes::Bytes> = std::sync::OnceLock::new();
     RLOG.get_or_init(|| {
-        let first = log_record(0);
-        let mut writer = rlog_writer(&tenant());
-        for i in 0..BIG_ROWS {
-            writer
-                .push(log_record_in(
-                    first.stream_id,
-                    first.stream_attrs.clone(),
-                    i,
-                ))
-                .expect("push record");
-        }
-        bytes::Bytes::from(writer.finish().expect("finish rlog"))
+        bytes::Bytes::from(util::fixture_cache::cached_bytes(
+            &fixture_cache_dir(),
+            "big",
+            || rlog_of_rows(BIG_ROWS, |_, _| {}),
+        ))
     })
     .clone()
 }
@@ -299,21 +314,25 @@ fn str_key(i: i64) -> Option<String> {
     }
 }
 
-/// The declared-string fixture's RLOG object, written once per test binary:
-/// [`log_record`]'s rows with `s` set as [`str_key`] says.
+/// Row `i` of the declared-string fixture: [`log_record`]'s row with `s` set
+/// as [`str_key`] says.
+fn with_str_key(i: i64, record: &mut LogRecord) {
+    if let Some(s) = str_key(i) {
+        record.attrs.push(("s".to_string(), AttrValue::Str(s)));
+    }
+}
+
+/// The declared-string fixture's RLOG object of [`STR_ROWS`] rows as
+/// [`with_str_key`] writes them, cached across processes and within one
+/// as [`big_rlog`] is.
 fn str_rlog() -> bytes::Bytes {
     static RLOG: std::sync::OnceLock<bytes::Bytes> = std::sync::OnceLock::new();
     RLOG.get_or_init(|| {
-        let first = log_record(0);
-        let mut writer = rlog_writer(&tenant());
-        for i in 0..STR_ROWS {
-            let mut record = log_record_in(first.stream_id, first.stream_attrs.clone(), i);
-            if let Some(s) = str_key(i) {
-                record.attrs.push(("s".to_string(), AttrValue::Str(s)));
-            }
-            writer.push(record).expect("push record");
-        }
-        bytes::Bytes::from(writer.finish().expect("finish rlog"))
+        bytes::Bytes::from(util::fixture_cache::cached_bytes(
+            &fixture_cache_dir(),
+            "str",
+            || rlog_of_rows(STR_ROWS, with_str_key),
+        ))
     })
     .clone()
 }
@@ -344,6 +363,72 @@ async fn big_executor(config: SqlConfig, max_tenant_bytes: usize) -> SqlExecutor
     )
     .await;
     executor_over(store, config, max_tenant_bytes)
+}
+
+/// A scratch cache directory path for `case` under the target's tmp dir,
+/// with nothing at that path yet.
+fn scratch_cache_dir(case: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "bucketed-fixture-cache-test-{case}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&dir);
+    dir
+}
+
+/// The fixture cache stores what it builds, reads it back without building,
+/// rebuilds a truncated file rather than trusting it, and builds in process
+/// when its directory cannot be created.
+#[test]
+fn the_fixture_cache_rebuilds_a_truncated_file_and_survives_io_errors() {
+    const CACHE_ROWS: i64 = 5_000;
+    let fresh = rlog_of_rows(CACHE_ROWS, with_str_key);
+    let builds = AtomicUsize::new(0);
+    let build = || {
+        builds.fetch_add(1, Ordering::SeqCst);
+        rlog_of_rows(CACHE_ROWS, with_str_key)
+    };
+
+    let dir = scratch_cache_dir("truncated");
+    let same = |got: Vec<u8>, what: &str| {
+        assert!(
+            got == fresh,
+            "{what}: {} bytes that differ from a fresh build of {} bytes",
+            got.len(),
+            fresh.len()
+        );
+    };
+    let cached = |build| util::fixture_cache::cached_bytes(&dir, "small", build);
+    same(cached(&build), "first call");
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    let file = util::fixture_cache::data_path(&dir, "small").expect("cache file path");
+    let stored = std::fs::metadata(&file).expect("the first call stored the file");
+    assert!(stored.len() > fresh.len() as u64);
+    same(cached(&build), "a read of the stored file");
+    assert_eq!(builds.load(Ordering::SeqCst), 1, "a hit builds nothing");
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .and_then(|f| f.set_len(fresh.len() as u64 / 2))
+        .expect("truncate the cached file");
+    same(cached(&build), "a read of the truncated file");
+    assert_eq!(builds.load(Ordering::SeqCst), 2, "a torn file is rebuilt");
+    same(cached(&build), "a read of the rewritten file");
+    assert_eq!(builds.load(Ordering::SeqCst), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let blocker = scratch_cache_dir("blocked");
+    std::fs::create_dir_all(blocker.parent().expect("parent")).expect("tmp dir");
+    std::fs::write(&blocker, b"a regular file").expect("write the blocking file");
+    let under_a_file = blocker.join("cache");
+    same(
+        util::fixture_cache::cached_bytes(&under_a_file, "small", build),
+        "a cache directory under a regular file",
+    );
+    assert_eq!(builds.load(Ordering::SeqCst), 3);
+    let _ = std::fs::remove_file(&blocker);
 }
 
 fn request(sql: &str) -> SqlRequest {
@@ -915,8 +1000,22 @@ async fn peak_asked_bytes_are_lower_than_the_stock_final_on_unique_keys() {
         routed_chunk_rows: 1024,
         routed_chunk_bytes: 1 << 20,
     };
-    let on = executor(PEAK_ROWS, sql_config(4, Some(tuning), None)).await;
-    let off = executor(PEAK_ROWS, sql_config(4, None, None)).await;
+    let records: Vec<LogRecord> = (0..PEAK_ROWS).map(log_record).collect();
+    let (object, span) = logs_rlog(&tenant(), &records);
+    let mut executors = Vec::new();
+    for config in [sql_config(4, Some(tuning), None), sql_config(4, None, None)] {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        publish_rlog(
+            store.as_ref(),
+            &tenant(),
+            object.clone(),
+            PEAK_ROWS as u64,
+            span,
+        )
+        .await;
+        executors.push(executor_over(store, config, 1 << 30));
+    }
+    let [on, off]: [SqlExecutor; 2] = executors.try_into().ok().expect("two executors");
     let on_outcome = on
         .execute(tenant().hash(), &request(sql))
         .await
