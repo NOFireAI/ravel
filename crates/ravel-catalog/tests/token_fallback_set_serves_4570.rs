@@ -876,3 +876,36 @@ async fn a_faulted_tombstone_get_fails_the_resolve() {
     );
     assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
 }
+
+/// A present token whose tombstoned bucket the window listing covers: the
+/// listing saw the tombstone and left the bucket out, and the token step
+/// answers it from that listing, with zero segments and no tombstone GET.
+#[tokio::test]
+async fn present_token_in_a_listed_tombstoned_bucket_adds_nothing_without_a_get() {
+    let signal = Signal::Logs;
+    let inner = Arc::new(MemoryStore::new());
+    let store = RangeLog::new(inner.clone());
+    let a = record_a(signal);
+    put_l0(inner.as_ref(), &a).await;
+    put_tombstone(inner.as_ref(), signal, HOUR).await;
+
+    let plain = resolve(&catalog_on(store.clone(), None), signal, live_now(), &[]).await;
+    assert_eq!(sorted_keys(&plain), Vec::<String>::new());
+    let snapshot = resolve(
+        &catalog_on(store.clone(), None),
+        signal,
+        live_now(),
+        &[token(&a)],
+    )
+    .await;
+    assert_eq!(
+        sorted_keys(&snapshot),
+        Vec::<String>::new(),
+        "A's bucket is tombstoned: A is not added"
+    );
+    assert_eq!(
+        store.ranges_of(&tombstone_key(signal, HOUR)),
+        Vec::<GetRange>::new(),
+        "the window listing saw the tombstone: no tombstone GET"
+    );
+}

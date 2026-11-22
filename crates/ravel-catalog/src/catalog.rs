@@ -2909,6 +2909,10 @@ impl Catalog {
         // means no window was listed (no fan-out to overlap), so the LIST runs
         // standalone after the token loop, exactly as before.
         let mut pending_erasure: Option<ErasureState> = None;
+        // Every bucket the window listing saw a key of, and whether one of
+        // them was its tombstone: the present-token step reads no tombstone
+        // key for these.
+        let mut tombstoned_buckets = TombstonedBuckets::new();
 
         if let Some((window_start_hour, window_end_hour)) = window {
             // A snapshot at watermark W serves every window hour <= W
@@ -3056,6 +3060,8 @@ impl Catalog {
                     pending_erasure = Some(erasure?);
                     listed?
                 };
+                let (listed, listed_buckets) = listed;
+                tombstoned_buckets = listed_buckets;
                 for (key, segment_ref) in listed {
                     if !segments.contains_key(&key) {
                         origin_by_key.insert(key.clone(), SegmentOrigin::Recent);
@@ -3108,7 +3114,6 @@ impl Catalog {
                 }
             }
         }
-        let mut tombstoned_buckets = HashMap::new();
         for (token, segment_ref) in present_tokens {
             self.include_token_l0(
                 tenant,
@@ -3557,7 +3562,7 @@ impl Catalog {
         range: TimeRange,
         generations: &[crate::provisioning::ShardGeneration],
         accounting: &QueryAccounting,
-    ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
+    ) -> Result<(HashMap<String, SegmentRef>, TombstonedBuckets), CatalogError> {
         // Union scan set over the suffix: the widest per-shard bound any hour
         // in the range needs (a per-shard LIST cannot vary per hour), floored
         // at the signal's writer-pinned shards.
@@ -3614,6 +3619,7 @@ impl Catalog {
         // concurrently. resolve_fanout's final deterministic sort makes the
         // result independent of merge order.
         let mut coords: Vec<((u32, u32), Vec<ListedKey>)> = grouped.into_iter().collect();
+        let listed_buckets = listed_bucket_tombstones(&coords);
         self.cached_commit_records(tenant, signal, &mut coords, accounting)?;
         let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
             stream::iter(coords)
@@ -3630,7 +3636,7 @@ impl Catalog {
                 out.entry(key).or_insert(segment_ref);
             }
         }
-        Ok(out)
+        Ok((out, listed_buckets))
     }
 
     /// List one shard's commit buckets for the hours in
@@ -4055,7 +4061,7 @@ impl Catalog {
         range: TimeRange,
         generations: &[crate::provisioning::ShardGeneration],
         accounting: &QueryAccounting,
-    ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
+    ) -> Result<(HashMap<String, SegmentRef>, TombstonedBuckets), CatalogError> {
         // One recursive LIST per shard, grouping keys by (shard, hour), each
         // shard's scan bounded below the watermark by a `list_after` start
         // marker so it does not page through the shard's whole history before
@@ -4123,6 +4129,7 @@ impl Catalog {
         // collide across buckets, and resolve_impl's final deterministic sort
         // makes the result independent of merge order.
         let mut coords: Vec<((u32, u32), Vec<ListedKey>)> = grouped.into_iter().collect();
+        let listed_buckets = listed_bucket_tombstones(&coords);
         self.cached_commit_records(tenant, signal, &mut coords, accounting)?;
         let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
             stream::iter(coords)
@@ -4139,7 +4146,7 @@ impl Catalog {
                 out.entry(key).or_insert(segment_ref);
             }
         }
-        Ok(out)
+        Ok((out, listed_buckets))
     }
 
     /// One shard's drain for [`Catalog::list_window_by_prefix`]: its pages in
@@ -4731,10 +4738,12 @@ impl Catalog {
     /// listed a `.done` (`erasure_completed`). A rewrite outlives its
     /// request's `.dreq` only after that request completed, so without a
     /// `.done` and without a pending request no rewrite can name the input.
-    /// With none of the three, the bucket's fixed tombstone key is read
-    /// instead ([`Self::token_bucket_tombstoned`]): a tombstone answers zero
-    /// segments, and its absence adds the input. A tombstone the bucket LIST
-    /// shows answers zero segments on every path.
+    /// With none of the three, [`Self::token_bucket_tombstoned`] answers
+    /// whether the bucket is tombstoned, from the window listing when it
+    /// saw the bucket and otherwise from one GET of the bucket's fixed
+    /// tombstone key: a tombstone answers zero segments, and its absence adds
+    /// the input. A tombstone the bucket LIST shows answers zero segments on
+    /// every path.
     #[allow(clippy::too_many_arguments)]
     async fn token_input_replacement(
         &self,
@@ -4802,10 +4811,12 @@ impl Catalog {
             .map(Some)
     }
 
-    /// Whether the token's `(shard, ingest_hour)` bucket is tombstoned, from
-    /// one GET of its fixed tombstone key, recorded in `tombstoned_buckets`
-    /// so later tokens of the same bucket in this resolve issue none.
-    /// NotFound means no tombstone; any other store error fails the resolve.
+    /// Whether the token's `(shard, ingest_hour)` bucket is tombstoned. A
+    /// bucket in `tombstoned_buckets` (the window listing saw it, or an
+    /// earlier token of this resolve read its tombstone key) is answered
+    /// from there; otherwise one GET of its fixed tombstone key decides, and
+    /// is recorded there. NotFound means no tombstone; any other store error
+    /// fails the resolve.
     /// Observing the tombstone invalidates the bucket's cached records
     /// (ADR-0010 §10), as [`Self::load_token_bucket`] does.
     async fn token_bucket_tombstoned(
@@ -5346,10 +5357,26 @@ struct ErasureState {
     any_completed: bool,
 }
 
-/// Whether each `(shard, ingest_hour)` bucket a resolve's present-token step
-/// has checked is tombstoned, so the step reads each bucket's tombstone at
-/// most once per resolve.
+/// Whether each `(shard, ingest_hour)` bucket a resolve has seen is
+/// tombstoned, from its window listing or from the present-token step's
+/// tombstone GET, so the step reads each bucket's tombstone at most once per
+/// resolve and never for a bucket the listing saw.
 type TombstonedBuckets = HashMap<(u32, u32), bool>;
+
+/// Every listed bucket and whether its listing held its tombstone. A bucket
+/// with no key listed is absent, so a token whose commit record the listing
+/// could not have missed is answered here only when its bucket was listed.
+fn listed_bucket_tombstones(coords: &[((u32, u32), Vec<ListedKey>)]) -> TombstonedBuckets {
+    coords
+        .iter()
+        .map(|(bucket, objects)| {
+            let tombstoned = objects
+                .iter()
+                .any(|listed| matches!(listed.kind, BucketKind::Tombstone));
+            (*bucket, tombstoned)
+        })
+        .collect()
+}
 
 /// A token bucket's compaction and rewrite records, as
 /// [`Catalog::load_token_bucket`] loaded them.

@@ -1337,11 +1337,12 @@ async fn present_token_raises_the_sibling_alarm_and_serves_the_first_live_rewrit
 }
 
 /// The bucket is tombstoned, but the set holds no level-1 part of it and no
-/// erasure is pending, so the step does not check the bucket: L is added as
-/// before, at the commit-record GET alone, and is the only object serving
-/// its rows.
+/// erasure is pending, so the step does not LIST the bucket. HEAD serves the
+/// hour, so no window listing saw the bucket either: one GET of the
+/// tombstone key, after the commit-record GET, finds the tombstone and L is
+/// not added, as the plain read serves nothing of the bucket.
 #[tokio::test]
-async fn token_in_a_tombstoned_bucket_without_the_check_is_added() {
+async fn token_in_a_tombstoned_bucket_without_the_check_adds_nothing() {
     let store = Arc::new(MemoryStore::new());
     let l = l0(Signal::Logs, 1, HOUR, hour_start(HOUR), L_ROWS);
     put_l0(store.as_ref(), &l).await;
@@ -1352,14 +1353,13 @@ async fn token_in_a_tombstoned_bucket_without_the_check_is_added() {
     let (plain, plain_reads) = resolve_counted(&store, Signal::Logs, window, &[]).await;
     assert!(plain.segments.is_empty());
     let (snapshot, reads) = resolve_counted(&store, Signal::Logs, window, &[token(&l)]).await;
-    assert_eq!(sorted_keys(&snapshot), vec![l0_key(&l)]);
-    assert_eq!(rows(&snapshot), L_ROWS);
+    assert_eq!(sorted_keys(&snapshot), Vec::<String>::new());
     assert_eq!(
         reads,
         Reads {
             lists: plain_reads.lists,
-            gets: plain_reads.gets + 1,
-            total: plain_reads.total + 1,
+            gets: plain_reads.gets + 2,
+            total: plain_reads.total + 2,
         }
     );
 }
