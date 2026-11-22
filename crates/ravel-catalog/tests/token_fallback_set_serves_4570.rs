@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::Bytes;
 use ravel_catalog::{
     Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
     DEFAULT_MAX_FLUSH_LIFETIME_NS, Snapshot,
@@ -27,7 +28,10 @@ use ravel_commit::{erasure, keys, signal};
 use ravel_cpu_gate::MonotonicClock;
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence, SequenceStep};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError,
+};
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord,
     ErasurePredicateMatcher, ErasureRequest, RewriteDrop, RewriteRecord,
@@ -410,6 +414,95 @@ fn counting_store(
         inner.clone(),
         FaultPlan::empty().with_sequence(probe),
     ))
+}
+
+/// A store that records the range of every GET, by key.
+struct RangeLog {
+    inner: Arc<MemoryStore>,
+    gets: std::sync::Mutex<Vec<(String, GetRange)>>,
+}
+
+impl RangeLog {
+    fn new(inner: Arc<MemoryStore>) -> Arc<Self> {
+        Arc::new(RangeLog {
+            inner,
+            gets: std::sync::Mutex::default(),
+        })
+    }
+
+    fn ranges_of(&self, key: &str) -> Vec<GetRange> {
+        self.gets
+            .lock()
+            .expect("gets")
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, range)| *range)
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for RangeLog {
+    async fn put(&self, k: &str, d: Bytes, o: PutOptions) -> Result<PutOutcome, StoreError> {
+        self.inner.put(k, d, o).await
+    }
+    async fn get(&self, k: &str, r: GetRange) -> Result<GetOutcome, StoreError> {
+        self.gets.lock().expect("gets").push((k.to_string(), r));
+        self.inner.get(k, r).await
+    }
+    async fn head(&self, k: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(k).await
+    }
+    async fn list(&self, p: &str, t: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(p, t).await
+    }
+    async fn list_after(
+        &self,
+        p: &str,
+        s: Option<&str>,
+        t: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.inner.list_after(p, s, t).await
+    }
+    async fn list_delimited(&self, p: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(p).await
+    }
+    async fn delete(&self, k: &str) -> Result<(), StoreError> {
+        self.inner.delete(k).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+/// Re-validating a cached commit record reads one byte of it: only the
+/// record's presence is in question, and the cached decode is reused. The
+/// listing's first, uncached GET reads the record whole, since it decodes it.
+#[tokio::test]
+async fn warm_cache_revalidation_reads_one_byte_of_the_commit_record() {
+    let signal = Signal::Logs;
+    let inner = Arc::new(MemoryStore::new());
+    let a = record_a(signal);
+    let store = RangeLog::new(inner.clone());
+    let warm = catalog_on(store.clone(), None);
+    put_l0(inner.as_ref(), &a).await;
+
+    let first = resolve(&warm, signal, live_now(), &[token(&a)]).await;
+    assert_eq!(sorted_keys(&first), vec![l0_key(&a)]);
+    assert_eq!(store.ranges_of(&commit_key(&a)), vec![GetRange::Full]);
+
+    // C replaces A with L; the set holds L, not A, so the cached record is
+    // re-validated.
+    let c = put_compaction(inner.as_ref(), signal, &[&a], A_ROWS).await;
+    let compacted = resolve(&warm, signal, live_now(), &[token(&a)]).await;
+    assert_eq!(sorted_keys(&compacted), vec![part_key(&c)]);
+    assert_eq!(
+        store.ranges_of(&commit_key(&a)),
+        vec![GetRange::Full, GetRange::Range(0, 1)]
+    );
 }
 
 /// A warm node's cached commit record costs one GET of its key per token
