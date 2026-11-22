@@ -283,7 +283,8 @@ Residuals of the fence itself:
   `--late-commit-fence off` is given. Nothing checks the server's setting
   against its peers: a rolling change of either value is done with the
   fence off on every maintainer, or by draining every maintainer on the old
-  configuration before any starts on the new one.
+  configuration before any starts on the new one. (The server
+  flush-lifetime refusal amendment below closes the server side of this.)
 - A maintainer of a release before this ADR plans without the fence. During
   a rolling upgrade, a pre-fence maintainer running beside a fenced one can
   take a late record into a compaction that a fenced rewrite does not cover,
@@ -368,3 +369,34 @@ In `crates/ravel-maintain/tests/late_commit_fence.rs`, with stamps set on
 - `with_the_fence_off_every_commit_record_is_planned` (R7).
 - `a_fenced_compaction_evaluates_both_invariants` (R8), in the capture
   build.
+
+## Amendment (2026-11-22, #4579): the server flush-lifetime refusal
+
+<!-- amendment-applies: sections="Residuals and follow-ups" pointer="server flush-lifetime refusal amendment" -->
+
+The seal-margin residual under "Residuals and follow-ups" left the server's
+side unchecked: `ravel-server` took any `--gc-max-flush-lifetime` at or
+above the ingest floor with the fence on, while `ravel-cli maintain
+compact-bucket` and `compact-tenant` refuse any value but the default. A
+maintain process run at `2h` beside a CLI run at the default draws a cutoff
+an hour later, so a commit record stamped between the two cutoffs is on
+time for one and late for the other, and the partial cover is reachable
+from a supported flag combination with no diagnostic.
+
+`ravel-server --mode maintain` now refuses to start, with the fence on, when
+its resolved `--gc-max-flush-lifetime` differs from the default
+(`ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS`). The check sits in
+the one resolution both `Cli::validate` and `Cli::resolve_gc_runtime` call,
+so the value the compactor gets is the value checked. It compares the
+resolved value, so the default written out (`1h`, `60m`) is accepted. Other
+modes plan no compaction or rewrite and are not refused.
+`--late-commit-fence off` takes any value at or above the floor, as before.
+
+With every maintainer held to the default while the fence is on, the
+flush-lifetime half of the residual is closed for maintainers on this
+release. The clock-skew allowance is compiled in, so it differs only
+between builds. A rolling change to it is still done with the fence off, or
+by draining. A maintainer on an earlier release is checked by nothing here.
+
+Test: `maintain_refuses_a_non_default_flush_lifetime_under_the_late_commit_fence`
+(`ravel-server`, `config.rs`).

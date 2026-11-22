@@ -843,16 +843,21 @@ and `migrate`:
   the bucket while a pass could not yet plan it.
 
 Every maintainer of a store must use the same `max_flush_lifetime` and
-clock-skew allowance while the fence is on: for `ravel-server` that is
-`--gc-max-flush-lifetime` and the compiled clock-skew allowance, and for
-`ravel-cli maintain compact-bucket` and `compact-tenant` the default
-`--max-flush-lifetime` (they refuse another value with the fence on). The
-cutoff is derived from those values, so two maintainers with different ones
-disagree about which records are late, and a compaction can again publish
-next to an erasure rewrite that it only partly overlaps. To change either
-value on a running fleet, either switch the fence off on every maintainer
-first, or stop every maintainer on the old configuration before any
-maintainer starts on the new one.
+clock-skew allowance while the fence is on. The cutoff is derived from those
+values, so two maintainers with different ones disagree about which records
+are late, and a compaction can again publish next to an erasure rewrite that
+it only partly overlaps. The clock-skew allowance is compiled in. The flush
+lifetime is held at its default while the fence is on:
+
+- `ravel-server --mode maintain` refuses to start with a
+  `--gc-max-flush-lifetime` other than the default.
+- `ravel-cli maintain compact-bucket` and `compact-tenant` refuse a
+  `--max-flush-lifetime` other than the default.
+
+To run another flush lifetime, switch the fence off on every maintainer
+first. To move to a build with another clock-skew allowance, either switch
+the fence off on every maintainer first, or stop every maintainer on the old
+build before any maintainer starts on the new one.
 
 A maintainer on a release without the fence plans from every listed commit
 record. During a rolling upgrade such a maintainer, running beside a fenced

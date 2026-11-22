@@ -2010,8 +2010,9 @@ pub struct MaintenanceArgs {
     /// counts it under `ravel_maintain_late_commit_records_total`. The cutoff
     /// is derived from `--gc-max-flush-lifetime` and the clock-skew allowance,
     /// so while the fence is on every maintainer of a store must use the same
-    /// values. `off` plans from every listed commit record once the bucket
-    /// seals.
+    /// values, and `--mode maintain` refuses to start with a
+    /// `--gc-max-flush-lifetime` other than the default. `off` plans from
+    /// every listed commit record once the bucket seals.
     #[arg(long = "late-commit-fence", value_enum, default_value_t = LateCommitFenceArg::On)]
     pub late_commit_fence: LateCommitFenceArg,
 }
@@ -3929,7 +3930,10 @@ pub struct GcArgs {
     /// tenant an operator has confirmed quiescent, this flag governs a live
     /// process's compactor for every tenant it serves, so there is no
     /// per-invocation "this tenant is quiescent" case that makes a lower
-    /// value safe here.
+    /// value safe here. With `--late-commit-fence on`, the default,
+    /// `--mode maintain` also refuses any value other than the default: the
+    /// late-commit cutoff is derived from it, and `ravel-cli maintain` refuses
+    /// any other value under the fence too (ADR-4561).
     #[arg(long, value_name = "DURATION")]
     pub gc_max_flush_lifetime: Option<String>,
 }
@@ -10558,7 +10562,9 @@ impl Cli {
     /// Resolve `--gc-max-flush-lifetime` (or its compiled-in default) to
     /// nanoseconds and refuse a value below the ingest floor; see
     /// [`ravel_maintain::ingest_max_flush_lifetime_floor_ns`] for why (issue
-    /// #1744). Shared by [`Cli::validate`] and [`Cli::resolve_gc_runtime`] so
+    /// #1744). In `--mode maintain` with the late-commit fence on, also refuse
+    /// any value other than the default ([`check_fenced_gc_max_flush_lifetime`]).
+    /// Shared by [`Cli::validate`] and [`Cli::resolve_gc_runtime`] so
     /// both are checked against the exact same resolved value, whether it
     /// came from the flag or from the compiled-in default.
     fn resolve_gc_max_flush_lifetime_ns(&self) -> anyhow::Result<i64> {
@@ -10567,6 +10573,12 @@ impl Cli {
             None => ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS,
         };
         check_gc_max_flush_lifetime_floor(self.gc.gc_max_flush_lifetime.as_deref(), configured_ns)?;
+        check_fenced_gc_max_flush_lifetime(
+            self.mode,
+            self.maintenance.late_commit_fence,
+            self.gc.gc_max_flush_lifetime.as_deref(),
+            configured_ns,
+        )?;
         Ok(configured_ns)
     }
 
@@ -10803,6 +10815,37 @@ fn check_gc_max_flush_lifetime_floor(s: Option<&str>, configured_ns: i64) -> any
              allowed to flush into it, voiding the erasure completion gate \
              (bucket_erasure_completion) and undercutting the retention floor it also \
              derives. Raise --gc-max-flush-lifetime to at least the ingest floor."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a `--mode maintain` process whose resolved `max_flush_lifetime_ns`
+/// is not the default while `--late-commit-fence` is on (ADR-4561, server
+/// flush-lifetime refusal amendment). The late-commit cutoff is derived from
+/// it, and `ravel-cli maintain compact-bucket` and `compact-tenant` refuse any
+/// other value under the fence, so a different value here would draw a
+/// different cutoff for the same bucket than they do. Only `--mode maintain`
+/// plans compactions and rewrites, so no other mode is refused.
+fn check_fenced_gc_max_flush_lifetime(
+    mode: Mode,
+    fence: LateCommitFenceArg,
+    s: Option<&str>,
+    configured_ns: i64,
+) -> anyhow::Result<()> {
+    let default_ns = ravel_maintain::config::DEFAULT_MAX_FLUSH_LIFETIME_NS;
+    if mode == Mode::Maintain && fence == LateCommitFenceArg::On && configured_ns != default_ns {
+        let given = s.unwrap_or("(unset)");
+        anyhow::bail!(
+            "--mode maintain with --late-commit-fence on (the default) cannot be combined with \
+             --gc-max-flush-lifetime {given} ({configured_ns} ns; the default is {default_ns} ns): \
+             an hour's late-commit cutoff is its end plus max_flush_lifetime plus \
+             clock_skew_allowance, and ravel-cli maintain refuses any value but the default \
+             under the fence, so this process would classify a different set of commit records \
+             as late than the store's other maintainers, and two plans of one bucket could name \
+             different inputs, which is the partial cover the fence exists to prevent \
+             (ADR-4561). Remove --gc-max-flush-lifetime, or pass --late-commit-fence off on \
+             every maintainer of the store"
         );
     }
     Ok(())
@@ -21649,6 +21692,84 @@ mod tests {
                     .starts_with("--maintain-key-file was set with --mode"),
                 "{mode}: names the flag: {err}"
             );
+        }
+    }
+
+    /// ADR-4561, server flush-lifetime refusal amendment (#4579): with the
+    /// late-commit fence on, `--mode maintain` refuses a
+    /// `--gc-max-flush-lifetime` other than the default, through both
+    /// `validate` and `resolve_gc_runtime`. `--late-commit-fence off` takes the
+    /// same value, the default given explicitly in any spelling is not
+    /// refused, and no other mode is refused.
+    #[test]
+    fn maintain_refuses_a_non_default_flush_lifetime_under_the_late_commit_fence() {
+        let key = fragment_key_tmp();
+        let key_path = key.path().to_str().expect("utf8");
+        let maintain = |extra: &[&str]| {
+            let mut args = vec!["--mode", "maintain", "--maintain-key-file", key_path];
+            args.extend_from_slice(extra);
+            cli(&args)
+        };
+
+        let refused = maintain(&["--gc-max-flush-lifetime", "2h"]);
+        let err = refused
+            .validate()
+            .expect_err("2h with the fence on by default must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--late-commit-fence on") && msg.contains("--gc-max-flush-lifetime 2h"),
+            "names both flags and the value given: {msg}"
+        );
+        assert!(
+            msg.contains("--late-commit-fence off"),
+            "names the escape: {msg}"
+        );
+        let err = refused
+            .resolve_gc_runtime(DERIVED_QUERY_DEADLINE)
+            .expect_err("resolve_gc_runtime must refuse the value validate refuses");
+        assert!(
+            err.to_string().contains("--gc-max-flush-lifetime 2h"),
+            "{err}"
+        );
+        maintain(&[
+            "--late-commit-fence",
+            "on",
+            "--gc-max-flush-lifetime",
+            "90m",
+        ])
+        .validate()
+        .expect_err("an explicit --late-commit-fence on refuses a non-default value too");
+
+        let off = maintain(&[
+            "--late-commit-fence",
+            "off",
+            "--gc-max-flush-lifetime",
+            "2h",
+        ]);
+        off.validate()
+            .expect("--late-commit-fence off takes a non-default flush lifetime");
+        assert_eq!(
+            off.resolve_gc_runtime(DERIVED_QUERY_DEADLINE)
+                .expect("resolve_gc_runtime takes it with the fence off")
+                .max_flush_lifetime_ns,
+            2 * 3_600 * 1_000_000_000
+        );
+
+        for default_spelling in ["1h", "60m", "3600s"] {
+            maintain(&["--gc-max-flush-lifetime", default_spelling])
+                .validate()
+                .unwrap_or_else(|e| {
+                    panic!("the default given as {default_spelling} must be accepted: {e}")
+                });
+        }
+        maintain(&[])
+            .validate()
+            .expect("no --gc-max-flush-lifetime is accepted under the fence");
+
+        for mode in ["all", "query"] {
+            cli(&["--mode", mode, "--gc-max-flush-lifetime", "2h"])
+                .validate()
+                .unwrap_or_else(|e| panic!("--mode {mode} plans nothing and is not refused: {e}"));
         }
     }
 
