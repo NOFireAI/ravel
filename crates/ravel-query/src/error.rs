@@ -180,4 +180,14 @@ pub enum QueryError {
         "aggregation pushdown collected series {series_id} from more than one slice; the ADR-0103 eligibility gate guarantees each series lives on exactly one worker, so a repeat means the gate was violated and the query must fail closed rather than keep one of two partials"
     )]
     DuplicatePushdownSeries { series_id: String },
+    /// The allocator refused an allocation the query had already charged to
+    /// its memory budget, or the allocation's size overflowed
+    /// (`TryReserveError`'s `CapacityOverflow`). The budget did not refuse,
+    /// so this is not a
+    /// [`FetchError::FetchMemoryExhausted`]: no budget refusal counter moves
+    /// and the budget's reserved figure says nothing about the refusal.
+    #[error(
+        "query memory exhausted: the allocator refused, or the size overflowed, a {requested}-byte allocation"
+    )]
+    AllocationRefused { requested: u64 },
 }
