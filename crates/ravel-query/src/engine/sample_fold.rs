@@ -16,28 +16,30 @@
 //! equal carry the same priority and the same value bits, so the fold's
 //! output is the same whatever order objects complete in, and the same as
 //! the two merges produce over the whole pool.
+//!
+//! The fold charges its containers by capacity (issue #4530, ADR-4523
+//! decision 6): each level's and each spine's buffer, the `by_series` and
+//! `prefix_ids` tables, the prefix Vec and each label set's strings. It
+//! reserves an allocation before it makes it, holding the old and the new
+//! buffer at once while a reallocation copies, and an allocation the
+//! allocator refuses releases that charge and fails the absorb with
+//! [`FetchError::FetchMemoryExhausted`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, TryReserveError};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use ravel_promql::{HistogramSeriesData, SeriesData};
 use ravel_segment::{HistogramCounts, HistogramValue};
-use ravel_types::{LabelSet, Sample, SeriesId};
+use ravel_types::{Label, LabelSet, Sample, SeriesId};
 
-use super::{
-    RunPriorities, histogram_sort_key, histogram_value_to_float, is_greater, retained_series_len,
-};
+use super::{RunPriorities, histogram_sort_key, histogram_value_to_float, is_greater};
 use crate::error::QueryError;
 use crate::fetcher::{FetchError, FetchedHistogramSeries, FetchedSeriesSoa};
 
 /// `(created_unix_ns, writer_epoch, writer_seq)`: the part of a sample's
 /// dedup key its object shares. The fold stores it once per distinct value.
 type ProvenancePrefix = (i64, u64, u64);
-
-/// The bytes one distinct provenance prefix is charged: its table entry and
-/// its index entry.
-const PREFIX_LEN: u64 = (std::mem::size_of::<ProvenancePrefix>()
-    + std::mem::size_of::<(ProvenancePrefix, u32)>()) as u64;
 
 /// A sample value the fold can rank and charge.
 pub(super) trait FoldValue: Clone {
@@ -128,8 +130,6 @@ struct FoldedSample<V> {
 struct FoldedSeries<V> {
     labels: LabelSet,
     levels: Vec<Vec<FoldedSample<V>>>,
-    /// The bytes `levels`' samples take, under [`sample_len`].
-    sample_bytes: u64,
 }
 
 /// One decoded run, in the shape both fetched kinds share.
@@ -212,16 +212,134 @@ pub(super) struct RunFold<V> {
     prefixes: Vec<ProvenancePrefix>,
     prefix_ids: HashMap<ProvenancePrefix, u32>,
     max_series: usize,
-    /// The bytes the fold holds now, under [`RunFold::charged`]'s figures.
-    retained: u64,
-    budget: Arc<ravel_memory::MemoryBudget>,
-    reservations: Vec<ravel_memory::Reservation>,
+    ledger: Ledger,
+    /// The most bytes [`RunFold::finish`]'s merges allocate beyond what the
+    /// fold holds: the level capacity of the largest series held as more
+    /// than one level, at any point so far.
+    finish_headroom: u64,
 }
 
 /// The scalar fold.
 pub(super) type ScalarFold = RunFold<f64>;
 /// The native-histogram fold.
 pub(super) type HistogramFold = RunFold<HistogramValue>;
+
+/// A fold's reservations against its budget and the bytes it holds.
+struct Ledger {
+    budget: Arc<ravel_memory::MemoryBudget>,
+    reservations: Vec<ravel_memory::Reservation>,
+    /// The sum of `reservations`' sizes.
+    charged: u64,
+    /// The bytes the fold's containers hold allocated, by capacity.
+    held: u64,
+}
+
+impl Ledger {
+    /// Grows the reservations to at least `bytes`.
+    fn cover(&mut self, bytes: u64) -> Result<(), QueryError> {
+        if bytes <= self.charged {
+            return Ok(());
+        }
+        let reservation = self.budget.reserve(bytes - self.charged).map_err(|e| {
+            FetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+                cause: e.cause,
+            }
+        })?;
+        self.charged = self.charged.saturating_add(reservation.size());
+        self.reservations.push(reservation);
+        Ok(())
+    }
+
+    /// Charges `bytes` already allocated that the fold takes ownership of.
+    fn take(&mut self, bytes: u64) -> Result<(), QueryError> {
+        self.cover(self.held.saturating_add(bytes))?;
+        self.held = self.held.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Stops charging `bytes` the fold has freed or dropped.
+    fn release(&mut self, bytes: u64) {
+        self.held = self.held.saturating_sub(bytes);
+    }
+
+    /// Charges a `new`-byte allocation that replaces an `old`-byte buffer,
+    /// then makes it with `alloc`. Both buffers are charged while both are
+    /// live, so the reservation covers `held + new` before `alloc` runs; once
+    /// `alloc` succeeds the old buffer is the caller's to free. When `alloc`
+    /// fails, the `new` bytes charged for it are released, once, and the
+    /// failure is [`FetchError::FetchMemoryExhausted`] for them.
+    fn grow(
+        &mut self,
+        old: u64,
+        new: u64,
+        alloc: impl FnOnce() -> Result<(), TryReserveError>,
+    ) -> Result<(), QueryError> {
+        self.cover(self.held.saturating_add(new))?;
+        self.held = self.held.saturating_add(new);
+        if !allocate(self.charged, alloc) {
+            self.held = self.held.saturating_sub(new);
+            return Err(allocation_failed(&self.budget, new));
+        }
+        self.held = self.held.saturating_sub(old);
+        Ok(())
+    }
+
+    /// Replaces a `predicted` allocation's charge with the `actual` bytes
+    /// the allocation took.
+    fn settle(&mut self, predicted: u64, actual: u64) {
+        self.held = self.held.saturating_sub(predicted).saturating_add(actual);
+    }
+
+    /// Shrinks the reservations to `bytes`, reserving `bytes` before it
+    /// releases the larger reservations it replaces. A budget that refuses
+    /// the new reservation leaves the old ones in place.
+    fn trim_to(&mut self, bytes: u64) {
+        if bytes >= self.charged {
+            return;
+        }
+        if bytes == 0 {
+            self.reservations.clear();
+            self.charged = 0;
+            return;
+        }
+        if let Ok(reservation) = self.budget.reserve_best_effort(bytes) {
+            self.reservations.clear();
+            self.charged = reservation.size();
+            self.reservations.push(reservation);
+        }
+    }
+}
+
+/// Runs `alloc`, unless a test armed an allocation failure with
+/// [`support::fail_allocation_after`]. `charged` is what the fold had
+/// reserved when it asked.
+fn allocate(charged: u64, alloc: impl FnOnce() -> Result<(), TryReserveError>) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if support::take_injected_failure(charged) {
+        return false;
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = charged;
+    alloc().is_ok()
+}
+
+/// The error for a `requested`-byte allocation the allocator refused. The
+/// budget's own figures are reported, with [`ExhaustionCause::Accounted`]
+/// since the budget has no cause for an allocator refusal.
+///
+/// [`ExhaustionCause::Accounted`]: ravel_memory::ExhaustionCause::Accounted
+fn allocation_failed(budget: &ravel_memory::MemoryBudget, requested: u64) -> QueryError {
+    FetchError::FetchMemoryExhausted {
+        requested,
+        reserved: budget.reserved(),
+        limit: budget.limit(),
+        cause: ravel_memory::ExhaustionCause::Accounted,
+    }
+    .into()
+}
 
 impl<V: FoldValue> RunFold<V> {
     pub(super) fn new(budget: Arc<ravel_memory::MemoryBudget>, max_series: usize) -> Self {
@@ -230,114 +348,234 @@ impl<V: FoldValue> RunFold<V> {
             prefixes: Vec::new(),
             prefix_ids: HashMap::new(),
             max_series,
-            retained: 0,
-            budget,
-            reservations: Vec::new(),
+            ledger: Ledger {
+                budget,
+                reservations: Vec::new(),
+                charged: 0,
+                held: 0,
+            },
+            finish_headroom: 0,
         }
     }
 
-    /// Reserves the most folding `runs` in can make the fold hold, then
-    /// folds them in, so the fold never holds more than it has reserved
-    /// (issue #4118). A series past `max_series` is refused with
-    /// [`QueryError::TooManySeries`] (ADR-0051 S7) the moment it would be
-    /// added; a run whose priority column is not parallel to its samples, or
-    /// whose timestamps descend, with the error the merge returns for it; and
-    /// a refused reservation with [`FetchError::FetchMemoryExhausted`], the
-    /// error a fetch reservation returns, before any of `runs` is folded.
+    /// Reserves the most folding `runs` in can make the fold hold at once,
+    /// then folds them in, charging each allocation before it is made, so the
+    /// fold never holds more than it has reserved (issue #4118). A series
+    /// past `max_series` is refused with [`QueryError::TooManySeries`]
+    /// (ADR-0051 S7) the moment it would be added; a run whose priority
+    /// column is not parallel to its samples, or whose timestamps descend,
+    /// with the error the merge returns for it; a refused reservation with
+    /// [`FetchError::FetchMemoryExhausted`], the error a fetch reservation
+    /// returns, before any of `runs` is folded; and an allocation the
+    /// allocator refuses with the same error.
+    ///
+    /// The reservation is then shrunk, whether the call succeeded or not, to
+    /// what the fold holds plus the headroom [`RunFold::finish`]'s merges
+    /// need, so a call's merge room is not held past it.
     ///
     /// The bound is computed over `runs` in place, sorted by series so each
     /// series' incoming samples sum without a side table (issue #4198); the
     /// fold's output does not depend on the order runs are folded in.
     pub(super) fn absorb<R: FoldInput<V>>(&mut self, mut runs: Vec<R>) -> Result<(), QueryError> {
         runs.sort_unstable_by_key(FoldInput::series_id);
-        let mut growth = 0u64;
-        // One merge runs at a time, and the level it builds holds at most the
-        // samples its series held before this call plus every sample this
-        // call brings it.
-        let mut merge = 0u64;
-        for series in runs.chunk_by(|a, b| a.series_id() == b.series_id()) {
-            let mut incoming = 0u64;
-            for run in series {
-                let (added, samples) = self.growth_bound(run);
-                growth = growth.saturating_add(added);
-                incoming = incoming.saturating_add(samples);
-            }
-            if let Some(run) = series.first() {
-                let held = self.held_sample_len(&run.series_id());
-                merge = merge.max(held.saturating_add(incoming));
-            }
-        }
-        self.reserve_up_to(self.retained.saturating_add(growth).saturating_add(merge))?;
-        for run in runs {
-            self.absorb_run(run.into_run())?;
-        }
+        let (bound, new_series) = self.call_bound(&runs);
+        let folded = match self.ledger.cover(bound) {
+            Ok(()) => self.fold_runs(runs, new_series),
+            Err(e) => Err(e),
+        };
+        let keep = self.ledger.held.saturating_add(self.finish_headroom);
+        let covered = self.ledger.cover(keep);
+        self.ledger.trim_to(keep);
+        folded?;
+        covered?;
         #[cfg(any(test, feature = "test-support"))]
         support::observe_absorb(|| self.charged());
         Ok(())
     }
 
-    /// The most folding `run` in adds to [`RunFold::retained`], and the
-    /// bytes its samples alone take. The growth counts every sample as kept,
-    /// the series' labels when it is new, and one prefix entry for each change
-    /// of provenance prefix along the run that the fold has not interned.
-    fn growth_bound(&self, run: &impl FoldInput<V>) -> (u64, u64) {
-        let inline = std::mem::size_of::<FoldedSample<V>>() as u64;
-        let samples = run
-            .values()
-            .iter()
-            .map(|value| inline.saturating_add(value.heap_len()))
-            .fold(0u64, u64::saturating_add);
-        let held = self.by_series.get(&run.series_id());
-        let labels = if held.is_some() {
-            0
-        } else {
-            retained_series_len(run.labels())
-        };
-        let prefixes = match run.per_sample() {
-            None => u64::from(!self.prefix_ids.contains_key(&run.prefix())),
-            Some(column) => {
-                let mut last = None;
-                let mut new = 0u64;
-                for p in column {
-                    let key = (p.created_unix_ns, p.writer_epoch, p.writer_seq);
-                    if last != Some(key) && !self.prefix_ids.contains_key(&key) {
-                        new += 1;
-                    }
-                    last = Some(key);
-                }
-                new
-            }
-        };
-        (
-            samples
-                .saturating_add(labels)
-                .saturating_add(prefixes.saturating_mul(PREFIX_LEN)),
-            samples,
-        )
+    fn fold_runs<R: FoldInput<V>>(
+        &mut self,
+        runs: Vec<R>,
+        new_series: usize,
+    ) -> Result<(), QueryError> {
+        let len = self.by_series.len();
+        let need = len.saturating_add(new_series.min(self.max_series.saturating_sub(len)));
+        grow_table(&mut self.ledger, &mut self.by_series, need)?;
+        for run in runs {
+            self.absorb_run(run.into_run())?;
+        }
+        Ok(())
     }
 
-    /// The bytes the samples the fold holds for `series_id` take.
-    fn held_sample_len(&self, series_id: &SeriesId) -> u64 {
-        self.by_series
-            .get(series_id)
-            .map_or(0, |series| series.sample_bytes)
+    /// The most the fold can hold at once while it folds `runs`, sorted by
+    /// series, in, and how many of their series it does not hold yet.
+    ///
+    /// The growth counts every incoming sample as kept in a level of its
+    /// run's length, the labels of each new series, each spine's growth to
+    /// one more level per run, the `by_series` table's growth to the new
+    /// series, and the prefix Vec's and `prefix_ids`' growth to one entry per
+    /// change of provenance prefix along the call that the fold has not
+    /// interned. While the fold grows, one buffer at a time is live beside
+    /// what it holds: the buffer a container's last growth replaces, or the
+    /// level a merge builds, which holds at most the samples its series held
+    /// plus those the call brings it. A merge is counted only for a series
+    /// that can merge: one with more than one run in the call, or whose last
+    /// held level is at most twice its incoming run.
+    fn call_bound<R: FoldInput<V>>(&self, runs: &[R]) -> (u64, usize) {
+        let inline = inline_len::<V>();
+        let spine = std::mem::size_of::<Vec<FoldedSample<V>>>();
+        let mut growth = 0u64;
+        let mut transient = self.finish_headroom;
+        let mut new_series = 0usize;
+        let mut new_prefixes = 0usize;
+        let mut last_prefix = None;
+        let mut note_prefix = |key: ProvenancePrefix| {
+            if last_prefix != Some(key) {
+                last_prefix = Some(key);
+                if !self.prefix_ids.contains_key(&key) {
+                    new_prefixes += 1;
+                }
+            }
+        };
+        for series in runs.chunk_by(|a, b| a.series_id() == b.series_id()) {
+            let Some(first) = series.first() else {
+                continue;
+            };
+            let mut incoming = 0usize;
+            for run in series {
+                incoming = incoming.saturating_add(run.values().len());
+                growth = run
+                    .values()
+                    .iter()
+                    .map(FoldValue::heap_len)
+                    .fold(growth, u64::saturating_add);
+                match run.per_sample() {
+                    None => note_prefix(run.prefix()),
+                    Some(column) => {
+                        for p in column {
+                            note_prefix((p.created_unix_ns, p.writer_epoch, p.writer_seq));
+                        }
+                    }
+                }
+            }
+            growth = growth.saturating_add((incoming as u64).saturating_mul(inline));
+            let held = self.by_series.get(&first.series_id());
+            let (levels, held_samples) = match held {
+                Some(held) => (&held.levels[..], held.levels.iter().map(Vec::len).sum()),
+                None => {
+                    new_series += 1;
+                    growth = growth.saturating_add(label_len(first.labels()));
+                    (&[][..], 0usize)
+                }
+            };
+            let (spine_growth, spine_old) = vec_growth(
+                held.map_or(0, |held| held.levels.capacity()),
+                levels.len().saturating_add(series.len()),
+                spine,
+            );
+            growth = growth.saturating_add(spine_growth);
+            transient = transient.max(spine_old);
+            let merges = series.len() > 1
+                || levels
+                    .last()
+                    .is_some_and(|last| last.len() <= incoming.saturating_mul(2));
+            if merges {
+                let merged = (held_samples.saturating_add(incoming) as u64).saturating_mul(inline);
+                transient = transient.max(merged);
+            }
+        }
+        let len = self.by_series.len();
+        let need = len.saturating_add(new_series.min(self.max_series.saturating_sub(len)));
+        if need > self.by_series.capacity() {
+            let slot = std::mem::size_of::<(SeriesId, FoldedSeries<V>)>();
+            let old = table_bytes(self.by_series.capacity(), slot);
+            let new = table_alloc(table_buckets(need), slot);
+            growth = growth.saturating_add(new.saturating_sub(old));
+            transient = transient.max(old);
+        }
+        let need = self.prefixes.len().saturating_add(new_prefixes);
+        let (prefixes, prefixes_old) = vec_growth(
+            self.prefixes.capacity(),
+            need,
+            std::mem::size_of::<ProvenancePrefix>(),
+        );
+        let (ids, ids_old) = table_growth(
+            self.prefix_ids.capacity(),
+            need,
+            std::mem::size_of::<(ProvenancePrefix, u32)>(),
+        );
+        growth = growth.saturating_add(prefixes).saturating_add(ids);
+        transient = transient.max(prefixes_old).max(ids_old);
+        let bound = self
+            .ledger
+            .held
+            .saturating_add(growth)
+            .saturating_add(transient);
+        (bound, new_series)
     }
 
     fn absorb_run(&mut self, run: FoldRun<V>) -> Result<(), QueryError> {
-        if !self.by_series.contains_key(&run.series_id) && self.by_series.len() >= self.max_series {
+        let FoldRun {
+            series_id,
+            labels,
+            timestamps,
+            values,
+            priorities,
+        } = run;
+        if !self.by_series.contains_key(&series_id) && self.by_series.len() >= self.max_series {
             return Err(QueryError::TooManySeries {
                 count: self.by_series.len() + 1,
                 max: self.max_series,
             });
         }
-        run.priorities.check_len(run.timestamps.len())?;
-        let mut level: Vec<FoldedSample<V>> = Vec::with_capacity(run.timestamps.len());
+        priorities.check_len(timestamps.len())?;
+        let inline = inline_len::<V>();
+        let n = timestamps.len();
+        let mut level: Vec<FoldedSample<V>> = Vec::new();
+        self.ledger.grow(0, (n as u64).saturating_mul(inline), || {
+            level.try_reserve_exact(n)
+        })?;
+        let mut heap = 0u64;
+        let filled = self.fill_level(&mut level, &mut heap, &timestamps, values, &priorities);
+        let capacity = (level.capacity() as u64).saturating_mul(inline);
+        if let Err(e) = filled.and_then(|()| self.ledger.take(heap)) {
+            self.ledger.release(capacity);
+            return Err(e);
+        }
+        if level.len() < level.capacity() {
+            let len = level.len();
+            let mut exact = Vec::new();
+            if let Err(e) = self
+                .ledger
+                .grow(capacity, (len as u64).saturating_mul(inline), || {
+                    exact.try_reserve_exact(len)
+                })
+            {
+                self.ledger.release(capacity.saturating_add(heap));
+                return Err(e);
+            }
+            exact.append(&mut level);
+            level = exact;
+        }
+        self.place(series_id, labels, level, heap)
+    }
+
+    /// Fills `level` with `values` in timestamp order, one sample per
+    /// timestamp, and adds the heap bytes of the samples it keeps to `heap`.
+    fn fill_level(
+        &mut self,
+        level: &mut Vec<FoldedSample<V>>,
+        heap: &mut u64,
+        timestamps: &[i64],
+        values: Vec<V>,
+        priorities: &RunPriorities,
+    ) -> Result<(), QueryError> {
         let mut last_prefix: Option<(ProvenancePrefix, u32)> = None;
-        for (pos, (&ts, value)) in run.timestamps.iter().zip(run.values).enumerate() {
-            let Some((created, epoch, seq, in_page_index)) = run.priorities.at(pos) else {
+        for (pos, (&ts, value)) in timestamps.iter().zip(values).enumerate() {
+            let Some((created, epoch, seq, in_page_index)) = priorities.at(pos) else {
                 return Err(QueryError::PrioritySampleCountMismatch {
-                    priorities: run.priorities.column_len().unwrap_or(0),
-                    samples: run.timestamps.len(),
+                    priorities: priorities.column_len().unwrap_or(0),
+                    samples: timestamps.len(),
                 });
             };
             let key = (created, epoch, seq);
@@ -364,33 +602,60 @@ impl<V: FoldValue> RunFold<V> {
                 }
                 Some(last) if ts == last.ts => {
                     if self.sample_serves_over(&sample, last) {
+                        *heap = heap
+                            .saturating_sub(last.value.heap_len())
+                            .saturating_add(sample.value.heap_len());
                         *last = sample;
                     }
                 }
-                _ => level.push(sample),
+                _ => {
+                    *heap = heap.saturating_add(sample.value.heap_len());
+                    level.push(sample);
+                }
             }
         }
-        if level.len() < level.capacity() {
-            level.shrink_to_fit();
-        }
-        let added: u64 = level.iter().map(sample_len).sum();
-        self.retained = self.retained.saturating_add(added);
+        Ok(())
+    }
 
-        let series = match self.by_series.entry(run.series_id) {
+    /// Adds `level`, whose samples hold `heap` heap bytes and which the fold
+    /// already charges, to its series, merging it with the series' smaller
+    /// levels. On an error the level is dropped and its charge released.
+    fn place(
+        &mut self,
+        series_id: SeriesId,
+        labels: LabelSet,
+        mut level: Vec<FoldedSample<V>>,
+        heap: u64,
+    ) -> Result<(), QueryError> {
+        let inline = inline_len::<V>();
+        let spine = std::mem::size_of::<Vec<FoldedSample<V>>>() as u64;
+        let level_bytes = (level.capacity() as u64)
+            .saturating_mul(inline)
+            .saturating_add(heap);
+        // `entry` reserves room for a vacant key, so a full table grows here,
+        // charged, before it would grow there.
+        if !self.by_series.contains_key(&series_id) {
+            let need = self.by_series.len().saturating_add(1);
+            if let Err(e) = grow_table(&mut self.ledger, &mut self.by_series, need) {
+                self.ledger.release(level_bytes);
+                return Err(e);
+            }
+        }
+        let series = match self.by_series.entry(series_id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                self.retained = self
-                    .retained
-                    .saturating_add(retained_series_len(&run.labels));
+                if let Err(e) = self.ledger.take(label_len(&labels)) {
+                    self.ledger.release(level_bytes);
+                    return Err(e);
+                }
                 entry.insert(FoldedSeries {
-                    labels: run.labels,
+                    labels,
                     levels: Vec::new(),
-                    sample_bytes: 0,
                 })
             }
         };
         let prefixes = &self.prefixes;
-        let mut dropped = 0u64;
+        let ledger = &mut self.ledger;
         while let Some(last) = series.levels.last() {
             if last.len() > level.len().saturating_mul(2) {
                 break;
@@ -398,16 +663,56 @@ impl<V: FoldValue> RunFold<V> {
             let Some(last) = series.levels.pop() else {
                 break;
             };
-            level = merge_levels(prefixes, last, level, &mut dropped);
+            let len = merged_len(&last, &level);
+            let mut out = Vec::new();
+            if let Err(e) = ledger.grow(0, (len as u64).saturating_mul(inline), || {
+                out.try_reserve_exact(len)
+            }) {
+                // The pop left room for `last`, so this push does not allocate.
+                series.levels.push(last);
+                ledger.release(
+                    (level.capacity() as u64)
+                        .saturating_mul(inline)
+                        .saturating_add(heap_len(&level)),
+                );
+                return Err(e);
+            }
+            let freed = ((last.capacity() + level.capacity()) as u64).saturating_mul(inline);
+            let mut dropped = 0u64;
+            merge_into(prefixes, last, level, &mut out, &mut dropped);
+            ledger.release(freed.saturating_add(dropped));
+            level = out;
         }
-        if !level.is_empty() {
-            series.levels.push(level);
+        if level.is_empty() {
+            return Ok(());
         }
-        series.sample_bytes = series
-            .sample_bytes
-            .saturating_add(added)
-            .saturating_sub(dropped);
-        self.retained = self.retained.saturating_sub(dropped);
+        let len = series.levels.len();
+        let capacity = series.levels.capacity();
+        if len == capacity {
+            let next = next_capacity(capacity);
+            let levels = &mut series.levels;
+            if let Err(e) = ledger.grow(
+                (capacity as u64).saturating_mul(spine),
+                (next as u64).saturating_mul(spine),
+                || levels.try_reserve_exact(next - len),
+            ) {
+                ledger.release(
+                    (level.capacity() as u64)
+                        .saturating_mul(inline)
+                        .saturating_add(heap_len(&level)),
+                );
+                return Err(e);
+            }
+        }
+        series.levels.push(level);
+        if series.levels.len() > 1 {
+            let held = series
+                .levels
+                .iter()
+                .map(|level| (level.capacity() as u64).saturating_mul(inline))
+                .fold(0u64, u64::saturating_add);
+            self.finish_headroom = self.finish_headroom.max(held);
+        }
         Ok(())
     }
 
@@ -418,13 +723,26 @@ impl<V: FoldValue> RunFold<V> {
         if let Some(&id) = self.prefix_ids.get(&prefix) {
             return Ok(id);
         }
-        let id = u32::try_from(self.prefixes.len()).map_err(|_| QueryError::TooManySamples {
-            count: self.prefixes.len().saturating_add(1),
+        let len = self.prefixes.len();
+        let id = u32::try_from(len).map_err(|_| QueryError::TooManySamples {
+            count: len.saturating_add(1),
             max: u32::MAX as usize,
         })?;
+        let capacity = self.prefixes.capacity();
+        if len == capacity {
+            let entry = std::mem::size_of::<ProvenancePrefix>() as u64;
+            let next = next_capacity(capacity);
+            let prefixes = &mut self.prefixes;
+            self.ledger.grow(
+                (capacity as u64).saturating_mul(entry),
+                (next as u64).saturating_mul(entry),
+                || prefixes.try_reserve_exact(next - len),
+            )?;
+        }
+        let need = self.prefix_ids.len().saturating_add(1);
+        grow_table(&mut self.ledger, &mut self.prefix_ids, need)?;
         self.prefixes.push(prefix);
         self.prefix_ids.insert(prefix, id);
-        self.retained = self.retained.saturating_add(PREFIX_LEN);
         Ok(id)
     }
 
@@ -432,51 +750,40 @@ impl<V: FoldValue> RunFold<V> {
         serves_over(&self.prefixes, a, b)
     }
 
-    /// Grows the fold's reservation to at least `bytes`. The reservation only
-    /// grows: it is the most any absorb could have made the fold hold.
-    fn reserve_up_to(&mut self, bytes: u64) -> Result<(), QueryError> {
-        let charged = self.charged();
-        if bytes <= charged {
-            return Ok(());
-        }
-        let reservation =
-            self.budget
-                .reserve(bytes - charged)
-                .map_err(|e| FetchError::FetchMemoryExhausted {
-                    requested: e.requested,
-                    reserved: e.reserved,
-                    limit: e.limit,
-                    cause: e.cause,
-                })?;
-        self.reservations.push(reservation);
-        Ok(())
-    }
-
-    /// The bytes this fold holds reserved: the most it has held after any
-    /// object was folded in. Each series is charged its id and label set
-    /// ([`retained_series_len`]), each held sample its inline size plus its
-    /// value's heap bytes, and each distinct provenance prefix
-    /// [`PREFIX_LEN`].
+    /// The bytes this fold holds reserved. After each absorb that is the
+    /// bytes its containers hold, by capacity, plus the headroom its final
+    /// merges need: each level's buffer at its inline sample size plus its
+    /// samples' heap bytes, each series' spine of levels, the `by_series` and
+    /// `prefix_ids` tables at hashbrown's allocation for their capacity, the
+    /// prefix Vec, and each label's inline size plus its strings' capacity.
+    /// The headroom is the level capacity of the largest series it has held
+    /// as more than one level, 0 while every series is one level. During an
+    /// absorb it is at most that call's bound.
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn charged(&self) -> u64 {
-        self.reservations
-            .iter()
-            .map(ravel_memory::Reservation::size)
-            .sum()
+        self.ledger.charged
     }
 
     /// Hands the fold's reservations to the caller, which holds them for as
     /// long as it holds the series [`into_series`](RunFold::into_series)
-    /// returns: those take no more than the fold reserved, since a merged
-    /// sample is smaller than a held one (issue #4118).
+    /// returns, and leaves the fold charging nothing, so each reserved byte
+    /// is held once. The scalar series take no more than the fold held plus
+    /// its headroom (issue #4118): the final merges build levels within the
+    /// headroom and convert in place to a smaller sample. A histogram
+    /// series' converted values allocate apart from the fold's buffers and
+    /// are not covered.
     pub(super) fn take_reservations(&mut self) -> Vec<ravel_memory::Reservation> {
-        std::mem::take(&mut self.reservations)
+        self.ledger.charged = 0;
+        std::mem::take(&mut self.ledger.reservations)
     }
 
     /// Collapses each series' runs into one, converts each held sample with
     /// `convert`, and checks `max_samples` over the whole result, counting one
     /// sample per `(series, ts)` slot as the merge does. Reservations not
     /// taken with [`take_reservations`](RunFold::take_reservations) are
-    /// released when this returns.
+    /// released when this returns. Each merge's level is sized exactly
+    /// before it is built, within the fold's headroom; an allocation the
+    /// allocator refuses is [`FetchError::FetchMemoryExhausted`].
     fn finish<T>(
         self,
         max_samples: usize,
@@ -485,17 +792,35 @@ impl<V: FoldValue> RunFold<V> {
         let Self {
             by_series,
             prefixes,
-            reservations,
+            ledger,
             ..
         } = self;
+        let inline = inline_len::<V>();
         let mut total = 0usize;
-        let mut out = Vec::with_capacity(by_series.len());
+        let mut out = Vec::new();
+        let count = by_series.len();
+        if !allocate(ledger.charged, || out.try_reserve_exact(count)) {
+            let entry = std::mem::size_of::<(LabelSet, Vec<T>)>() as u64;
+            return Err(allocation_failed(
+                &ledger.budget,
+                (count as u64).saturating_mul(entry),
+            ));
+        }
         for series in by_series.into_values() {
             let mut levels = series.levels;
             let mut merged = levels.pop().unwrap_or_default();
-            let mut dropped = 0u64;
             while let Some(level) = levels.pop() {
-                merged = merge_levels(&prefixes, level, merged, &mut dropped);
+                let len = merged_len(&level, &merged);
+                let mut next = Vec::new();
+                if !allocate(ledger.charged, || next.try_reserve_exact(len)) {
+                    return Err(allocation_failed(
+                        &ledger.budget,
+                        (len as u64).saturating_mul(inline),
+                    ));
+                }
+                let mut dropped = 0u64;
+                merge_into(&prefixes, level, merged, &mut next, &mut dropped);
+                merged = next;
             }
             total = total.saturating_add(merged.len());
             if total > max_samples {
@@ -506,7 +831,7 @@ impl<V: FoldValue> RunFold<V> {
             }
             out.push((series.labels, merged.into_iter().map(&convert).collect()));
         }
-        drop(reservations);
+        drop(ledger);
         Ok(out)
     }
 }
@@ -545,8 +870,158 @@ impl RunFold<HistogramValue> {
     }
 }
 
-fn sample_len<V: FoldValue>(sample: &FoldedSample<V>) -> u64 {
-    (std::mem::size_of::<FoldedSample<V>>() as u64).saturating_add(sample.value.heap_len())
+/// The bytes one held sample takes in a level's buffer.
+fn inline_len<V>() -> u64 {
+    std::mem::size_of::<FoldedSample<V>>() as u64
+}
+
+/// The heap bytes `level`'s samples hold beyond the level's buffer.
+fn heap_len<V: FoldValue>(level: &[FoldedSample<V>]) -> u64 {
+    level
+        .iter()
+        .map(|s| s.value.heap_len())
+        .fold(0u64, u64::saturating_add)
+}
+
+/// The heap bytes `labels` holds: each label's slot in the set's Vec and
+/// its two strings' capacity.
+fn label_len(labels: &LabelSet) -> u64 {
+    labels
+        .iter()
+        .map(|l| {
+            (std::mem::size_of::<Label>() + l.name.capacity() + l.value.capacity()) as u64
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// The capacity a full Vec of `capacity` grows to: double, at least 4,
+/// as `Vec::push` grows a Vec of elements this small.
+fn next_capacity(capacity: usize) -> usize {
+    capacity.saturating_mul(2).max(4)
+}
+
+/// The bytes a Vec of `entry`-byte elements grows by, one
+/// [`next_capacity`] step at a time from `capacity`, to hold `need`
+/// elements, and the bytes of the buffer its last step replaces.
+fn vec_growth(capacity: usize, need: usize, entry: usize) -> (u64, u64) {
+    let mut grown = capacity;
+    let mut replaced = 0usize;
+    while grown < need {
+        replaced = grown;
+        grown = next_capacity(grown);
+    }
+    let entry = entry as u64;
+    (
+        ((grown - capacity) as u64).saturating_mul(entry),
+        (replaced as u64).saturating_mul(entry),
+    )
+}
+
+/// hashbrown's group width: the SSE2 group on x86, 8 bytes elsewhere.
+const GROUP_WIDTH: u64 = if cfg!(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "sse2"
+)) {
+    16
+} else {
+    8
+};
+
+/// The entries hashbrown lets a table of `buckets` buckets hold.
+fn bucket_capacity(buckets: usize) -> usize {
+    if buckets <= 8 {
+        buckets - 1
+    } else {
+        buckets / 8 * 7
+    }
+}
+
+/// The fewest buckets, a power of two of at least 4, whose
+/// [`bucket_capacity`] covers `capacity`: the bucket count hashbrown
+/// allocates for a table asked to hold `capacity` entries.
+fn table_buckets(capacity: usize) -> usize {
+    let mut buckets = 4usize;
+    while bucket_capacity(buckets) < capacity {
+        match buckets.checked_mul(2) {
+            Some(next) => buckets = next,
+            None => break,
+        }
+    }
+    buckets
+}
+
+/// The bytes a table of `buckets` buckets of `slot`-byte entries allocates:
+/// buckets x slot, plus one control byte per bucket and the group width. A
+/// table of no buckets allocates nothing.
+fn table_alloc(buckets: usize, slot: usize) -> u64 {
+    if buckets == 0 {
+        return 0;
+    }
+    let buckets = buckets as u64;
+    buckets
+        .saturating_mul(slot as u64)
+        .saturating_add(buckets)
+        .saturating_add(GROUP_WIDTH)
+}
+
+/// The bytes a `HashMap` whose [`HashMap::capacity`] is `capacity` and
+/// whose `(key, value)` slot is `slot` bytes allocates, as the R5
+/// pre-registration defines it: [`table_alloc`] for its bucket count.
+/// HashMap has no allocation accessor, so the bucket count is recovered
+/// from the capacity: the fewest buckets, a power of two of at least 4,
+/// whose hashbrown capacity covers `capacity`, where `buckets` hold
+/// `buckets - 1` entries up to 8 buckets and `buckets / 8 * 7` above. That
+/// is exact for every capacity a table that never removed an entry reports,
+/// which the fold's tables never do. A capacity of 0 is a table that never
+/// allocated. hashbrown's padding of the slot array to the control bytes'
+/// alignment is not counted; `tests/run_fold_accounting.rs` asserts the
+/// formula against jemalloc.
+fn table_bytes(capacity: usize, slot: usize) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    table_alloc(table_buckets(capacity), slot)
+}
+
+/// The bytes a table of `slot`-byte entries grows by, one doubling at a
+/// time from `capacity`, to hold `need` entries, and the bytes of the table
+/// its last doubling replaces.
+fn table_growth(capacity: usize, need: usize, slot: usize) -> (u64, u64) {
+    if need <= capacity {
+        return (0, 0);
+    }
+    let from = if capacity == 0 {
+        0
+    } else {
+        table_buckets(capacity)
+    };
+    let to = table_buckets(need);
+    let replaced = if to / 2 >= from.max(4) { to / 2 } else { from };
+    (
+        table_alloc(to, slot).saturating_sub(table_alloc(from, slot)),
+        table_alloc(replaced, slot),
+    )
+}
+
+/// Grows `table` to hold `need` entries, in one allocation charged to
+/// `ledger` before it is made.
+fn grow_table<K: Eq + Hash, T>(
+    ledger: &mut Ledger,
+    table: &mut HashMap<K, T>,
+    need: usize,
+) -> Result<(), QueryError> {
+    let capacity = table.capacity();
+    if need <= capacity {
+        return Ok(());
+    }
+    let slot = std::mem::size_of::<(K, T)>();
+    let predicted = table_alloc(table_buckets(need), slot);
+    let additional = need - table.len();
+    ledger.grow(table_bytes(capacity, slot), predicted, || {
+        table.try_reserve(additional)
+    })?;
+    ledger.settle(predicted, table_bytes(table.capacity(), slot));
+    Ok(())
 }
 
 fn priority<V>(prefixes: &[ProvenancePrefix], s: &FoldedSample<V>) -> (i64, u64, u64, u32) {
@@ -571,16 +1046,57 @@ fn serves_over<V: FoldValue>(
     )
 }
 
-/// Merges two sorted runs of one sample per timestamp into one, keeping the
-/// sample served over the other where both hold a timestamp, and adds the
-/// bytes of every sample it drops to `dropped`.
-fn merge_levels<V: FoldValue>(
+/// The samples [`merge_into`] keeps from `a` and `b`, two sorted runs of
+/// one sample per timestamp: both lengths less the timestamps they share,
+/// which can only lie where their spans overlap.
+fn merged_len<V>(a: &[FoldedSample<V>], b: &[FoldedSample<V>]) -> usize {
+    let total = a.len() + b.len();
+    let (Some(a_first), Some(a_last), Some(b_first), Some(b_last)) =
+        (a.first(), a.last(), b.first(), b.last())
+    else {
+        return total;
+    };
+    let lo = a_first.ts.max(b_first.ts);
+    let hi = a_last.ts.min(b_last.ts);
+    if lo > hi {
+        return total;
+    }
+    let window = |run: &[FoldedSample<V>]| -> (usize, usize) {
+        (
+            run.partition_point(|s| s.ts < lo),
+            run.partition_point(|s| s.ts <= hi),
+        )
+    };
+    let ((mut i, a_end), (mut j, b_end)) = (window(a), window(b));
+    let mut shared = 0usize;
+    while i < a_end && j < b_end {
+        let (Some(x), Some(y)) = (a.get(i), b.get(j)) else {
+            break;
+        };
+        match x.ts.cmp(&y.ts) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    total - shared
+}
+
+/// Merges two sorted runs of one sample per timestamp into `out`, sized by
+/// the caller for [`merged_len`] samples, keeping the sample served over
+/// the other where both hold a timestamp, and adds the heap bytes of every
+/// sample it drops to `dropped`.
+fn merge_into<V: FoldValue>(
     prefixes: &[ProvenancePrefix],
     a: Vec<FoldedSample<V>>,
     b: Vec<FoldedSample<V>>,
+    out: &mut Vec<FoldedSample<V>>,
     dropped: &mut u64,
-) -> Vec<FoldedSample<V>> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
+) {
     let mut a = a.into_iter().peekable();
     let mut b = b.into_iter().peekable();
     loop {
@@ -593,7 +1109,7 @@ fn merge_levels<V: FoldValue>(
                 let a_wins = serves_over(prefixes, x, y);
                 let loser = if a_wins { b.next() } else { a.next() };
                 if let Some(loser) = loser {
-                    *dropped = dropped.saturating_add(sample_len(&loser));
+                    *dropped = dropped.saturating_add(loser.value.heap_len());
                 }
                 a_wins
             }
@@ -603,14 +1119,6 @@ fn merge_levels<V: FoldValue>(
             out.push(sample);
         }
     }
-    // The emptied inputs still hold their buffers, which the fold charges as
-    // held levels. Freed first, the shrunk copy takes bytes they released, so
-    // the merge holds at most the inputs plus `out`, as `absorb` reserved.
-    drop((a, b));
-    if out.len() < out.capacity() {
-        out.shrink_to_fit();
-    }
-    out
 }
 
 /// Test and bench support only (issue #4530, ADR-4523 decision 6, R5): the
@@ -625,6 +1133,7 @@ fn merge_levels<V: FoldValue>(
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod support {
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::sync::{Arc, OnceLock};
 
@@ -742,59 +1251,50 @@ pub mod support {
             .collect()
     }
 
-    /// hashbrown's group width: the SSE2 group on x86, 8 bytes elsewhere.
-    const GROUP_WIDTH: u64 = if cfg!(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "sse2"
-    )) {
-        16
-    } else {
-        8
-    };
-
-    /// The bytes a `HashMap` whose [`HashMap::capacity`] is `capacity` and
-    /// whose `(key, value)` slot is `slot` bytes allocates, as the R5
-    /// pre-registration defines it: buckets x slot, plus one control byte
-    /// per bucket and the group width. HashMap has no allocation accessor,
-    /// so the bucket count is recovered from the capacity: the fewest buckets,
-    /// a power of two of at least 4, whose hashbrown capacity covers
-    /// `capacity`, where `buckets` hold `buckets - 1` entries up to 8 buckets
-    /// and `buckets / 8 * 7` above. That is exact for every capacity a table
-    /// that never removed an entry reports, which the fold's tables never do.
-    /// A capacity of 0 is a table that never allocated. hashbrown's padding
-    /// of the slot array to the control bytes' alignment is not counted;
-    /// `tests/run_fold_accounting.rs` asserts the formula against jemalloc.
+    /// The fold's own table size formula, which charges its `by_series` and
+    /// `prefix_ids` tables: the bytes a `HashMap` whose
+    /// [`HashMap::capacity`] is `capacity` and whose `(key, value)` slot is
+    /// `slot` bytes allocates, buckets x slot plus one control byte per
+    /// bucket and the group width.
     pub fn table_bytes(capacity: usize, slot: usize) -> u64 {
-        if capacity == 0 {
-            return 0;
-        }
-        let buckets = table_buckets(capacity) as u64;
-        buckets
-            .saturating_mul(slot as u64)
-            .saturating_add(buckets)
-            .saturating_add(GROUP_WIDTH)
+        super::table_bytes(capacity, slot)
     }
 
-    /// The entries hashbrown lets a table of `buckets` buckets hold.
-    pub(super) fn bucket_capacity(buckets: usize) -> usize {
-        if buckets <= 8 {
-            buckets - 1
-        } else {
-            buckets / 8 * 7
-        }
+    thread_local! {
+        static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+        static INJECTED_CHARGE: Cell<Option<u64>> = const { Cell::new(None) };
     }
 
-    /// The fewest buckets, a power of two of at least 4, whose
-    /// [`bucket_capacity`] covers `capacity`.
-    pub(super) fn table_buckets(capacity: usize) -> usize {
-        let mut buckets = 4usize;
-        while bucket_capacity(buckets) < capacity {
-            match buckets.checked_mul(2) {
-                Some(next) => buckets = next,
-                None => break,
+    /// Makes the fold's allocation after the next `skip` ones on this
+    /// thread fail as an allocator refusal would, without allocating. Each
+    /// level, spine, table and prefix Vec growth in an absorb, and each
+    /// buffer `into_series` sizes, is one allocation.
+    pub fn fail_allocation_after(skip: usize) {
+        FAIL_AFTER.with(|f| f.set(Some(skip)));
+        INJECTED_CHARGE.with(|c| c.set(None));
+    }
+
+    /// The fold's [`charged`](super::RunFold::charged) bytes when the armed
+    /// failure fired on this thread, `None` while it has not.
+    pub fn injected_failure_charge() -> Option<u64> {
+        INJECTED_CHARGE.with(Cell::get)
+    }
+
+    /// Whether the allocation about to be made is the one armed to fail,
+    /// recording `charged` when it is.
+    pub(super) fn take_injected_failure(charged: u64) -> bool {
+        FAIL_AFTER.with(|f| match f.get() {
+            None => false,
+            Some(0) => {
+                f.set(None);
+                INJECTED_CHARGE.with(|c| c.set(Some(charged)));
+                true
             }
-        }
-        buckets
+            Some(skip) => {
+                f.set(Some(skip - 1));
+                false
+            }
+        })
     }
 
     /// A table of the fold's key and value types, sized for its entries up
@@ -830,7 +1330,6 @@ pub mod support {
                 FoldedSeries::<f64> {
                     labels: LabelSet::default(),
                     levels: Vec::new(),
-                    sample_bytes: 0,
                 },
             );
         }
@@ -1208,53 +1707,50 @@ mod tests {
         assert_eq!(format!("{err:?}"), format!("{want:?}"));
     }
 
-    /// Issue #3747: the bytes held for a known result are its series' ids
-    /// and label sets, its held samples and its distinct provenance prefixes.
-    /// Two objects carry the same series at the same three timestamps under
-    /// two provenance prefixes; the merged result is one series of three
-    /// samples, and the second object's copies are dropped, so what is held
-    /// is one series, three samples and two prefixes, not one copy per object.
-    ///
-    /// Issue #4118: each absorb reserves before it folds: every incoming
-    /// sample, the labels of a new series, one prefix per unseen provenance
-    /// prefix, and the level the merge builds beside the levels it replaces.
+    /// Issue #4530: after an absorb the fold charges exactly the buffers it
+    /// holds, by capacity. Two objects carry the same series at the same
+    /// three timestamps under two provenance prefixes; the merged result is
+    /// one series of three samples, and the second object's copies are
+    /// dropped, so after either absorb the fold holds one `by_series` table
+    /// of 4 buckets, one spine of 4 levels, one level of 3 samples, the
+    /// series' labels, a prefix Vec of 4 and a `prefix_ids` table of 4
+    /// buckets, and no headroom, since the series is one level.
     #[test]
-    fn the_fold_reserves_what_an_absorb_can_hold_before_holding_it() {
+    fn the_fold_charges_exactly_the_buffers_it_holds_after_an_absorb() {
         let budget = unlimited();
         let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
         let samples = [(1, 1.0), (2, 2.0), (3, 3.0)];
         fold.absorb(vec![scalar_run(7, &samples, (1, 1, 1), None)])
             .expect("absorb");
 
-        let label = std::mem::size_of::<ravel_types::Label>() as u64;
-        let series_len = std::mem::size_of::<SeriesId>() as u64
-            + std::mem::size_of::<LabelSet>() as u64
-            + (label + "__name__".len() as u64 + "m".len() as u64)
-            + (label + "id".len() as u64 + "s7".len() as u64);
         // ts (8) + prefix index (4) + in-page index (4) + value (8).
-        let sample_len = 24u64;
-        assert_eq!(std::mem::size_of::<FoldedSample<f64>>() as u64, sample_len);
-        // The prefix table entry (24) and its index entry (32).
-        let prefix_len = 56u64;
-        assert_eq!(PREFIX_LEN, prefix_len);
-
-        let one_object = series_len + 3 * sample_len + prefix_len;
-        assert_eq!(fold.retained, one_object);
-        // The merge level of the first absorb is the three incoming samples.
-        let first_bound = one_object + 3 * sample_len;
-        assert_eq!(fold.charged(), first_bound);
-        assert_eq!(budget.reserved(), first_bound);
+        let sample = 24u64;
+        assert_eq!(std::mem::size_of::<FoldedSample<f64>>() as u64, sample);
+        let series_slot = std::mem::size_of::<(SeriesId, FoldedSeries<f64>)>() as u64;
+        let id_slot = std::mem::size_of::<(ProvenancePrefix, u32)>() as u64;
+        assert_eq!(id_slot, 32);
+        let labels: u64 = labels(7)
+            .iter()
+            .map(|l| {
+                std::mem::size_of::<Label>() as u64
+                    + l.name.capacity() as u64
+                    + l.value.capacity() as u64
+            })
+            .sum();
+        let held = (4 * series_slot + 4 + GROUP_WIDTH)
+            + 4 * std::mem::size_of::<Vec<FoldedSample<f64>>>() as u64
+            + 3 * sample
+            + labels
+            + 4 * 24
+            + (4 * id_slot + 4 + GROUP_WIDTH);
+        assert_eq!(fold.charged(), held);
+        assert_eq!(fold.charged(), live_bytes(&fold).total());
+        assert_eq!(budget.reserved(), held);
 
         fold.absorb(vec![scalar_run(7, &samples, (2, 1, 1), None)])
             .expect("absorb");
-        let merged = series_len + 3 * sample_len + 2 * prefix_len;
-        assert_eq!(fold.retained, merged);
-        // Before the second absorb the fold held `one_object`; it can add
-        // three samples and one prefix, and its merge builds a level of the
-        // three held samples and the three incoming ones.
-        let second_bound = one_object + (3 * sample_len + prefix_len) + 6 * sample_len;
-        assert_eq!(fold.charged(), second_bound);
-        assert_eq!(budget.reserved(), second_bound);
+        assert_eq!(fold.charged(), held, "the merged level replaced both");
+        assert_eq!(budget.reserved(), held);
 
         let series = fold.into_series(usize::MAX).expect("finish");
         assert_eq!(series.len(), 1);
@@ -1312,7 +1808,13 @@ mod tests {
         .expect("absorb");
         let charged = fold.charged();
         assert!(charged > 0);
-        assert_eq!(*seen.lock().expect("lock"), vec![charged; 3]);
+        let seen = seen.lock().expect("lock").clone();
+        let bound = seen[0];
+        assert_eq!(seen, vec![bound; 3]);
+        // Series 2's two runs merge, so the call reserved room for that
+        // merge's level, which the trim after the call released.
+        assert!(bound > charged, "bound {bound} B, charged {charged} B");
+        assert_eq!(budget.reserved(), charged);
     }
 
     /// Reservations taken from the fold stay held after its result is built,
@@ -1348,7 +1850,7 @@ mod tests {
             ),
             "{err:?}"
         );
-        assert_eq!(fold.retained, 0, "nothing was folded");
+        assert_eq!(fold.ledger.held, 0, "nothing was folded");
         assert!(fold.by_series.is_empty());
         assert_eq!(budget.reserved(), 0);
     }
@@ -1652,10 +2154,10 @@ mod tests {
         for entries in 1..=10_000usize {
             let table: HashMap<u64, u64> = HashMap::with_capacity(entries);
             let capacity = table.capacity();
-            let buckets = support::table_buckets(capacity);
+            let buckets = table_buckets(capacity);
             assert!(buckets.is_power_of_two() && buckets >= 4);
             assert_eq!(
-                support::bucket_capacity(buckets),
+                bucket_capacity(buckets),
                 capacity,
                 "with_capacity({entries}) reports capacity {capacity}, which no bucket count holds"
             );
