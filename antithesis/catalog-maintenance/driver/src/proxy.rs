@@ -17,6 +17,10 @@
 //! - `refuse-records`, `refuse-key <key>`: answer every PUT of a compaction
 //!   record, or of that key, `503 SlowDown` without forwarding it, as a store
 //!   failing those writes would.
+//! - `freeze-key <key>`, `thaw-key <key>`: refuse every PUT of that key the
+//!   same way, as a set of its own that `thaw-key` lifts without touching the
+//!   refuse rules. The driver freezes HEAD around each clock move (README.md,
+//!   "The clock jump"), sometimes inside a race that refuses HEAD itself.
 //! - `held`: `held <key> <age_ms>`, or `none`.
 //! - `held-result`: `<key> <status>` of the last forwarded held request, or
 //!   `none`.
@@ -183,6 +187,8 @@ struct State {
     releases: u64,
     refuse_records: bool,
     refuse_keys: BTreeSet<String>,
+    /// The keys `freeze-key` refuses, apart from `refuse_keys`.
+    frozen_keys: BTreeSet<String>,
     /// The key and upstream status of the last forwarded held request.
     held_result: Option<(String, u16)>,
 }
@@ -236,6 +242,12 @@ impl Rules {
             ("refuse-key", key) if !key.is_empty() => {
                 s.refuse_keys.insert(key.to_string());
             }
+            ("freeze-key", key) if !key.is_empty() => {
+                s.frozen_keys.insert(key.to_string());
+            }
+            ("thaw-key", key) if !key.is_empty() => {
+                s.frozen_keys.remove(key);
+            }
             ("release", "") => {
                 s.hold_next_record = false;
                 s.hold_key = None;
@@ -268,7 +280,10 @@ impl Rules {
         }
         let record = keys::parse_record_key(key).is_some();
         let mut s = self.lock();
-        if s.refuse_keys.contains(key) || (record && s.refuse_records) {
+        if s.refuse_keys.contains(key)
+            || s.frozen_keys.contains(key)
+            || (record && s.refuse_records)
+        {
             return Admit::Refuse;
         }
         let hold_this_key = s.hold_key.as_deref() == Some(key);
@@ -891,6 +906,30 @@ mod tests {
         );
         assert!(rules.apply("refuse-key").starts_with("error"));
         assert!(rules.apply("bogus").starts_with("error"));
+    }
+
+    #[test]
+    fn a_freeze_refuses_its_key_until_thawed_and_leaves_refusals_alone() {
+        let rules = Rules::default();
+        let cap = Duration::from_millis(10);
+        let head = "t/0a0b/catalog/logs/HEAD";
+        assert_eq!(rules.apply(&format!("freeze-key {head}")), "ok");
+        assert_eq!(rules.admit("PUT", head, cap), Admit::Refuse);
+        assert_eq!(rules.admit("GET", head, cap), Admit::Forward);
+        assert_eq!(rules.admit("PUT", RECORD, cap), Admit::Forward);
+        assert_eq!(rules.apply(&format!("thaw-key {head}")), "ok");
+        assert_eq!(rules.admit("PUT", head, cap), Admit::Forward);
+        // Thawing does not lift a race's own refusal of the same key.
+        rules.apply(&format!("refuse-key {head}"));
+        rules.apply(&format!("freeze-key {head}"));
+        rules.apply(&format!("thaw-key {head}"));
+        assert_eq!(rules.admit("PUT", head, cap), Admit::Refuse);
+        // pass lifts a freeze with every other rule.
+        rules.apply(&format!("freeze-key {head}"));
+        rules.apply("pass");
+        assert_eq!(rules.admit("PUT", head, cap), Admit::Forward);
+        assert!(rules.apply("freeze-key").starts_with("error"));
+        assert!(rules.apply("thaw-key").starts_with("error"));
     }
 
     #[test]

@@ -328,6 +328,53 @@ driver moves it forward once per timeline (ADR-4326, clock-jump amendment).
 - Monotonic clocks are not faked, so timeouts and leases measured on them
   are untouched. Shell waits in the entrypoints use `/proc/uptime`.
 
+### HEAD holds still before every move
+
+A query process caches HEAD for `head_cache_ttl` (30 s) on its monotonic
+clock, which no jump moves. ADR-1133's delete gate assumes a superseded
+object stays in place, in real time, for at least that long after HEAD stops
+naming it: the gate's pinned-query window (4830 s) counts the TTL in. A jump
+makes that wall-clock window pass in seconds, so without a wait a sweep
+could delete an input a server still served from its cached HEAD (#4571).
+So before every move, the sealing jump, both sweep jumps and every
+forced-race nudge, the driver:
+
+1. has the proxy refuse every server's PUT of HEAD (`freeze-key`), so no
+   fold moves HEAD meanwhile, and renews that rule every second, so a
+   restarted proxy gets it back;
+2. reads HEAD through raw S3 every second and waits until it has held still
+   for `head_cache_ttl` plus the store client's 20 s request timeout (50 s).
+   The second term covers a server's read of HEAD started just before HEAD
+   changed, which can return the old HEAD that late and is then cached for
+   the TTL. A changed or unreadable HEAD, or a freeze the proxy did not
+   confirm, starts the wait again. After four such spans without one the
+   move is given up and nothing is written: the sealing jump and the sweep
+   jumps are then taken by a later rule or the eventually, and a forced race
+   reports not reached;
+3. computes the move from its clock after the wait, so a nudge aimed at a
+   window still lands in it, writes the offset as above, and keeps HEAD
+   frozen until one more reread passed, so every process moved before any
+   fold can move HEAD again (`thaw-key`).
+
+No driver query is in flight across a move, since every move runs under the
+write gate, so the TTL and the late read are the whole wait. Each move's
+`clock: jumped` line records `head_quiet_s` and whether a read after the
+landing found HEAD changed anyway (`head_moved_while_landing`; only a proxy
+restarted inside the landing's 3 s lets a fold through then), which a
+`clock: HEAD changed while the move landed` line also reports. The wait
+adds about 56 s to each move, so up to 18 moves add about 1000 s to an
+eventually.
+
+The TTL comes from the server configuration. No flag in
+`config/docker-compose.yaml` and no `gc-config set` in `ravel/init.sh`
+overrides it, so every server runs the compiled default, which `sys/gc`
+records (format version 1 records none, and `gc-config show` prints the
+compiled one). The compose states that value to the driver as
+`HEAD_CACHE_TTL_SECS`. The driver refuses to start if it is not the TTL the
+sweep jumps were sized with, and, once every node serves, if `ravel-cli
+gc-config show` reports another. A clock test checks that the compose and
+`init.sh` still set no other TTL.
+
 ## The sweep jumps
 
 The sweep deletes a superseded compaction input (GC rule 2,
@@ -354,6 +401,13 @@ the driver, holding its write gate throughout:
 3. folds, then sweeps all four shards, which writes the markers;
 4. moves every clock forward by `CLOCK_SWEEP_WINDOW_JUMP_SECS` (config
    5400 s), the same way.
+
+Each move first holds HEAD still for 50 s ("HEAD holds still before every
+move"). For the window jump that wait is what keeps the gate's premise: the
+fold in step 3 is the one that stopped naming the inputs, and the jump after
+it is what lets their markers' window pass, so the inputs stay in place for
+at least the TTL and a late HEAD read after HEAD stopped naming them. Before
+#4571 the window jump followed the fold by a few seconds.
 
 The next sweep, from `maint1`/`maint2`, the `sweep` rule or the
 `eventually`, deletes the inputs. The driver refuses to start if either
