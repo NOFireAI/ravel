@@ -150,10 +150,13 @@ impl From<QueryError> for ApiError {
             // (the ledger's limit, or the host-memory gate), carrying only
             // byte figures, so it is echoed rather than redacted.
             // `redacted_storage_message` returns `None` for both.
+            // An allocation the allocator refused after the budget admitted it
+            // is the same class from the client's view: the query needed more
+            // memory than the process could give it. The text carries one byte
+            // figure, so it is echoed.
             QueryError::Fetch(FetchError::FetchMemoryExhausted { .. })
-            | QueryError::Catalog(CatalogError::MemoryExhausted(_)) => {
-                ApiError::Unsupported(e.to_string())
-            }
+            | QueryError::Catalog(CatalogError::MemoryExhausted(_))
+            | QueryError::AllocationRefused { .. } => ApiError::Unsupported(e.to_string()),
             QueryError::DeadlineExceeded { .. } => ApiError::Timeout(e.to_string()),
             QueryError::Eval(inner) => from_eval_error(inner, &e),
             // Handled above by `redacted_storage_message`.
@@ -1611,5 +1614,24 @@ mod tests {
             assert_eq!(response.message, format!("catalog decode refused: {text}"));
             assert_redacted(&response.message);
         }
+    }
+
+    /// Issue #4530: an allocation the allocator refused after the budget
+    /// admitted its charge answers the same 422 `execution` as a budget
+    /// refusal, with its own message echoed. FLIP: move
+    /// `QueryError::AllocationRefused` into the `MSG_UNAVAILABLE` arm and the
+    /// status assertion fails with 503 against 422.
+    #[test]
+    fn an_allocation_refusal_answers_422_like_a_budget_refusal() {
+        let response =
+            QueryErrorResponse::from_query_error(QueryError::AllocationRefused { requested: 4096 });
+        assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.error_type, "execution");
+        assert_eq!(
+            response.message,
+            "query memory exhausted: the allocator refused, or the size overflowed, a 4096-byte \
+             allocation"
+        );
+        assert_redacted(&response.message);
     }
 }

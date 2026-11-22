@@ -1,7 +1,8 @@
 //! ADR-4523 R5 (issue #4530): the metrics run fold's absorb plus finish on
 //! the pre-registered fold shapes A, B and C, driven through the engine's
 //! real `RunFold` by `ravel_query::run_fold_support`. Not banded; this is
-//! the baseline a later step compares against.
+//! the baseline a later step compares against. The bench builds the fold as
+//! production does, apart from the absorb observer.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
