@@ -1,7 +1,8 @@
 //! Issue #4530 (ADR-4523 decision 6, R5 step 2): PromQL range queries over
 //! one `MemoryStore`, sharing one `MemoryBudget`, answer the same run
 //! concurrently as run one after another, and the budget returns to zero
-//! after each pass.
+//! after each pass. On a budget too tight for some of them, the rest still
+//! answer the same and the refused ones fail with the budget's typed error.
 //!
 //! The tenant is five L0 flushes of `SERIES` series: four cover a quarter of
 //! the hour each, and the fifth rewrites the second quarter of every even
@@ -15,14 +16,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ravel_catalog::{Catalog, CatalogConfig};
+use ravel_catalog::{Catalog, CatalogConfig, CatalogError};
 use ravel_commit::keys::commit_key_for_record;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_memory::MemoryBudget;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_promql::RangeValue;
-use ravel_query::{EngineConfig, QueryEngine};
+use ravel_query::{EngineConfig, FetchError, QueryEngine, QueryError};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use uuid::Uuid;
@@ -180,7 +181,7 @@ async fn tenant() -> Arc<MemoryStore> {
 /// form, so two equal texts hold the same values.
 type Answer = String;
 
-async fn answer(engine: &QueryEngine, query: &str) -> Answer {
+async fn try_answer(engine: &QueryEngine, query: &str) -> Result<Answer, QueryError> {
     let (value, _annotations, _stats) = engine
         .range_hist_with_budgets(
             TENANT,
@@ -193,15 +194,71 @@ async fn answer(engine: &QueryEngine, query: &str) -> Answer {
             Duration::from_secs(600),
             None,
         )
-        .await
-        .expect("the query answers");
+        .await?;
     let RangeValue::Matrix(matrix) = value else {
         panic!("{query} answers a matrix, got {value:?}");
     };
     assert!(!matrix.is_empty(), "{query} answers no series");
     let mut sorted: Vec<_> = matrix.iter().collect();
     sorted.sort_by(|a, b| a.0.iter().cmp(b.0.iter()));
-    format!("{sorted:?}")
+    Ok(format!("{sorted:?}"))
+}
+
+async fn answer(engine: &QueryEngine, query: &str) -> Answer {
+    try_answer(engine, query).await.expect("the query answers")
+}
+
+/// Whether `err` is the budget's typed refusal of a query's memory.
+fn is_budget_refusal(err: &QueryError) -> bool {
+    matches!(
+        err,
+        QueryError::Fetch(FetchError::FetchMemoryExhausted { .. })
+            | QueryError::Catalog(CatalogError::MemoryExhausted(_))
+    )
+}
+
+fn engine_on(catalog: &Arc<Catalog>, backend: &Arc<dyn ObjectStoreBackend>, budget: &Arc<MemoryBudget>) -> Arc<QueryEngine> {
+    Arc::new(
+        QueryEngine::new(
+            Arc::clone(catalog),
+            Arc::clone(backend),
+            EngineConfig::default(),
+        )
+        .with_memory_budget(Arc::clone(budget)),
+    )
+}
+
+/// The smallest budget limit, to within 64 bytes, on which `query` answers
+/// alone on a fresh engine. Each probe on a smaller limit must fail with the
+/// budget's typed refusal, and every probe returns the budget to 0.
+async fn threshold(
+    catalog: &Arc<Catalog>,
+    backend: &Arc<dyn ObjectStoreBackend>,
+    query: &str,
+) -> u64 {
+    let answers = |limit: u64| async move {
+        let budget = Arc::new(MemoryBudget::new(limit));
+        let result = try_answer(&engine_on(catalog, backend, &budget), query).await;
+        assert_eq!(budget.reserved(), 0, "{query} at {limit} B released");
+        match result {
+            Ok(_) => true,
+            Err(err) => {
+                assert!(is_budget_refusal(&err), "{query} at {limit} B: {err:?}");
+                false
+            }
+        }
+    };
+    let (mut refused, mut answered) = (0u64, 1u64 << 30);
+    assert!(answers(answered).await, "{query} answers on 1 GiB");
+    while answered - refused > 64 {
+        let mid = refused + (answered - refused) / 2;
+        if answers(mid).await {
+            answered = mid;
+        } else {
+            refused = mid;
+        }
+    }
+    answered
 }
 
 #[test]
@@ -247,5 +304,76 @@ fn concurrent_range_queries_sharing_one_budget_answer_as_sequential_ones_and_rel
                 0,
                 "the concurrent pass released the budget"
             );
+        });
+}
+
+/// The query over one job's 80 series, which answers on a budget the
+/// queries over all 400 series do not.
+const SMALL: &str = "m{job=\"job-1\"}";
+
+/// The same queries, run concurrently on a budget of twice what [`SMALL`]
+/// needs alone, which is less than `m` over all 400 series needs alone, so
+/// some queries are refused. Every query either answers exactly as on an
+/// ample budget or fails with the budget's typed refusal, and the budget
+/// returns to 0 after every round. Rounds repeat, at most 100, until a query
+/// has answered beside the refused ones.
+#[test]
+fn concurrent_range_queries_on_a_tight_budget_answer_or_refuse_typed_and_release_it() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            let store = tenant().await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let catalog = Arc::new(
+                Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog"),
+            );
+            let ample = Arc::new(MemoryBudget::new(1 << 30));
+            let reference = engine_on(&catalog, &backend, &ample);
+            let mut sequential = Vec::new();
+            for query in QUERIES {
+                sequential.push(answer(&reference, query).await);
+            }
+
+            let small = threshold(&catalog, &backend, SMALL).await;
+            let all = threshold(&catalog, &backend, "m").await;
+            let limit = 2 * small;
+            println!("tight budget: {SMALL} needs {small} B, m needs {all} B, limit {limit} B");
+            assert!(all > limit, "m needs {all} B, within the {limit} B limit");
+
+            let budget = Arc::new(MemoryBudget::new(limit));
+            let engine = engine_on(&catalog, &backend, &budget);
+            let (mut answered, mut refused) = (0usize, 0usize);
+            for round in 0..100 {
+                let tasks: Vec<_> = (0..COPIES)
+                    .flat_map(|_| QUERIES.iter().enumerate())
+                    .map(|(n, &query)| {
+                        let engine = Arc::clone(&engine);
+                        tokio::spawn(async move { (n, try_answer(&engine, query).await) })
+                    })
+                    .collect();
+                for task in tasks {
+                    let (n, got) = task.await.expect("query task");
+                    match got {
+                        Ok(got) => {
+                            assert_eq!(got, sequential[n], "{} on the tight budget", QUERIES[n]);
+                            answered += 1;
+                        }
+                        Err(err) => {
+                            assert!(is_budget_refusal(&err), "{}: {err:?}", QUERIES[n]);
+                            refused += 1;
+                        }
+                    }
+                }
+                assert_eq!(budget.reserved(), 0, "round {round} released the budget");
+                if answered > 0 {
+                    break;
+                }
+            }
+            println!("tight budget: {answered} answered, {refused} refused");
+            assert!(answered > 0, "no query answered on the tight budget");
+            assert!(refused > 0, "no query was refused on the tight budget");
         });
 }

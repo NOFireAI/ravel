@@ -2757,9 +2757,8 @@ mod tests {
     /// invariant across [`RunFold::into_series`]: the most it holds live at
     /// once while it merges, converts and builds the result, by
     /// [`live_bytes`]' definition plus the result Vec, is at most what the
-    /// fold charged plus the result reservation. Returns the peak and that
-    /// charge.
-    fn finish_peak(calls: Vec<Vec<FetchedSeriesSoa>>) -> (u64, u64) {
+    /// fold charged plus the result reservation. Prints the two figures.
+    fn check_finish_peak(shape: &str, calls: Vec<Vec<FetchedSeriesSoa>>) {
         let budget = unlimited();
         let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
         for call in calls {
@@ -2771,6 +2770,11 @@ mod tests {
         let mut held = Vec::new();
         let series = fold.into_series(usize::MAX, &mut held).expect("finish");
         let (peak, covered) = support::take_finish_peak().expect("finish recorded");
+        println!("R5 finish shape={shape} peak_live={peak} charged={covered}");
+        assert!(
+            peak <= covered,
+            "shape {shape}: peak live {peak} B > charged {covered} B"
+        );
         assert_eq!(covered, charged + result);
         let sizes: u64 = held.iter().map(ravel_memory::Reservation::size).sum();
         assert_eq!(sizes, result, "the result reservation is handed over");
@@ -2778,7 +2782,6 @@ mod tests {
         drop(series);
         drop(held);
         assert_eq!(budget.reserved(), 0);
-        (peak, covered)
     }
 
     /// Issue #4118 across finish: for shapes A, B and C, `into_series`
@@ -2793,12 +2796,7 @@ mod tests {
             ("B", support::shape_b().expect("shape B")),
             ("C", support::shape_c().expect("shape C")),
         ] {
-            let (peak, covered) = finish_peak(calls);
-            println!("R5 finish shape={shape} peak_live={peak} charged={covered}");
-            assert!(
-                peak <= covered,
-                "shape {shape}: peak live {peak} B > charged {covered} B"
-            );
+            check_finish_peak(shape, calls);
         }
         assert_eq!(result_len::<SeriesData>(20_000), 960_000);
     }
