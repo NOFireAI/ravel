@@ -569,8 +569,8 @@ fn worst_expecting(kind: Kind, shape: Shape, expected: &Limit) -> Limit {
 }
 
 /// [`worst_in`], its `n` found by [`largest_admitted`] from `expected_n`. The
-/// optimized depth is measured on its own 2 MiB thread while the statement
-/// runs.
+/// optimized depth is measured by [`optimized_depth`] on a [`WORKER_STACK`]
+/// thread of its own while the statement runs.
 fn worst_near(
     kind: Kind,
     shape: Shape,
@@ -591,7 +591,11 @@ fn worst_near(
         };
         let (n, prepared, longer) = largest_admitted(expected_n, |n| admitted(k, n));
         let source = shape.statement(kind, k, n);
-        let optimizing = std::thread::spawn(move || optimized_depth(source, ranged));
+        let optimizing = std::thread::Builder::new()
+            .name("esql-optimized-depth".to_string())
+            .stack_size(WORKER_STACK)
+            .spawn(move || optimized_depth(source, ranged))
+            .expect("spawns");
 
         let fixture = fixture().await;
         let outcome = run_prepared(&fixture, &prepared)
