@@ -293,23 +293,36 @@ impl Ledger {
         self.held = self.held.saturating_sub(predicted).saturating_add(actual);
     }
 
-    /// Shrinks the reservations to `bytes`, reserving `bytes` before it
-    /// releases the larger reservations it replaces. A budget that refuses
-    /// the new reservation leaves the old ones in place.
+    /// Shrinks the reservations to `bytes`: keeps the leading reservations
+    /// that fit in `bytes`, reserves the rest before it releases the ones it
+    /// replaces, so the fold is never charged less than it holds. A budget
+    /// that refuses the new reservation leaves the old ones in place, and the
+    /// fold over-charged until it drops; a [`Reservation`] cannot shrink.
     fn trim_to(&mut self, bytes: u64) {
         if bytes >= self.charged {
             return;
         }
-        if bytes == 0 {
-            self.reservations.clear();
-            self.charged = 0;
-            return;
+        let mut kept = 0;
+        let mut sum = 0u64;
+        for reservation in &self.reservations {
+            let next = sum.saturating_add(reservation.size());
+            if next > bytes {
+                break;
+            }
+            sum = next;
+            kept += 1;
         }
-        if let Ok(reservation) = self.budget.reserve_best_effort(bytes) {
-            self.reservations.clear();
-            self.charged = reservation.size();
+        let rest = bytes - sum;
+        if rest > 0 {
+            let Ok(reservation) = self.budget.reserve_best_effort(rest) else {
+                return;
+            };
+            self.reservations.truncate(kept);
             self.reservations.push(reservation);
+        } else {
+            self.reservations.truncate(kept);
         }
+        self.charged = bytes;
     }
 }
 
@@ -1123,13 +1136,15 @@ fn merge_into<V: FoldValue>(
 
 /// Test and bench support only (issue #4530, ADR-4523 decision 6, R5): the
 /// scalar fold driven from outside the crate, the pre-registered fold shapes,
-/// the hash-table size formula, and an observer of the fold's charge after
-/// each absorb. Only tests, `tests/run_fold_accounting.rs` and
-/// `benches/run_fold.rs` call into it; the crate itself reaches it only
-/// through [`RunFold::absorb`]'s observer check, which does nothing unless an
-/// observer was installed with [`set_absorb_observer`](support::set_absorb_observer).
+/// the hash-table size formula, an observer of the fold's charge after each
+/// absorb, and an injected allocation failure. Only tests,
+/// `tests/run_fold_accounting.rs` and `benches/run_fold.rs` call into it; the
+/// crate itself reaches it only through [`RunFold::absorb`]'s observer check
+/// and the fold's allocation check, which do nothing unless an observer was
+/// installed with [`set_absorb_observer`](support::set_absorb_observer) or a
+/// failure armed with [`fail_allocation_after`](support::fail_allocation_after).
 /// Built only under `cfg(test)` or the `test-support` feature, so a
-/// production build carries neither the module nor the observer check.
+/// production build carries neither the module nor either check.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod support {
@@ -1271,6 +1286,12 @@ pub mod support {
     /// buffer `into_series` sizes, is one allocation.
     pub fn fail_allocation_after(skip: usize) {
         FAIL_AFTER.with(|f| f.set(Some(skip)));
+        INJECTED_CHARGE.with(|c| c.set(None));
+    }
+
+    /// Disarms a failure [`fail_allocation_after`] armed on this thread.
+    pub fn clear_allocation_failure() {
+        FAIL_AFTER.with(|f| f.set(None));
         INJECTED_CHARGE.with(|c| c.set(None));
     }
 
@@ -2143,6 +2164,347 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #4530: every absorb of shapes A, B and C succeeds, after each
+    /// one the fold's running count of what it holds is exactly
+    /// [`live_bytes`] recomputed from its containers, and it charges exactly
+    /// that plus its finish headroom, which is 0 for A and B, whose series
+    /// are each one level; the budget holds exactly the charge. The result
+    /// equals `merge_soa_runs` over every call's runs at once.
+    #[test]
+    fn every_absorb_succeeds_charging_what_the_fold_holds_plus_headroom() {
+        let shapes = [
+            ("A", support::shape_a().expect("shape A")),
+            ("B", support::shape_b().expect("shape B")),
+            ("C", support::shape_c().expect("shape C")),
+        ];
+        for (shape, calls) in shapes {
+            let want = project_scalar(
+                merge_soa_runs(calls.clone(), usize::MAX, usize::MAX).expect("merge"),
+            );
+            let budget = unlimited();
+            let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+            for (call, runs) in calls.into_iter().enumerate() {
+                fold.absorb(runs).expect("absorb");
+                let live = live_bytes(&fold).total();
+                assert_eq!(fold.ledger.held, live, "shape {shape}, call {call}");
+                assert_eq!(
+                    fold.charged(),
+                    live + fold.finish_headroom,
+                    "shape {shape}, call {call}"
+                );
+                assert_eq!(budget.reserved(), fold.charged(), "shape {shape}");
+            }
+            if shape != "C" {
+                assert_eq!(fold.finish_headroom, 0, "shape {shape}");
+            }
+            let got = project_scalar(fold.into_series(usize::MAX).expect("finish"));
+            assert_eq!(got, want, "shape {shape}");
+            assert_eq!(budget.reserved(), 0, "shape {shape}");
+        }
+    }
+
+    /// Three series that fill a `by_series` table of 4 buckets.
+    fn three_series() -> Vec<FetchedSeriesSoa> {
+        (1..=3)
+            .map(|s| scalar_run(s, &[(1, 1.0), (2, 2.0)], (1, 1, 1), None)
+            )
+            .collect()
+    }
+
+    /// Issue #4530: a budget too small for the `by_series` table's growth
+    /// to its next bucket count refuses the absorb that needs it with
+    /// [`FetchError::FetchMemoryExhausted`], before anything is folded,
+    /// leaves the fold charging exactly what it holds, and returns the
+    /// budget's reservation to its value before the call.
+    #[test]
+    fn a_budget_too_small_for_one_table_growth_refuses_and_keeps_the_charge_exact() {
+        let mut fold = ScalarFold::new(unlimited(), usize::MAX);
+        fold.absorb(three_series()).expect("absorb");
+        let before = fold.charged();
+        assert_eq!(fold.by_series.capacity(), 3, "the table is full");
+
+        let slot = std::mem::size_of::<(SeriesId, FoldedSeries<f64>)>();
+        let table_growth = table_alloc(8, slot) - table_alloc(4, slot);
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(before + table_growth - 1));
+        // Move the fold's charge onto the small budget, as if it had been
+        // folding against it all along.
+        fold.ledger.budget = Arc::clone(&budget);
+        fold.ledger.reservations.clear();
+        fold.ledger.charged = 0;
+        fold.ledger.cover(before).expect("the held bytes fit");
+
+        let err = fold
+            .absorb(vec![scalar_run(4, &[(1, 1.0)], (1, 1, 1), None)])
+            .expect_err("the table growth does not fit");
+        assert!(
+            matches!(
+                err,
+                QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                    cause: ravel_memory::ExhaustionCause::Accounted,
+                    ..
+                })
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fold.by_series.len(), 3, "nothing was folded");
+        assert_eq!(fold.by_series.capacity(), 3, "the table did not grow");
+        assert_eq!(fold.charged(), live_bytes(&fold).total());
+        assert_eq!(fold.charged(), before);
+        assert_eq!(budget.reserved(), before);
+    }
+
+    /// A run of series 1 at `ts` in `start..start + n` with one duplicate of
+    /// the first timestamp, which the fold drops, so its level is copied to
+    /// an exact buffer, an allocation the call's bound does not count.
+    fn duplicated_run(start: i64, n: i64) -> FetchedSeriesSoa {
+        let mut samples: Vec<(i64, f64)> = (start..start + n).map(|t| (t, t as f64)).collect();
+        samples.insert(1, (start, -1.0));
+        scalar_run(1, &samples, (1, 1, 1), None)
+    }
+
+    /// Issue #4530: an absorb whose bound fits and whose exact copy of a
+    /// level does not is refused mid-absorb with
+    /// [`FetchError::FetchMemoryExhausted`]; the fold then charges exactly
+    /// what it holds and the budget's reservation returns to its value
+    /// before the call.
+    #[test]
+    fn a_refusal_mid_absorb_returns_the_budget_to_its_value_before_the_call() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        let first: Vec<(i64, f64)> = (0..60).map(|t| (t, t as f64)).collect();
+        fold.absorb(vec![scalar_run(1, &first, (1, 1, 1), None)])
+            .expect("absorb");
+        // 60 held samples against 21 incoming do not merge, so the call's
+        // bound carries no merge transient that would cover the copy.
+        let runs = vec![duplicated_run(100, 20)];
+        let (bound, _) = fold.call_bound(&runs);
+        let filler = budget
+            .reserve(budget.limit() - budget.reserved() - (bound - fold.charged()))
+            .expect("filler");
+        let before = budget.reserved();
+        let held = fold.ledger.held;
+
+        let err = fold.absorb(runs).expect_err("the copy does not fit");
+        assert!(
+            matches!(
+                err,
+                QueryError::Fetch(FetchError::FetchMemoryExhausted { limit, .. })
+                    if limit == 1 << 20
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fold.by_series[&SeriesId([1; 16])].levels.len(), 1);
+        assert_eq!(fold.ledger.held, held);
+        assert_eq!(fold.ledger.held, live_bytes(&fold).total());
+        assert_eq!(fold.charged(), fold.ledger.held);
+        assert_eq!(budget.reserved(), before);
+        drop(fold);
+        drop(filler);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A refusal mid-absorb on a budget with no room left cannot shrink the
+    /// call's reservation, since the smaller one is reserved before the
+    /// larger is released: the fold stays charged the call's bound, never
+    /// less than it holds, until it drops.
+    #[test]
+    fn a_refusal_on_a_full_budget_keeps_the_fold_over_charged_never_under() {
+        let runs = vec![duplicated_run(0, 20)];
+        let (bound, _) = ScalarFold::new(unlimited(), usize::MAX).call_bound(&runs);
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(bound));
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        let err = fold.absorb(runs).expect_err("the copy does not fit");
+        assert!(
+            matches!(
+                err,
+                QueryError::Fetch(FetchError::FetchMemoryExhausted { limit, .. }) if limit == bound
+            ),
+            "{err:?}"
+        );
+        assert!(fold.by_series.is_empty(), "the series was not added");
+        assert_eq!(fold.ledger.held, live_bytes(&fold).total());
+        assert!(fold.ledger.held > 0, "the tables grew before the copy");
+        assert_eq!(fold.charged(), bound);
+        assert_eq!(budget.reserved(), bound);
+        drop(fold);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Two absorb calls whose second one allocates at every kind of site:
+    /// the `by_series` table's growth, a level per run, a merge with a held
+    /// level and between two runs of one call, a spine's growth, an exact
+    /// copy of a level with a duplicate timestamp, and the prefix Vec's and
+    /// `prefix_ids`' growth. Series 13 ends as two levels, so `into_series`
+    /// merges.
+    fn injection_calls() -> [Vec<FetchedSeriesSoa>; 2] {
+        let eight: Vec<(i64, f64)> = (0..8).map(|t| (t, t as f64)).collect();
+        let sixteen: Vec<(i64, f64)> = (0..16).map(|t| (t, t as f64)).collect();
+        let mut first: Vec<_> = (1..=3)
+            .map(|s| scalar_run(s, &eight, (1, 1, 1), None))
+            .collect();
+        first.push(scalar_run(13, &sixteen, (1, 1, 1), None));
+        let later: Vec<(i64, f64)> = (4..12).map(|t| (t, t as f64 + 0.5)).collect();
+        let mut second = vec![
+            scalar_run(1, &later, (2, 1, 1), None),
+            scalar_run(2, &later, (2, 1, 1), None),
+            scalar_run(2, &eight, (3, 1, 1), None),
+            scalar_run(11, &[(1, 1.0), (1, 2.0), (2, 1.0)], (2, 1, 1), None),
+            scalar_run(13, &[(20, 1.0), (21, 1.0)], (2, 1, 1), None),
+        ];
+        second.extend((4..=10).map(|s| scalar_run(s, &eight, (2, 1, 1), None)));
+        let column = (0..8)
+            .map(|t| SamplePriority {
+                created_unix_ns: 10 + t,
+                writer_epoch: 1,
+                writer_seq: 1,
+                in_page_index: 0,
+            })
+            .collect();
+        second.push(scalar_run(12, &eight, (0, 1, 1), Some(column)));
+        [first, second]
+    }
+
+    /// Issue #4530: an allocation the allocator refuses, injected at each of
+    /// the second absorb's allocation sites in turn, fails the absorb with
+    /// [`FetchError::FetchMemoryExhausted`], and the charge taken for it is
+    /// released exactly once: afterwards the fold's running count equals
+    /// [`live_bytes`] recomputed from its containers, so a charge kept or
+    /// released twice shows as a difference of the failed allocation's
+    /// size; it charges exactly that plus its headroom, and the budget holds
+    /// exactly the charge.
+    #[test]
+    fn an_injected_allocation_failure_releases_its_charge_exactly_once() {
+        let mut fired = 0usize;
+        for skip in 0.. {
+            let budget = unlimited();
+            let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+            let [first, second] = injection_calls();
+            fold.absorb(first).expect("absorb");
+            support::fail_allocation_after(skip);
+            let result = fold.absorb(second);
+            let Some(charge) = support::injected_failure_charge() else {
+                support::clear_allocation_failure();
+                result.expect("no failure was injected");
+                break;
+            };
+            fired += 1;
+            let err = result.expect_err("the injected failure fails the absorb");
+            assert!(
+                matches!(
+                    err,
+                    QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                        cause: ravel_memory::ExhaustionCause::Accounted,
+                        ..
+                    })
+                ),
+                "allocation {skip}: {err:?}"
+            );
+            let live = live_bytes(&fold).total();
+            assert_eq!(fold.ledger.held, live, "allocation {skip}");
+            assert_eq!(
+                fold.charged(),
+                live + fold.finish_headroom,
+                "allocation {skip}"
+            );
+            assert!(charge >= fold.charged(), "allocation {skip}: charged first");
+            assert_eq!(budget.reserved(), fold.charged(), "allocation {skip}");
+            drop(fold);
+            assert_eq!(budget.reserved(), 0, "allocation {skip}");
+        }
+        assert!(fired >= 20, "only {fired} allocation sites failed");
+    }
+
+    /// An allocation refused while `into_series` merges is
+    /// [`FetchError::FetchMemoryExhausted`], and the fold's reservation is
+    /// released with it.
+    #[test]
+    fn an_injected_allocation_failure_in_into_series_is_typed_and_releases() {
+        for skip in [0, 1] {
+            let budget = unlimited();
+            let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+            for call in injection_calls() {
+                fold.absorb(call).expect("absorb");
+            }
+            assert!(fold.finish_headroom > 0, "series 13 is two levels");
+            support::fail_allocation_after(skip);
+            let err = fold.into_series(usize::MAX).expect_err("refused");
+            assert!(support::injected_failure_charge().is_some(), "fired");
+            assert!(
+                matches!(
+                    err,
+                    QueryError::Fetch(FetchError::FetchMemoryExhausted { .. })
+                ),
+                "allocation {skip}: {err:?}"
+            );
+            assert_eq!(budget.reserved(), 0, "allocation {skip}");
+        }
+    }
+
+    /// Issue #4530: a fold dropped between absorbs, as a cancelled query
+    /// drops it, returns the budget to what it held before the fold started,
+    /// leaving another holder's reservation in place.
+    #[test]
+    fn dropping_the_fold_mid_run_returns_the_budget_to_its_start() {
+        let budget = unlimited();
+        let other = budget.reserve(1000).expect("reserve");
+        let start = budget.reserved();
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        for call in support::shape_c().expect("shape C").into_iter().take(10) {
+            fold.absorb(call).expect("absorb");
+        }
+        assert!(budget.reserved() > start);
+        drop(fold);
+        assert_eq!(budget.reserved(), start);
+        drop(other);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Issue #4530: the reservations `take_reservations` hands over hold
+    /// exactly what the fold charged, and the fold charges nothing after, so
+    /// nothing is charged twice while the result is built and held.
+    #[test]
+    fn taken_reservations_hold_exactly_the_charge_and_nothing_twice() {
+        let budget = unlimited();
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        for call in injection_calls() {
+            fold.absorb(call).expect("absorb");
+        }
+        let charged = fold.charged();
+        let taken = fold.take_reservations();
+        let sizes: u64 = taken.iter().map(ravel_memory::Reservation::size).sum();
+        assert_eq!(sizes, charged);
+        assert_eq!(fold.charged(), 0);
+        assert_eq!(budget.reserved(), charged);
+        let series = fold.into_series(usize::MAX).expect("finish");
+        assert_eq!(budget.reserved(), charged, "held with the series");
+        drop(series);
+        drop(taken);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Issue #4530: the charge is released when its last holder drops,
+    /// whichever of the fold, its result and the taken reservations that is.
+    #[test]
+    fn the_charge_is_released_on_its_last_holders_drop() {
+        let budget = unlimited();
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        fold.absorb(three_series()).expect("absorb");
+        let charged = fold.charged();
+        let taken = fold.take_reservations();
+        drop(fold);
+        assert_eq!(budget.reserved(), charged, "the taken reservations hold it");
+        drop(taken);
+        assert_eq!(budget.reserved(), 0);
+
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        fold.absorb(three_series()).expect("absorb");
+        let taken = fold.take_reservations();
+        drop(taken);
+        assert_eq!(budget.reserved(), 0, "the fold charges nothing once taken");
+        drop(fold);
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// `table_bytes`' bucket count inverts hashbrown's capacity exactly: for
