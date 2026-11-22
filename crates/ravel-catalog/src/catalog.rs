@@ -3108,6 +3108,7 @@ impl Catalog {
                 }
             }
         }
+        let mut tombstoned_buckets = HashMap::new();
         for (token, segment_ref) in present_tokens {
             self.include_token_l0(
                 tenant,
@@ -3116,6 +3117,7 @@ impl Catalog {
                 segment_ref,
                 &mut segments,
                 &mut origin_by_key,
+                &mut tombstoned_buckets,
                 erasure_pending,
                 erasure_completed,
                 accounting,
@@ -4665,6 +4667,7 @@ impl Catalog {
         segment_ref: SegmentRef,
         out: &mut HashMap<String, SegmentRef>,
         origin_by_key: &mut HashMap<String, SegmentOrigin>,
+        tombstoned_buckets: &mut TombstonedBuckets,
         erasure_pending: bool,
         erasure_completed: bool,
         accounting: &QueryAccounting,
@@ -4678,6 +4681,7 @@ impl Catalog {
                 signal,
                 token,
                 out,
+                tombstoned_buckets,
                 erasure_pending,
                 erasure_completed,
                 accounting,
@@ -4722,17 +4726,15 @@ impl Catalog {
     ///   is added, since the rewrite's parts would serve that object's rows a
     ///   second time.
     ///
-    /// These checks run, for every signal, only when `out` holds an output
-    /// part of the bucket, an erasure request is pending, or a live rewrite
-    /// names the input. With none of the three the answer is `None` whatever
-    /// the bucket holds, tombstone or not. Whether a live rewrite names the
-    /// input takes the bucket LIST, which runs only when `erasure_completed`
-    /// (the resolve's `del/` LIST found a `.done`): a rewrite outlives its
+    /// The bucket LIST runs, for every signal, only when `out` holds an
+    /// output part of the bucket, an erasure request is pending, or step 6
+    /// listed a `.done` (`erasure_completed`). A rewrite outlives its
     /// request's `.dreq` only after that request completed, so without a
-    /// `.done` and without a pending request no rewrite can name the input
-    /// and the answer is `None` at no store read. Whenever the bucket LIST
-    /// does run, a tombstone it shows answers zero segments, on the
-    /// `.done`-only path too.
+    /// `.done` and without a pending request no rewrite can name the input.
+    /// With none of the three, the bucket's fixed tombstone key is read
+    /// instead ([`Self::token_bucket_tombstoned`]): a tombstone answers zero
+    /// segments, and its absence adds the input. A tombstone the bucket LIST
+    /// shows answers zero segments on every path.
     #[allow(clippy::too_many_arguments)]
     async fn token_input_replacement(
         &self,
@@ -4740,6 +4742,7 @@ impl Catalog {
         signal: Signal,
         token: &CommitToken,
         out: &HashMap<String, SegmentRef>,
+        tombstoned_buckets: &mut TombstonedBuckets,
         erasure_pending: bool,
         erasure_completed: bool,
         accounting: &QueryAccounting,
@@ -4751,7 +4754,10 @@ impl Catalog {
         });
         let checked = bucket_output_in_out || erasure_pending;
         if !checked && !erasure_completed {
-            return Ok(None);
+            let tombstoned = self
+                .token_bucket_tombstoned(tenant, signal, token, tombstoned_buckets, accounting)
+                .await?;
+            return Ok(tombstoned.then(Vec::new));
         }
         let Some(bucket) = self
             .load_token_bucket(tenant, signal, token, accounting)
@@ -4794,6 +4800,44 @@ impl Catalog {
             .map(|part| build_rewrite_l1_segment_ref(record, part, rkey))
             .collect::<Result<Vec<_>, _>>()
             .map(Some)
+    }
+
+    /// Whether the token's `(shard, ingest_hour)` bucket is tombstoned, from
+    /// one GET of its fixed tombstone key, recorded in `tombstoned_buckets`
+    /// so later tokens of the same bucket in this resolve issue none.
+    /// NotFound means no tombstone; any other store error fails the resolve.
+    /// Observing the tombstone invalidates the bucket's cached records
+    /// (ADR-0010 §10), as [`Self::load_token_bucket`] does.
+    async fn token_bucket_tombstoned(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        tombstoned_buckets: &mut TombstonedBuckets,
+        accounting: &QueryAccounting,
+    ) -> Result<bool, CatalogError> {
+        let bucket = (token.shard, token.ingest_hour_bucket);
+        if let Some(&tombstoned) = tombstoned_buckets.get(&bucket) {
+            return Ok(tombstoned);
+        }
+        let key =
+            keys::retention_tombstone_key(tenant, signal, token.shard, token.ingest_hour_bucket)?;
+        let tombstoned = match self.guarded_get(&key, GetRange::Full, accounting).await {
+            Ok(_) => true,
+            Err(StoreError::NotFound) => false,
+            Err(e) => return Err(CatalogError::Store(e)),
+        };
+        if tombstoned {
+            let prefix = keys::commit_shard_hour_prefix(
+                tenant,
+                signal,
+                token.shard,
+                token.ingest_hour_bucket,
+            )?;
+            self.invalidate_bucket_cache(tenant, &prefix);
+        }
+        tombstoned_buckets.insert(bucket, tombstoned);
+        Ok(tombstoned)
     }
 
     /// LIST the token's `(shard, ingest_hour)` bucket and load its compaction
@@ -5301,6 +5345,11 @@ struct ErasureState {
     /// listed no erasure rewrite can be live without its request pending.
     any_completed: bool,
 }
+
+/// Whether each `(shard, ingest_hour)` bucket a resolve's present-token step
+/// has checked is tombstoned, so the step reads each bucket's tombstone at
+/// most once per resolve.
+type TombstonedBuckets = HashMap<(u32, u32), bool>;
 
 /// A token bucket's compaction and rewrite records, as
 /// [`Catalog::load_token_bucket`] loaded them.
