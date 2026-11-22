@@ -1,13 +1,14 @@
 #!/bin/bash
-# Write a copy of config/ that runs one catalog mutant (ADR-4326 decision 3):
-# every image the workload builds names its catalog-maintenance-mutants tag,
-# and RAVEL_ANTITHESIS_MUTANT names the mutant on every ravel-server
-# container (ravel1, ravel2, maint1, maint2). launch.sh launches the copy;
-# local-run.sh runs it under the local override.
+# Write a copy of config/ that runs one mutant (ADR-4326 decision 3): every
+# image the workload builds names its catalog-maintenance-mutants tag, and
+# RAVEL_ANTITHESIS_MUTANT names the mutant on every ravel-server container
+# (ravel1, ravel2, maint1, maint2). launch.sh launches the copy; local-run.sh
+# runs it under the local override.
 #
 # Usage: scripts/mutant-config.sh <mutant> <dest-dir>
-#   mutant    one of the catalog/<stem> names in
-#             formal/tla/catalog/antithesis-mutants.tsv
+#   mutant    one of the <area>/<stem> mutant names in
+#             formal/tla/<area>/antithesis-mutants.tsv, for the areas
+#             mutant-tsv.sh lists: catalog, resharding and maintenance
 #   dest-dir  created; refused when it exists and is not empty
 #
 # Exit 0: the copy is written and selects the mutant. Exit 1: refused, with
@@ -15,7 +16,8 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WL="$(cd "$HERE/.." && pwd)"
-TSV="$(cd "$WL/../.." && pwd)/formal/tla/catalog/antithesis-mutants.tsv"
+# shellcheck source=mutant-tsv.sh
+. "$HERE/mutant-tsv.sh"
 MUTANT="${1:?mutant name}"
 DEST="${2:?destination directory}"
 PLAIN_TAG=catalog-maintenance
@@ -27,11 +29,10 @@ refuse() {
     exit 1
 }
 
-[ -r "$TSV" ] || refuse "cannot read $TSV"
-names=$(awk -F '\t' '$2 ~ /^catalog\// { print $2 }' "$TSV")
-[ -n "$names" ] || refuse "$TSV names no catalog mutant"
+names=$(mutant_names) || refuse "could not read the mutant names"
+[ -n "$names" ] || refuse "the tsv files of $MUTANT_AREAS name no mutant"
 if ! printf '%s\n' "$names" | grep -qxF -- "$MUTANT"; then
-    refuse "'$MUTANT' is not a catalog mutant in $TSV; one of: $(printf '%s\n' "$names" | tr '\n' ' ')"
+    refuse "'$MUTANT' is not a mutant of $MUTANT_AREAS; one of: $(printf '%s\n' "$names" | tr '\n' ' ')"
 fi
 # The name is written into YAML between double quotes below.
 case "$MUTANT" in
