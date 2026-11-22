@@ -3309,24 +3309,38 @@ async fn two_level_records(
 }
 
 /// ADR-3853 phase B through the shipping entry point, `maintain
-/// compact-tenant`: `--level2-workers 2` reaches the merge, level 2 cuts the
+/// compact-tenant`, run once at `--level2-workers 2` and once at 1.
+///
+/// At 2 workers: `--level2-workers 2` reaches the merge, level 2 cuts the
 /// fixture into 4 ranges at `--range-records 30000`, and the bucket's line
 /// names the workers and ranges the merge ran with. The one compaction record
 /// names every input, every part it lists is on the store, the part indexes
 /// come from the ranges' proportional windows (not `0, 1, 2, ...`), and the
 /// scratch directory holds no unit subdirectory afterwards.
 ///
+/// The range cut does not depend on the worker count: the fixture at
+/// `--level2-workers 1` publishes the same part keys, so the same bytes, as at
+/// 2.
+///
 /// Distinguishing: with `build_compactor_config` dropping
 /// `scratch.level2_workers`, the derived count (1 at a core share of 1) is on
-/// the line and the `ends_with` assertion fails.
+/// the 2-worker line and its `ends_with` assertion fails. With the two runs on
+/// different `--range-records` the part key sets differ and the final
+/// `assert_eq!` fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compact_tenant_runs_level_2_on_range_workers() {
+async fn compact_tenant_runs_level_2_on_range_workers_with_the_same_parts_at_any_count() {
     let (mem, line, writers, scratch) = compact_tenant_on_range_workers(2).await;
     assert!(line.contains(" outcome=Compacted "), "{line}");
     assert!(
         line.ends_with(&format!(
             " publish=Published level1_groups=5 level1_workers=1 level2_workers=2 \
              level2_ranges={TWO_LEVEL_RANGES}"
+        )),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(&format!(
+            " level2_workers=2 level2_ranges={TWO_LEVEL_RANGES}"
         )),
         "{line}"
     );
@@ -3355,34 +3369,17 @@ async fn compact_tenant_runs_level_2_on_range_workers() {
         scratch_entries(scratch.path()),
         Vec::<std::path::PathBuf>::new()
     );
-}
 
-/// The range cut does not depend on the worker count: the fixture at
-/// `--level2-workers 1` publishes the same part keys, so the same bytes, as at
-/// 2.
-///
-/// Distinguishing: with the two runs on different `--range-records` the part
-/// key sets differ and the `assert_eq!` fails.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compact_tenant_range_workers_publish_the_same_parts_at_any_worker_count() {
     let (one, line_one, _, _scratch_one) = compact_tenant_on_range_workers(1).await;
-    let (two, line_two, _, _scratch_two) = compact_tenant_on_range_workers(2).await;
     assert!(
         line_one.ends_with(&format!(
             " level2_workers=1 level2_ranges={TWO_LEVEL_RANGES}"
         )),
         "{line_one}"
     );
-    assert!(
-        line_two.ends_with(&format!(
-            " level2_workers=2 level2_ranges={TWO_LEVEL_RANGES}"
-        )),
-        "{line_two}"
-    );
     let keys_one = two_level_records(one.as_ref()).await;
-    let keys_two = two_level_records(two.as_ref()).await;
     assert_eq!(keys_one.len(), 1);
-    assert_eq!(keys_one[0].1, keys_two[0].1);
+    assert_eq!(keys_one[0].1, *part_keys);
 }
 
 /// The line reports the level-2 workers the merge ran with, not the flag: a
