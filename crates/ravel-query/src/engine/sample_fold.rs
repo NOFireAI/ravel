@@ -398,8 +398,8 @@ impl<V: FoldValue> RunFold<V> {
     /// folded. Two charges lie outside the bound and can be refused after
     /// some of `runs` were folded, which then stay folded: the exact-size
     /// copy of a run's level that a duplicate timestamp shortened, and the
-    /// finish headroom raised at the call's end for a series the bound did
-    /// not predict to merge that ends the call as more than one level.
+    /// finish headroom, charged at the call's end, of a series the bound did
+    /// not predict to merge that the call left as more than one level.
     ///
     /// The reservation is then shrunk, whether the call succeeded or not, to
     /// what the fold holds plus the headroom [`RunFold::finish`]'s merges
