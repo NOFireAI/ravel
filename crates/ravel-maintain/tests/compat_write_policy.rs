@@ -58,6 +58,11 @@ const HOUR_NS: i64 = 3_600_000_000_000;
 /// How long a test waits for a held call before failing instead of hanging.
 const HOLD_WAIT: Duration = Duration::from_secs(30);
 
+/// Serializes the tests that seed an unknown section kind, so the before/after
+/// delta of the process-wide `buckets_held_unknown_section_total` covers only
+/// the hold of the test that reads it.
+static UNKNOWN_SECTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug)]
 struct ManualClock(AtomicI64);
 
@@ -702,6 +707,7 @@ async fn seed_second_input_as(
 /// fails here.
 #[tokio::test]
 async fn an_unknown_section_kind_holds_the_bucket_in_compaction() {
+    let _guard = UNKNOWN_SECTION_LOCK.lock().await;
     let store = MemoryStore::new();
     seed_input(
         &store,
@@ -746,6 +752,7 @@ async fn an_unknown_section_kind_holds_the_bucket_in_compaction() {
 /// that knows the kind.
 #[tokio::test]
 async fn the_scan_reports_count_an_unknown_section_hold_apart_from_out_of_window() {
+    let _guard = UNKNOWN_SECTION_LOCK.lock().await;
     let store = MemoryStore::new();
     seed_input(
         &store,
@@ -810,6 +817,7 @@ async fn the_scan_reports_count_an_unknown_section_hold_apart_from_out_of_window
 /// names the trailer's version, the one the object was written at.
 #[tokio::test]
 async fn an_unknown_section_kind_holds_the_bucket_in_migrate() {
+    let _guard = UNKNOWN_SECTION_LOCK.lock().await;
     let store = MemoryStore::new();
     provision(&store).await;
     let data_key = seed_input_with_unknown_section(&store, u32::from(VERSION_V7) - 1).await;
