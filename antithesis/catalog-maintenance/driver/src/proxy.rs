@@ -24,21 +24,154 @@
 //!
 //! A restarted proxy starts with no rules, so a proxy killed mid-race
 //! leaves the servers on the plain path.
+//!
+//! Each relayed connection runs on two threads, and a network fault can
+//! leave a peer that never sends, reads or closes. So the proxy relays at
+//! most [`MAX_CONNECTIONS`] at once and answers one more `503 SlowDown`
+//! unsent, as it answers a refused PUT, and every socket it relays or
+//! serves times out a read or write blocked for [`IO_TIMEOUT`] and drops
+//! the connection. A connection whose thread cannot be spawned is refused
+//! the same way. The control port has its own cap,
+//! [`MAX_CONTROL_CONNECTIONS`].
 
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::keys;
 
+/// The servers' store client request timeout (`DEFAULT_REQUEST_TIMEOUT` in
+/// crates/ravel-object-store/src/s3.rs): a server gives up on a request this
+/// long after sending it.
+const STORE_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// The servers' store client `pool_idle_timeout` (`S3HttpConfig::default`
+/// in the same file): a server drops a kept-alive connection idle this long
+/// rather than reuse it.
+const STORE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The longest a held request waits for `release`: below the 20-second
 /// request timeout of the servers' store client, so a hold the driver never
 /// releases still reaches rustfs while the server waits for the answer.
 pub const HOLD_CAP: Duration = Duration::from_secs(18);
+/// How long one read or write on a relayed or control socket may block
+/// before the proxy drops the connection. Above the servers' request
+/// timeout, which bounds every wait inside a request (a held one included),
+/// and above their pool idle timeout, which bounds every wait between
+/// requests, so the proxy only drops a connection its server no longer uses.
+pub const IO_TIMEOUT: Duration = Duration::from_secs(60);
+const _: () = assert!(
+    HOLD_CAP.as_secs() < STORE_REQUEST_TIMEOUT.as_secs()
+        && STORE_REQUEST_TIMEOUT.as_secs() < IO_TIMEOUT.as_secs()
+        && STORE_POOL_IDLE_TIMEOUT.as_secs() < IO_TIMEOUT.as_secs()
+);
+/// The most client connections the proxy relays at once, two threads each:
+/// four times the four servers' fault-free peak in the local loop, about
+/// 130 (README.md, "The forced races"), so retries under faults have room.
+/// Past it a connection is answered `503 SlowDown`, which the servers' store
+/// client retries like any 5xx.
+pub const MAX_CONNECTIONS: usize = 512;
+/// The most control connections served at once. The driver opens one per
+/// command and runs one command at a time per thread.
+pub const MAX_CONTROL_CONNECTIONS: usize = 8;
+/// How long the accept loop may block writing a refusal.
+const REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// The largest request head the proxy reads.
 const MAX_HEAD: usize = 64 * 1024;
+
+/// Counts the connections one listener serves at once, up to a cap.
+pub struct Slots {
+    cap: usize,
+    live: AtomicUsize,
+}
+
+/// One connection's place under its listener's cap, given back on drop.
+pub struct Slot(Arc<Slots>);
+
+impl Slots {
+    pub fn new(cap: usize) -> Arc<Slots> {
+        Arc::new(Slots {
+            cap,
+            live: AtomicUsize::new(0),
+        })
+    }
+
+    /// The connections being served now.
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    /// A slot, or `None` when `cap` connections are being served.
+    pub fn take(self: &Arc<Self>) -> Option<Slot> {
+        let mut n = self.live.load(Ordering::SeqCst);
+        loop {
+            if n >= self.cap {
+                return None;
+            }
+            match self
+                .live
+                .compare_exchange(n, n + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Some(Slot(Arc::clone(self))),
+                Err(now) => n = now,
+            }
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Bound every blocking read and write on `stream` (and on each of its
+/// clones, which share the socket) to `timeout`.
+fn bound(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
+}
+
+/// Connect to `addr` within `timeout`, with every read and write on the
+/// connection bounded by it too.
+fn connect(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
+    let mut last = io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("{addr} resolves to nothing"),
+    );
+    for sock in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&sock, timeout) {
+            Ok(stream) => {
+                bound(&stream, timeout)?;
+                return Ok(stream);
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Answer `stream` with `reply` unread and close it, without letting a peer
+/// that does not read block the caller for long.
+fn turn_away(stream: TcpStream, reply: &[u8]) {
+    let _ = stream.set_write_timeout(Some(REFUSAL_WRITE_TIMEOUT));
+    let mut w = &stream;
+    let _ = w.write_all(reply).and_then(|()| w.flush());
+    let _ = stream.shutdown(Shutdown::Write);
+}
+
+/// Run `work` on a new thread. `Err` when the thread cannot be spawned, as
+/// when the process is at its thread limit; `work` is dropped then.
+fn spawn(
+    name: &str,
+    work: impl FnOnce() + Send + 'static,
+) -> io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(work)
+}
 
 #[derive(Default)]
 struct State {
@@ -405,20 +538,34 @@ pub fn refusal() -> Vec<u8> {
     .into_bytes()
 }
 
-/// Relay one client connection to `upstream`.
-pub fn relay(client: TcpStream, upstream: &str, bucket: &str, rules: &Rules) -> io::Result<()> {
-    let up = TcpStream::connect(upstream)?;
+/// Relay one client connection to `upstream`, every read and write on
+/// either side bounded by `io_timeout`.
+pub fn relay(
+    client: TcpStream,
+    upstream: &str,
+    bucket: &str,
+    rules: &Rules,
+    io_timeout: Duration,
+) -> io::Result<()> {
+    bound(&client, io_timeout)?;
+    let up = connect(upstream, io_timeout)?;
     let _ = up.set_nodelay(true);
     let _ = client.set_nodelay(true);
     let mut up_read = up.try_clone()?;
     let mut client_write = client.try_clone()?;
-    let answers = std::thread::spawn(move || {
+    let answers = match spawn("s3-proxy-answers", move || {
         let _ = io::copy(&mut up_read, &mut client_write);
-        // The upstream closed: so does the client, which ends the request
-        // loop below.
+        // The upstream closed or stalled: so does the client, which ends the
+        // request loop below.
         let _ = client_write.shutdown(Shutdown::Both);
-    });
-    let result = requests(&client, &up, upstream, bucket, rules);
+    }) {
+        Ok(answers) => answers,
+        Err(e) => {
+            turn_away(client, &refusal());
+            return Err(e);
+        }
+    };
+    let result = requests(&client, &up, upstream, bucket, rules, io_timeout);
     let _ = up.shutdown(Shutdown::Both);
     let _ = client.shutdown(Shutdown::Both);
     let _ = answers.join();
@@ -431,6 +578,7 @@ fn requests(
     upstream: &str,
     bucket: &str,
     rules: &Rules,
+    io_timeout: Duration,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(client.try_clone()?);
     let mut up_write = up.try_clone()?;
@@ -463,7 +611,15 @@ fn requests(
                 // in-flight one, so the raw-copy `answers` thread has no bytes
                 // to relay from `up` while this runs, and writing the response
                 // to the client here does not race it.
-                forward_and_capture(&key, &head, &mut reader, client, upstream, rules)?;
+                forward_and_capture(
+                    &key,
+                    &head,
+                    &mut reader,
+                    client,
+                    upstream,
+                    rules,
+                    io_timeout,
+                )?;
                 return Ok(());
             }
         }
@@ -483,8 +639,9 @@ fn forward_and_capture(
     client: &TcpStream,
     upstream: &str,
     rules: &Rules,
+    io_timeout: Duration,
 ) -> io::Result<()> {
-    let up = TcpStream::connect(upstream)?;
+    let up = connect(upstream, io_timeout)?;
     let _ = up.set_nodelay(true);
     let mut up_write = up.try_clone()?;
     up_write.write_all(&head.raw)?;
@@ -501,30 +658,78 @@ fn forward_and_capture(
     Ok(())
 }
 
-/// Accept connections on `listener` forever, one thread each.
-pub fn serve(listener: TcpListener, upstream: String, bucket: String, rules: Arc<Rules>) {
+/// Accept connections on `listener` forever, one thread each, at most
+/// `slots`' cap at once; each socket's reads and writes are bounded by
+/// `io_timeout`.
+pub fn serve(
+    listener: TcpListener,
+    upstream: String,
+    bucket: String,
+    rules: Arc<Rules>,
+    slots: Arc<Slots>,
+    io_timeout: Duration,
+) {
     for conn in listener.incoming() {
         let Ok(client) = conn else {
             continue;
         };
+        let Some(slot) = slots.take() else {
+            eprintln!(
+                "s3-proxy: refused a connection: {} relayed, the cap",
+                slots.live()
+            );
+            turn_away(client, &refusal());
+            continue;
+        };
+        // Kept to answer the client if its thread cannot be spawned.
+        let Ok(refuse_to) = client.try_clone() else {
+            continue;
+        };
         let (upstream, bucket, rules) = (upstream.clone(), bucket.clone(), Arc::clone(&rules));
-        std::thread::spawn(move || {
-            if let Err(e) = relay(client, &upstream, &bucket, &rules) {
+        let spawned = spawn("s3-proxy-relay", move || {
+            let _slot = slot;
+            if let Err(e) = relay(client, &upstream, &bucket, &rules, io_timeout) {
                 eprintln!("s3-proxy: connection ended: {e}");
             }
         });
+        if let Err(e) = spawned {
+            eprintln!("s3-proxy: refused a connection: no thread for it: {e}");
+            turn_away(refuse_to, &refusal());
+        }
     }
 }
 
 /// Serve the control port forever: one command per line, one reply line
-/// each.
-pub fn serve_control(listener: TcpListener, rules: Arc<Rules>) {
+/// each, at most `slots`' cap of connections at once, each socket's reads
+/// and writes bounded by `io_timeout`.
+pub fn serve_control(
+    listener: TcpListener,
+    rules: Arc<Rules>,
+    slots: Arc<Slots>,
+    io_timeout: Duration,
+) {
+    const BUSY: &[u8] = b"error: busy\n";
     for conn in listener.incoming() {
         let Ok(stream) = conn else {
             continue;
         };
+        let Some(slot) = slots.take() else {
+            eprintln!(
+                "s3-proxy: refused a control connection: {} open",
+                slots.live()
+            );
+            turn_away(stream, BUSY);
+            continue;
+        };
+        let Ok(refuse_to) = stream.try_clone() else {
+            continue;
+        };
         let rules = Arc::clone(&rules);
-        std::thread::spawn(move || {
+        let spawned = spawn("s3-proxy-control", move || {
+            let _slot = slot;
+            if bound(&stream, io_timeout).is_err() {
+                return;
+            }
             let Ok(mut w) = stream.try_clone() else {
                 return;
             };
@@ -539,6 +744,10 @@ pub fn serve_control(listener: TcpListener, rules: Arc<Rules>) {
                 }
             }
         });
+        if let Err(e) = spawned {
+            eprintln!("s3-proxy: refused a control connection: no thread for it: {e}");
+            turn_away(refuse_to, BUSY);
+        }
     }
 }
 
@@ -869,10 +1078,187 @@ mod tests {
     }
 
     fn proxy(up: String, rules: Arc<Rules>) -> String {
+        proxy_with(up, rules, Slots::new(MAX_CONNECTIONS), IO_TIMEOUT)
+    }
+
+    fn proxy_with(
+        up: String,
+        rules: Arc<Rules>,
+        slots: Arc<Slots>,
+        io_timeout: Duration,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("an address").to_string();
-        std::thread::spawn(move || serve(listener, up, "ravel".to_string(), rules));
+        std::thread::spawn(move || {
+            serve(listener, up, "ravel".to_string(), rules, slots, io_timeout)
+        });
         addr
+    }
+
+    /// Poll until `slots` serves `want` connections, for up to 5 s; whether
+    /// it did.
+    fn live_reaches(slots: &Slots, want: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slots.live() != want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        slots.live() == want
+    }
+
+    /// A fake rustfs that accepts connections and holds them open, reading
+    /// what arrives when `drain` and nothing otherwise, and never answers:
+    /// a peer a network fault stalled.
+    fn silent_upstream(drain: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("an address").to_string();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                if drain {
+                    std::thread::spawn(move || {
+                        let _ = io::copy(&mut conn, &mut io::sink());
+                        std::thread::sleep(Duration::from_secs(600));
+                    });
+                } else {
+                    held.push(conn);
+                }
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn connections_past_the_cap_are_refused_until_one_ends() {
+        let (up, _) = upstream();
+        let slots = Slots::new(2);
+        let addr = proxy_with(
+            up,
+            Arc::new(Rules::default()),
+            Arc::clone(&slots),
+            Duration::from_secs(30),
+        );
+        let first = TcpStream::connect(&addr).expect("connects");
+        let _second = TcpStream::connect(&addr).expect("connects");
+        assert!(live_reaches(&slots, 2), "live {}", slots.live());
+        // The third is answered 503 SlowDown without reading a byte from it.
+        let mut third = TcpStream::connect(&addr).expect("connects");
+        third
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("sets a read timeout");
+        let mut refused = Vec::new();
+        third
+            .read_to_end(&mut refused)
+            .expect("the refusal and the close");
+        assert_eq!(refused, refusal());
+        assert_eq!(slots.live(), 2);
+        // One ends: the next connection is relayed.
+        drop(first);
+        assert!(live_reaches(&slots, 1), "live {}", slots.live());
+        let mut next = TcpStream::connect(&addr).expect("connects");
+        next.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("sets a read timeout");
+        next.write_all(b"GET /ravel/a HTTP/1.1\r\nHost: s3proxy:9000\r\n\r\n")
+            .expect("writes");
+        assert!(answer(&mut BufReader::new(next)).starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
+    fn an_upstream_that_never_answers_is_dropped_at_the_timeout() {
+        let up = silent_upstream(true);
+        let slots = Slots::new(1);
+        let addr = proxy_with(
+            up,
+            Arc::new(Rules::default()),
+            Arc::clone(&slots),
+            Duration::from_millis(200),
+        );
+        let mut conn = TcpStream::connect(&addr).expect("connects");
+        conn.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("sets a read timeout");
+        conn.write_all(b"GET /ravel/a HTTP/1.1\r\nHost: s3proxy:9000\r\n\r\n")
+            .expect("writes");
+        // The proxy closes the connection, unanswered, instead of waiting on
+        // the upstream for good.
+        let mut answer = Vec::new();
+        conn.read_to_end(&mut answer)
+            .expect("the close, before the client's own 5 s timeout");
+        assert!(answer.is_empty(), "{answer:?}");
+        assert!(live_reaches(&slots, 0), "live {}", slots.live());
+    }
+
+    #[test]
+    fn an_upstream_that_stops_reading_frees_the_connection_at_the_timeout() {
+        let up = silent_upstream(false);
+        let slots = Slots::new(1);
+        let addr = proxy_with(
+            up,
+            Arc::new(Rules::default()),
+            Arc::clone(&slots),
+            Duration::from_millis(200),
+        );
+        let mut conn = TcpStream::connect(&addr).expect("connects");
+        conn.set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("sets a write timeout");
+        // A body far larger than every socket buffer between the client and
+        // the upstream, so the proxy's write to the upstream blocks.
+        const BODY: usize = 64 << 20;
+        std::thread::spawn(move || {
+            let head = format!("PUT /ravel/big HTTP/1.1\r\nContent-Length: {BODY}\r\n\r\n");
+            let _ = conn.write_all(head.as_bytes());
+            let chunk = vec![0u8; 1 << 20];
+            for _ in 0..BODY / chunk.len() {
+                if conn.write_all(&chunk).is_err() {
+                    return;
+                }
+            }
+        });
+        assert!(live_reaches(&slots, 1), "live {}", slots.live());
+        assert!(live_reaches(&slots, 0), "live {}", slots.live());
+    }
+
+    #[test]
+    fn control_connections_past_their_cap_are_refused() {
+        let rules = Arc::new(Rules::default());
+        let slots = Slots::new(1);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("an address").to_string();
+        let (r, s) = (Arc::clone(&rules), Arc::clone(&slots));
+        std::thread::spawn(move || serve_control(listener, r, s, Duration::from_secs(30)));
+        let idle = TcpStream::connect(&addr).expect("connects");
+        assert!(live_reaches(&slots, 1), "live {}", slots.live());
+        // Refused with a reply line, before anything is read from it.
+        let refused = TcpStream::connect(&addr).expect("connects");
+        refused
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("sets a read timeout");
+        let mut reply = String::new();
+        BufReader::new(refused)
+            .read_line(&mut reply)
+            .expect("the refusal line");
+        assert_eq!(reply, "error: busy\n");
+        drop(idle);
+        assert!(live_reaches(&slots, 0), "live {}", slots.live());
+        assert_eq!(control(&addr, "held"), Ok("none".to_string()));
+    }
+
+    #[test]
+    fn an_idle_control_connection_is_dropped_at_the_timeout() {
+        let slots = Slots::new(1);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("an address").to_string();
+        let s = Arc::clone(&slots);
+        std::thread::spawn(move || {
+            serve_control(
+                listener,
+                Arc::new(Rules::default()),
+                s,
+                Duration::from_millis(200),
+            )
+        });
+        let _idle = TcpStream::connect(&addr).expect("connects");
+        assert!(live_reaches(&slots, 1), "live {}", slots.live());
+        assert!(live_reaches(&slots, 0), "live {}", slots.live());
     }
 
     fn answer(r: &mut impl BufRead) -> String {
@@ -1012,7 +1398,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("an address").to_string();
         let r = Arc::clone(&rules);
-        std::thread::spawn(move || serve_control(listener, r));
+        std::thread::spawn(move || {
+            serve_control(listener, r, Slots::new(MAX_CONTROL_CONNECTIONS), IO_TIMEOUT)
+        });
         assert_eq!(control(&addr, "refuse-records"), Ok("ok".to_string()));
         assert_eq!(rules.admit("PUT", RECORD, HOLD_CAP), Admit::Refuse);
         assert_eq!(control(&addr, "held"), Ok("none".to_string()));

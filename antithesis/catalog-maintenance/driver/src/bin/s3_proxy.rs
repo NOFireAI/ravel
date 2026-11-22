@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use antithesis_instrumentation as _;
 
-use ravel_antithesis_catalog_driver::proxy::{self, Rules};
+use ravel_antithesis_catalog_driver::proxy::{self, Rules, Slots};
 
 fn var(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -35,7 +35,26 @@ fn main() {
     let data = bind(&listen);
     let ctl = bind(&control);
     let r = Arc::clone(&rules);
-    std::thread::spawn(move || proxy::serve_control(ctl, r));
-    println!("s3-proxy: {listen} to {upstream} (bucket {bucket}), control on {control}");
-    proxy::serve(data, upstream, bucket, rules);
+    let control_slots = Slots::new(proxy::MAX_CONTROL_CONNECTIONS);
+    if let Err(e) = std::thread::Builder::new()
+        .name("s3-proxy-control-accept".to_string())
+        .spawn(move || proxy::serve_control(ctl, r, control_slots, proxy::IO_TIMEOUT))
+    {
+        eprintln!("s3-proxy: starting the control port: {e}");
+        std::process::exit(1);
+    }
+    println!(
+        "s3-proxy: {listen} to {upstream} (bucket {bucket}), control on {control}, at most {} \
+         connections, {} s socket timeout",
+        proxy::MAX_CONNECTIONS,
+        proxy::IO_TIMEOUT.as_secs()
+    );
+    proxy::serve(
+        data,
+        upstream,
+        bucket,
+        rules,
+        Slots::new(proxy::MAX_CONNECTIONS),
+        proxy::IO_TIMEOUT,
+    );
 }
