@@ -112,7 +112,17 @@ prost-build = { workspace = true }
 tonic-prost-build = { workspace = true }
 protox = { workspace = true }
 
+[features]
+# Test and bench support only, off in every production build: the sample
+# fold's R5 measurement module `run_fold_support` (issue #4530) and its
+# process-global absorb observer. Only dev-dependencies may enable it.
+test-support = []
+
 [dev-dependencies]
+# This crate's own integration tests and benches (tests/run_fold_accounting.rs,
+# benches/run_fold.rs) use `run_fold_support`; a self dev-dependency is how an
+# integration test binary enables a feature of the crate it tests.
+ravel-query = { path = ".", features = ["test-support"] }
 # Already a normal dependency (ADR-0046 read cache); also needed in the
 # integration tests to build a RAM `Cache` and prove selective-erasure
 # exclusion runs on cache-served bytes (tests/log_fetcher.rs).
@@ -165,6 +175,10 @@ harness = false
 
 [[bench]]
 name = "merge_kway_vs_materialized"
+harness = false
+
+[[bench]]
+name = "run_fold"
 harness = false
 
 [lints]

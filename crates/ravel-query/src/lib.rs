@@ -41,6 +41,11 @@ pub use config::{
     resolve_logs_fetch,
 };
 pub use dedup_order::{DedupKey, serves_over};
+/// Test and bench support only: the sample fold's R5 measurement hooks
+/// (issue #4530), built only with the `test-support` feature.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use engine::run_fold_support;
 pub use engine::{
     Coverage, LiveQueryAccounting, QueryEngine, QueryStats, snapshot_erasure_predicates,
 };
