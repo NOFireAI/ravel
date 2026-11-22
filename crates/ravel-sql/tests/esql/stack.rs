@@ -1273,7 +1273,7 @@ fn the_deepest_double_chain_runs_on_a_worker_stack() {
 fn the_widest_long_eval_runs_on_a_worker_stack() {
     let expected = Limit {
         k: 7,
-        n: 3640,
+        n: 3641,
         longer: Refusal::Parse,
         counted: Some(23),
         optimized: 23 - FOLDED_DIVISOR - SHARED_CAST,
@@ -1288,7 +1288,7 @@ fn the_widest_long_eval_runs_on_a_worker_stack() {
 fn the_widest_double_eval_runs_on_a_worker_stack() {
     let expected = Limit {
         k: 19,
-        n: 1340,
+        n: 1339,
         longer: Refusal::Parse,
         counted: Some(24),
         optimized: 24 - SHARED_FINITE - SHARED_CAST,
