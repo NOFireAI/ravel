@@ -430,7 +430,9 @@ current HEAD names` would go unevaluated in a timeline whose sweep jumps
 are its last moves. For the same reason the driver, still holding its write
 gate after the window jump, waits up to 150 s (the wait the unfolded sweep
 gives the servers' sweeps) for a LIST to show a superseded input gone before
-any sweep of its own can run, and prints how long that took.
+any sweep of its own can run, and prints how long that took. Only an input
+the LIST taken just before the window jump still held counts, so one
+deleted earlier in the timeline cannot end the wait.
 
 The next sweep, from `maint1`/`maint2`, the `sweep` rule or the
 `eventually`, deletes the inputs. The driver refuses to start if either

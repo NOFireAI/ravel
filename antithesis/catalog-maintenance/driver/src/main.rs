@@ -831,6 +831,12 @@ impl Shared {
         let Some((horizon, marked)) = *lock(&self.sweep_horizon) else {
             return;
         };
+        // What the store holds just before the window jump, so the wait after
+        // it counts only inputs deleted since, not ones deleted earlier.
+        let before: Option<BTreeSet<String>> = self
+            .tenant_prefix()
+            .and_then(|prefix| self.store.list(&prefix).ok())
+            .map(|keys| keys.into_iter().collect());
         let window = self.shift_clock(reason, &|_| self.clock.window_jump_s);
         *lock(&self.sweep_jumps) = state.after(
             clock::SweepStep::Window,
@@ -856,7 +862,7 @@ impl Shared {
             })
         );
         self.settle("pinned-window jump");
-        self.wait_for_server_sweep();
+        self.wait_for_server_sweep(before.as_ref());
     }
 
     /// After the window jump: the servers' first sweep is a full pass that
@@ -866,32 +872,46 @@ impl Shared {
     /// no SDK assertions and the SUT's `catalog: a sweep never deletes an
     /// object the current HEAD names` is evaluated only on a server's. The
     /// caller holds the gate's write guard, so no driver sweep runs
-    /// meanwhile. The first input a LIST shows gone ends the wait; returns
-    /// whether one did.
-    fn wait_for_server_sweep(&self) -> bool {
+    /// meanwhile. `before` is the LIST taken just before the window jump
+    /// (and its quiet wait): the first input it held that a later LIST does
+    /// not ends the wait (`forced::deleted_since`), so an input deleted
+    /// earlier in the timeline never does. Without `before` the wait runs to
+    /// its end. Returns whether an input was deleted since.
+    fn wait_for_server_sweep(&self, before: Option<&BTreeSet<String>>) -> bool {
         let Some(prefix) = self.tenant_prefix() else {
             return false;
         };
+        let inputs: Vec<InputKeys> = lock(&self.inputs_of).values().flatten().cloned().collect();
         let started = Instant::now();
         while started.elapsed() < UNFOLDED_PASS_WAIT {
             std::thread::sleep(Duration::from_secs(10));
+            let Some(before) = before else {
+                continue;
+            };
             let Ok(keys) = self.store.list(&prefix) else {
                 continue;
             };
             let listed: BTreeSet<String> = keys.into_iter().collect();
-            let inputs: Vec<InputKeys> =
-                lock(&self.inputs_of).values().flatten().cloned().collect();
-            if !lock(&self.sweeps).unconfirmed(&inputs, &listed).is_empty() {
+            let deleted = forced::deleted_since(&inputs, before, &listed);
+            if !deleted.is_empty() {
                 println!(
-                    "sweep jump: a superseded input was gone {} s after the window jump",
+                    "sweep jump: {} superseded input keys listed before the window jump were \
+                     gone {} s after it",
+                    deleted.len(),
                     started.elapsed().as_secs()
                 );
                 return true;
             }
         }
         println!(
-            "sweep jump: no superseded input gone within {} s of the window jump",
-            UNFOLDED_PASS_WAIT.as_secs()
+            "sweep jump: no superseded input listed before the window jump was gone within {} s \
+             of it{}",
+            UNFOLDED_PASS_WAIT.as_secs(),
+            if before.is_none() {
+                " (no LIST before the jump)"
+            } else {
+                ""
+            }
         );
         false
     }
