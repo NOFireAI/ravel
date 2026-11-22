@@ -1729,27 +1729,45 @@ object's fetch completes (`RunFold` in `engine/sample_fold.rs`), keeping on a
 duplicate `(series, timestamp)` the sample the dedup order serves, so the
 result is the one `merge_soa_runs` gives over every object at once, whatever
 order the objects complete in. Cross-selector and federation scalar runs fold
-into the same accumulator. The fold holds, against the same budget, each
-series' id and labels (`retained_series_len`), each held sample and each
-distinct provenance prefix, and it reserves before it folds a batch of runs
-in, not after: every incoming sample as if kept, the labels of
-each series it does not hold yet, one prefix per unseen provenance prefix
-along each run, and the level the merge of one series builds beside the
-levels it replaces. The bound is read off the fetched runs where they lie,
-sorted by series in place, so the fold allocates nothing of its own before
-it reserves; a merge frees the two levels it consumed before it shrinks the
-level it built, so the shrink's copy reuses their bytes. A read whose merged
-samples do not fit is refused with
-the same 422 `FetchMemoryExhausted`, against the budget's limit, before the
-batch is folded. The reservation is the most any batch could have made the
-fold hold, so it does not shrink when a later object's duplicates are dropped.
-`max_series` is checked as each series is added and `max_samples` once the
-fold is finished, with the merge's errors. The local fetch holds a batch's
-decoded runs under the batch's own reservation (above) while the fold takes
-them. When the fold is finished its reservation moves to the merged series
-the evaluator reads and is released with them when the evaluation ends, or
-when the read fails; a range query's selector-cache copies are charged on top
-of it. The distributed coordinator still holds every slice's runs until the
+into the same accumulator. The fold charges its containers, against the
+same budget, by capacity: each level's buffer (and each held histogram
+value's heap bytes), each series' spine of levels, the `by_series` and
+`prefix_ids` hash tables at hashbrown's allocation (the series id lives in
+a `by_series` slot), the prefix Vec, and each label's slot plus its
+strings' capacity. Before it folds a batch of runs in, it reserves what it
+holds plus the batch's growth: every incoming sample as if kept, in a level
+of its run's length; the labels of each new series; each spine's growth and
+the `by_series` table's growth; and the prefix Vec's and `prefix_ids`'
+growth, one entry per change of provenance prefix along the batch not yet
+interned. To that it adds the larger of two amounts, the finish headroom
+and one transient buffer, which is either a container buffer its growth
+replaces or the level a merge builds, counted only for a series that can
+merge. The bound is read off the fetched runs where they lie, sorted by
+series in place, so the fold allocates nothing of its own before it
+reserves. Each merge's level is sized exactly before it is built, and the
+two levels it consumed are freed after it; nothing is shrunk, and the only
+copy is the exact-size copy of a level a duplicate timestamp shortened,
+which is charged beside the level it copies. A batch whose bound does not
+fit is refused with the 422 `FetchMemoryExhausted` before any of it is
+folded. Two charges lie outside the bound and can be refused after part of
+the batch was folded, which then stays folded and charged: that exact copy
+of a shortened level, and the finish headroom of a series not predicted to
+merge. An allocation the allocator refuses fails with
+`QueryError::AllocationRefused`, also a 422 `execution` error. After each
+batch, successful or not, the reservation is shrunk to what the fold holds
+plus the headroom its final merges need. The smaller reservation is taken
+before the larger is released, so a budget without room for it beside the
+larger refuses the shrink, and the fold stays over-charged, never
+under-charged, until a later shrink succeeds. `max_series` is checked as
+each series is added and `max_samples` once the fold is finished, with the
+merge's errors. The local fetch holds a batch's decoded runs under the
+batch's own reservation (above) while the fold takes them. Before it builds
+the result, finishing the fold reserves the result's series list (48 bytes
+per series) as a reservation of its own, so a query can be refused with
+`FetchMemoryExhausted` after its last batch was folded. That reservation and
+the fold's reservations move to the merged series the evaluator reads, and
+are released with them when the evaluation ends, or when the read fails; a
+range query's selector-cache copies are charged on top of them. The distributed coordinator still holds every slice's runs until the
 last slice answers before they are folded, and federation histogram runs are
 merged whole as before, both unreserved until they are folded.
 

@@ -328,21 +328,22 @@ impl Ledger {
     }
 }
 
-/// Runs `alloc`, unless a test armed an allocation failure with
+/// Runs `alloc`, unless a unit test armed an allocation failure with
 /// [`support::fail_allocation_after`]. `charged` is what the fold had
 /// reserved when it asked.
 fn allocate(charged: u64, alloc: impl FnOnce() -> Result<(), TryReserveError>) -> bool {
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     if support::take_injected_failure(charged) {
         return false;
     }
-    #[cfg(not(any(test, feature = "test-support")))]
+    #[cfg(not(test))]
     let _ = charged;
     alloc().is_ok()
 }
 
-/// The error for a `requested`-byte allocation the allocator refused after
-/// the budget admitted its charge. It is not a budget refusal, so it is not
+/// The error for a `requested`-byte allocation the allocator refused, or
+/// whose size overflowed, after the budget admitted its charge. It is not a
+/// budget refusal, so it is not
 /// [`FetchError::FetchMemoryExhausted`], whose causes are the budget's.
 fn allocation_failed(requested: u64) -> QueryError {
     QueryError::AllocationRefused { requested }
@@ -787,8 +788,9 @@ impl<V: FoldValue> RunFold<V> {
         serves_over(&self.prefixes, a, b)
     }
 
-    /// The bytes this fold holds reserved. It is never less than the bytes
-    /// its containers hold, by capacity: each level's buffer at its inline
+    /// The bytes this fold holds reserved. Until
+    /// [`take_reservations`](RunFold::take_reservations) hands the charge on,
+    /// it is never less than the bytes its containers hold, by capacity: each level's buffer at its inline
     /// sample size plus its samples' heap bytes, each series' spine of
     /// levels, the `by_series` and `prefix_ids` tables at hashbrown's
     /// allocation for their capacity, the prefix Vec, and each label's inline
@@ -819,9 +821,15 @@ impl<V: FoldValue> RunFold<V> {
     /// this returns.
     ///
     /// Before it allocates the result Vec it reserves that Vec's bytes,
-    /// [`result_len`], as a reservation of its own, and pushes it to `held`
-    /// once the result is built, so the caller holds it with the result; a
-    /// budget that refuses it is [`FetchError::FetchMemoryExhausted`]. Each
+    /// [`result_len`] (48 bytes per series for both result types), as a
+    /// reservation of its own, and pushes it to `held` once the result is
+    /// built, so the caller holds it with the result. A budget that refuses
+    /// it is [`FetchError::FetchMemoryExhausted`], so a query whose fold fit
+    /// can be refused here, after every object was fetched and folded; that
+    /// includes a budget concurrent holders filled between the last absorb
+    /// and this reservation. Before issue #4530 finish took no reservation
+    /// and never refused. Every query that is served returns the same series
+    /// as before. Each
     /// merge's level is sized exactly before it is built, within the fold's
     /// headroom; an allocation the allocator refuses is
     /// [`QueryError::AllocationRefused`]. So the fold's charge and the result
@@ -960,15 +968,15 @@ impl RunFold<HistogramValue> {
 /// ([`support::take_finish_peak`]). It starts from the fold's running count
 /// of what it holds, which the tests check against the containers after
 /// every absorb, and counts the labels, the tables and the prefix Vec as
-/// live until finish returns.
-#[cfg(any(test, feature = "test-support"))]
+/// live until finish returns. Unit tests only.
+#[cfg(test)]
 struct FinishProbe {
     live: u64,
     peak: u64,
     charged: u64,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl FinishProbe {
     fn new(live: u64, charged: u64) -> Self {
         Self {
@@ -1005,10 +1013,10 @@ impl FinishProbe {
     }
 }
 
-#[cfg(not(any(test, feature = "test-support")))]
+#[cfg(not(test))]
 struct FinishProbe;
 
-#[cfg(not(any(test, feature = "test-support")))]
+#[cfg(not(test))]
 impl FinishProbe {
     #[inline(always)]
     fn new(_live: u64, _charged: u64) -> Self {
@@ -1326,18 +1334,20 @@ fn merge_into<V: FoldValue>(
 
 /// Test and bench support only (issue #4530, ADR-4523 decision 6, R5): the
 /// scalar fold driven from outside the crate, the pre-registered fold shapes,
-/// the hash-table size formula, an observer of the fold's charge after each
-/// absorb, and an injected allocation failure. Only tests,
-/// `tests/run_fold_accounting.rs` and `benches/run_fold.rs` call into it; the
-/// crate itself reaches it only through [`RunFold::absorb`]'s observer check
-/// and the fold's allocation check, which do nothing unless an observer was
-/// installed with [`set_absorb_observer`](support::set_absorb_observer) or a
-/// failure armed with [`fail_allocation_after`](support::fail_allocation_after).
-/// Built only under `cfg(test)` or the `test-support` feature, so a
-/// production build carries neither the module nor either check.
+/// the hash-table size formula and an observer of the fold's charge after
+/// each absorb. Only tests, `tests/run_fold_accounting.rs` and
+/// `benches/run_fold.rs` call into it; the crate itself reaches it only
+/// through [`RunFold::absorb`]'s observer check, which does nothing unless an
+/// observer was installed with
+/// [`set_absorb_observer`](support::set_absorb_observer). Built only under
+/// `cfg(test)` or the `test-support` feature, so a production build carries
+/// neither the module nor the check. The injected allocation failure and the
+/// finish probe are `cfg(test)` only, so the bench, which enables
+/// `test-support`, runs the fold's allocations and finish as production does.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod support {
+    #[cfg(test)]
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::sync::{Arc, OnceLock};
@@ -1465,12 +1475,14 @@ pub mod support {
         super::table_bytes(capacity, slot)
     }
 
+    #[cfg(test)]
     thread_local! {
         static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
         static INJECTED_CHARGE: Cell<Option<u64>> = const { Cell::new(None) };
         static FINISH_PEAK: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
     }
 
+    #[cfg(test)]
     pub(super) fn record_finish_peak(peak: u64, charged: u64) {
         FINISH_PEAK.with(|p| p.set(Some((peak, charged))));
     }
@@ -1479,6 +1491,7 @@ pub mod support {
     /// most it held live at once, by step 1's definition plus its result
     /// Vec, and what the fold had charged plus the result reservation.
     /// Taking it clears it.
+    #[cfg(test)]
     pub fn take_finish_peak() -> Option<(u64, u64)> {
         FINISH_PEAK.with(|p| p.take())
     }
@@ -1487,12 +1500,14 @@ pub mod support {
     /// thread fail as an allocator refusal would, without allocating. Each
     /// level, spine, table and prefix Vec growth in an absorb, and each
     /// buffer `into_series` sizes, is one allocation.
+    #[cfg(test)]
     pub fn fail_allocation_after(skip: usize) {
         FAIL_AFTER.with(|f| f.set(Some(skip)));
         INJECTED_CHARGE.with(|c| c.set(None));
     }
 
     /// Disarms a failure [`fail_allocation_after`] armed on this thread.
+    #[cfg(test)]
     pub fn clear_allocation_failure() {
         FAIL_AFTER.with(|f| f.set(None));
         INJECTED_CHARGE.with(|c| c.set(None));
@@ -1500,12 +1515,14 @@ pub mod support {
 
     /// The fold's [`charged`](super::RunFold::charged) bytes when the armed
     /// failure fired on this thread, `None` while it has not.
+    #[cfg(test)]
     pub fn injected_failure_charge() -> Option<u64> {
         INJECTED_CHARGE.with(Cell::get)
     }
 
     /// Whether the allocation about to be made is the one armed to fail,
     /// recording `charged` when it is.
+    #[cfg(test)]
     pub(super) fn take_injected_failure(charged: u64) -> bool {
         FAIL_AFTER.with(|f| match f.get() {
             None => false,
@@ -2407,7 +2424,9 @@ mod tests {
     /// histogram fold's on [`histogram_shape`], captured from main's code
     /// (c9ef663) before the R5 step 2 change; on main the histogram digest
     /// is the same from the fold and from `merge_histogram_soa_runs`. The
-    /// fold must return exactly these results.
+    /// fold must return exactly these results. The outputs are bit-identical
+    /// for every query that is served; the folds here run on an unlimited
+    /// budget, and a query the fold or finish refuses returns no output.
     #[test]
     fn fold_outputs_are_bit_identical_to_main() {
         let want = vec![
@@ -2840,6 +2859,7 @@ mod tests {
         let charged = fold.charged();
         let result = result_len::<SeriesData>(3);
         assert_eq!(result, 3 * 48);
+        assert_eq!(result_len::<HistogramSeriesData>(3), 3 * 48);
         let mut held = fold.take_reservations();
         let series = fold.into_series(usize::MAX, &mut held).expect("finish");
         assert_eq!(series.len(), 3);
@@ -3069,7 +3089,10 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            format!("query memory exhausted: the allocator refused a {requested}-byte allocation")
+            format!(
+                "query memory exhausted: the allocator refused, or the size overflowed, a \
+                 {requested}-byte allocation"
+            )
         );
         assert_eq!(budget.accounted_refusals(), 0);
         assert_eq!(budget.gate_refusals(), 0);

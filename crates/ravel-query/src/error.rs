@@ -181,9 +181,13 @@ pub enum QueryError {
     )]
     DuplicatePushdownSeries { series_id: String },
     /// The allocator refused an allocation the query had already charged to
-    /// its memory budget. The budget did not refuse, so this is not a
+    /// its memory budget, or the allocation's size overflowed
+    /// (`TryReserveError`'s `CapacityOverflow`). The budget did not refuse,
+    /// so this is not a
     /// [`FetchError::FetchMemoryExhausted`]: no budget refusal counter moves
     /// and the budget's reserved figure says nothing about the refusal.
-    #[error("query memory exhausted: the allocator refused a {requested}-byte allocation")]
+    #[error(
+        "query memory exhausted: the allocator refused, or the size overflowed, a {requested}-byte allocation"
+    )]
     AllocationRefused { requested: u64 },
 }
