@@ -271,6 +271,7 @@ impl<V: FoldValue> RunFold<V> {
         for run in runs {
             self.absorb_run(run.into_run())?;
         }
+        #[cfg(any(test, feature = "test-support"))]
         support::observe_absorb(|| self.charged());
         Ok(())
     }
@@ -619,6 +620,9 @@ fn merge_levels<V: FoldValue>(
 /// `benches/run_fold.rs` call into it; the crate itself reaches it only
 /// through [`RunFold::absorb`]'s observer check, which does nothing unless an
 /// observer was installed with [`set_absorb_observer`](support::set_absorb_observer).
+/// Built only under `cfg(test)` or the `test-support` feature, so a
+/// production build carries neither the module nor the observer check.
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod support {
     use std::collections::HashMap;
@@ -752,25 +756,45 @@ pub mod support {
     /// whose `(key, value)` slot is `slot` bytes allocates, as the R5
     /// pre-registration defines it: buckets x slot, plus one control byte
     /// per bucket and the group width. HashMap has no allocation accessor,
-    /// so the bucket count is recovered from the capacity the way hashbrown
-    /// computes it: the next power of two of `capacity * 8 / 7`, and 4 below
-    /// a capacity of 4. A capacity of 0 is a table that never allocated.
-    /// hashbrown's padding of the slot array to the control bytes' alignment
-    /// is not counted; `tests/run_fold_accounting.rs` reports the formula's
-    /// error against jemalloc.
+    /// so the bucket count is recovered from the capacity: the fewest buckets,
+    /// a power of two of at least 4, whose hashbrown capacity covers
+    /// `capacity`, where `buckets` hold `buckets - 1` entries up to 8 buckets
+    /// and `buckets / 8 * 7` above. That is exact for every capacity a table
+    /// that never removed an entry reports, which the fold's tables never do.
+    /// A capacity of 0 is a table that never allocated. hashbrown's padding
+    /// of the slot array to the control bytes' alignment is not counted;
+    /// `tests/run_fold_accounting.rs` asserts the formula against jemalloc.
     pub fn table_bytes(capacity: usize, slot: usize) -> u64 {
         if capacity == 0 {
             return 0;
         }
-        let buckets = if capacity < 4 {
-            4
-        } else {
-            (capacity.saturating_mul(8) / 7).next_power_of_two()
-        } as u64;
+        let buckets = table_buckets(capacity) as u64;
         buckets
             .saturating_mul(slot as u64)
             .saturating_add(buckets)
             .saturating_add(GROUP_WIDTH)
+    }
+
+    /// The entries hashbrown lets a table of `buckets` buckets hold.
+    pub(super) fn bucket_capacity(buckets: usize) -> usize {
+        if buckets <= 8 {
+            buckets - 1
+        } else {
+            buckets / 8 * 7
+        }
+    }
+
+    /// The fewest buckets, a power of two of at least 4, whose
+    /// [`bucket_capacity`] covers `capacity`.
+    pub(super) fn table_buckets(capacity: usize) -> usize {
+        let mut buckets = 4usize;
+        while bucket_capacity(buckets) < capacity {
+            match buckets.checked_mul(2) {
+                Some(next) => buckets = next,
+                None => break,
+            }
+        }
+        buckets
     }
 
     /// A table of the fold's key and value types, sized for its entries up
@@ -1396,17 +1420,38 @@ mod tests {
         fold.into_series(usize::MAX).expect("finish")
     }
 
-    fn emit(lines: &mut Vec<String>, line: String) {
+    /// Folds one shape, prints its R5 figure line, asserts probing left the
+    /// fold's result unchanged, and returns every figure line it printed.
+    fn r5_shape(shape: &str, calls: Vec<Vec<FetchedSeriesSoa>>) -> Vec<String> {
+        let mut emitted = Vec::new();
+        let (probed, charged, live) = probed_fold(calls.clone());
+        let line = support::r5_line(shape, charged, live.total());
         println!("{line}");
-        lines.push(line);
+        emitted.push(line);
+        println!(
+            "R5 breakdown shape={shape} levels={} spines={} by_series={} prefix_ids={} \
+             prefixes={} labels={}",
+            live.levels, live.spines, live.by_series, live.prefix_ids, live.prefixes, live.labels
+        );
+        assert_eq!(
+            project_scalar(probed),
+            project_scalar(plain_fold(calls)),
+            "shape {shape}: probing changed the fold's result"
+        );
+        emitted
     }
 
     /// Issue #4530 (ADR-4523 R5, step 1): the fold's charged bytes against
     /// the bytes its containers hold, at its peak charge, for pre-registered
-    /// shapes A, B and C. The predicted bands are what the figures are
-    /// measured against, not a pass condition: this asserts only that each
-    /// shape reports exactly one nonzero figure line and that probing the
-    /// fold leaves its result unchanged.
+    /// shapes A, B and C.
+    ///
+    /// This asserts presence only: each shape's run emits exactly one
+    /// figure line with nonzero charged and live figures, checked over the
+    /// lines the shapes actually emitted, and probing the fold leaves its
+    /// result unchanged. The predicted bands are deliberately not asserted.
+    /// They live in the pre-registration (issue #4530 comments 7079576120
+    /// and 7080468122) and the step's report, so an out-of-band figure does
+    /// not fail this test the way a missing line does.
     #[test]
     fn r5_run_fold_charged_against_live_bytes() {
         let shapes = [
@@ -1416,25 +1461,50 @@ mod tests {
         ];
         let mut lines = Vec::new();
         for (shape, calls) in shapes {
-            let (probed, charged, live) = probed_fold(calls.clone());
-            emit(&mut lines, support::r5_line(shape, charged, live.total()));
-            println!(
-                "R5 breakdown shape={shape} levels={} spines={} by_series={} prefix_ids={} \
-                 prefixes={} labels={}",
-                live.levels,
-                live.spines,
-                live.by_series,
-                live.prefix_ids,
-                live.prefixes,
-                live.labels
-            );
-            assert_eq!(
-                project_scalar(probed),
-                project_scalar(plain_fold(calls)),
-                "shape {shape}: probing changed the fold's result"
-            );
+            lines.extend(r5_shape(shape, calls));
         }
         let violations = support::presence_violations(&lines, &["A", "B", "C"]);
         assert!(violations.is_empty(), "R5 presence rule: {violations:?}");
+    }
+
+    /// The presence rule fails a shape with no figure line, two figure
+    /// lines, or a zero figure.
+    #[test]
+    fn r5_presence_rule_fails_missing_duplicate_and_zero_lines() {
+        let a = support::r5_line("A", 10, 20);
+        let b = support::r5_line("B", 30, 40);
+        let shapes = ["A", "B"];
+        assert!(support::presence_violations(&[a.clone(), b.clone()], &shapes).is_empty());
+        assert_eq!(
+            support::presence_violations(std::slice::from_ref(&a), &shapes),
+            vec!["shape B: 0 figure lines, want exactly 1".to_string()]
+        );
+        assert_eq!(
+            support::presence_violations(&[a.clone(), b.clone(), b], &shapes),
+            vec!["shape B: 2 figure lines, want exactly 1".to_string()]
+        );
+        assert_eq!(
+            support::presence_violations(&[a, support::r5_line("B", 30, 0)], &shapes),
+            vec!["shape B: live is Some(0), want > 0".to_string()]
+        );
+    }
+
+    /// `table_bytes`' bucket count inverts hashbrown's capacity exactly: for
+    /// every table size up to 10,000 entries, the capacity a `HashMap`
+    /// reports is exactly the capacity of the bucket count recovered from
+    /// it, so no reported capacity falls between two bucket counts.
+    #[test]
+    fn r5_table_buckets_invert_hashmap_capacity() {
+        for entries in 1..=10_000usize {
+            let table: HashMap<u64, u64> = HashMap::with_capacity(entries);
+            let capacity = table.capacity();
+            let buckets = support::table_buckets(capacity);
+            assert!(buckets.is_power_of_two() && buckets >= 4);
+            assert_eq!(
+                support::bucket_capacity(buckets),
+                capacity,
+                "with_capacity({entries}) reports capacity {capacity}, which no bucket count holds"
+            );
+        }
     }
 }

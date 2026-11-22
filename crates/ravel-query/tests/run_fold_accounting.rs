@@ -32,6 +32,7 @@ use ravel_maintain::{
 use ravel_memory::MemoryBudget;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
+use ravel_promql::RangeValue;
 use ravel_query::run_fold_support;
 use ravel_query::{EngineConfig, QueryEngine};
 use ravel_segment::{
@@ -58,6 +59,13 @@ const SAMPLES_PER_SERIES: i64 = NS_PER_HOUR / INTERVAL_NS;
 const FLUSHES: i64 = 4;
 const QUERY: &str = "rate(m[5m])";
 const MIB: u64 = 1_048_576;
+const PAGE: u64 = 4_096;
+/// The query's step.
+const STEP_MS: i64 = 60_000;
+/// Points per series of `rate(m[5m])` at a 60 s step over the hour: 61
+/// steps, start and end inclusive, less the first, whose window holds only
+/// the sample at the hour's start and so yields no rate.
+const POINTS_PER_SERIES: usize = 60;
 
 fn hour_start() -> i64 {
     i64::from(HOUR) * NS_PER_HOUR
@@ -283,7 +291,8 @@ fn jemalloc_check(lines: &mut Vec<String>) {
 }
 
 /// `run_fold_support::table_bytes` against jemalloc for one table of each of
-/// the fold's key and value types.
+/// the fold's key and value types: jemalloc's figure is at least the
+/// formula's and less than one 4 KiB page above it.
 fn table_formula_check() {
     for (name, build) in [
         (
@@ -302,6 +311,13 @@ fn table_formula_check() {
              jemalloc={measured} error_bytes={error} error_pct={:.4}",
             table.capacity(),
             error as f64 * 100.0 / measured.max(1) as f64
+        );
+        // The slack is jemalloc rounding the table's one allocation up to
+        // whole 4 KiB pages.
+        assert!(
+            formula <= measured && measured < formula + PAGE,
+            "table {name}: formula {formula} B against jemalloc {measured} B, \
+             want formula <= jemalloc < formula + {PAGE}"
         );
         drop(table);
     }
@@ -343,7 +359,7 @@ fn r5_shape_d_fold_charge_against_jemalloc() {
                     QUERY,
                     hour_start() / 1_000_000,
                     span_end() / 1_000_000,
-                    60_000,
+                    STEP_MS,
                     &[],
                     now_ns(),
                     Duration::from_secs(600),
@@ -352,10 +368,17 @@ fn r5_shape_d_fold_charge_against_jemalloc() {
                 .await;
             ARMED.store(false, Ordering::Release);
             let (value, _annotations, _stats) = result.expect("shape D answers");
-            assert!(
-                !format!("{value:?}").is_empty(),
-                "the query produced a value"
-            );
+            let RangeValue::Matrix(matrix) = value else {
+                panic!("shape D answers a matrix, got {value:?}");
+            };
+            assert_eq!(matrix.len(), SERIES, "shape D's answered series");
+            for (labels, points) in &matrix {
+                assert_eq!(
+                    points.len(),
+                    POINTS_PER_SERIES,
+                    "points for {labels:?} over 1 h at a {STEP_MS} ms step"
+                );
+            }
 
             let baseline = BASELINE.load(Ordering::Acquire);
             let peak = *PEAK
