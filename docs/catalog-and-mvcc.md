@@ -3625,7 +3625,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    rewrite of the bucket can name the input only then: a `.dreq` is
    deleted only once its `.done` exists, so with neither listed no rewrite
    can be live without its request pending. Without any of the three, the
-   input is added as before, even when its bucket is tombstoned (#4573);
+   input is added as before, even when its bucket is tombstoned;
    its rows are not counted twice there, because the set then holds no
    level-1 part of the bucket that could also hold them. When the check
    runs, it LISTs the bucket and, in this order:
