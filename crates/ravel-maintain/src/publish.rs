@@ -358,6 +358,7 @@ async fn publish_compaction_record(
                 "catalog: compaction record published",
                 std::collections::BTreeMap::from([("record_key", record_key.clone())])
             );
+            assert_record_is_ours(store, &record_key, &payload, input_set_hash, ledger).await;
             // The tombstone race is closed by verification, not retention
             // (ADR-0979 decision 3): a part that answered `AlreadyExists` at PUT
             // carries an abandoned run's age and could have been swept between
@@ -414,6 +415,58 @@ async fn verify_already_existed_parts(
         }
     }
     Ok(())
+}
+
+/// Re-read the record a winning compaction publish just wrote and judge it
+/// against the bytes this attempt PUT. The predicate is the record clause of
+/// `QueryVisibleDataCorrectUnderDuplicateOwnership` (a present record's content
+/// equals the first writer's), the clause the negative config
+/// `ownership-as-publication-authority` breaks; through it this site carries the
+/// `OwnershipIsNotPublicationAuthority` row of ADR-4326 decision 2.
+///
+/// The record key is a bucket prefix plus the input-set hash prefix, every
+/// record PUT is `CreateIfAbsent`, and the payload carries `created_unix_ns`, so
+/// a fresh GET returns bytes other than ours only if another publisher, owner or
+/// not, overwrote the record, or if the record was deleted (a retention
+/// `delete_all`, the superseded sweep) and a stalled publisher then created it
+/// again. The re-read cannot tell an overwrite from a delete-then-recreate and
+/// reports either as false. It observes such a write only when it lands between
+/// this attempt's PUT and its re-read; a later overwrite is not seen here.
+///
+/// The verdict is `Some(true)` when the GET returns our payload, `Some(false)`
+/// for any other bytes, and `None` on `NotFound` or any error (a record a later
+/// sweep removed was not replaced, and a failed read cannot tell). The GET and
+/// its ledger charge live inside the `inv_always_if_known!` condition, so the
+/// default build, where `EVALUATES` is false, issues no request and evaluates
+/// nothing.
+async fn assert_record_is_ours(
+    store: &dyn ObjectStoreBackend,
+    record_key: &str,
+    our_payload: &bytes::Bytes,
+    our_hash: &[u8; 32],
+    ledger: Option<&RequestLedger>,
+) {
+    let _ = (store, our_payload, ledger);
+    if !ravel_invariant::EVALUATES {
+        return;
+    }
+    let details = std::collections::BTreeMap::from([
+        ("record_key", record_key.to_string()),
+        ("our_input_set_hash", hex::encode(our_hash)),
+    ]);
+    let _ = &details;
+    ravel_invariant::inv_always_if_known!(
+        {
+            let after = store.get(record_key, GetRange::Full).await;
+            note_get(ledger, RequestPhase::Publish, &after);
+            match after {
+                Ok(got) => Some(got.data == *our_payload),
+                Err(_) => None,
+            }
+        },
+        "maintenance: the store holds the record a winning compaction publish wrote",
+        details
+    );
 }
 
 /// The identity of each input, in input order: what a version 1 record names
@@ -677,9 +730,14 @@ async fn resolve_against_winner(
 pub(crate) mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
     use proptest::prelude::*;
     use ravel_object_store::list_all;
     use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{GetOutcome, ObjectMeta, PutOutcome};
     use ravel_proto::commit::v1::{CommitRecord, CompactionPart};
     use ravel_types::{Signal, TenantId};
 
@@ -1338,6 +1396,260 @@ pub(crate) mod tests {
     async fn a_published_record_names_exactly_its_inputs() {
         let (identities, record) = publish_and_read_record().await;
         assert_eq!(record.inputs, identities);
+    }
+
+    const RECORD_IS_OURS: &str =
+        "maintenance: the store holds the record a winning compaction publish wrote";
+
+    type ReReadHook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+    /// A store that runs `hook` once, before answering the first GET of a key
+    /// `keys::parse_compaction_record_key` accepts (an L1 compaction record, not
+    /// an L0 commit record or a rewrite record). The winning
+    /// publish's re-read of its own record is that GET, so the hook models a
+    /// concurrent publisher writing between this attempt's record PUT and its
+    /// re-read.
+    struct FirstGetHook {
+        inner: Arc<MemoryStore>,
+        hook: Mutex<Option<ReReadHook>>,
+    }
+
+    impl FirstGetHook {
+        fn new(inner: Arc<MemoryStore>, hook: ReReadHook) -> Self {
+            FirstGetHook {
+                inner,
+                hook: Mutex::new(Some(hook)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for FirstGetHook {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> std::result::Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> std::result::Result<GetOutcome, StoreError> {
+            if keys::parse_compaction_record_key(key).is_ok() {
+                let hook = self.hook.lock().expect("hook").take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> std::result::Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The single compaction record key in `store`.
+    async fn record_key_of(store: &MemoryStore) -> String {
+        list_all(store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|m| m.key.ends_with(&format!(".{}", keys::COMMIT_SUFFIX)))
+            .expect("a compaction record")
+            .key
+    }
+
+    /// One run of a winning publish contended at its re-read.
+    struct ReReadRun {
+        winner: Result<PublishOutcome>,
+        loser: PublishOutcome,
+        key: String,
+        /// The record bytes the winner PUT, read before the loser ran.
+        winner_bytes: bytes::Bytes,
+        /// The record bytes after the loser ran (the loser's, under the mutant;
+        /// the winner's otherwise).
+        after_bytes: bytes::Bytes,
+        store: Arc<MemoryStore>,
+    }
+
+    /// Publishes a winner through a [`FirstGetHook`] whose hook, firing on the
+    /// winner's record re-read, puts the winner's part keys (so a loser can
+    /// converge) and then runs a real losing publish against the inner store
+    /// under `hash`. The loser's `CreateIfAbsent` loses to the winner's record;
+    /// whether it overwrites the record is the `catalog/compaction-loser-overwrites`
+    /// mutant's choice, scoped by the caller.
+    async fn publish_with_concurrent_loser_on_reread(hash: [u8; 32]) -> ReReadRun {
+        let inner = Arc::new(MemoryStore::new());
+        let bucket = bucket(Signal::Metrics);
+        let inputs = vec![input(1, 10, &bucket), input(2, 7, &bucket)];
+
+        let winner_slot: Arc<Mutex<Option<bytes::Bytes>>> = Arc::new(Mutex::new(None));
+        let after_slot: Arc<Mutex<Option<bytes::Bytes>>> = Arc::new(Mutex::new(None));
+        let loser_slot: Arc<Mutex<Option<PublishOutcome>>> = Arc::new(Mutex::new(None));
+
+        let hook_inner = Arc::clone(&inner);
+        let hook_winner = Arc::clone(&winner_slot);
+        let hook_after = Arc::clone(&after_slot);
+        let hook_loser = Arc::clone(&loser_slot);
+        let hook: ReReadHook = Box::new(move || {
+            Box::pin(async move {
+                let key = record_key_of(hook_inner.as_ref()).await;
+                let winner_bytes = record_bytes(hook_inner.as_ref(), &key).await;
+                *hook_winner.lock().expect("winner slot") = Some(winner_bytes.clone());
+                let record =
+                    ravel_commit::record::decode_compaction(&winner_bytes).expect("decode");
+                for p in &record.parts {
+                    let part_key = keys::reconstruct_l1_part_key(&record, p).expect("part key");
+                    hook_inner
+                        .put(
+                            &part_key,
+                            bytes::Bytes::new(),
+                            PutOptions::create_if_absent(),
+                        )
+                        .await
+                        .expect("put winner part");
+                }
+                let loser = publish_loser(hook_inner.as_ref(), &hash)
+                    .await
+                    .expect("the loser resolves");
+                *hook_loser.lock().expect("loser slot") = Some(loser);
+                let after = record_bytes(hook_inner.as_ref(), &key).await;
+                *hook_after.lock().expect("after slot") = Some(after);
+            })
+        });
+
+        let wrapper = FirstGetHook::new(Arc::clone(&inner), hook);
+        let winner = publish_record(
+            &wrapper,
+            &CompactorConfig::default(),
+            &FixedClock::new(1),
+            &bucket,
+            &inputs,
+            &hash,
+            &[part(0, 12), part(1, 5)],
+            1,
+        )
+        .await;
+
+        let key = record_key_of(inner.as_ref()).await;
+        ReReadRun {
+            winner,
+            loser: loser_slot
+                .lock()
+                .expect("loser slot")
+                .clone()
+                .expect("the loser ran"),
+            winner_bytes: winner_slot
+                .lock()
+                .expect("winner slot")
+                .clone()
+                .expect("the winner record was read"),
+            after_bytes: after_slot
+                .lock()
+                .expect("after slot")
+                .clone()
+                .expect("the record was read after the loser"),
+            key,
+            store: inner,
+        }
+    }
+
+    #[tokio::test]
+    async fn mutant_loser_overwrite_breaks_winning_publish_record() {
+        let Some(_mutant) = scoped_mutant("catalog/compaction-loser-overwrites") else {
+            return;
+        };
+        let hash = [0x61; 32];
+        let run = publish_with_concurrent_loser_on_reread(hash).await;
+        assert_eq!(
+            run.winner.expect("the winner published"),
+            PublishOutcome::Published
+        );
+        let found = evaluations(RECORD_IS_OURS, &hex::encode(hash));
+        assert!(
+            found.iter().any(|(held, _)| !held),
+            "the winner's re-read observed the loser's overwrite: {found:?}"
+        );
+        // The record the winner re-read holds the loser's bytes, not its own.
+        assert_ne!(run.after_bytes, run.winner_bytes, "the mutant replaced it");
+        let stored = record_bytes(run.store.as_ref(), &run.key).await;
+        assert_eq!(stored, run.after_bytes, "the stored record is the loser's");
+        let stored = ravel_commit::record::decode_compaction(&stored).expect("decode");
+        let counts: Vec<u64> = stored.parts.iter().map(|p| p.sample_count).collect();
+        assert_eq!(
+            counts,
+            vec![17],
+            "the stored record names the loser's single part, not the winner's 12 and 5"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_winning_publish_keeps_its_record_under_a_concurrent_loser() {
+        if !capturing() {
+            return;
+        }
+        let hash = [0x62; 32];
+        let run = publish_with_concurrent_loser_on_reread(hash).await;
+        assert_eq!(
+            run.winner.expect("the winner published"),
+            PublishOutcome::Published
+        );
+        assert_eq!(run.loser, PublishOutcome::Converged { parts_repaired: 0 });
+        let found = evaluations(RECORD_IS_OURS, &hex::encode(hash));
+        assert!(
+            found.iter().any(|(held, _)| *held),
+            "the winner's re-read observed its own record: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|(held, _)| !held),
+            "no re-read observed anything else: {found:?}"
+        );
+        assert_eq!(
+            record_bytes(run.store.as_ref(), &run.key).await,
+            run.winner_bytes,
+            "the record is still the winner's"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncontended_publish_evaluates_the_record_once() {
+        if !capturing() {
+            return;
+        }
+        let hash = [0x63; 32];
+        let store = MemoryStore::new();
+        publish_winner(&store, &hash, false).await;
+        let found = evaluations(RECORD_IS_OURS, &hex::encode(hash));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].0, "{found:?}");
     }
 
     proptest! {

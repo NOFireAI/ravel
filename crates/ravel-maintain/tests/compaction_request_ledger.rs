@@ -106,8 +106,12 @@ async fn bytes_under(store: &dyn ObjectStoreBackend, prefix: &str) -> u64 {
 ///   streams are stream 0 in both inputs, stream 1 in the first and stream 2
 ///   in the second, so a GET per (stream, input) cursor would read 4.
 /// - `part_put` 1: the single L1 part's `CreateIfAbsent` PUT.
-/// - `publish` 1: the compaction record's PUT. No post-publish HEAD: no part
-///   answered `AlreadyExists` on a first run.
+/// - `publish` 1 (plus one re-read GET when invariants evaluate): the
+///   compaction record's PUT. No post-publish HEAD: no part answered
+///   `AlreadyExists` on a first run. The winning publish re-reads its own
+///   record to judge `OwnershipIsNotPublicationAuthority` (ADR-4326), but only
+///   when `ravel_invariant::EVALUATES`; the default build issues no such GET, so
+///   `record_rereads` is zero there.
 ///
 /// Flip proofs, each run against this test:
 ///
@@ -159,8 +163,13 @@ async fn per_phase_counts_match_the_instrumented_oracle_exactly() {
         "one block GET per (input, row group), not per (stream, input)"
     );
     assert_eq!(report.part_put.requests, 1, "one L1 part PUT");
-    assert_eq!(report.publish.requests, 1, "the compaction record PUT");
-    assert_eq!(report.total_requests(), 10);
+    let record_rereads = u64::from(ravel_invariant::EVALUATES);
+    assert_eq!(
+        report.publish.requests,
+        1 + record_rereads,
+        "the compaction record PUT, plus the re-read when invariants evaluate"
+    );
+    assert_eq!(report.total_requests(), 10 + record_rereads);
 
     assert_reconciles(&report, &before, &after);
 
@@ -363,8 +372,9 @@ async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
     );
     assert_eq!(report.block_read.requests, 2);
     assert_eq!(report.part_put.requests, 1);
-    assert_eq!(report.publish.requests, 1);
-    assert_eq!(report.total_requests(), 11);
+    let record_rereads = u64::from(ravel_invariant::EVALUATES);
+    assert_eq!(report.publish.requests, 1 + record_rereads);
+    assert_eq!(report.total_requests(), 11 + record_rereads);
     assert_reconciles(&report, &before, &after);
     assert_eq!(
         report.catalog_read.wire_bytes_received,
@@ -403,6 +413,8 @@ async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
 /// - `part_put` sent bytes equal the L1 part object's own size, exactly.
 /// - `publish` sent bytes equal the compaction record object's own size,
 ///   exactly.
+/// - `publish` received bytes equal that size once per record re-read: zero
+///   in the default build, the record's size when invariants evaluate.
 /// - the ranged read phases are banded against the inputs' OWN sizes, per
 ///   object: the catalog phase must cover at least every input's footer probe
 ///   (`min(rlog_footer_probe_bytes, that object's size)`, which on this fixture's
@@ -467,6 +479,15 @@ async fn wire_bytes_track_the_fixtures_real_object_sizes() {
     assert_eq!(
         report.publish.wire_bytes_sent, published,
         "the record PUT offered exactly the record object's bytes"
+    );
+    // The winning publish re-reads its own record only when invariants evaluate,
+    // so the received bytes for this phase are the record's length then and zero
+    // in the default build (ADR-4326 OwnershipIsNotPublicationAuthority).
+    let record_rereads = u64::from(ravel_invariant::EVALUATES);
+    assert_eq!(
+        report.publish.wire_bytes_received,
+        published * record_rereads,
+        "the re-read returns the record object's own bytes, and only under EVALUATES"
     );
 
     // Per-object band, not a flat floor: each input's probe window is capped by
@@ -664,7 +685,8 @@ async fn a_conservation_abort_reports_zero_publish_requests() {
 /// Run scoping: a second run reports only its own figures. The rerun here is
 /// gated `AlreadyCompacted` after its LIST, so its report is exactly one
 /// listing request and nothing else -- none of the first run's 10 requests
-/// survive into it.
+/// (plus the winning publish's re-read when invariants evaluate) survive into
+/// it.
 ///
 /// Flip proofs, both run against this test before the pre-publish re-list
 /// added the first run's second LIST:
@@ -691,7 +713,8 @@ async fn a_second_run_reports_only_its_own_figures() {
         first.list.requests, 2,
         "the driver's LIST survives the rewrite, beside the pre-publish re-list"
     );
-    assert_eq!(first.total_requests(), 10);
+    let record_rereads = u64::from(ravel_invariant::EVALUATES);
+    assert_eq!(first.total_requests(), 10 + record_rereads);
 
     let outcome = compact_bucket(&store, &clock, &config, &bucket)
         .await
@@ -720,8 +743,9 @@ async fn a_second_run_reports_only_its_own_figures() {
 /// proof (run): dropping the `note_get` on RSPAN's SKIP_IDX section fetch
 /// leaves every per-phase assertion here passing (the footer probe still puts
 /// `catalog_read` above zero) and fails only the reconciliation, 9 attributed
-/// against the wrapper's 11 -- exactly the "a request went uncounted" case a
-/// per-phase floor cannot see.
+/// against the wrapper's 11 in the default build (the invariants build adds the
+/// attributed record re-read to both sides) -- exactly the "a request went
+/// uncounted" case a per-phase floor cannot see.
 #[tokio::test]
 async fn the_rseg_and_rspan_paths_report_under_the_same_phases() {
     for signal in ["metrics", "spans"] {
@@ -786,7 +810,12 @@ async fn the_rseg_and_rspan_paths_report_under_the_same_phases() {
             report.part_put.requests > 0,
             "{signal}: part PUTs attributed"
         );
-        assert_eq!(report.publish.requests, 1, "{signal}: the record PUT");
+        let record_rereads = u64::from(ravel_invariant::EVALUATES);
+        assert_eq!(
+            report.publish.requests,
+            1 + record_rereads,
+            "{signal}: the record PUT, plus the re-read when invariants evaluate"
+        );
         assert_reconciles(&report, &before, &after);
     }
 }
@@ -1015,9 +1044,16 @@ async fn build_rewrite_logs_refuses_a_zero_run_block_target_before_any_store_req
 /// migration's 12 is the bare rewrite's 8 plus its planning LIST, its two
 /// eligibility reads of the commit records, and its pre-publish re-list. The
 /// erasure rewrite's 10 includes its own pre-publish re-list.
+///
+/// Compaction, migration and the bare rewrite each publish through
+/// `publish_compaction_record`, whose winning Ok arm re-reads the record when
+/// `ravel_invariant::EVALUATES`, so each gains one GET there (`rr`). The erasure
+/// rewrite publishes through `publish_rewrite_record`, which does not call
+/// `assert_record_is_ours`, so its 10 is unchanged.
 #[tokio::test]
 async fn the_default_level_runs_each_rlog_entry_point_against_the_store() {
-    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([10, 12, 8, 10]) {
+    let rr = u64::from(ravel_invariant::EVALUATES);
+    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([10 + rr, 12 + rr, 8 + rr, 10]) {
         let (result, oracle, _) = run_rlog_entry_at(entry, 9).await;
         assert!(result.is_ok(), "{entry:?}: {result:?}");
         assert_eq!(oracle, expected, "{entry:?}: store requests");
