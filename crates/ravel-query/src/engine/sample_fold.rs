@@ -1331,7 +1331,12 @@ mod tests {
 
     impl LiveBytes {
         fn total(&self) -> u64 {
-            self.levels + self.spines + self.by_series + self.prefix_ids + self.prefixes + self.labels
+            self.levels
+                + self.spines
+                + self.by_series
+                + self.prefix_ids
+                + self.prefixes
+                + self.labels
         }
     }
 
@@ -1416,7 +1421,12 @@ mod tests {
             println!(
                 "R5 breakdown shape={shape} levels={} spines={} by_series={} prefix_ids={} \
                  prefixes={} labels={}",
-                live.levels, live.spines, live.by_series, live.prefix_ids, live.prefixes, live.labels
+                live.levels,
+                live.spines,
+                live.by_series,
+                live.prefix_ids,
+                live.prefixes,
+                live.labels
             );
             assert_eq!(
                 project_scalar(probed),

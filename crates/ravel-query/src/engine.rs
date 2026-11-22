@@ -45,9 +45,9 @@ use crate::segment_admission::{self, RequestBudget};
 
 mod sample_fold;
 
-use sample_fold::{HistogramFold, ScalarFold};
 #[doc(hidden)]
 pub use sample_fold::support as run_fold_support;
+use sample_fold::{HistogramFold, ScalarFold};
 
 /// Which evaluation shape a prefetch is being computed for: an instant
 /// query has one lookup instant, a range query spans a step grid whose

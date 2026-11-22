@@ -227,7 +227,10 @@ async fn shape_d_tenant() -> Arc<MemoryStore> {
         put_l0(&store, u64::try_from(flush).expect("flush") + 1, inputs).await;
     }
     let entries = compact_l1(&store).await;
-    let samples: u64 = entries.iter().map(|e| u64::from(e.entry.sample_count)).sum();
+    let samples: u64 = entries
+        .iter()
+        .map(|e| u64::from(e.entry.sample_count))
+        .sum();
     println!(
         "R5 fixture shape=D series={} samples={samples}",
         entries.len()
@@ -253,7 +256,9 @@ fn observe(charged: u64) {
         return;
     }
     let now = allocated();
-    let mut peak = PEAK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut peak = PEAK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if peak.is_none_or(|(c, _)| charged >= c) {
         *peak = Some((charged, now));
     }
@@ -353,7 +358,9 @@ fn r5_shape_d_fold_charge_against_jemalloc() {
             );
 
             let baseline = BASELINE.load(Ordering::Acquire);
-            let peak = *PEAK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let peak = *PEAK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((charged, at_peak)) = peak {
                 let line =
                     run_fold_support::r5_line("D", charged, at_peak.saturating_sub(baseline));
