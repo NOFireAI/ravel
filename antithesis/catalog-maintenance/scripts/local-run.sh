@@ -94,8 +94,12 @@ SETUP_LIMIT=900
 # unreadable-HEAD sweep (README.md, "The forced races"; about 2200 s between
 # them at their waits' bounds), folds, compacts and audits, takes the two
 # sweep jumps (each with its reread and serving waits), sweeps, folds, audits
-# again and reads; 4800 s bounds all of it.
-END_LIMIT=$((SECS + 4800))
+# again and reads; 4800 s bounds all of it. On top of that each of its up to
+# 18 clock moves (the jump, the 11 race nudges, three moves of the unfolded
+# sweep, one of the unreadable-HEAD sweep, the two sweep jumps) first holds
+# HEAD still for 50 s and keeps it frozen through one reread (README.md, "HEAD
+# holds still before every move"): 60 s each.
+END_LIMIT=$((SECS + 4800 + 18 * 60))
 SERVERS="ravel1 ravel2 maint1 maint2"
 MULTISET="catalog: compaction preserves the acked multiset"
 UPPER="catalog: no scan shows a phantom or an excess copy"

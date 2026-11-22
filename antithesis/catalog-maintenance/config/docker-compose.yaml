@@ -270,6 +270,13 @@ services:
       CLOCK_JUMP_SECS: "9000"
       CLOCK_SWEEP_HORIZON_JUMP_SECS: "91200"
       CLOCK_SWEEP_WINDOW_JUMP_SECS: "5400"
+      # The HEAD cache TTL every ravel-server runs with: the compiled default,
+      # which no flag here and no `gc-config set` in init overrides, and which
+      # sys/gc records. Before each clock move the driver holds HEAD still
+      # for this long plus the store request timeout, in real time, and it
+      # refuses to start if sys/gc records another TTL (README.md, "The clock
+      # jump").
+      HEAD_CACHE_TTL_SECS: "30"
     # Read-write: the driver is the one writer of the offset file.
     volumes: ["faketime:/faketime"]
     depends_on:

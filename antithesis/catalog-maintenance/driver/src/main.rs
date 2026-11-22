@@ -115,6 +115,11 @@ const UNSATISFIABLE_RETRY: Duration = Duration::from_secs(2);
 const LOCAL_RESTART_DONE: &str = "/tmp/local-restart-done";
 /// How long the eventually waits for that restart, and then for every node.
 const LOCAL_RESTART_WAIT: Duration = Duration::from_secs(300);
+/// A clock move waits at most this many quiet spans (`clock::head_quiet_s`)
+/// for HEAD to hold still, then gives the move up.
+const QUIET_HEAD_TRIES: u32 = 4;
+/// How often the quiet wait reads HEAD and renews the proxy's freeze of it.
+const QUIET_HEAD_POLL: Duration = Duration::from_secs(1);
 
 fn now_ns() -> u64 {
     SystemTime::now()
@@ -157,6 +162,9 @@ struct ClockPlan {
     window_jump_s: u64,
     /// libfaketime's reread interval (`FAKETIME_CACHE_DURATION`).
     reread_s: u64,
+    /// The servers' HEAD cache TTL as the compose states it
+    /// (`HEAD_CACHE_TTL_SECS`), checked against `sys/gc` at startup.
+    head_cache_ttl_s: u64,
     /// Acked live writes the jump rule waits for, so the jump has live hours
     /// to seal.
     min_acked: usize,
@@ -225,6 +233,7 @@ impl Config {
                     clock::DEFAULT_WINDOW_JUMP_S,
                 ),
                 reread_s: env_u64("FAKETIME_CACHE_DURATION", clock::FAKETIME_CACHE_DURATION_S),
+                head_cache_ttl_s: env_u64("HEAD_CACHE_TTL_SECS", clock::HEAD_CACHE_TTL_S),
                 min_acked: usize::try_from(env_u32("CLOCK_JUMP_MIN_ACKED", 20)).unwrap_or(20),
             },
             proxy: std::env::var("S3_PROXY_CONTROL").unwrap_or_else(|_| "s3proxy:9001".to_string()),
@@ -237,9 +246,30 @@ impl Config {
 struct Jump {
     before_ns: u64,
     after_ns: u64,
+    /// How far this move took the clocks; 0 when there was nothing to move.
+    by_s: u64,
     /// The total offset after this move.
     offset_s: u64,
     reached_driver: bool,
+}
+
+/// HEAD held still by the proxy for a clock move, thawed on drop.
+struct Frozen<'a> {
+    shared: &'a Shared,
+    /// `None` when no HEAD key was known, so nothing was frozen.
+    key: Option<String>,
+    /// HEAD as read at the end of the quiet wait.
+    head: clock::HeadRead,
+    /// How long HEAD had held still when the wait ended.
+    quiet: Duration,
+}
+
+impl Drop for Frozen<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = &self.key {
+            let _ = self.shared.proxy_cmd(&format!("thaw-key {key}"));
+        }
+    }
 }
 
 struct Shared {
@@ -719,7 +749,11 @@ impl Shared {
             return;
         }
         let acked = lock(&self.model).acked_logs.len();
-        let jump = self.shift_clock(self.clock.jump_s, reason);
+        // A move given up before its offset write leaves the slot empty, so a
+        // later rule or the eventually takes the jump instead.
+        let Ok(jump) = self.shift_clock(reason, &|_| self.clock.jump_s) else {
+            return;
+        };
         *slot = Some(jump);
         drop(slot);
         if !jump.reached_driver {
@@ -744,8 +778,11 @@ impl Shared {
     /// clock past the record's protection horizon, fold so HEAD stops naming
     /// its inputs, sweep every shard so each input gets its unnamed-since
     /// marker, then move every clock past the marker's pinned-query window.
-    /// The next sweep deletes the inputs. The caller holds the gate's write
-    /// guard for all of it, as for the sealing jump.
+    /// The next sweep deletes the inputs. Like every move, the window jump
+    /// first waits for HEAD to hold still for `clock::head_quiet_s` in real
+    /// time, so no server still serves the HEAD that named the inputs when
+    /// the delete gate opens. The caller holds the gate's write guard for all
+    /// of it, as for the sealing jump.
     fn sweep_jump(&self, reason: &str) {
         if lock(&self.jump).is_none_or(|j| !j.reached_driver)
             || !self.compacted.load(Ordering::SeqCst)
@@ -761,7 +798,14 @@ impl Shared {
             },
             None => println!("sweep jump: no HEAD key known, so nothing listed before the jump"),
         }
-        let horizon = self.shift_clock(self.clock.horizon_jump_s, reason);
+        let horizon = match self.shift_clock(reason, &|_| self.clock.horizon_jump_s) {
+            Ok(jump) => jump,
+            Err(_) => {
+                // Nothing moved: a later rule or the eventually retries.
+                self.sweep_jump_started.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
         if !horizon.reached_driver {
             return;
         }
@@ -770,7 +814,9 @@ impl Shared {
             println!("sweep jump: the fold after the horizon jump failed");
         }
         let marked = (0..SHARDS).filter(|&shard| self.sweep(shard)).count();
-        let window = self.shift_clock(self.clock.window_jump_s, reason);
+        let Ok(window) = self.shift_clock(reason, &|_| self.clock.window_jump_s) else {
+            return;
+        };
         if !window.reached_driver {
             return;
         }
@@ -790,11 +836,94 @@ impl Shared {
         self.settle("pinned-window jump");
     }
 
-    /// Raise the total offset by `by_s` and wait for the driver's own clock
-    /// to move by it. libfaketime rereads the file every `reread_s` seconds;
-    /// the driver runs under it like every other container.
-    fn shift_clock(&self, by_s: u64, reason: &str) -> Jump {
+    /// One raw read of the object at `key`, for the quiet wait.
+    fn head_read(&self, key: &str) -> clock::HeadRead {
+        match self.store.get(key) {
+            Ok(Some(bytes)) => clock::HeadRead::Bytes(bytes),
+            Ok(None) => clock::HeadRead::Absent,
+            Err(_) => clock::HeadRead::Failed,
+        }
+    }
+
+    /// Hold HEAD still and wait until it has held still for
+    /// `clock::head_quiet_s` in real time (README.md, "The clock jump"). The
+    /// proxy refuses every server's PUT of HEAD until the returned freeze is
+    /// dropped; the freeze is renewed with every read, so a restarted proxy
+    /// gets it back, and a changed or unreadable HEAD, or a freeze the proxy
+    /// did not confirm, starts the wait again. `Err` after
+    /// [`QUIET_HEAD_TRIES`] quiet spans without one.
+    fn quiet_head(&self, reason: &str) -> Result<Frozen<'_>, String> {
+        let need = Duration::from_secs(clock::head_quiet_s(self.clock.head_cache_ttl_s));
+        let start = Instant::now();
+        if lock(&self.head_key).is_none() {
+            let _ = self.inspect_json();
+        }
+        let Some(key) = lock(&self.head_key).clone() else {
+            // No inspect could show HEAD: nothing to freeze or read.
+            std::thread::sleep(need);
+            return Ok(Frozen {
+                shared: self,
+                key: None,
+                head: clock::HeadRead::Failed,
+                quiet: need,
+            });
+        };
+        let read = |key: &str| self.head_read(key);
+        let freeze = || self.proxy_cmd(&format!("freeze-key {key}")).is_ok();
+        let mut frozen = Frozen {
+            shared: self,
+            key: Some(key.clone()),
+            head: clock::HeadRead::Failed,
+            quiet: Duration::ZERO,
+        };
+        let confirmed = freeze();
+        let mut quiet = clock::Quiet::new(start.elapsed(), read(&key));
+        if !confirmed {
+            quiet.sample(start.elapsed(), clock::HeadRead::Failed, false);
+        }
+        loop {
+            let now = start.elapsed();
+            if quiet.quiet_for(now) >= need {
+                frozen.head = quiet.head().clone();
+                frozen.quiet = quiet.quiet_for(now);
+                return Ok(frozen);
+            }
+            if now >= need * QUIET_HEAD_TRIES {
+                let e = format!(
+                    "HEAD did not hold still for {} s within {} s",
+                    need.as_secs(),
+                    now.as_secs()
+                );
+                println!("clock: giving the move up ({reason}): {e}");
+                return Err(e);
+            }
+            std::thread::sleep(QUIET_HEAD_POLL);
+            let confirmed = freeze();
+            quiet.sample(start.elapsed(), read(&key), confirmed);
+        }
+    }
+
+    /// Raise the total offset by `by_s` of the driver's clock, and wait for
+    /// the driver's own clock to move by it. HEAD is held still for the
+    /// quiet span first, and `by_s` reads the clock after that wait; it stays
+    /// frozen until every other process rereads the offset too, so no fold
+    /// moves HEAD while the move lands. libfaketime rereads the file every
+    /// `reread_s` seconds; the driver runs under it like every other
+    /// container. A move of zero writes nothing. `Err` when the quiet wait
+    /// gave the move up, before any write.
+    fn shift_clock(&self, reason: &str, by_s: &dyn Fn(u64) -> u64) -> Result<Jump, String> {
+        let frozen = self.quiet_head(reason)?;
         let before_ns = now_ns();
+        let by_s = by_s(before_ns / NS_PER_SECOND);
+        if by_s == 0 {
+            return Ok(Jump {
+                before_ns,
+                after_ns: before_ns,
+                by_s: 0,
+                offset_s: *lock(&self.offset_s),
+                reached_driver: true,
+            });
+        }
         let offset_s = {
             let mut total = lock(&self.offset_s);
             if let Err(e) = clock::write_offset(&self.clock.file, *total + by_s) {
@@ -802,12 +931,13 @@ impl Shared {
                     "clock: the driver could not write the clock offset",
                     &json!({ "file": self.clock.file.display().to_string(), "detail": e })
                 );
-                return Jump {
+                return Ok(Jump {
                     before_ns,
                     after_ns: before_ns,
+                    by_s: 0,
                     offset_s: *total,
                     reached_driver: false,
-                };
+                });
             }
             *total += by_s;
             *total
@@ -819,37 +949,68 @@ impl Shared {
             after_ns = now_ns();
         }
         let reached_driver = clock::moved(before_ns, after_ns, by_s);
+        std::thread::sleep(Duration::from_secs(clock::reach_wait_s(
+            self.clock.reread_s,
+        )));
+        let landed_head = frozen.key.as_deref().map(|key| self.head_read(key));
+        // Only a read that succeeded can show HEAD moved while the move landed.
+        let head_moved_while_landing = landed_head.as_ref().map(|h| {
+            *h != clock::HeadRead::Failed
+                && frozen.head != clock::HeadRead::Failed
+                && *h != frozen.head
+        });
         let details = json!({
             "reason": reason,
             "offset_s": offset_s,
             "by_s": by_s,
             "before_ns": before_ns,
             "after_ns": after_ns,
+            "head_quiet_s": frozen.quiet.as_secs_f64(),
+            "head_quiet_needed_s": clock::head_quiet_s(self.clock.head_cache_ttl_s),
+            "head_moved_while_landing": head_moved_while_landing,
         });
+        drop(frozen);
         println!("clock: jumped ({details})");
+        if head_moved_while_landing == Some(true) {
+            println!(
+                "clock: HEAD changed while the move landed, so a server may serve a HEAD older \
+                 than the delete gate assumes ({reason})"
+            );
+        }
         if !reached_driver {
             assert_unreachable!("clock: the clock jump did not reach the driver", &details);
         }
-        Jump {
+        Ok(Jump {
             before_ns,
             after_ns,
+            by_s,
             offset_s,
             reached_driver,
-        }
+        })
     }
 
-    /// Move every clock forward by `by_s` outside the three planned jumps,
-    /// and settle. The local loop adds every such move, from the line this
-    /// prints, to the offset it expects.
-    fn nudge(&self, by_s: u64, reason: &str) -> bool {
-        if by_s == 0 {
+    /// Move every clock forward by `by_s` of the driver's clock outside the
+    /// three planned jumps, and settle; `by_s` is read again after the quiet
+    /// wait, so a move aimed at a window still lands in it. The local loop
+    /// adds every such move, from the line this prints, to the offset it
+    /// expects.
+    fn nudge(&self, reason: &str, by_s: &dyn Fn(u64) -> u64) -> bool {
+        if by_s(now_ns() / NS_PER_SECOND) == 0 {
             return true;
         }
-        let jump = self.shift_clock(by_s, reason);
+        let Ok(jump) = self.shift_clock(reason, by_s) else {
+            return false;
+        };
         if !jump.reached_driver {
             return false;
         }
-        println!("clock: moved forward by {by_s} s outside the planned jumps ({reason})");
+        if jump.by_s == 0 {
+            return true;
+        }
+        println!(
+            "clock: moved forward by {} s outside the planned jumps ({reason})",
+            jump.by_s
+        );
         self.settle(reason);
         true
     }
@@ -1024,10 +1185,7 @@ impl Shared {
             println!("fold race: no HEAD key known yet");
             return false;
         };
-        if !self.nudge(
-            clock::fold_race_nudge_s(now_ns() / NS_PER_SECOND),
-            "fold race",
-        ) {
+        if !self.nudge("fold race", &clock::fold_race_nudge_s) {
             return false;
         }
         let now_s = now_ns() / NS_PER_SECOND;
@@ -1251,12 +1409,12 @@ impl Shared {
 
     /// [`Shared::record_race`] once the proxy runs with no rules.
     fn record_race_held(&self, n: u64, prefix: &str, bucket: (u64, u32), reason: &str) -> bool {
-        let now_s = now_ns() / NS_PER_SECOND;
-        let nudge_s = clock::seal_nudge_s(now_s, bucket.0, clock::compaction_seal_margin_s());
+        let nudge_s =
+            |now_s| clock::seal_nudge_s(now_s, bucket.0, clock::compaction_seal_margin_s());
         // The nudge's settle waits `clock::reach_wait_s` after the move
         // reached the driver, so every record PUT held below was signed on
         // the moved clock, which rustfs shares: none is refused for skew.
-        if !self.nudge(nudge_s, "record race") || self.proxy_cmd("hold-record").is_err() {
+        if !self.nudge("record race", &nudge_s) || self.proxy_cmd("hold-record").is_err() {
             return false;
         }
         let deadline = Instant::now() + HELD_WAIT;
@@ -1404,9 +1562,8 @@ impl Shared {
         (hour, shard): (u64, u32),
         reason: &str,
     ) -> bool {
-        let now_s = now_ns() / NS_PER_SECOND;
-        let nudge_s = clock::seal_nudge_s(now_s, hour, clock::seal_margin_s());
-        if !self.nudge(nudge_s, "unfolded sweep: fold seal") {
+        let nudge_s = |now_s| clock::seal_nudge_s(now_s, hour, clock::seal_margin_s());
+        if !self.nudge("unfolded sweep: fold seal", &nudge_s) {
             return false;
         }
         let folded = (0..3).find_map(|attempt| {
@@ -1509,17 +1666,15 @@ impl Shared {
         lock(&self.sweeps).observe(before.iter().cloned());
         let present = forced::present_inputs(&inputs, &before);
         self.unfolded_started.store(true, Ordering::SeqCst);
-        if !self.nudge(
-            self.clock.horizon_jump_s,
-            "unfolded sweep: protection horizon",
-        ) {
+        if !self.nudge("unfolded sweep: protection horizon", &|_| {
+            self.clock.horizon_jump_s
+        }) {
             return false;
         }
         std::thread::sleep(UNFOLDED_PASS_WAIT);
-        if !self.nudge(
-            clock::unfolded_window_jump_s(),
-            "unfolded sweep: pinned-query window",
-        ) {
+        if !self.nudge("unfolded sweep: pinned-query window", &|_| {
+            clock::unfolded_window_jump_s()
+        }) {
             return false;
         }
         // The servers' next full sweep pass would delete a marked input; a
@@ -1636,10 +1791,9 @@ impl Shared {
         lock(&self.sweeps).observe(before.iter().cloned());
         let inputs: Vec<InputKeys> = lock(&self.inputs_of).values().flatten().cloned().collect();
         let inputs_before = forced::present_inputs(&inputs, &before);
-        if !self.nudge(
-            self.clock.horizon_jump_s,
-            "unreadable-HEAD sweep: protection horizon",
-        ) {
+        if !self.nudge("unreadable-HEAD sweep: protection horizon", &|_| {
+            self.clock.horizon_jump_s
+        }) {
             return false;
         }
         std::thread::sleep(UNFOLDED_PASS_WAIT);
@@ -2764,6 +2918,9 @@ fn check_clock(plan: &ClockPlan) {
     if let Err(e) = clock::check_sweep_jumps(plan.horizon_jump_s, plan.window_jump_s) {
         die(&e);
     }
+    if let Err(e) = clock::check_head_cache_ttl(plan.head_cache_ttl_s, None) {
+        die(&e);
+    }
     if plan.jump_s < clock::min_jump_s() {
         die(&format!(
             "CLOCK_JUMP_SECS={} is below {}, the jump that seals an hour acknowledged \
@@ -2888,6 +3045,29 @@ fn main(tc: TestCase) {
     wait_for("every node serves", setup_deadline, || {
         shared.all_nodes_serve()
     });
+    let ttl_s = shared.clock.head_cache_ttl_s;
+    wait_for(
+        "sys/gc records the HEAD cache TTL the compose states",
+        setup_deadline,
+        || {
+            let out = shared
+                .cli
+                .run(&["gc-config", "show"], seconds_left(setup_deadline));
+            if !out.ok() {
+                return Err(format!("gc-config show: {}", out.summary()));
+            }
+            let Some(recorded_ns) = clock::recorded_head_cache_ttl_ns(&out.stdout) else {
+                return Err(format!(
+                    "gc-config show printed no TTL: {}",
+                    out.stdout.trim()
+                ));
+            };
+            if let Err(e) = clock::check_head_cache_ttl(ttl_s, Some(recorded_ns)) {
+                die(&e);
+            }
+            Ok(())
+        },
+    );
     antithesis_sdk::lifecycle::setup_complete(&json!({
         "nodes": nodes,
         "maintain_nodes": maint_nodes,
@@ -2896,6 +3076,8 @@ fn main(tc: TestCase) {
         "clock_jump_s": shared.clock.jump_s,
         "sweep_horizon_jump_s": shared.clock.horizon_jump_s,
         "sweep_window_jump_s": shared.clock.window_jump_s,
+        "head_cache_ttl_s": ttl_s,
+        "head_quiet_s": clock::head_quiet_s(ttl_s),
     }));
     println!("startup: setup complete; waiting for /workload-active");
     while !Path::new("/workload-active").exists() {

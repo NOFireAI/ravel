@@ -40,6 +40,101 @@ pub const MAX_QUERY_DURATION_S: u64 = 3600;
 pub const GRACE_S: u64 = 86_400;
 pub const HEAD_CACHE_TTL_S: u64 = 30;
 
+/// The servers' store client request timeout (`DEFAULT_REQUEST_TIMEOUT` in
+/// crates/ravel-object-store/src/s3.rs). A server's read of HEAD started
+/// before HEAD changed can return the old HEAD up to this long after the
+/// change, and the cache entry it fills lives `head_cache_ttl` from then.
+pub const STORE_REQUEST_TIMEOUT_S: u64 = 20;
+
+/// How long HEAD must have held still, in real time, before a clock move.
+///
+/// The sweep's delete gate (ADR-1133) measures its pinned-query window on the
+/// wall clock and assumes that window also passed in real time: a query
+/// process caches HEAD for `head_cache_ttl` on its monotonic clock, which no
+/// jump moves. A jump makes the wall-clock window pass in seconds, so before
+/// each one the driver waits until no server can still hold, or still be
+/// reading, a HEAD older than the current one: the TTL plus
+/// [`STORE_REQUEST_TIMEOUT_S`]. No driver query is in flight meanwhile, since
+/// every move runs under the gate's write guard.
+pub fn head_quiet_s(head_cache_ttl_s: u64) -> u64 {
+    head_cache_ttl_s + STORE_REQUEST_TIMEOUT_S
+}
+
+/// The HEAD cache TTL `ravel-cli gc-config show` prints for `sys/gc`, in
+/// nanoseconds: its `head_cache_ttl_ns: <n>` line.
+pub fn recorded_head_cache_ttl_ns(show: &str) -> Option<u64> {
+    show.lines()
+        .find_map(|l| l.trim().strip_prefix("head_cache_ttl_ns:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+}
+
+/// Refuse a HEAD cache TTL plan whose parts disagree: the TTL the compose
+/// states for the servers (`HEAD_CACHE_TTL_SECS`), the one the sweep jumps
+/// were sized with ([`HEAD_CACHE_TTL_S`], a term of [`pinned_window_s`]),
+/// and, once known, the one `sys/gc` records, which bounds every query
+/// process's TTL and which the delete gate is specified against.
+pub fn check_head_cache_ttl(stated_s: u64, recorded_ns: Option<u64>) -> Result<(), String> {
+    if stated_s != HEAD_CACHE_TTL_S {
+        return Err(format!(
+            "HEAD_CACHE_TTL_SECS={stated_s}, but the sweep jumps are sized for a \
+             {HEAD_CACHE_TTL_S} s HEAD cache TTL"
+        ));
+    }
+    match recorded_ns {
+        Some(ns) if ns != stated_s * NS_PER_SECOND => Err(format!(
+            "sys/gc records head_cache_ttl_ns={ns}, but HEAD_CACHE_TTL_SECS={stated_s}"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// What one read of HEAD returned, for [`Quiet`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadRead {
+    Bytes(Vec<u8>),
+    Absent,
+    /// The read failed: whether HEAD changed is unknown.
+    Failed,
+}
+
+/// How long HEAD has held still, from reads taken at injected times
+/// (durations since any fixed start).
+#[derive(Debug)]
+pub struct Quiet {
+    since: std::time::Duration,
+    last: HeadRead,
+}
+
+impl Quiet {
+    /// Start counting at `now`, from the HEAD read then.
+    pub fn new(now: std::time::Duration, head: HeadRead) -> Quiet {
+        Quiet {
+            since: now,
+            last: head,
+        }
+    }
+
+    /// One more read at `now`, taken while `frozen` held (the proxy confirmed
+    /// its freeze of HEAD since the previous read). A changed HEAD, a failed
+    /// read or an unconfirmed freeze starts the count again.
+    pub fn sample(&mut self, now: std::time::Duration, head: HeadRead, frozen: bool) {
+        if !frozen || head == HeadRead::Failed || head != self.last {
+            self.since = now;
+        }
+        self.last = head;
+    }
+
+    pub fn quiet_for(&self, now: std::time::Duration) -> std::time::Duration {
+        now.saturating_sub(self.since)
+    }
+
+    /// HEAD as last read.
+    pub fn head(&self) -> &HeadRead {
+        &self.last
+    }
+}
+
 /// The first sweep jump: the protection horizon plus 15 minutes.
 pub const DEFAULT_HORIZON_JUMP_S: u64 = 91_200;
 /// The second sweep jump: the pinned-query window plus 570 s.
@@ -432,6 +527,83 @@ mod tests {
         assert_eq!(compose.matches("FAKETIME_CACHE_DURATION:").count(), 1);
         // A held PUT is taken only once the move reached every clock.
         assert!(reach_wait_s(FAKETIME_CACHE_DURATION_S) >= 3);
+    }
+
+    #[test]
+    fn the_quiet_span_is_the_ttl_and_a_late_head_read() {
+        assert_eq!(head_quiet_s(HEAD_CACHE_TTL_S), 50);
+        // A HEAD read that started just before the change returns at the
+        // store timeout and is served for the TTL after that.
+        assert!(head_quiet_s(HEAD_CACHE_TTL_S) >= STORE_REQUEST_TIMEOUT_S + HEAD_CACHE_TTL_S);
+    }
+
+    #[test]
+    fn quiet_counts_only_an_unchanged_frozen_head() {
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        let a = HeadRead::Bytes(b"head a".to_vec());
+        let b = HeadRead::Bytes(b"head b".to_vec());
+        let mut q = Quiet::new(s(0), a.clone());
+        q.sample(s(10), a.clone(), true);
+        q.sample(s(20), a.clone(), true);
+        assert_eq!(q.quiet_for(s(20)), s(20));
+        // A new HEAD starts the count at the read that saw it.
+        q.sample(s(25), b.clone(), true);
+        assert_eq!(q.quiet_for(s(25)), s(0));
+        assert_eq!(q.quiet_for(s(40)), s(15));
+        assert_eq!(q.head(), &b);
+        // So does a read that failed, and a freeze the proxy did not confirm.
+        q.sample(s(41), HeadRead::Failed, true);
+        assert_eq!(q.quiet_for(s(45)), s(4));
+        q.sample(s(46), b.clone(), true);
+        assert_eq!(q.quiet_for(s(50)), s(4));
+        q.sample(s(51), b.clone(), false);
+        assert_eq!(q.quiet_for(s(60)), s(9));
+        // An absent HEAD that stays absent is quiet too.
+        let mut q = Quiet::new(s(0), HeadRead::Absent);
+        q.sample(s(60), HeadRead::Absent, true);
+        assert_eq!(q.quiet_for(s(60)), s(60));
+    }
+
+    #[test]
+    fn the_recorded_head_cache_ttl_is_read_from_gc_config_show() {
+        let v1 = "format_version: 1\nprotection_horizon_ns: 90300000000000\n\
+                  head_cache_ttl_ns: 30000000000 (format version 1 records none; the compiled \
+                  default applies)\n";
+        assert_eq!(recorded_head_cache_ttl_ns(v1), Some(30_000_000_000));
+        assert_eq!(
+            recorded_head_cache_ttl_ns("format_version: 2\nhead_cache_ttl_ns: 45000000000\n"),
+            Some(45_000_000_000)
+        );
+        let absent = "sys/gc is not present: this bucket has not been bootstrapped by a server \
+                      yet.";
+        assert_eq!(recorded_head_cache_ttl_ns(absent), None);
+        assert_eq!(recorded_head_cache_ttl_ns("head_cache_ttl_ns: x"), None);
+    }
+
+    #[test]
+    fn a_head_cache_ttl_plan_that_disagrees_is_refused() {
+        let ttl_ns = HEAD_CACHE_TTL_S * NS_PER_SECOND;
+        assert_eq!(check_head_cache_ttl(HEAD_CACHE_TTL_S, None), Ok(()));
+        assert_eq!(check_head_cache_ttl(HEAD_CACHE_TTL_S, Some(ttl_ns)), Ok(()));
+        assert!(check_head_cache_ttl(HEAD_CACHE_TTL_S, Some(ttl_ns + 1)).is_err());
+        assert!(check_head_cache_ttl(HEAD_CACHE_TTL_S + 15, None).is_err());
+        assert!(
+            check_head_cache_ttl(HEAD_CACHE_TTL_S + 15, Some(ttl_ns + 15 * NS_PER_SECOND)).is_err()
+        );
+    }
+
+    #[test]
+    fn the_compose_states_the_head_cache_ttl_and_overrides_it_nowhere() {
+        let compose = include_str!("../../config/docker-compose.yaml");
+        let line = format!("      HEAD_CACHE_TTL_SECS: \"{HEAD_CACHE_TTL_S}\"\n");
+        assert_eq!(compose.matches(&line).count(), 1, "{line:?}");
+        assert_eq!(compose.matches("HEAD_CACHE_TTL_SECS:").count(), 1);
+        // The servers run the compiled TTL: no flag sets another, and init
+        // writes no sys/gc that records another.
+        assert_eq!(compose.matches("head-cache-ttl").count(), 0);
+        let init = include_str!("../../ravel/init.sh");
+        assert_eq!(init.matches("gc-config").count(), 0);
     }
 
     #[test]
