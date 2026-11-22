@@ -3162,8 +3162,9 @@ jobs:
   # `invariants` lane): the crates that carry them, tested with every
   # evaluation recorded in process (`ravel-invariant/capture`) and every
   # mutant compiled in (`ravel-invariant/antithesis-mutants`), with no
-  # Antithesis SDK; a clippy step then compiles them with
-  # `ravel-invariant/antithesis` alone, and a last step tests them that way.
+  # Antithesis SDK, and, on a runner of its own so the two passes run side by
+  # side (ADR-4583 decision 3), clippied and tested with
+  # `ravel-invariant/antithesis` alone.
   # The workspace jobs build none of these features, so a site or mutant test
   # that only exists under them runs nowhere else.
   invariants:
@@ -3173,6 +3174,19 @@ jobs:
     # 30m (provisional): not a measurement; tighten or loosen once this job
     # has a few runs.
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pass: capture and mutants
+            features: ravel-invariant/capture,ravel-invariant/antithesis-mutants
+          # Every assertion condition compiles under `antithesis`, but neither
+          # the capture nor the mutant module does without its own feature
+          # (#4497). The test step runs ravel-invariant's test_support
+          # fallbacks, which no other job compiles.
+          - pass: antithesis alone
+            features: ravel-invariant/antithesis
+    name: invariants (${{ matrix.pass }})
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -3192,18 +3206,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           # Names the cargo profile, as in `sql-shard` above.
           key: ci-profile
-      - name: Clippy the invariant crates with capture and mutants
-        run: cargo clippy --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants --all-targets -- -D warnings
-      - name: Test the invariant crates with capture and mutants
-        run: cargo test --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/capture,ravel-invariant/antithesis-mutants
-      # Every assertion condition compiles under `antithesis`, but neither the
-      # capture nor the mutant module does without its own feature (#4497).
-      - name: Clippy the invariant crates with the antithesis feature alone
-        run: cargo clippy --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis --all-targets -- -D warnings
-      # Runs ravel-invariant's test_support fallbacks, which no other step
-      # compiles.
-      - name: Test the invariant crates with the antithesis feature alone
-        run: cargo test --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features ravel-invariant/antithesis
+      - name: Clippy the invariant crates with ${{ matrix.pass }}
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo clippy --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features "$FEATURES" --all-targets -- -D warnings
+      - name: Test the invariant crates with ${{ matrix.pass }}
+        env:
+          FEATURES: ${{ matrix.features }}
+        run: cargo test --locked --profile ci -p ravel-invariant -p ravel-commit -p ravel-ingest -p ravel-catalog -p ravel-maintain -p ravel-fleet --features "$FEATURES"
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
