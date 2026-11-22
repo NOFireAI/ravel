@@ -28,8 +28,9 @@
 //! Each fixture object is built column by column as one `ColumnarLogBatch`
 //! and written through `RlogWriter::push_columnar`, the call `ravel-ingest`'s
 //! log shard flush makes, with the objects encoded on parallel threads.
-//! [`columnar_fixture_object_equals_the_row_path_object`] pins that this
-//! writes the same bytes as pushing the same records one at a time.
+//! [`columnar_fixture_object_equals_the_row_path_object`] pins, on a
+//! 1,000-record object, that this writes the same bytes as pushing the same
+//! records one at a time.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -74,9 +75,8 @@ const ATTRS_PER_RECORD: usize = 100;
 /// RLOG objects in the fixture.
 const OBJECTS: usize = 30;
 /// Records per object. Kept modest because each object is built as one
-/// in-memory batch before `finish()`, so this times the build threads (see
-/// [`build_wide_objects`]), not `TOTAL_RECORDS`, bounds the fixture builder's
-/// own peak memory.
+/// in-memory batch before `finish()`, so this, not `TOTAL_RECORDS`, bounds what
+/// each build thread (see [`build_wide_objects`]) holds.
 const RECORDS_PER_OBJECT: usize = 10_000;
 /// Total records in the `logs` table under test.
 const TOTAL_RECORDS: usize = OBJECTS * RECORDS_PER_OBJECT;
@@ -134,8 +134,8 @@ fn identity(index: usize, tenant_hash: [u8; 16], writer_id: Uuid) -> ObjectIdent
 /// dictionary (`dyn_col_dicts`), with which the writer pays string encoding
 /// and token bloom per distinct value rather than per row. The log shard
 /// flush leaves `dyn_col_dicts` empty; the object written here is still byte
-/// for byte the row path's
-/// ([`columnar_fixture_object_equals_the_row_path_object`]).
+/// for byte the row path's, checked at 1,000 records by
+/// [`columnar_fixture_object_equals_the_row_path_object`].
 fn wide_object_bytes(identity: ObjectIdentity, first_ts: i64, count: usize) -> Vec<u8> {
     let resource = vec![(
         "service.name".to_string(),
@@ -587,9 +587,9 @@ async fn sql_stats_json_carries_peak_asked_intermediate_bytes() {
     );
 }
 
-/// The columnar fixture build writes byte for byte the object the same records
-/// pushed one at a time through the row path write, so the scan reads the
-/// fixture exactly as it reads row-built objects.
+/// On a 1,000-record object, the columnar fixture build writes byte for byte
+/// the object the same records pushed one at a time through the row path
+/// write, so the scan reads it exactly as it reads the row-built one.
 #[test]
 fn columnar_fixture_object_equals_the_row_path_object() {
     let tenant = TenantId::new("acme".to_string());
