@@ -135,6 +135,110 @@ impl Quiet {
     }
 }
 
+/// How the quiet wait before a clock move runs: the span HEAD must hold
+/// still, how many spans it may take, and how often it reads HEAD.
+#[derive(Clone, Copy, Debug)]
+pub struct QuietWait {
+    pub need: std::time::Duration,
+    pub tries: u32,
+    pub poll: std::time::Duration,
+}
+
+/// The quiet wait before a clock move, over injected time and I/O: `now`
+/// reads a monotonic clock, `sleep` waits, `freeze` asks the proxy to refuse
+/// HEAD PUTs (whether it confirmed), `read` reads HEAD. Returns HEAD as last
+/// read and how long it had held still once that reached `need`. `Err` when
+/// no HEAD key is known, since HEAD can then be neither frozen nor read, and
+/// after `tries` spans without a quiet one.
+pub fn wait_quiet(
+    head_key_known: bool,
+    w: QuietWait,
+    now: &mut dyn FnMut() -> std::time::Duration,
+    sleep: &mut dyn FnMut(std::time::Duration),
+    freeze: &mut dyn FnMut() -> bool,
+    read: &mut dyn FnMut() -> HeadRead,
+) -> Result<(HeadRead, std::time::Duration), String> {
+    if !head_key_known {
+        return Err("no HEAD key is known, so HEAD can be neither frozen nor read".to_string());
+    }
+    let start = now();
+    let confirmed = freeze();
+    let mut quiet = Quiet::new(now(), read());
+    if !confirmed {
+        quiet.sample(now(), HeadRead::Failed, false);
+    }
+    loop {
+        let t = now();
+        if quiet.quiet_for(t) >= w.need {
+            return Ok((quiet.head().clone(), quiet.quiet_for(t)));
+        }
+        let waited = t.saturating_sub(start);
+        if waited >= w.need * w.tries {
+            return Err(format!(
+                "HEAD did not hold still for {} s within {} s",
+                w.need.as_secs(),
+                waited.as_secs()
+            ));
+        }
+        sleep(w.poll);
+        let confirmed = freeze();
+        let head = read();
+        quiet.sample(now(), head, confirmed);
+    }
+}
+
+/// Whether HEAD changed between the end of the quiet wait (`quiet`) and the
+/// read after the move landed (`landed`); `None` when either read failed,
+/// so nothing is known.
+pub fn moved_while_landing(quiet: &HeadRead, landed: &HeadRead) -> Option<bool> {
+    if *quiet == HeadRead::Failed || *landed == HeadRead::Failed {
+        return None;
+    }
+    Some(quiet != landed)
+}
+
+/// Where the two sweep jumps (README.md, "The sweep jumps") stand. A jump
+/// written is never written again, whether or not it reached the driver; a
+/// jump the quiet wait gave up, before any write, is taken by the next call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SweepJumps {
+    #[default]
+    NotStarted,
+    /// The horizon jump was written; `reached`: it reached the driver.
+    HorizonWritten { reached: bool },
+    /// The window jump was written too.
+    Done { reached: bool },
+}
+
+/// The sweep jump a call takes next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SweepStep {
+    Horizon,
+    Window,
+    Nothing,
+}
+
+impl SweepJumps {
+    pub fn next(self) -> SweepStep {
+        match self {
+            SweepJumps::NotStarted => SweepStep::Horizon,
+            SweepJumps::HorizonWritten { reached: true } => SweepStep::Window,
+            _ => SweepStep::Nothing,
+        }
+    }
+
+    /// The state after `step`: `Ok(reached)` when its offset was written,
+    /// `Err` when the quiet wait gave it up before any write.
+    pub fn after(self, step: SweepStep, outcome: Result<bool, ()>) -> SweepJumps {
+        match (step, outcome) {
+            (_, Err(())) => self,
+            (SweepStep::Horizon, Ok(reached)) => SweepJumps::HorizonWritten { reached },
+            (SweepStep::Window, Ok(reached)) => SweepJumps::Done { reached },
+            (SweepStep::Nothing, Ok(_)) => self,
+        }
+    }
+}
+
 /// The first sweep jump: the protection horizon plus 15 minutes.
 pub const DEFAULT_HORIZON_JUMP_S: u64 = 91_200;
 /// The second sweep jump: the pinned-query window plus 570 s.
@@ -563,6 +667,116 @@ mod tests {
         let mut q = Quiet::new(s(0), HeadRead::Absent);
         q.sample(s(60), HeadRead::Absent, true);
         assert_eq!(q.quiet_for(s(60)), s(60));
+    }
+
+    /// Run `wait_quiet` on a fake clock that only `sleep` advances, with
+    /// `heads` giving HEAD at each read (the last repeats). Returns the
+    /// result and how many freezes and reads it made.
+    fn fake_wait(
+        key_known: bool,
+        heads: &[HeadRead],
+    ) -> (
+        Result<(HeadRead, std::time::Duration), String>,
+        usize,
+        usize,
+    ) {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let t = Cell::new(Duration::ZERO);
+        let (freezes, reads) = (Cell::new(0), Cell::new(0));
+        let w = QuietWait {
+            need: Duration::from_secs(50),
+            tries: 4,
+            poll: Duration::from_secs(1),
+        };
+        let r = wait_quiet(
+            key_known,
+            w,
+            &mut || t.get(),
+            &mut |d| t.set(t.get() + d),
+            &mut || {
+                freezes.set(freezes.get() + 1);
+                true
+            },
+            &mut || {
+                let i = reads.get();
+                reads.set(i + 1);
+                heads[i.min(heads.len() - 1)].clone()
+            },
+        );
+        (r, freezes.get(), reads.get())
+    }
+
+    #[test]
+    fn the_quiet_wait_refuses_a_move_with_no_head_key() {
+        let (r, freezes, reads) = fake_wait(false, &[HeadRead::Absent]);
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!((freezes, reads), (0, 0), "nothing frozen or read");
+    }
+
+    #[test]
+    fn the_quiet_wait_ends_once_head_held_still_for_the_span() {
+        use std::time::Duration;
+        let a = HeadRead::Bytes(b"a".to_vec());
+        let (r, freezes, reads) = fake_wait(true, std::slice::from_ref(&a));
+        assert_eq!(r, Ok((a.clone(), Duration::from_secs(50))));
+        assert_eq!(
+            (freezes, reads),
+            (51, 51),
+            "one freeze and one read per second"
+        );
+        // A HEAD that changes at the 20th read is quiet 50 s after that.
+        let b = HeadRead::Bytes(b"b".to_vec());
+        let mut heads = vec![a.clone(); 20];
+        heads.push(b.clone());
+        let (r, _, reads) = fake_wait(true, &heads);
+        assert_eq!(r, Ok((b, Duration::from_secs(50))));
+        assert_eq!(reads, 71);
+        // One that never holds still gives the move up at four spans.
+        let flapping: Vec<HeadRead> = (0..300u32)
+            .map(|i| HeadRead::Bytes(i.to_le_bytes().to_vec()))
+            .collect();
+        let (r, _, reads) = fake_wait(true, &flapping);
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(reads, 201);
+    }
+
+    #[test]
+    fn a_landing_read_tells_a_change_only_when_both_reads_succeeded() {
+        let a = HeadRead::Bytes(b"a".to_vec());
+        let b = HeadRead::Bytes(b"b".to_vec());
+        assert_eq!(moved_while_landing(&a, &a), Some(false));
+        assert_eq!(moved_while_landing(&a, &b), Some(true));
+        assert_eq!(moved_while_landing(&a, &HeadRead::Absent), Some(true));
+        assert_eq!(moved_while_landing(&HeadRead::Failed, &a), None);
+        assert_eq!(moved_while_landing(&a, &HeadRead::Failed), None);
+    }
+
+    #[test]
+    fn a_sweep_jump_given_up_is_taken_by_the_next_call() {
+        use SweepJumps::*;
+        assert_eq!(NotStarted.next(), SweepStep::Horizon);
+        // A horizon jump given up before its write is taken again.
+        assert_eq!(NotStarted.after(SweepStep::Horizon, Err(())), NotStarted);
+        let h = NotStarted.after(SweepStep::Horizon, Ok(true));
+        assert_eq!(h, HorizonWritten { reached: true });
+        assert_eq!(h.next(), SweepStep::Window);
+        // So is a window jump given up after the horizon jump landed.
+        assert_eq!(h.after(SweepStep::Window, Err(())), h);
+        assert_eq!(
+            h.after(SweepStep::Window, Err(())).next(),
+            SweepStep::Window
+        );
+        let done = h.after(SweepStep::Window, Ok(true));
+        assert_eq!(done, Done { reached: true });
+        assert_eq!(done.next(), SweepStep::Nothing);
+        // A jump written but not reached is never written again.
+        let lost = NotStarted.after(SweepStep::Horizon, Ok(false));
+        assert_eq!(lost.next(), SweepStep::Nothing);
+        assert_eq!(
+            h.after(SweepStep::Window, Ok(false)).next(),
+            SweepStep::Nothing
+        );
     }
 
     #[test]

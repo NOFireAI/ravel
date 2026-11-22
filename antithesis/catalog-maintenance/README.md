@@ -294,6 +294,7 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: inspect reported a corrupt HEAD` | reachable | every `catalog inspect --json` | |
 | `clock: the driver could not write the clock offset` | unreachable | `jump_clock`, the sweep jumps | |
 | `clock: the clock jump did not reach the driver` | unreachable | `jump_clock`, the sweep jumps | The driver's clock did not move by the jump within one reread plus 30 s. |
+| `clock: HEAD changed while a clock move landed` | unreachable | every clock move | HEAD differed after the move landed from the HEAD that held still before it ("HEAD holds still before every move"), so a delete after it can break the gate's TTL premise. A harness condition, not a Ravel defect. |
 | `catalog: the seeded load was refused` | unreachable | setup | |
 | `catalog: the seeded load reported other rows than planned` | unreachable | setup | |
 
@@ -347,10 +348,12 @@ forced-race nudge, the driver:
    The second term covers a server's read of HEAD started just before HEAD
    changed, which can return the old HEAD that late and is then cached for
    the TTL. A changed or unreadable HEAD, or a freeze the proxy did not
-   confirm, starts the wait again. After four such spans without one the
-   move is given up and nothing is written: the sealing jump and the sweep
-   jumps are then taken by a later rule or the eventually, and a forced race
-   reports not reached;
+   confirm, starts the wait again. After four such spans without one, or
+   when no `catalog inspect` has shown the HEAD key so HEAD can be neither
+   frozen nor read, the move is given up and nothing is written. The sealing
+   jump and each sweep jump (the window jump on its own, once the horizon
+   jump landed) are then taken by a later rule or the eventually, and a
+   forced race reports not reached;
 3. computes the move from its clock after the wait, so a nudge aimed at a
    window still lands in it, writes the offset as above, and keeps HEAD
    frozen until one more reread passed, so every process moved before any
@@ -360,12 +363,13 @@ The driver sends no query across a move, since every move runs under the
 write gate. The wait does not cover a query that the driver's 30 s client
 timeout gave up on but that its server is still running. Each move's
 `clock: jumped` line records `head_quiet_s` and whether a read after the
-landing found HEAD changed anyway (`head_moved_while_landing`; only a proxy
-restarted inside the landing's 3 s lets a fold through then), which a
-`clock: HEAD changed while the move landed` line also reports.
-`local-run.sh` fails a run with a move whose `head_quiet_s` is below the
-span or that saw HEAD change while it landed, and checks that there is one
-such line per move. The wait
+landing found HEAD changed anyway (`head_moved_while_landing`, null when
+either read failed; only a proxy restarted inside the landing's 3 s lets a
+fold through then). A change also fails the unreachable assertion `clock:
+HEAD changed while a clock move landed`, so a cloud run attributes what
+follows to the harness. `local-run.sh` fails a run with a move whose
+`head_quiet_s` is below the span or whose `head_moved_while_landing` is not
+false, and checks that there is one such line per move. The wait
 adds about 56 s to each move, so up to 18 moves add about 1000 s to an
 eventually.
 

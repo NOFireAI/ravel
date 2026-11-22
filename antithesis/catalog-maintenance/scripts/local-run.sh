@@ -298,14 +298,16 @@ offset=$(docker compose exec -T ravel1 cat /faketime/offset 2>/dev/null | tr -d 
 # Every clock move held HEAD still for the quiet span first and kept it still
 # while it landed (README.md, "HEAD holds still before every move"): one
 # `clock: jumped` line per move, each with head_quiet_s at least
-# head_quiet_needed_s, and no move that saw HEAD change while it landed.
+# head_quiet_needed_s and head_moved_while_landing false: true is a move that
+# saw HEAD change while it landed, and null one whose landing read could not
+# tell.
 if [ -n "$driver_log" ]; then
     sed -n 's/.*clock: jumped (\(.*\))$/\1/p' "$OUT/driver.log" > "$OUT/clock-moves.jsonl"
     moves=$(wc -l < "$OUT/clock-moves.jsonl")
     [ "$moves" -eq $((3 + nudges)) ] \
         || fail "the driver logged $moves clock moves, not the three jumps and $nudges forced-race moves"
     if short=$(jq -r 'select((.head_quiet_s // -1) < (.head_quiet_needed_s // 1e9)
-            or .head_moved_while_landing == true) | .reason' "$OUT/clock-moves.jsonl"); then
+            or .head_moved_while_landing != false) | .reason' "$OUT/clock-moves.jsonl"); then
         [ -z "$short" ] \
             || fail "clock moves that did not hold HEAD still for the quiet span: $(tr '\n' ' ' <<< "$short")"
     else
