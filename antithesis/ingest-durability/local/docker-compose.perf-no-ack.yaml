@@ -8,7 +8,8 @@
 #
 # A flush delay cannot do this: the server refuses a --max-flush-delay at or
 # above 2500ms at startup (validate_strict_visibility_budget, a 3 s budget
-# with a 500 ms reserve), so a buffer still flushes, and acks, within 2.5 s.
+# with a 500 ms reserve), so a strict waiter's buffer still flushes within
+# 2.5 s of its oldest row.
 # The run expects both TTFA samples to come out none and no ack probe to run
 # (the gate checks it).
 #
