@@ -23,7 +23,7 @@
 //! reserves an allocation before it makes it, holding the old and the new
 //! buffer at once while a reallocation copies, and an allocation the
 //! allocator refuses releases that charge and fails the absorb with
-//! [`FetchError::FetchMemoryExhausted`].
+//! [`QueryError::AllocationRefused`].
 
 use std::collections::{HashMap, TryReserveError};
 use std::hash::Hash;
@@ -240,14 +240,10 @@ impl Ledger {
         if bytes <= self.charged {
             return Ok(());
         }
-        let reservation = self.budget.reserve(bytes - self.charged).map_err(|e| {
-            FetchError::FetchMemoryExhausted {
-                requested: e.requested,
-                reserved: e.reserved,
-                limit: e.limit,
-                cause: e.cause,
-            }
-        })?;
+        let reservation = self
+            .budget
+            .reserve(bytes - self.charged)
+            .map_err(budget_refused)?;
         self.charged = self.charged.saturating_add(reservation.size());
         self.reservations.push(reservation);
         Ok(())
@@ -270,7 +266,7 @@ impl Ledger {
     /// live, so the reservation covers `held + new` before `alloc` runs; once
     /// `alloc` succeeds the old buffer is the caller's to free. When `alloc`
     /// fails, the `new` bytes charged for it are released, once, and the
-    /// failure is [`FetchError::FetchMemoryExhausted`] for them.
+    /// failure is [`QueryError::AllocationRefused`] for them.
     fn grow(
         &mut self,
         old: u64,
@@ -281,7 +277,7 @@ impl Ledger {
         self.held = self.held.saturating_add(new);
         if !allocate(self.charged, alloc) {
             self.held = self.held.saturating_sub(new);
-            return Err(allocation_failed(&self.budget, new));
+            return Err(allocation_failed(new));
         }
         self.held = self.held.saturating_sub(old);
         Ok(())
@@ -295,9 +291,15 @@ impl Ledger {
 
     /// Shrinks the reservations to `bytes`: keeps the leading reservations
     /// that fit in `bytes`, reserves the rest before it releases the ones it
-    /// replaces, so the fold is never charged less than it holds. A budget
-    /// that refuses the new reservation leaves the old ones in place, and the
-    /// fold over-charged until it drops; a [`Reservation`] cannot shrink.
+    /// replaces, so the fold is never charged less than it holds. That new
+    /// reservation is asked for while the old ones are still held, so the
+    /// budget refuses it whenever its room is short of it: a budget the
+    /// call's own reservation filled, other holders on a tight budget, or a
+    /// closed host gate. A refusal gives up the trim and leaves the old
+    /// reservations in place, a [`Reservation`] being unable to shrink: the
+    /// fold stays over-charged, never under-charged, until a later trim
+    /// succeeds. Under that memory pressure the fold keeps the call's merge
+    /// room as it did before issue #4530.
     fn trim_to(&mut self, bytes: u64) {
         if bytes >= self.charged {
             return;
@@ -339,19 +341,29 @@ fn allocate(charged: u64, alloc: impl FnOnce() -> Result<(), TryReserveError>) -
     alloc().is_ok()
 }
 
-/// The error for a `requested`-byte allocation the allocator refused. The
-/// budget's own figures are reported, with [`ExhaustionCause::Accounted`]
-/// since the budget has no cause for an allocator refusal.
-///
-/// [`ExhaustionCause::Accounted`]: ravel_memory::ExhaustionCause::Accounted
-fn allocation_failed(budget: &ravel_memory::MemoryBudget, requested: u64) -> QueryError {
+/// The error for a `requested`-byte allocation the allocator refused after
+/// the budget admitted its charge. It is not a budget refusal, so it is not
+/// [`FetchError::FetchMemoryExhausted`], whose causes are the budget's.
+fn allocation_failed(requested: u64) -> QueryError {
+    QueryError::AllocationRefused { requested }
+}
+
+/// A reservation the budget refused, as the error a fetch reservation
+/// returns.
+fn budget_refused(e: ravel_memory::MemoryExhausted) -> QueryError {
     FetchError::FetchMemoryExhausted {
-        requested,
-        reserved: budget.reserved(),
-        limit: budget.limit(),
-        cause: ravel_memory::ExhaustionCause::Accounted,
+        requested: e.requested,
+        reserved: e.reserved,
+        limit: e.limit,
+        cause: e.cause,
     }
     .into()
+}
+
+/// The bytes [`RunFold::finish`]'s output Vec of `S` allocates for
+/// `series` series.
+fn result_len<S>(series: usize) -> u64 {
+    (series as u64).saturating_mul(std::mem::size_of::<S>() as u64)
 }
 
 impl<V: FoldValue> RunFold<V> {
@@ -371,20 +383,28 @@ impl<V: FoldValue> RunFold<V> {
         }
     }
 
-    /// Reserves the most folding `runs` in can make the fold hold at once,
-    /// then folds them in, charging each allocation before it is made, so the
+    /// Reserves the call's bound ([`call_bound`](RunFold::call_bound)), then
+    /// folds `runs` in, charging each allocation before it is made, so the
     /// fold never holds more than it has reserved (issue #4118). A series
     /// past `max_series` is refused with [`QueryError::TooManySeries`]
     /// (ADR-0051 S7) the moment it would be added; a run whose priority
     /// column is not parallel to its samples, or whose timestamps descend,
-    /// with the error the merge returns for it; a refused reservation with
-    /// [`FetchError::FetchMemoryExhausted`], the error a fetch reservation
-    /// returns, before any of `runs` is folded; and an allocation the
-    /// allocator refuses with the same error.
+    /// with the error the merge returns for it; a reservation the budget
+    /// refuses with [`FetchError::FetchMemoryExhausted`], the error a fetch
+    /// reservation returns; and an allocation the allocator refuses with
+    /// [`QueryError::AllocationRefused`].
+    ///
+    /// A bound the budget refuses fails the call before any of `runs` is
+    /// folded. Two charges lie outside the bound and can be refused after
+    /// some of `runs` were folded, which then stay folded: the exact-size
+    /// copy of a run's level that a duplicate timestamp shortened, and the
+    /// finish headroom raised at the call's end for a series the bound did
+    /// not predict to merge that ends the call as more than one level.
     ///
     /// The reservation is then shrunk, whether the call succeeded or not, to
     /// what the fold holds plus the headroom [`RunFold::finish`]'s merges
-    /// need, so a call's merge room is not held past it.
+    /// need, so a call's merge room is not held past it, unless the budget
+    /// refuses the smaller reservation ([`Ledger::trim_to`]).
     ///
     /// The bound is computed over `runs` in place, sorted by series so each
     /// series' incoming samples sum without a side table (issue #4198); the
@@ -420,10 +440,15 @@ impl<V: FoldValue> RunFold<V> {
         Ok(())
     }
 
-    /// The most the fold can hold at once while it folds `runs`, sorted by
-    /// series, in, and how many of their series it does not hold yet.
+    /// The reservation [`absorb`](RunFold::absorb) takes before it folds
+    /// `runs`, sorted by series, in, and how many of their series the fold
+    /// does not hold yet. It is not the most the fold can hold during the
+    /// call: the exact-size copy of a level that a duplicate timestamp
+    /// shortened is not counted, nor the finish headroom raised for a series
+    /// not predicted to merge; each is charged when it arises.
     ///
-    /// The growth counts every incoming sample as kept in a level of its
+    /// The bound is what the fold holds, plus its growth, plus the finish
+    /// headroom or one transient buffer, whichever is larger. The growth counts every incoming sample as kept in a level of its
     /// run's length, the labels of each new series, each spine's growth to
     /// one more level per run, the `by_series` table's growth to the new
     /// series, and the prefix Vec's and `prefix_ids`' growth to one entry per
@@ -761,15 +786,16 @@ impl<V: FoldValue> RunFold<V> {
         serves_over(&self.prefixes, a, b)
     }
 
-    /// The bytes this fold holds reserved. After each absorb that is the
-    /// bytes its containers hold, by capacity, plus the headroom its final
-    /// merges need: each level's buffer at its inline sample size plus its
-    /// samples' heap bytes, each series' spine of levels, the `by_series` and
-    /// `prefix_ids` tables at hashbrown's allocation for their capacity, the
-    /// prefix Vec, and each label's inline size plus its strings' capacity.
-    /// The headroom is the level capacity of the largest series it has held
-    /// as more than one level, 0 while every series is one level. During an
-    /// absorb it is at most that call's bound.
+    /// The bytes this fold holds reserved. It is never less than the bytes
+    /// its containers hold, by capacity: each level's buffer at its inline
+    /// sample size plus its samples' heap bytes, each series' spine of
+    /// levels, the `by_series` and `prefix_ids` tables at hashbrown's
+    /// allocation for their capacity, the prefix Vec, and each label's inline
+    /// size plus its strings' capacity. After an absorb that succeeded and
+    /// whose trim the budget granted, it is exactly those bytes plus the
+    /// finish headroom: the level capacity of the largest series the fold has
+    /// held as more than one level, 0 while every series is one level. A
+    /// trim the budget refused leaves it above that ([`Ledger::trim_to`]).
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn charged(&self) -> u64 {
         self.ledger.charged
@@ -777,29 +803,47 @@ impl<V: FoldValue> RunFold<V> {
 
     /// Hands the fold's reservations to the caller, which holds them for as
     /// long as it holds the series [`into_series`](RunFold::into_series)
-    /// returns, and leaves the fold charging nothing, so each reserved byte
-    /// is held once. The scalar series take no more than the fold held plus
-    /// its headroom (issue #4118): the final merges build levels within the
-    /// headroom and convert in place to a smaller sample. A histogram
-    /// series' converted values allocate apart from the fold's buffers and
-    /// are not covered.
+    /// returns, and zeroes the fold's charged figure, so each reserved byte
+    /// is held once.
     pub(super) fn take_reservations(&mut self) -> Vec<ravel_memory::Reservation> {
         self.ledger.charged = 0;
         std::mem::take(&mut self.ledger.reservations)
     }
 
     /// Collapses each series' runs into one, converts each held sample with
-    /// `convert`, and checks `max_samples` over the whole result, counting one
-    /// sample per `(series, ts)` slot as the merge does. Reservations not
-    /// taken with [`take_reservations`](RunFold::take_reservations) are
-    /// released when this returns. Each merge's level is sized exactly
-    /// before it is built, within the fold's headroom; an allocation the
-    /// allocator refuses is [`FetchError::FetchMemoryExhausted`].
-    fn finish<T>(
+    /// `convert` and each series with `wrap`, and checks `max_samples` over
+    /// the whole result, counting one sample per `(series, ts)` slot as the
+    /// merge does. Reservations not taken with
+    /// [`take_reservations`](RunFold::take_reservations) are released when
+    /// this returns.
+    ///
+    /// Before it allocates the result Vec it reserves that Vec's bytes,
+    /// [`result_len`], as a reservation of its own, and pushes it to `held`
+    /// once the result is built, so the caller holds it with the result; a
+    /// budget that refuses it is [`FetchError::FetchMemoryExhausted`]. Each
+    /// merge's level is sized exactly before it is built, within the fold's
+    /// headroom; an allocation the allocator refuses is
+    /// [`QueryError::AllocationRefused`]. So the fold's charge and the result
+    /// reservation together cover the containers, the result Vec and the
+    /// merge buffer being built at every point (issue #4118).
+    ///
+    /// The scalar conversion maps a held sample to a smaller [`Sample`] of
+    /// the same alignment, which `Vec`'s in-place collect writes into the
+    /// merged level's own buffer. Two histogram allocations stay uncharged,
+    /// because the one reservation taken here is sized for the result Vec
+    /// only and is not grown per series: the converted level, a new buffer of
+    /// its length times the size of a [`ravel_promql::HistogramSample`],
+    /// which is larger than a held histogram sample, allocated while the
+    /// merged level is live; and each converted value's span, bucket and
+    /// custom-value Vecs, each allocated before the held value it replaces is
+    /// dropped.
+    fn finish<T, S>(
         self,
         max_samples: usize,
         convert: impl Fn(FoldedSample<V>) -> T,
-    ) -> Result<Vec<(LabelSet, Vec<T>)>, QueryError> {
+        wrap: impl Fn(LabelSet, Vec<T>) -> S,
+        held: &mut Vec<ravel_memory::Reservation>,
+    ) -> Result<Vec<S>, QueryError> {
         let Self {
             by_series,
             prefixes,
@@ -807,16 +851,19 @@ impl<V: FoldValue> RunFold<V> {
             ..
         } = self;
         let inline = inline_len::<V>();
+        let spine = std::mem::size_of::<Vec<FoldedSample<V>>>() as u64;
+        let count = by_series.len();
+        let result = ledger
+            .budget
+            .reserve(result_len::<S>(count))
+            .map_err(budget_refused)?;
+        let mut probe = FinishProbe::new(ledger.held, ledger.charged.saturating_add(result.size()));
         let mut total = 0usize;
         let mut out = Vec::new();
-        let count = by_series.len();
         if !allocate(ledger.charged, || out.try_reserve_exact(count)) {
-            let entry = std::mem::size_of::<(LabelSet, Vec<T>)>() as u64;
-            return Err(allocation_failed(
-                &ledger.budget,
-                (count as u64).saturating_mul(entry),
-            ));
+            return Err(allocation_failed(result_len::<S>(count)));
         }
+        probe.alloc(result_len::<S>(out.capacity()));
         for series in by_series.into_values() {
             let mut levels = series.levels;
             let mut merged = levels.pop().unwrap_or_default();
@@ -824,15 +871,17 @@ impl<V: FoldValue> RunFold<V> {
                 let len = merged_len(&level, &merged);
                 let mut next = Vec::new();
                 if !allocate(ledger.charged, || next.try_reserve_exact(len)) {
-                    return Err(allocation_failed(
-                        &ledger.budget,
-                        (len as u64).saturating_mul(inline),
-                    ));
+                    return Err(allocation_failed((len as u64).saturating_mul(inline)));
                 }
+                probe.alloc((next.capacity() as u64).saturating_mul(inline));
+                let freed = ((level.capacity() + merged.capacity()) as u64).saturating_mul(inline);
                 let mut dropped = 0u64;
                 merge_into(&prefixes, level, merged, &mut next, &mut dropped);
+                probe.free(freed.saturating_add(dropped));
                 merged = next;
             }
+            probe.free((levels.capacity() as u64).saturating_mul(spine));
+            drop(levels);
             total = total.saturating_add(merged.len());
             if total > max_samples {
                 return Err(QueryError::TooManySamples {
@@ -840,45 +889,139 @@ impl<V: FoldValue> RunFold<V> {
                     max: max_samples,
                 });
             }
-            out.push((series.labels, merged.into_iter().map(&convert).collect()));
+            let source = (
+                merged.as_ptr() as usize,
+                (merged.capacity() as u64).saturating_mul(inline),
+            );
+            let samples: Vec<T> = merged.into_iter().map(&convert).collect();
+            probe.converted(
+                source,
+                samples.as_ptr() as usize,
+                result_len::<T>(samples.capacity()),
+            );
+            out.push(wrap(series.labels, samples));
         }
+        probe.finish();
         drop(ledger);
+        held.push(result);
         Ok(out)
     }
 }
 
 impl RunFold<f64> {
     /// The merged series, as [`merge_soa_runs`](super::merge_soa_runs)
-    /// returns them.
-    pub(super) fn into_series(self, max_samples: usize) -> Result<Vec<SeriesData>, QueryError> {
-        Ok(self
-            .finish(max_samples, |s| Sample {
+    /// returns them. The reservation for the result Vec is pushed to `held`
+    /// ([`finish`](RunFold::finish)).
+    pub(super) fn into_series(
+        self,
+        max_samples: usize,
+        held: &mut Vec<ravel_memory::Reservation>,
+    ) -> Result<Vec<SeriesData>, QueryError> {
+        self.finish(
+            max_samples,
+            |s| Sample {
                 ts_ns: s.ts,
                 value: s.value,
-            })?
-            .into_iter()
-            .map(|(labels, samples)| SeriesData { labels, samples })
-            .collect())
+            },
+            |labels, samples| SeriesData { labels, samples },
+            held,
+        )
     }
 }
 
 impl RunFold<HistogramValue> {
     /// The merged series, as
     /// [`merge_histogram_soa_runs`](super::merge_histogram_soa_runs) returns
-    /// them.
+    /// them. The reservation for the result Vec is pushed to `held`
+    /// ([`finish`](RunFold::finish)).
     pub(super) fn into_series(
         self,
         max_samples: usize,
+        held: &mut Vec<ravel_memory::Reservation>,
     ) -> Result<Vec<HistogramSeriesData>, QueryError> {
-        Ok(self
-            .finish(max_samples, |s| ravel_promql::HistogramSample {
+        self.finish(
+            max_samples,
+            |s| ravel_promql::HistogramSample {
                 ts_ns: s.ts,
                 value: histogram_value_to_float(&s.value),
-            })?
-            .into_iter()
-            .map(|(labels, samples)| HistogramSeriesData { labels, samples })
-            .collect())
+            },
+            |labels, samples| HistogramSeriesData { labels, samples },
+            held,
+        )
     }
+}
+
+/// What [`RunFold::finish`] holds live as it runs, by step 1's definition
+/// plus the result Vec, recorded for the #4118 check across finish
+/// ([`support::take_finish_peak`]). It starts from the fold's running count
+/// of what it holds, which the tests check against the containers after
+/// every absorb, and counts the labels, the tables and the prefix Vec as
+/// live until finish returns.
+#[cfg(any(test, feature = "test-support"))]
+struct FinishProbe {
+    live: u64,
+    peak: u64,
+    charged: u64,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FinishProbe {
+    fn new(live: u64, charged: u64) -> Self {
+        Self {
+            live,
+            peak: live,
+            charged,
+        }
+    }
+
+    fn alloc(&mut self, bytes: u64) {
+        self.live = self.live.saturating_add(bytes);
+        self.peak = self.peak.max(self.live);
+    }
+
+    fn free(&mut self, bytes: u64) {
+        self.live = self.live.saturating_sub(bytes);
+    }
+
+    /// A level of `source` (its address and bytes) converted into a buffer
+    /// at `address` of `bytes`. A conversion that moved to another buffer
+    /// held both while it ran.
+    fn converted(&mut self, source: (usize, u64), address: usize, bytes: u64) {
+        if source.0 == address {
+            self.free(source.1);
+            self.live = self.live.saturating_add(bytes);
+        } else {
+            self.alloc(bytes);
+            self.free(source.1);
+        }
+    }
+
+    fn finish(self) {
+        support::record_finish_peak(self.peak, self.charged);
+    }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+struct FinishProbe;
+
+#[cfg(not(any(test, feature = "test-support")))]
+impl FinishProbe {
+    #[inline(always)]
+    fn new(_live: u64, _charged: u64) -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    fn alloc(&mut self, _bytes: u64) {}
+
+    #[inline(always)]
+    fn free(&mut self, _bytes: u64) {}
+
+    #[inline(always)]
+    fn converted(&mut self, _source: (usize, u64), _address: usize, _bytes: u64) {}
+
+    #[inline(always)]
+    fn finish(self) {}
 }
 
 /// The bytes one held sample takes in a level's buffer.
@@ -1239,7 +1382,7 @@ pub mod support {
         }
 
         pub fn into_series(self) -> Result<Vec<SeriesData>, QueryError> {
-            self.0.into_series(usize::MAX)
+            self.0.into_series(usize::MAX, &mut Vec::new())
         }
     }
 
@@ -1321,6 +1464,19 @@ pub mod support {
     thread_local! {
         static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
         static INJECTED_CHARGE: Cell<Option<u64>> = const { Cell::new(None) };
+        static FINISH_PEAK: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn record_finish_peak(peak: u64, charged: u64) {
+        FINISH_PEAK.with(|p| p.set(Some((peak, charged))));
+    }
+
+    /// The last `into_series` that returned a result on this thread: the
+    /// most it held live at once, by step 1's definition plus its result
+    /// Vec, and what the fold had charged plus the result reservation.
+    /// Taking it clears it.
+    pub fn take_finish_peak() -> Option<(u64, u64)> {
+        FINISH_PEAK.with(|p| p.take())
     }
 
     /// Makes the fold's allocation after the next `skip` ones on this
@@ -1751,7 +1907,7 @@ mod tests {
             for idx in completion_order(objects.len(), seed) {
                 fold.absorb(objects[idx].clone()).expect("absorb");
             }
-            let got = project_scalar(fold.into_series(usize::MAX).expect("finish"));
+            let got = project_scalar(fold.into_series(usize::MAX, &mut Vec::new()).expect("finish"));
             prop_assert_eq!(got, want);
         }
 
@@ -1769,7 +1925,7 @@ mod tests {
             for idx in completion_order(objects.len(), seed) {
                 fold.absorb(objects[idx].clone()).expect("absorb");
             }
-            let got = project_histograms(fold.into_series(usize::MAX).expect("finish"));
+            let got = project_histograms(fold.into_series(usize::MAX, &mut Vec::new()).expect("finish"));
             prop_assert_eq!(got, want);
         }
     }
@@ -1784,7 +1940,7 @@ mod tests {
         let mut fold = ScalarFold::new(unlimited(), usize::MAX);
         fold.absorb(old).expect("absorb");
         fold.absorb(new).expect("absorb");
-        let series = fold.into_series(usize::MAX).expect("finish");
+        let series = fold.into_series(usize::MAX, &mut Vec::new()).expect("finish");
         assert_eq!(series[0].samples[0].value.to_bits(), 2.0f64.to_bits());
     }
 
@@ -1806,7 +1962,9 @@ mod tests {
         for object in &objects {
             fold.absorb(object.clone()).expect("absorb");
         }
-        let err = fold.into_series(2).expect_err("three samples");
+        let err = fold
+            .into_series(2, &mut Vec::new())
+            .expect_err("three samples");
         let want = merge_soa_runs(objects, usize::MAX, 2).expect_err("merge");
         assert_eq!(format!("{err:?}"), format!("{want:?}"));
     }
@@ -1856,7 +2014,7 @@ mod tests {
         assert_eq!(fold.charged(), held, "the merged level replaced both");
         assert_eq!(budget.reserved(), held);
 
-        let series = fold.into_series(usize::MAX).expect("finish");
+        let series = fold.into_series(usize::MAX, &mut Vec::new()).expect("finish");
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].samples.len(), 3);
         assert_eq!(budget.reserved(), 0, "released once the result is built");
@@ -1932,7 +2090,7 @@ mod tests {
         let charged = fold.charged();
         assert!(charged > 0);
         let held = fold.take_reservations();
-        let series = fold.into_series(usize::MAX).expect("finish");
+        let series = fold.into_series(usize::MAX, &mut Vec::new()).expect("finish");
         assert_eq!(series.len(), 1);
         assert_eq!(budget.reserved(), charged, "held with the series");
         drop(held);
@@ -2045,7 +2203,7 @@ mod tests {
             }
         }
         let (charged, live) = peak.expect("at least one absorb");
-        (fold.into_series(usize::MAX).expect("finish"), charged, live)
+        (fold.into_series(usize::MAX, &mut Vec::new()).expect("finish"), charged, live)
     }
 
     fn plain_fold(calls: Vec<Vec<FetchedSeriesSoa>>) -> Vec<SeriesData> {
@@ -2053,7 +2211,7 @@ mod tests {
         for call in calls {
             fold.absorb(call).expect("absorb");
         }
-        fold.into_series(usize::MAX).expect("finish")
+        fold.into_series(usize::MAX, &mut Vec::new()).expect("finish")
     }
 
     /// Folds one shape, prints its R5 figure line, asserts charged/live sits
@@ -2220,7 +2378,7 @@ mod tests {
         for call in histogram_shape() {
             fold.absorb(call).expect("absorb");
         }
-        let histograms = project_histograms(fold.into_series(usize::MAX).expect("finish"));
+        let histograms = project_histograms(fold.into_series(usize::MAX, &mut Vec::new()).expect("finish"));
         got.push(("histogram", fnv(&format!("{histograms:?}"))));
         for (shape, digest) in &got {
             println!("R5 digest shape={shape} {digest:#018x}");
@@ -2286,7 +2444,7 @@ mod tests {
             if shape != "C" {
                 assert_eq!(fold.finish_headroom, 0, "shape {shape}");
             }
-            let got = project_scalar(fold.into_series(usize::MAX).expect("finish"));
+            let got = project_scalar(fold.into_series(usize::MAX, &mut Vec::new()).expect("finish"));
             assert_eq!(got, want, "shape {shape}");
             assert_eq!(budget.reserved(), 0, "shape {shape}");
         }
@@ -2515,7 +2673,7 @@ mod tests {
             }
             assert!(fold.finish_headroom > 0, "series 13 is two levels");
             support::fail_allocation_after(skip);
-            let err = fold.into_series(usize::MAX).expect_err("refused");
+            let err = fold.into_series(usize::MAX, &mut Vec::new()).expect_err("refused");
             assert!(support::injected_failure_charge().is_some(), "fired");
             assert!(
                 matches!(
@@ -2563,7 +2721,7 @@ mod tests {
         assert_eq!(sizes, charged);
         assert_eq!(fold.charged(), 0);
         assert_eq!(budget.reserved(), charged);
-        let series = fold.into_series(usize::MAX).expect("finish");
+        let series = fold.into_series(usize::MAX, &mut Vec::new()).expect("finish");
         assert_eq!(budget.reserved(), charged, "held with the series");
         drop(series);
         drop(taken);

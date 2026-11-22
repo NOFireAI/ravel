@@ -150,10 +150,13 @@ impl From<QueryError> for ApiError {
             // (the ledger's limit, or the host-memory gate), carrying only
             // byte figures, so it is echoed rather than redacted.
             // `redacted_storage_message` returns `None` for both.
+            // An allocation the allocator refused after the budget admitted it
+            // is the same class from the client's view: the query needed more
+            // memory than the process could give it. The text carries one byte
+            // figure, so it is echoed.
             QueryError::Fetch(FetchError::FetchMemoryExhausted { .. })
-            | QueryError::Catalog(CatalogError::MemoryExhausted(_)) => {
-                ApiError::Unsupported(e.to_string())
-            }
+            | QueryError::Catalog(CatalogError::MemoryExhausted(_))
+            | QueryError::AllocationRefused { .. } => ApiError::Unsupported(e.to_string()),
             QueryError::DeadlineExceeded { .. } => ApiError::Timeout(e.to_string()),
             QueryError::Eval(inner) => from_eval_error(inner, &e),
             // Handled above by `redacted_storage_message`.

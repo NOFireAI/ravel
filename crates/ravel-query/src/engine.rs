@@ -2301,8 +2301,9 @@ impl QueryEngine {
                                     &mut histogram_fold,
                                 )
                                 .await?;
-                            let histogram_held = histogram_fold.take_reservations();
-                            let histograms = histogram_fold.into_series(max_samples)?;
+                            let mut histogram_held = histogram_fold.take_reservations();
+                            let histograms =
+                                histogram_fold.into_series(max_samples, &mut histogram_held)?;
                             Ok::<PerPlan, QueryError>((
                                 histograms,
                                 histogram_held,
@@ -2449,7 +2450,7 @@ impl QueryEngine {
                 .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             held.extend(scalar_fold.take_reservations());
-            let mut series = scalar_fold.into_series(max_samples)?;
+            let mut series = scalar_fold.into_series(max_samples, &mut held)?;
             series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
             let mut histogram_series: Vec<HistogramSeriesData> =
                 combined_histograms.into_values().collect();
