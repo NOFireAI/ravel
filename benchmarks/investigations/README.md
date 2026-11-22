@@ -1689,7 +1689,7 @@ python3 benchmarks/investigations/investigations_cases.py --refresh-local-smoke
 ## Tests
 
 `bash benchmarks/investigations/investigations.test.sh`, in CI's
-`doc-scripts` job: no AWS, no server, about 11 minutes (the Box suite alone
+`doc-scripts-suite` job: no AWS, no server, about 11 minutes (the Box suite alone
 about 504 s). It runs `bash -n`
 over every script, generator recounts at 1,000 traces and at 5,000 (where
 the logs reach 4 blocks of 8,192 rows and the needle-block recount applies,
