@@ -4724,7 +4724,9 @@ impl Catalog {
     /// (the resolve's `del/` LIST found a `.done`): a rewrite outlives its
     /// request's `.dreq` only after that request completed, so without a
     /// `.done` and without a pending request no rewrite can name the input
-    /// and the answer is `None` at no store read.
+    /// and the answer is `None` at no store read. Whenever the bucket LIST
+    /// does run, a tombstone it shows answers zero segments, on the
+    /// `.done`-only path too.
     #[allow(clippy::too_many_arguments)]
     async fn token_input_replacement(
         &self,
@@ -4749,7 +4751,7 @@ impl Catalog {
             .load_token_bucket(tenant, signal, token, accounting)
             .await?
         else {
-            return Ok(checked.then(Vec::new));
+            return Ok(Some(Vec::new()));
         };
         let identity = token_identity(token);
         let superseded_records = bucket.supersession()?.superseded_records;

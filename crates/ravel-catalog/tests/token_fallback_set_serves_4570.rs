@@ -30,7 +30,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord,
-    ErasurePredicateMatcher, ErasureRequest, RewriteDrop, RewriteRecord,
+    ErasurePredicateMatcher, ErasureRequest, RetentionTombstone, RewriteDrop, RewriteRecord,
 };
 use ravel_segment::VERSION_V7;
 use ravel_types::{CommitToken, Signal, TenantHash, TimeRange};
@@ -531,4 +531,69 @@ async fn metrics_present_token_replaced_by_a_completed_erasure_serves_the_rewrit
         "R's part serves A's surviving rows; A, which holds the erased row, is not added"
     );
     assert_eq!(rows(&snapshot), A_ROWS - 1);
+}
+
+/// A token whose commit record is still present, in a bucket retention has
+/// tombstoned, on a tenant that has a completed erasure request (`.done`)
+/// unrelated to the bucket. The query window excludes the token's hour, so
+/// the set holds nothing of the bucket and no erasure is pending: the bucket
+/// LIST runs only because of the `.done`, and it shows the tombstone. The
+/// token is satisfied with zero segments, as the absent-record fallback
+/// answers a tombstoned bucket, so A, which retention is deleting, is not
+/// added.
+async fn present_token_in_a_tombstoned_bucket_after_a_completed_erasure(signal: Signal) {
+    let store = Arc::new(MemoryStore::new());
+    let a = record_a(signal);
+    put_l0(store.as_ref(), &a).await;
+    let q = Uuid::from_u128(0x4573_d001);
+    put(
+        store.as_ref(),
+        &keys::erasure_completion_key(&tenant(), signal, q).expect("done key"),
+        b"done".to_vec(),
+    )
+    .await;
+    let tombstone = RetentionTombstone {
+        format_version: 1,
+        tenant_hash: tenant().0.to_vec(),
+        signal: signal::to_proto(signal) as i32,
+        shard: 0,
+        ingest_hour_bucket: HOUR,
+        retired_at_ns: 0,
+        retention_window_ns: 0,
+        record_count_observed: 0,
+    };
+    put(
+        store.as_ref(),
+        &keys::retention_tombstone_key_for(&tombstone).expect("tombstone key"),
+        record::encode_tombstone(&tombstone).to_vec(),
+    )
+    .await;
+
+    let other_hour = HOUR + 5;
+    let snapshot = catalog_on(store.clone(), None)
+        .resolve(
+            &tenant(),
+            signal,
+            hour_range(other_hour),
+            &[token(&a)],
+            hour_start(other_hour) + 60_000_000_000,
+        )
+        .await
+        .expect("resolve");
+    assert!(snapshot.pending_erasure.is_empty(), "nothing is pending");
+    assert_eq!(
+        sorted_keys(&snapshot),
+        Vec::<String>::new(),
+        "A's bucket is tombstoned: A is not added"
+    );
+}
+
+#[tokio::test]
+async fn logs_present_token_in_a_tombstoned_bucket_after_a_completed_erasure_adds_nothing() {
+    present_token_in_a_tombstoned_bucket_after_a_completed_erasure(Signal::Logs).await;
+}
+
+#[tokio::test]
+async fn metrics_present_token_in_a_tombstoned_bucket_after_a_completed_erasure_adds_nothing() {
+    present_token_in_a_tombstoned_bucket_after_a_completed_erasure(Signal::Metrics).await;
 }
