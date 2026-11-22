@@ -6583,9 +6583,9 @@ fn render_maintain_safety_family(
         "Commit records a compaction, migration or erasure rewrite plan left out because the \
          store stamped them at or after their bucket's late-commit cutoff (the hour's end plus \
          the seal margin), by signal, counted once per plan that left each one out, since \
-         process start (ADR-4561). A record left out is still served, kept and swept as \
-         before, so a record that stays in its bucket is counted again by every pass that \
-         plans the bucket. A warn log line names its key. Nonzero means a writer's commit PUT \
+         process start (ADR-4561). A record left out is still served, and the sweep keeps \
+         it: it is never swept for being late, so a record that stays in its bucket is \
+         counted again by every pass that plans the bucket. A warn log line names its key. Nonzero means a writer's commit PUT \
          reached the store after the seal margin: check writer flush times and clock skew.",
         "counter",
     );
