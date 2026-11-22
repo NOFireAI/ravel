@@ -454,6 +454,10 @@ syntax and exit codes:
 - `check-lockfile-downgrade.sh <base-ref> [head-ref]`: a `Cargo.lock`
   downgrade needs a `Lockfile-downgrade: <crate> <version>` trailer in the
   range. CI's `supply-chain` job only; `gates.sh` does not run it.
+- `check-compat-corpus-append-only.sh <base-ref> [head-ref]`: a published
+  fixture under `crates/ravel-compat-tests/corpus/` may be added, never
+  modified or deleted (ADR-4233 decision 9). `gates.sh` runs its cases, and
+  its range check when `origin/main` is available.
 - `check-amendment-integrity.sh`, `check-adr-band-sources.sh`: an ADR
   amendment's marker matches the document, and every band table row has a
   source. `docs/adrs/README.md`, "Amending an ADR", has the marker syntax.
