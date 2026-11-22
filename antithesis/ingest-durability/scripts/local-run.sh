@@ -27,10 +27,13 @@
 #                                     variant"). Needs
 #                                     WORKLOAD_EVENTUALLY_AFTER_SECS; not with
 #                                     a mutant. The run also fails unless the
-#                                     driver printed exactly one perf summary
-#                                     line, two perf ttfa lines and 20 perf
-#                                     ack lines, every perf line is inside its
-#                                     band, and every "required" assertion in
+#                                     driver printed exactly one perf t0
+#                                     line, one perf summary line, two perf
+#                                     ttfa lines, 20 perf ack lines and two
+#                                     perf median lines (no ack and no median
+#                                     line with PERF_LEVER=no-ack), every perf
+#                                     line is inside its band, and every
+#                                     "required" assertion in
 #                                     local/perf-required.tsv was hit with its
 #                                     condition true.
 #   PERF_LEVER=slow-ack|no-ack        with CONFIG=config-perf: layer
@@ -278,24 +281,30 @@ if [ "$VARIANT" = perf ]; then
     ttfa=$(grep -cF "perf ttfa " "$OUT/compose.log") || ttfa=0
     acks=$(grep -cF "perf ack " "$OUT/compose.log") || acks=0
     skipped=$(grep -cF "perf skipped " "$OUT/compose.log") || skipped=0
+    t0=$(grep -cF "perf t0 " "$OUT/compose.log") || t0=0
+    medians=$(grep -cF "perf median " "$OUT/compose.log") || medians=0
+    perf_count t0 "$t0" 1
     perf_count summary "$summary" 1
     perf_count ttfa "$ttfa" 2
     perf_count skipped "$skipped" 0
     case "$PERF_LEVER" in
         '')
             perf_count ack "$acks" 20
+            perf_count median "$medians" 2
             perf_out_of_band "perf ack " acked 500 1500 "" > "$OUT/perf-ack-out-of-band.txt"
             perf_band "perf ack" "outcome=acked, 500 <= mono_ms <= 1500" "$OUT/perf-ack-out-of-band.txt"
-            perf_out_of_band "perf ttfa " acked 500 1500 probes > "$OUT/perf-ttfa-out-of-band.txt"
-            perf_band "perf ttfa" "outcome=acked, 500 <= mono_ms <= 1500, probes 1 or 2" "$OUT/perf-ttfa-out-of-band.txt"
+            perf_out_of_band "perf ttfa " acked 0 1500 probes > "$OUT/perf-ttfa-out-of-band.txt"
+            perf_band "perf ttfa" "outcome=acked, 0 <= mono_ms <= 1500, probes 1 or 2" "$OUT/perf-ttfa-out-of-band.txt"
             ;;
         slow-ack)
             perf_count ack "$acks" 20
-            perf_out_of_band "perf ack " acked 3500 6000 "" > "$OUT/perf-ack-out-of-band.txt"
-            perf_band "perf ack" "outcome=acked, 3500 <= mono_ms <= 6000" "$OUT/perf-ack-out-of-band.txt"
+            perf_count median "$medians" 2
+            perf_out_of_band "perf ack " acked 2400 3400 "" > "$OUT/perf-ack-out-of-band.txt"
+            perf_band "perf ack" "outcome=acked, 2400 <= mono_ms <= 3400" "$OUT/perf-ack-out-of-band.txt"
             ;;
         no-ack)
             perf_count ack "$acks" 0
+            perf_count median "$medians" 0
             perf_out_of_band "perf ttfa " none "" "" "" > "$OUT/perf-ttfa-out-of-band.txt"
             perf_band "perf ttfa" "outcome=none" "$OUT/perf-ttfa-out-of-band.txt"
             ;;

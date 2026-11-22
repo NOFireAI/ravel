@@ -1,9 +1,16 @@
 # Perf variant lever (scripts/local-run.sh with CONFIG=config-perf and
 # PERF_LEVER=slow-ack; README.md, "Perf variant"), layered over
 # ../config-perf/docker-compose.yaml and docker-compose.local.yaml.
-# ravel1 and ravel2 run with --max-flush-delay 4s and --max-flush-delay-idle
-# 5s instead of the config's 500ms and 5s; the run expects the strict-ack
-# latencies to move with the slower flush cadence (the gate checks it).
+# ravel1 and ravel2 run with --max-flush-delay 2400ms and
+# --max-flush-delay-idle 5s instead of the config's 500ms and 5s; the run
+# expects the strict-ack latencies to move with the slower flush cadence (the
+# gate checks it).
+#
+# 2400ms is close to the largest delay the server accepts: at startup
+# validate_strict_visibility_budget (services/ravel-server) adds a fixed
+# 500 ms reserve to --max-flush-delay and refuses the configuration unless
+# the sum is under the 3 s MAX_STRICT_VISIBILITY_BUDGET_NS, so a
+# --max-flush-delay at or above 2500ms never starts.
 #
 # Compose replaces a command list as a whole in an override, so this file
 # restates the full ravel-server command of ../config/docker-compose.yaml for
@@ -25,7 +32,7 @@ x-perf-slow-ack-command: &perf-slow-ack-command
   - "--startup-store-deadline"
   - "300s"
   - "--max-flush-delay"
-  - "4s"
+  - "2400ms"
   - "--max-flush-delay-idle"
   - "5s"
   - "--min-flush-bytes"

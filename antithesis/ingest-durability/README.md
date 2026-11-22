@@ -304,7 +304,10 @@ one sample. It is registered in the model before it is sent, past the
 `WORKLOAD_MAX_WRITES` cap, and judged and recorded the way a rule's write is,
 with no retry. The ack probes run before the eventually takes its list of
 acknowledged writes, so its token reads and scans check the probe writes
-too. No probe takes the rule gate or a stop helper.
+too. No probe takes the rule gate or a stop helper. Probe writes go through
+the same judging as rule writes (`judge_reply`), so in the perf variant they
+can also satisfy the existing reachability assertions about write outcomes,
+such as "a log write was answered 503".
 
 The clock is the driver's monotonic clock (`mono_ms`). Each figure also
 carries the signed wall-clock difference over the same interval
@@ -361,21 +364,32 @@ before the not-recovered exit.
 mutant. The local gate reads `local/perf-required.tsv`. Its bands are the
 local expectations of the plan, predicted and not yet measured:
 
-- Clean run: exactly 1 `perf summary`, 2 `perf ttfa` and 20 `perf ack`
-  lines and no `perf skipped` line; every `perf ack` line acked with
-  500 <= `mono_ms` <= 1500; every `perf ttfa` line acked with
-  500 <= `mono_ms` <= 1500 and `probes` 1 or 2; every `required` line hit
-  with its condition true.
+- Clean run: exactly 1 `perf t0`, 1 `perf summary`, 2 `perf ttfa`,
+  20 `perf ack` and 2 `perf median` lines and no `perf skipped` line; every
+  `perf ack` line acked with 500 <= `mono_ms` <= 1500; every `perf ttfa`
+  line acked with 0 <= `mono_ms` <= 1500 and `probes` 1 or 2; every
+  `required` line hit with its condition true. The TTFA floor is 0, not the
+  500 ms flush delay: a strict waiter's buffer flushes on the delay counted
+  from its oldest row, and buffered rows the rules wrote before t0 can
+  already be older than the delay, so the first probe can flush at the next
+  tick.
 - `PERF_LEVER=slow-ack` layers `local/docker-compose.perf-slow-ack.yaml`
-  (`--max-flush-delay 4s`, `--max-flush-delay-idle 5s`): the same counts,
-  every `perf ack` line acked with 3500 <= `mono_ms` <= 6000, no
+  (`--max-flush-delay 2400ms`, `--max-flush-delay-idle 5s`): the same
+  counts, every `perf ack` line acked with 2400 <= `mono_ms` <= 3400, no
   `slow-ack-never` line hit true and every `slow-ack-required` line hit true.
-  It is meant to show that the figures move with the flush cadence.
-- `PERF_LEVER=no-ack` layers `local/docker-compose.perf-no-ack.yaml`
-  (both flush delays 600 s): 1 summary, 2 `perf ttfa` lines, both
-  `outcome=none`, no `perf ack` line, and the `no-ack-never` line never hit
-  true. It is meant to show that a node that never acks is reported, not
-  dropped.
+  It is meant to show that the figures move with the flush cadence. 2400 ms
+  is near the server's limit: ravel-server refuses to start when
+  `--max-flush-delay` plus a fixed 500 ms reserve is not under its 3 s strict
+  visibility budget (`validate_strict_visibility_budget`), that is at
+  2500 ms or more.
+- `PERF_LEVER=no-ack` layers `local/docker-compose.perf-no-ack.yaml`, which
+  sets `RAVEL_ANTITHESIS_FAULTS` to `ingest/data-put-refused=1` on ravel1 and
+  ravel2: every data PUT is abandoned, so no strict write can be
+  acknowledged and the server answers it 503. No flush delay can do this,
+  because of the 2500 ms limit above. Expected: 1 `perf t0`, 1 summary,
+  2 `perf ttfa` lines, both `outcome=none`, no `perf ack` and no
+  `perf median` line, and the `no-ack-never` line never hit true. It is
+  meant to show that a node that never acks is reported, not dropped.
 
 The base gate (no always-type assertion violated) applies to every perf run.
 
