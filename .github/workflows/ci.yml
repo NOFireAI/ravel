@@ -1293,7 +1293,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -1438,7 +1438,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -1557,7 +1557,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -1697,7 +1697,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # The automatic key names the job, not the matrix entry, so without
@@ -2378,7 +2378,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -2448,7 +2448,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -2720,7 +2720,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -2829,7 +2829,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -3316,7 +3316,7 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: nextest
+          tool: nextest@0.9.143
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main, as in `features-otap`
@@ -3495,7 +3495,7 @@ jobs:
       - name: Install cargo-llvm-cov and nextest
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
-          tool: cargo-llvm-cov,nextest
+          tool: cargo-llvm-cov,nextest@0.9.143
       # Run this leg's share of the workspace suite once and keep the raw
       # coverage data (`--no-report`), then render lcov from that data. The
       # suite runs under nextest, as `check-shard` runs it, which is what
