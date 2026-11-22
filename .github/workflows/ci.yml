@@ -2312,11 +2312,20 @@ jobs:
       # every pull request commit reachable through HEAD^2. On merge_group it
       # holds every queued change since the queue's base. fetch-depth: 0
       # above already fetched both ends and the commits between them.
+      #
+      # !cancelled() runs it after an earlier step failed (a pull request
+      # with a new advisory and a downgrade shows both), but not on a
+      # cancelled run, where always() would. It needs only the checkout:
+      # it resolves its own base and runs no cargo.
       - name: Cargo.lock downgrade guard (issue #4595)
-        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
         env:
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
         run: |
+          if [ ! -f scripts/guards/check-lockfile-downgrade.sh ]; then
+            echo "::error::no checkout to compare: scripts/guards/check-lockfile-downgrade.sh is missing"
+            exit 1
+          fi
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             if ! BASE_SHA=$(git rev-parse --verify HEAD^1); then
               echo "::error::could not resolve HEAD^1 of the pull request's merge commit"
