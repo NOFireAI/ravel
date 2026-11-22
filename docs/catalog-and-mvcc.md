@@ -3602,8 +3602,10 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
 5. For each `min_token`: reconstruct its commit key and GET it directly
    (never by re-listing). The commit-record cache has no TTL and a sweep
    deletes the record of an input a compaction or rewrite replaced, so a
-   cached record counts as present only once that GET returns it (the
-   cached decoded record is reused, not decoded again); a NotFound after
+   cached record counts as present only once that GET returns it. For a
+   cached record the GET reads one byte (`GetRange::Range(0, 1)`), since
+   only presence is in question, and the cached decoded record is reused,
+   not decoded again; an uncached record is read whole. A NotFound after
    the one retry sends the token to the absent-record path below. The GET
    is skipped only when the set already holds the token's own level-0
    object, where both paths add nothing for the token. Present: ensure it

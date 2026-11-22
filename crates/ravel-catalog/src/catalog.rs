@@ -4569,7 +4569,8 @@ impl Catalog {
         // The record cache has no TTL and records are immutable, so a cached
         // record proves the content, not that the record is still present: a
         // sweep may have deleted it after a compaction or rewrite replaced its
-        // object. The GET below re-validates presence before it counts.
+        // object. The GET below re-validates presence before it counts; for a
+        // cached record it reads one byte, since only presence is in question.
         let cached = self
             .cache
             .get_cached(tenant, &key, accounting)
@@ -4595,8 +4596,13 @@ impl Catalog {
         // errors keep their own independent single retry.
         let mut notfound_retries: u32 = 1;
         let mut transient_retries: u32 = 1;
+        let range = if cached.is_some() {
+            GetRange::Range(0, 1)
+        } else {
+            GetRange::Full
+        };
         loop {
-            match self.guarded_get(&key, GetRange::Full, accounting).await {
+            match self.guarded_get(&key, range, accounting).await {
                 Ok(got) => {
                     if let Some(cached) = &cached {
                         return self.l0_segment_ref(tenant, &key, cached).map(Some);
