@@ -315,7 +315,10 @@ fn largest_admitted<T, E: std::fmt::Display>(
     }
     let n = largest(|n| admitted(n).is_ok());
     let past = match admitted(n + 1) {
-        Ok(_) => panic!("n + 1 = {} is refused", n + 1),
+        Ok(_) => panic!(
+            "n + 1 = {} was admitted, but the search found n = {n} as the largest admitted",
+            n + 1
+        ),
         Err(past) => past,
     };
     let at = admitted(n).unwrap_or_else(|e| panic!("n = {n} prepares: {e}"));

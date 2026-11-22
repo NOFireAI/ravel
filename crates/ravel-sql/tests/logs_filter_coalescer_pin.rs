@@ -502,12 +502,11 @@ async fn p1_report_one_match_per_block_output_size() {
         let charge = block_charge(&fx, SELECT_URL).await;
         assert_eq!(m.matched_rows, n, "one matching row per block");
         println!(
-            "  p1: output {} bytes, {} per matched row; registered band {} +/- 10%; pool {} against one block's charge {charge}; Utf8 rebuild {} bytes",
+            "  p1: output {} bytes, {} per matched row; registered band {} +/- 10%; pool {} against one block's charge {charge}",
             m.emitted,
             m.emitted / m.matched_rows,
             n * block_values_bytes(),
-            m.reserved_exhausted,
-            m.cast_utf8_bytes
+            m.reserved_exhausted
         );
     }
 }
