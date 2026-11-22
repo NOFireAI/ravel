@@ -25,7 +25,8 @@
 # carries the trailer line
 #   Lockfile-downgrade: <name> <W>
 # accepts the downgrade of that crate to that exact version, in every
-# lockfile. Any other downgrade fails.
+# lockfile. The key matches in any case, as git matches it; the crate name
+# and version match exactly. Any other downgrade fails.
 #
 # Exit 0: no downgrade, or every downgrade is accepted by a trailer.
 # Exit 1: a downgrade no trailer accepts. Each prints the trailer that would.
@@ -208,11 +209,16 @@ trailers="$(git log --format='%(trailers:only,unfold)' "${merge_base}..${head_sh
 }
 
 # accepted NAME VERSION: whether a trailer line names exactly this downgrade.
+# git prints each trailer as "<key>: <value>" with the key as written, and
+# matches keys case-insensitively, so the key is compared in lower case; the
+# value stays exact.
 accepted() {
-  local want="Lockfile-downgrade: $1 $2" line
+  local want="$1 $2" line key
   while IFS= read -r line; do
     line="${line%"${line##*[![:space:]]}"}"
-    [[ "${line}" == "${want}" ]] && return 0
+    [[ "${line}" == *": "* ]] || continue
+    key="${line%%: *}"
+    [[ "${key,,}" == lockfile-downgrade && "${line#*: }" == "${want}" ]] && return 0
   done <<<"${trailers}"
   return 1
 }
