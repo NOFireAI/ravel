@@ -3610,11 +3610,11 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    is skipped only when the set already holds the token's own level-0
    object, where both paths add nothing for the token. Present: ensure it
    is in the snapshot set (its event range might not overlap; include it
-   anyway so read-your-write holds), with one exception for every signal:
-   when the check below runs, the input is not added when the set already
-   serves its rows from a replacement, when a live rewrite replaced it and
-   the set holds nothing else that rewrite replaced, or when its bucket is
-   tombstoned. A compacted input's commit record stays present until the
+   anyway so read-your-write holds), with exceptions for every signal: the
+   input is never added when its bucket is tombstoned, and, when the check
+   below runs, it is not added when the set already serves its rows from a
+   replacement or when a live rewrite replaced it and the set holds nothing
+   else that rewrite replaced. A compacted input's commit record stays present until the
    sweep, and logs and spans have no query-time dedup, so adding it beside
    the part that holds its rows would count each of its records twice.
    Metrics get the same check: query-time dedup removes duplicate samples,
@@ -3627,10 +3627,18 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    rewrite of the bucket can name the input only then: a `.dreq` is
    deleted only once its `.done` exists, so with neither listed no rewrite
    can be live without its request pending. Without any of the three, the
-   input is added as before, even when its bucket is tombstoned;
-   its rows are not counted twice there, because the set then holds no
-   level-1 part of the bucket that could also hold them. When the check
-   runs, it LISTs the bucket and, in this order:
+   bucket is not LISTed and its tombstone decides: a tombstone keeps the
+   input out, the answer the absent-record path below gives (satisfied
+   with zero segments), and no tombstone adds the input, whose rows are
+   not counted twice there, because the set then holds no level-1 part of
+   the bucket that could also hold them. When step 1's listing kept a key
+   of the bucket for step 2, what it saw decides at no request. Otherwise
+   one GET of the bucket's fixed tombstone key
+   (`c/<shard>/<hour>/retire.tmb`) decides, issued at most once per bucket
+   per resolve and shared by every present token of the bucket; any error
+   other than NotFound fails the resolve. The check below, which LISTs the
+   bucket, issues none.
+   When the check runs, it LISTs the bucket and, in this order:
 
    - a tombstone in the bucket: the input is not added, the answer the
      absent-record path below gives (satisfied with zero segments);
