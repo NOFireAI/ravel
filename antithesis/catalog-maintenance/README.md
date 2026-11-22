@@ -408,7 +408,7 @@ the driver, holding its write gate throughout:
    sealing jump;
 3. folds, then sweeps all four shards, which writes the markers;
 4. moves every clock forward by `CLOCK_SWEEP_WINDOW_JUMP_SECS` (config
-   5400 s), the same way.
+   22200 s), the same way.
 
 Each move first holds HEAD still for 50 s ("HEAD holds still before every
 move"). For the window jump that wait is what keeps the gate's premise: the
@@ -417,11 +417,23 @@ it is what lets their markers' window pass, so the inputs stay in place for
 at least the TTL and a late HEAD read after HEAD stopped naming them. Before
 #4571 the window jump followed the fold by a few seconds.
 
+The window jump passes the interior re-verify interval (21600 s) as well as
+the pinned-query window. A maintain server sweeps the whole keyspace only
+when that long passed since its last full pass, and only a full pass reaches
+the hours the horizon jump left behind. The servers' first pass after the
+horizon jump is a full one, and it now runs during the wait before the
+window jump, while the markers are still inside their window. A 5400 s
+window jump would leave their next full pass 6 h of wall time away, so only
+the driver's own `ravel-cli` sweep would delete the inputs. That sweep
+reports no SDK assertions, so `catalog: a sweep never deletes an object the
+current HEAD names` would go unevaluated in a timeline whose sweep jumps
+are its last moves.
+
 The next sweep, from `maint1`/`maint2`, the `sweep` rule or the
 `eventually`, deletes the inputs. The driver refuses to start if either
-sweep jump is below its term (90300 s and 4830 s), computed from the shipped
-defaults; no grace or horizon flag is passed anywhere, so the run deletes
-under the shipped `sys/gc` defaults. Each jump is as far beyond SigV4's 900 s
+sweep jump is below its term (90300 s, and 21600 s for the window jump),
+computed from the shipped defaults; no grace or horizon flag is passed
+anywhere, so the run deletes under the shipped `sys/gc` defaults. Each jump is as far beyond SigV4's 900 s
 skew limit as the sealing jump is, and the gate hold across each reread
 window is the same mitigation. A token read after the sweep resolves a
 deleted level-0 commit record through the compaction record's input list

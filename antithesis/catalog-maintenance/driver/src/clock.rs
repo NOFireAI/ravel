@@ -241,8 +241,20 @@ impl SweepJumps {
 
 /// The first sweep jump: the protection horizon plus 15 minutes.
 pub const DEFAULT_HORIZON_JUMP_S: u64 = 91_200;
-/// The second sweep jump: the pinned-query window plus 570 s.
-pub const DEFAULT_WINDOW_JUMP_S: u64 = 5400;
+/// The second sweep jump: past the pinned-query window and the interior
+/// re-verify interval, plus 600 s ([`window_jump_floor_s`]).
+pub const DEFAULT_WINDOW_JUMP_S: u64 = 22_200;
+
+/// The smallest second sweep jump. It must pass the pinned-query window of
+/// the markers written after the horizon jump, and also the interior
+/// re-verify interval: the servers' first sweep after the horizon jump is a
+/// full pass, and it runs during the quiet wait before the window jump, so
+/// without the interval their next full pass, the only one that reaches the
+/// hours the clocks left behind, would be 6 h of wall time away and only the
+/// driver's own sweep would delete the inputs.
+pub fn window_jump_floor_s() -> u64 {
+    INTERIOR_REVERIFY_S.max(pinned_window_s())
+}
 
 /// How far the driver's own clock may fall short of the jump and still count
 /// as having jumped: the time between reading the clock before the write and
@@ -277,7 +289,8 @@ pub fn pinned_window_s() -> u64 {
 /// record seen before the horizon jump was created no later than the jump's
 /// start, so a sweep after it is past the record's horizon and writes the
 /// input's unnamed-since marker; a sweep after the window jump is past that
-/// marker's pinned-query window and deletes the input.
+/// marker's pinned-query window and deletes the input, and the servers' first
+/// sweep after it is a full pass ([`window_jump_floor_s`]).
 pub fn check_sweep_jumps(horizon_jump_s: u64, window_jump_s: u64) -> Result<(), String> {
     if horizon_jump_s < protection_horizon_s() {
         return Err(format!(
@@ -286,11 +299,11 @@ pub fn check_sweep_jumps(horizon_jump_s: u64, window_jump_s: u64) -> Result<(), 
             protection_horizon_s()
         ));
     }
-    if window_jump_s < pinned_window_s() {
+    if window_jump_s < window_jump_floor_s() {
         return Err(format!(
-            "CLOCK_SWEEP_WINDOW_JUMP_SECS={window_jump_s} is below {}, the default \
-             pinned-query window",
-            pinned_window_s()
+            "CLOCK_SWEEP_WINDOW_JUMP_SECS={window_jump_s} is below {}, the larger of the \
+             default pinned-query window and the interior re-verify interval",
+            window_jump_floor_s()
         ));
     }
     Ok(())
@@ -410,7 +423,7 @@ pub const INTERIOR_REVERIFY_S: u64 = 21_600;
 /// first jump, and past the interior re-verify interval, so the server sweep
 /// after it is a full pass that would delete an input it marked.
 pub fn unfolded_window_jump_s() -> u64 {
-    INTERIOR_REVERIFY_S.max(pinned_window_s()) + 600
+    window_jump_floor_s() + 600
 }
 
 #[cfg(test)]
@@ -574,11 +587,17 @@ mod tests {
         );
         // A jump of exactly a term is enough, one second less is refused.
         assert_eq!(
-            check_sweep_jumps(protection_horizon_s(), pinned_window_s()),
+            check_sweep_jumps(protection_horizon_s(), window_jump_floor_s()),
             Ok(())
         );
         assert!(check_sweep_jumps(protection_horizon_s() - 1, DEFAULT_WINDOW_JUMP_S).is_err());
-        assert!(check_sweep_jumps(DEFAULT_HORIZON_JUMP_S, pinned_window_s() - 1).is_err());
+        assert!(check_sweep_jumps(DEFAULT_HORIZON_JUMP_S, window_jump_floor_s() - 1).is_err());
+        // The window term is the interior re-verify interval, past which the
+        // servers' next sweep is a full pass; a jump past only the pinned-query
+        // window is refused.
+        assert_eq!(window_jump_floor_s(), INTERIOR_REVERIFY_S);
+        assert!(check_sweep_jumps(DEFAULT_HORIZON_JUMP_S, pinned_window_s()).is_err());
+        assert_eq!(DEFAULT_WINDOW_JUMP_S, unfolded_window_jump_s());
     }
 
     #[test]
