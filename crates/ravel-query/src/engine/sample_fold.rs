@@ -861,41 +861,71 @@ pub mod support {
         }
     }
 
-    /// One R5 figure line: `R5 shape=<shape> charged=.. live=.. ratio=..
-    /// gap_bytes=..`, the ratio to 4 decimals and the gap signed.
-    pub fn r5_line(shape: &str, charged: u64, live: u64) -> String {
-        let ratio = if live == 0 {
+    /// The field naming an R5 figure line's second figure for `shape`.
+    /// Shapes A, B and C report `live`, the fold's own container bytes.
+    /// Shape D reports `process_delta`, the whole process's
+    /// `stats.allocated` delta across the engine call, which counts
+    /// different bytes, so D's ratio is not comparable with A to C's.
+    pub fn r5_figure_field(shape: &str) -> &'static str {
+        if shape == "D" {
+            "process_delta"
+        } else {
+            "live"
+        }
+    }
+
+    /// One R5 figure line: `R5 shape=<shape> charged=.. <field>=.. ratio=..
+    /// gap_bytes=..`, `<field>` being [`r5_figure_field`] for the shape, the
+    /// ratio to 4 decimals and the gap signed.
+    pub fn r5_line(shape: &str, charged: u64, figure: u64) -> String {
+        let ratio = if figure == 0 {
             f64::INFINITY
         } else {
-            charged as f64 / live as f64
+            charged as f64 / figure as f64
         };
-        let gap = i128::from(charged) - i128::from(live);
-        format!("R5 shape={shape} charged={charged} live={live} ratio={ratio:.4} gap_bytes={gap}")
+        let gap = i128::from(charged) - i128::from(figure);
+        let field = r5_figure_field(shape);
+        format!(
+            "R5 shape={shape} charged={charged} {field}={figure} ratio={ratio:.4} gap_bytes={gap}"
+        )
     }
 
     /// The R5 presence rule over `lines`: each of `shapes` has exactly one
-    /// figure line, with a nonzero charged and live figure. Returns one
-    /// message per violation.
+    /// figure line, whose fields are `charged`, the shape's
+    /// [`r5_figure_field`], `ratio` and `gap_bytes` in that order, with a
+    /// nonzero charged and second figure. Returns one message per violation.
     pub fn presence_violations(lines: &[String], shapes: &[&str]) -> Vec<String> {
         let mut violations = Vec::new();
         for shape in shapes {
             let prefix = format!("R5 shape={shape} ");
             let found: Vec<&String> = lines.iter().filter(|l| l.starts_with(&prefix)).collect();
-            if found.len() != 1 {
+            let [line] = found.as_slice() else {
                 violations.push(format!(
                     "shape {shape}: {} figure lines, want exactly 1",
                     found.len()
                 ));
                 continue;
+            };
+            let field = r5_figure_field(shape);
+            let fields: Vec<(&str, &str)> = line
+                .strip_prefix(&prefix)
+                .unwrap_or_default()
+                .split(' ')
+                .map(|kv| kv.split_once('=').unwrap_or((kv, "")))
+                .collect();
+            let names: Vec<&str> = fields.iter().map(|(name, _)| *name).collect();
+            let want = ["charged", field, "ratio", "gap_bytes"];
+            if names != want {
+                violations.push(format!("shape {shape}: fields {names:?}, want {want:?}"));
+                continue;
             }
-            for field in ["charged", "live"] {
-                let value = found
+            for name in ["charged", field] {
+                let value = fields
                     .iter()
-                    .flat_map(|l| l.split(' '))
-                    .find_map(|kv| kv.strip_prefix(&format!("{field}=")).map(str::to_string))
-                    .and_then(|v| v.parse::<u64>().ok());
+                    .find(|(k, _)| *k == name)
+                    .and_then(|(_, v)| v.parse::<u64>().ok());
                 if !matches!(value, Some(v) if v > 0) {
-                    violations.push(format!("shape {shape}: {field} is {value:?}, want > 0"));
+                    violations.push(format!("shape {shape}: {name} is {value:?}, want > 0"));
                 }
             }
         }
@@ -1420,14 +1450,11 @@ mod tests {
         fold.into_series(usize::MAX).expect("finish")
     }
 
-    /// Folds one shape, prints its R5 figure line, asserts probing left the
-    /// fold's result unchanged, and returns every figure line it printed.
-    fn r5_shape(shape: &str, calls: Vec<Vec<FetchedSeriesSoa>>) -> Vec<String> {
-        let mut emitted = Vec::new();
+    /// Folds one shape, prints its R5 figure line and asserts probing left
+    /// the fold's result unchanged.
+    fn r5_shape(shape: &str, calls: Vec<Vec<FetchedSeriesSoa>>) {
         let (probed, charged, live) = probed_fold(calls.clone());
-        let line = support::r5_line(shape, charged, live.total());
-        println!("{line}");
-        emitted.push(line);
+        println!("{}", support::r5_line(shape, charged, live.total()));
         println!(
             "R5 breakdown shape={shape} levels={} spines={} by_series={} prefix_ids={} \
              prefixes={} labels={}",
@@ -1438,17 +1465,17 @@ mod tests {
             project_scalar(plain_fold(calls)),
             "shape {shape}: probing changed the fold's result"
         );
-        emitted
     }
 
     /// Issue #4530 (ADR-4523 R5, step 1): the fold's charged bytes against
     /// the bytes its containers hold, at its peak charge, for pre-registered
     /// shapes A, B and C.
     ///
-    /// This asserts presence only: each shape's run emits exactly one
-    /// figure line with nonzero charged and live figures, checked over the
-    /// lines the shapes actually emitted, and probing the fold leaves its
-    /// result unchanged. The predicted bands are deliberately not asserted.
+    /// This asserts only that probing the fold leaves its result unchanged.
+    /// Each shape prints its one figure line from one `r5_shape` call, so a
+    /// presence check over those lines could not fail here;
+    /// `r5_presence_rule_fails_missing_duplicate_and_zero_lines` covers the
+    /// rule itself. The predicted bands are deliberately not asserted.
     /// They live in the pre-registration (issue #4530 comments 7079576120
     /// and 7080468122) and the step's report, so an out-of-band figure does
     /// not fail this test the way a missing line does.
@@ -1459,16 +1486,14 @@ mod tests {
             ("B", support::shape_b().expect("shape B")),
             ("C", support::shape_c().expect("shape C")),
         ];
-        let mut lines = Vec::new();
         for (shape, calls) in shapes {
-            lines.extend(r5_shape(shape, calls));
+            r5_shape(shape, calls);
         }
-        let violations = support::presence_violations(&lines, &["A", "B", "C"]);
-        assert!(violations.is_empty(), "R5 presence rule: {violations:?}");
     }
 
     /// The presence rule fails a shape with no figure line, two figure
-    /// lines, or a zero figure.
+    /// lines, a zero figure, or a second figure named for another shape's
+    /// kind: `live` for D, `process_delta` for A to C.
     #[test]
     fn r5_presence_rule_fails_missing_duplicate_and_zero_lines() {
         let a = support::r5_line("A", 10, 20);
@@ -1484,8 +1509,34 @@ mod tests {
             vec!["shape B: 2 figure lines, want exactly 1".to_string()]
         );
         assert_eq!(
-            support::presence_violations(&[a, support::r5_line("B", 30, 0)], &shapes),
+            support::presence_violations(&[a.clone(), support::r5_line("B", 30, 0)], &shapes),
             vec!["shape B: live is Some(0), want > 0".to_string()]
+        );
+
+        let d = support::r5_line("D", 50, 60);
+        assert_eq!(
+            d,
+            "R5 shape=D charged=50 process_delta=60 ratio=0.8333 gap_bytes=-10"
+        );
+        assert!(support::presence_violations(&[a.clone(), d], &["A", "D"]).is_empty());
+        let d_as_live = "R5 shape=D charged=50 live=60 ratio=0.8333 gap_bytes=-10".to_string();
+        assert_eq!(
+            support::presence_violations(&[a, d_as_live], &["A", "D"]),
+            vec![
+                "shape D: fields [\"charged\", \"live\", \"ratio\", \"gap_bytes\"], want \
+                 [\"charged\", \"process_delta\", \"ratio\", \"gap_bytes\"]"
+                    .to_string()
+            ]
+        );
+        let a_as_delta =
+            "R5 shape=A charged=10 process_delta=20 ratio=0.5000 gap_bytes=-10".to_string();
+        assert_eq!(
+            support::presence_violations(&[a_as_delta], &["A"]),
+            vec![
+                "shape A: fields [\"charged\", \"process_delta\", \"ratio\", \"gap_bytes\"], \
+                 want [\"charged\", \"live\", \"ratio\", \"gap_bytes\"]"
+                    .to_string()
+            ]
         );
     }
 
