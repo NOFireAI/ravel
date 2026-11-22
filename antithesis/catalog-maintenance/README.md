@@ -575,6 +575,20 @@ last result. Only PUTs are judged. A killed or restarted proxy has no rules, so 
 race it interrupts leaves the servers on the plain path and the race reports
 not reached.
 
+Each relayed connection runs on two threads, and a network fault can leave a
+peer that never sends, reads or closes, so the proxy bounds both (#4568). It
+relays at most 512 connections at once, four times the four servers'
+fault-free peak of about 130 (264 threads, sampled every 2 s over a plain
+local loop). Past the cap, or when a thread cannot be spawned, it answers
+`503 SlowDown` unread and closes, as for a refused PUT, and the servers'
+store client retries. Every relayed and control socket times out a read or
+write blocked for 60 s and drops the connection. That is above the servers'
+20 s store request timeout, which bounds every wait inside a request (a held
+one included), and above their 30 s pool idle timeout, which bounds every
+wait between requests, so only a connection its server no longer uses is
+dropped. The control port takes at most 8 connections and answers one more
+`error: busy`.
+
 ## Mutants
 
 ADR-4326 decision 3 (as amended by #4335) gives the catalog area five
