@@ -26,6 +26,10 @@
 /// and the Flight-vs-HTTP transport parity gate.
 pub mod gate;
 
+/// A file cache that shares a large fixture's bytes across the processes of
+/// one test binary.
+pub mod fixture_cache;
+
 /// The in-process Flight SQL harness, shared across the Flight test suites.
 /// Only compiled under `flight-sql`, which is what links arrow-flight/tonic.
 #[cfg(feature = "flight-sql")]
