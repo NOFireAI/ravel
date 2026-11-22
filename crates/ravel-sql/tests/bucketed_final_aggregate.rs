@@ -279,9 +279,11 @@ fn rlog_of_rows(rows: i64, edit: impl Fn(i64, &mut LogRecord)) -> Vec<u8> {
     writer.finish().expect("finish rlog")
 }
 
-/// The large fixture's RLOG object, built once per target directory when
-/// each test runs in its own process (nextest) and once per process
-/// otherwise; [`util::fixture_cache`] holds it between processes.
+/// The large fixture's RLOG object. [`util::fixture_cache`] keeps it in a
+/// file under the target directory, so under nextest, which runs each test
+/// in its own process, one process per build of the test binary builds it
+/// and the rest read it; within one process (`cargo test`) the `OnceLock`
+/// keeps it after the first call.
 fn big_rlog() -> bytes::Bytes {
     static RLOG: std::sync::OnceLock<bytes::Bytes> = std::sync::OnceLock::new();
     RLOG.get_or_init(|| {
@@ -321,8 +323,8 @@ fn with_str_key(i: i64, record: &mut LogRecord) {
 }
 
 /// The declared-string fixture's RLOG object of [`STR_ROWS`] rows as
-/// [`with_str_key`] writes them, built once per target directory under
-/// nextest and once per process otherwise, as [`big_rlog`] is.
+/// [`with_str_key`] writes them, cached across processes and within one
+/// as [`big_rlog`] is.
 fn str_rlog() -> bytes::Bytes {
     static RLOG: std::sync::OnceLock<bytes::Bytes> = std::sync::OnceLock::new();
     RLOG.get_or_init(|| {
@@ -388,13 +390,21 @@ fn the_fixture_cache_rebuilds_a_truncated_file_and_survives_io_errors() {
     };
 
     let dir = scratch_cache_dir("truncated");
+    let same = |got: Vec<u8>, what: &str| {
+        assert!(
+            got == fresh,
+            "{what}: {} bytes that differ from a fresh build of {} bytes",
+            got.len(),
+            fresh.len()
+        );
+    };
     let cached = |build| util::fixture_cache::cached_bytes(&dir, "small", build);
-    assert_eq!(cached(&build), fresh, "first call");
+    same(cached(&build), "first call");
     assert_eq!(builds.load(Ordering::SeqCst), 1);
     let file = util::fixture_cache::data_path(&dir, "small").expect("cache file path");
     let stored = std::fs::metadata(&file).expect("the first call stored the file");
     assert!(stored.len() > fresh.len() as u64);
-    assert_eq!(cached(&build), fresh, "a read of the stored file");
+    same(cached(&build), "a read of the stored file");
     assert_eq!(builds.load(Ordering::SeqCst), 1, "a hit builds nothing");
 
     std::fs::OpenOptions::new()
@@ -402,9 +412,9 @@ fn the_fixture_cache_rebuilds_a_truncated_file_and_survives_io_errors() {
         .open(&file)
         .and_then(|f| f.set_len(fresh.len() as u64 / 2))
         .expect("truncate the cached file");
-    assert_eq!(cached(&build), fresh, "a read of the truncated file");
+    same(cached(&build), "a read of the truncated file");
     assert_eq!(builds.load(Ordering::SeqCst), 2, "a torn file is rebuilt");
-    assert_eq!(cached(&build), fresh, "a read of the rewritten file");
+    same(cached(&build), "a read of the rewritten file");
     assert_eq!(builds.load(Ordering::SeqCst), 2);
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -412,10 +422,9 @@ fn the_fixture_cache_rebuilds_a_truncated_file_and_survives_io_errors() {
     std::fs::create_dir_all(blocker.parent().expect("parent")).expect("tmp dir");
     std::fs::write(&blocker, b"a regular file").expect("write the blocking file");
     let under_a_file = blocker.join("cache");
-    assert_eq!(
+    same(
         util::fixture_cache::cached_bytes(&under_a_file, "small", &build),
-        fresh,
-        "a cache directory under a regular file"
+        "a cache directory under a regular file",
     );
     assert_eq!(builds.load(Ordering::SeqCst), 3);
     let _ = std::fs::remove_file(&blocker);

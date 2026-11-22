@@ -3,9 +3,10 @@
 //!
 //! nextest runs each test in its own process, so a `OnceLock` caches a
 //! fixture for one test only. [`cached_bytes`] keeps the fixture's bytes in
-//! a file under a directory the caller names, keyed by the test binary's
-//! path, size and modification time, so a rebuilt binary never reads bytes
-//! an older generator wrote.
+//! a file under a directory the caller names. The file name carries a key
+//! from the test binary's path, size and modification time, so relinking
+//! the binary, which changes its modification time, changes the name it
+//! reads.
 //!
 //! The cache is an optimisation only: every failure on the cache path (the
 //! directory, the lock, a read, a write, a rename, a file whose trailer does
@@ -121,8 +122,10 @@ impl Entry {
         Ok(file)
     }
 
-    /// Writes `payload` and its trailer to a temporary file and renames it
-    /// into place, so a reader sees no file or a whole one.
+    /// Writes `payload` and its trailer to a temporary file in the same
+    /// directory and renames it into place, so a reader of the final name
+    /// finds the previous file or the whole new one; [`Entry::read`]'s
+    /// trailer check covers a file torn some other way.
     fn store(&self, payload: &[u8]) -> io::Result<()> {
         let written = (|| {
             let mut file = File::create(&self.tmp)?;
