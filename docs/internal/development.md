@@ -65,8 +65,8 @@ jobs then do not each recompile the overlapping crates from scratch.
   `ACTIONS_RUNTIME_TOKEN`) that the backend needs; a plain binary installer
   does not. One job compiles the objects, and the others reuse them. No repo
   secret or setting beyond those two environment variables is necessary.
-- Tests run under `cargo nextest run` (installed via
-  `taiki-e/install-action@nextest`) instead of `cargo test`, for faster
+- Tests run under `cargo nextest run` (installed by `taiki-e/install-action`
+  with `tool: nextest@0.9.143`) instead of `cargo test`, for faster
   parallel execution and clearer output.
 - The jobs that reclaim runner disk before compiling share one composite
   action, `.github/actions/free-disk-space`, instead of copying the same
