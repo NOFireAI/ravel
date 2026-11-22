@@ -3623,7 +3623,8 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    when the set holds a level-1 part of the token's (shard, ingest_hour)
    bucket, step 6 found a pending erasure request, or step 6 listed a
    `.done` (step 6's LIST, which therefore completes before this step, is
-   the source of all three). The `.done` condition exists because a live
+   the source of the last two; the first comes from the set). The `.done`
+   condition exists because a live
    rewrite of the bucket can name the input only then: a `.dreq` is
    deleted only once its `.done` exists, so with neither listed no rewrite
    can be live without its request pending. Without any of the three, the
