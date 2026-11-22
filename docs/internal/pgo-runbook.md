@@ -32,8 +32,8 @@ Arm B is rustc 1.100.0 with no profile; arm C is B plus
 | Arm C build | 654 s, 1,041,292,216 bytes (7.3% larger) | reported | epic #4523 comment 7062870942 |
 | CPU-s per correct query, held-out warm suite of 13 statements | median 0.977 (rounds 0.977, 0.985, 0.983, 0.972, 0.973); 0 of 5 rounds at or under 0.95 | MISS against "at most 0.95 in at least 4 of 5" | epic #4523 comment 7062870942 |
 | Query p99, mixed run | rounds 1.088, 1.024, 0.966, 1.053, 1.077; spread within arm 0.257 | MISS (3 of 5 above 1.05) | epic #4523 comment 7062870942 |
-| Acknowledged ingest rate | rounds 0.997, 1.027, 0.978, 1.017, 1.032 | INCONCLUSIVE | epic #4523 comment 7062870942 |
-| Peak RSS | rounds 1.004, 1.023, 0.953, 1.035, 0.994 | INCONCLUSIVE | epic #4523 comment 7062870942 |
+| Acknowledged ingest rate | rounds 0.997, 1.027, 0.978, 1.017, 1.032; spread within arm 0.051 | INCONCLUSIVE (every round is inside 5%, but the within-arm spread is above the 5% at which the pre-registration, epic #4523 comment 7055806818, makes a figure inconclusive) | epic #4523 comment 7062870942; spread from `out/readout-after-r3-rerun.txt` of the run |
+| Peak RSS | rounds 1.004, 1.023, 0.953, 1.035, 0.994; spread within arm 0.064 | INCONCLUSIVE (same basis as the ingest rate) | epic #4523 comment 7062870942; spread from `out/readout-after-r3-rerun.txt` of the run |
 | Rows | 9 differences over 150 comparisons, all `q18_user_phrase_limit` | MISS as computed (an unordered `LIMIT`, below) | epic #4523 comment 7062870942 |
 | Per-phase GETs and wire bytes | 0 of 3,350 values outside the rule | PASS | epic #4523 comment 7062870942 |
 | Best per-statement CPU | q39 0.942, q18 0.944, q30 0.966, q21 0.967 | reported | epic #4523 comment 7062870942 |
@@ -110,8 +110,9 @@ Any one of these would reopen it, each as a new issue that links here:
    checks resolution, R3's gate: each of the binary's top 20 self-time
    symbols in `perf report`, clone suffixes stripped, must be a function
    of the profile with nonzero total samples, and the 20 must include a
-   `ravel_` symbol and a `datafusion` symbol. Exit 4 lists the symbols
-   that are missing or have zero samples. On success it writes the 20
+   `ravel_` symbol and a `datafusion` symbol. A report with fewer than 20
+   symbols of the binary exits 4: record longer or under more load. Exit 4
+   lists the symbols that are missing or have zero samples. On success it writes the 20
    symbols to `pgo/top-symbols.txt`, which `build` needs.
 
 ## Building with a profile

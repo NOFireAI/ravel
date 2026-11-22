@@ -27,7 +27,8 @@
 #   2  usage error
 #   3  a tool is missing, or llvm-profgen's LLVM major differs from rustc's
 #   4  record: perf record failed or was refused by perf_event_paranoid,
-#      perf recorded zero samples, llvm-profgen failed or wrote an empty
+#      perf recorded zero samples, perf report shows fewer than 20 symbols
+#      of the binary, llvm-profgen failed or wrote an empty
 #      profile, a top-20 symbol is missing from the profile or has zero
 #      samples in it, or the top 20 hold no ravel_ or no datafusion symbol;
 #      build: the profile is missing, empty, lists no functions, or has no
@@ -408,6 +409,8 @@ cmd_record() {
   while IFS= read -r sym; do
     symbols+=("$(strip_suffixes "${sym}")")
   done <<<"${top}"
+  [[ ${#symbols[@]} -ge ${TOP_N} ]] \
+    || die 4 "record: perf report shows only ${#symbols[@]} symbols in ${dso}, fewer than the ${TOP_N} the resolution check needs; record longer or under more load"
   printf '%s\n' "${symbols[@]}" >"${top_file}.tmp"
 
   # A profile function matches a symbol when its name is the symbol, or the

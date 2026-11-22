@@ -278,6 +278,16 @@ SHOW_NORAVEL="${TMP}/show-noravel.txt"
 write_report "${REPORT_NORAVEL}" "${NORAVEL_SYMS[@]}"
 write_show "${SHOW_NORAVEL}" "${NORAVEL_SYMS[@]}"
 
+# A short recording: perf report shows only 4 symbols of the binary (the 3
+# given here, then write_report's cold row). They include a Ravel and a
+# DataFusion symbol, and the count check runs before resolution, so only the
+# count can fail.
+FEW_SYMS=("${SYMS[@]:0:3}")
+REPORT_FEW="${TMP}/perf-report-few.txt"
+SHOW_FEW="${TMP}/show-few.txt"
+write_report "${REPORT_FEW}" "${FEW_SYMS[@]}"
+write_show "${SHOW_FEW}" "${FEW_SYMS[@]}"
+
 # The hottest Ravel symbol is a trait impl naming ravel_sql and ravel_query;
 # the longer crate name, ravel_query, is the one taken.
 GEN_SYMS=("${SYMS[@]}")
@@ -506,6 +516,12 @@ mapfile -t args < <(record_args "${BINARY}" "${TMP}/rec-nodf")
 run STUB_PERF_REPORT="${REPORT_NODF}" STUB_PROFDATA_SHOW="${SHOW_NODF}" -- record "${args[@]}"
 expect_code "$n" 4 && expect_out "$n" "hold no DataFusion (datafusion) symbol" \
   && expect_no_record_output "$n" "${TMP}/rec-nodf" && ok "$n"
+
+n="record: a report with fewer than 20 symbols of the binary exits 4"
+mapfile -t args < <(record_args "${BINARY}" "${TMP}/rec-few")
+run STUB_PERF_REPORT="${REPORT_FEW}" STUB_PROFDATA_SHOW="${SHOW_FEW}" -- record "${args[@]}"
+expect_code "$n" 4 && expect_out "$n" "shows only 4 symbols" && expect_out "$n" "fewer than the 20" \
+  && expect_no_record_output "$n" "${TMP}/rec-few" && ok "$n"
 
 n="record: a top 20 with no ravel_ symbol exits 4"
 mapfile -t args < <(record_args "${BINARY}" "${TMP}/rec-noravel")
