@@ -31,7 +31,7 @@ use antithesis_instrumentation as _;
 use coverage::Coverage;
 use model::{Attempt, Mode, Model, Signal, Write};
 use otlp::{METRIC_SERIES, PartialSuccess, Sample, VALUE_STRIDE};
-use perf::{Answer, Outcome, Perf, Stamp, StopFaults};
+use perf::{Answer, Outcome, Perf, Stamp};
 use ravel::{Ravel, Reply, SqlFailure};
 
 /// Retries after the first attempt of a write with no definite outcome.
@@ -217,7 +217,7 @@ impl Shared {
         keyed: bool,
     ) -> Option<Write> {
         let mut m = lock(&self.model);
-        if m.writes.len() >= self.max_writes {
+        if at_cap(m.writes.len(), self.max_writes) {
             return None;
         }
         Some(register_in(
@@ -236,13 +236,7 @@ impl Shared {
     /// `WORKLOAD_MAX_WRITES` cap, sent once. It takes neither the gate nor a
     /// stop helper, so it can run while the eventually holds the gate.
     fn probe_write(&self, node: usize, signal: Signal, timeout: Duration) -> Answer {
-        let w = {
-            let mut m = lock(&self.model);
-            match signal {
-                Signal::Logs => register_in(&mut m, signal, Mode::Strict, 1, 0, 0, false),
-                Signal::Metrics => register_in(&mut m, signal, Mode::Strict, 0, 1, 0, false),
-            }
-        };
+        let w = self.register_probe(signal);
         let (path, body) = match signal {
             Signal::Logs => ("/v1/logs", otlp::logs_request(w.id, 1, 1, w.ts_ns)),
             Signal::Metrics => ("/v1/metrics", otlp::metrics_request(&w.samples)),
@@ -259,6 +253,15 @@ impl Shared {
             outcome: Outcome::from_attempt(&attempt),
             sent,
             received,
+        }
+    }
+
+    /// Register one perf probe write, past the `WORKLOAD_MAX_WRITES` cap.
+    fn register_probe(&self, signal: Signal) -> Write {
+        let mut m = lock(&self.model);
+        match signal {
+            Signal::Logs => register_in(&mut m, signal, Mode::Strict, 1, 0, 0, false),
+            Signal::Metrics => register_in(&mut m, signal, Mode::Strict, 0, 1, 0, false),
         }
     }
 
@@ -620,6 +623,12 @@ impl Shared {
     }
 }
 
+/// Whether a model holding `len` writes has reached the `WORKLOAD_MAX_WRITES`
+/// cap `max`, so `register` refuses another.
+fn at_cap(len: usize, max: usize) -> bool {
+    len >= max
+}
+
 /// Register a write in the model, with no cap.
 fn register_in(
     m: &mut Model,
@@ -961,25 +970,9 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     // of a test run (snouty docs:
     // /docs/product/writing_tests/controlling_faults/pause_faults/). The local
     // loop injects no faults and leaves it unset, so this is a no-op there.
-    let stop_faults = match std::env::var("ANTITHESIS_STOP_FAULTS") {
-        Ok(cmd) => match std::process::Command::new(&cmd).arg("3600").status() {
-            Ok(st) => {
-                println!("eventually: {cmd} 3600 exited {st}");
-                if st.success() {
-                    StopFaults::Ok
-                } else {
-                    StopFaults::Failed
-                }
-            }
-            Err(e) => {
-                println!("eventually: running {cmd} failed: {e}");
-                StopFaults::Failed
-            }
-        },
-        Err(std::env::VarError::NotPresent) => StopFaults::Unset,
-        // Set but not UTF-8: the command was never run.
-        Err(std::env::VarError::NotUnicode(_)) => StopFaults::Failed,
-    };
+    let stop_faults = perf::stop_faults(std::env::var("ANTITHESIS_STOP_FAULTS"), |cmd| {
+        std::process::Command::new(cmd).arg("3600").status()
+    });
     let t0 = Stamp::now();
     let mut perf_run = s.perf.as_ref().and_then(|p| p.start(stop_faults, t0));
     // No drain may start once the checks below begin.
@@ -1268,5 +1261,70 @@ fn main(tc: TestCase) {
             .steps(i64::MAX)
             .max_concurrency(4)
             .run_concurrent(tc);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn shared(max_writes: usize) -> Shared {
+        Shared {
+            ravel: Ravel::new(Vec::new(), "t".to_string()).expect("client"),
+            model: Mutex::new(Model::default()),
+            gate: RwLock::new(()),
+            stop: stop::Stop::default(),
+            eventually_on: false,
+            max_writes,
+            inject_missing: false,
+            cov: None,
+            perf: None,
+        }
+    }
+
+    #[test]
+    fn at_cap_is_true_from_the_cap_on() {
+        assert!(at_cap(5, 5));
+        assert!(!at_cap(4, 5));
+        assert!(at_cap(6, 5));
+        assert!(at_cap(0, 0));
+    }
+
+    #[test]
+    fn register_in_inserts_with_the_next_id_at_any_size() {
+        let mut m = Model::default();
+        for want in 0..3u64 {
+            let w = register_in(&mut m, Signal::Logs, Mode::Strict, 1, 0, 0, false);
+            assert_eq!(w.id, want);
+            assert_eq!(m.next_id, want + 1);
+            assert_eq!(m.writes.len(), usize::try_from(want + 1).expect("small"));
+            assert_eq!(m.writes.get(&want).map(|x| x.id), Some(want));
+        }
+    }
+
+    #[test]
+    fn register_stops_at_the_cap_and_a_probe_registers_past_it() {
+        let s = shared(2);
+        for want in 0..2u64 {
+            let w = s
+                .register(Signal::Logs, Mode::Strict, 1, 0, 0, false)
+                .expect("under the cap");
+            assert_eq!(w.id, want);
+        }
+        assert!(
+            s.register(Signal::Logs, Mode::Strict, 1, 0, 0, false)
+                .is_none()
+        );
+        assert_eq!(lock(&s.model).writes.len(), 2);
+        for (want, signal) in [(2u64, Signal::Logs), (3, Signal::Metrics)] {
+            let w = s.register_probe(signal);
+            assert_eq!(w.id, want);
+            assert_eq!(w.mode, Mode::Strict);
+            let m = lock(&s.model);
+            assert_eq!(m.next_id, want + 1);
+            assert!(m.writes.contains_key(&want));
+        }
+        assert_eq!(lock(&s.model).writes.len(), 4);
     }
 }
