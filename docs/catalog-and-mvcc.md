@@ -3621,16 +3621,16 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    not erased ones, so a metrics input an erasure rewrite replaced is never
    added beside or instead of the rewrite's output. The step checks only
    when the set holds a level-1 part of the token's (shard, ingest_hour)
-   bucket, step 6 found a pending erasure request, or a live rewrite of the
-   bucket names the input (step 6's LIST, which therefore completes before
-   this step, is the source of the first two). Finding that live rewrite
-   takes the bucket LIST, so it is looked for only when step 6 listed a
-   `.done`: a `.dreq` is deleted only once its `.done` exists, so with
-   neither listed no rewrite can be live without its request pending.
-   Without any of the three, the input is added as before, even when its
-   bucket is tombstoned; its rows are not counted twice there, because the
-   set then holds no level-1 part of the bucket that could also hold them.
-   When the check runs, it LISTs the bucket and, in this order:
+   bucket, step 6 found a pending erasure request, or step 6 listed a
+   `.done` (step 6's LIST, which therefore completes before this step, is
+   the source of all three). The `.done` condition exists because a live
+   rewrite of the bucket can name the input only then: a `.dreq` is
+   deleted only once its `.done` exists, so with neither listed no rewrite
+   can be live without its request pending. Without any of the three, the
+   input is added as before, even when its bucket is tombstoned (#4573);
+   its rows are not counted twice there, because the set then holds no
+   level-1 part of the bucket that could also hold them. When the check
+   runs, it LISTs the bucket and, in this order:
 
    - a tombstone in the bucket: the input is not added, the answer the
      absent-record path below gives (satisfied with zero segments);
