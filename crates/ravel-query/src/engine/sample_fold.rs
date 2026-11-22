@@ -448,8 +448,9 @@ impl<V: FoldValue> RunFold<V> {
     /// not predicted to merge; each is charged when it arises.
     ///
     /// The bound is what the fold holds, plus its growth, plus the finish
-    /// headroom or one transient buffer, whichever is larger. The growth counts every incoming sample as kept in a level of its
-    /// run's length, the labels of each new series, each spine's growth to
+    /// headroom or one transient buffer, whichever is larger. The growth
+    /// counts every incoming sample as kept in a level of its run's length,
+    /// the labels of each new series, each spine's growth to
     /// one more level per run, the `by_series` table's growth to the new
     /// series, and the prefix Vec's and `prefix_ids`' growth to one entry per
     /// change of provenance prefix along the call that the fold has not
@@ -825,7 +826,7 @@ impl<V: FoldValue> RunFold<V> {
     /// headroom; an allocation the allocator refuses is
     /// [`QueryError::AllocationRefused`]. So the fold's charge and the result
     /// reservation together cover the containers, the result Vec and the
-    /// merge buffer being built at every point (issue #4118).
+    /// merge buffer being built through every merge (issue #4118).
     ///
     /// Two kinds of bytes stay uncharged, because the one reservation taken
     /// here is sized for the result Vec and is not grown per series. Each
