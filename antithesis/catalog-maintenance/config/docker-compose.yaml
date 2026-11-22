@@ -263,13 +263,15 @@ services:
       # then, once a compaction record is seen, twice more so a sweep can
       # delete a superseded input (README.md, "The sweep jumps"). Each sweep
       # jump is at least the shipped default it passes: protection horizon
-      # 90300 s, pinned-query window 4830 s. The forced races move every
+      # 90300 s; for the window jump, the larger of the pinned-query window
+      # (4830 s) and the interior re-verify interval (21600 s), so the
+      # servers' next sweep is a full pass. The forced races move every
       # clock further, each move printed on its own line (README.md, "The
       # forced races").
       CLOCK_JUMP_FILE: /faketime/offset
       CLOCK_JUMP_SECS: "9000"
       CLOCK_SWEEP_HORIZON_JUMP_SECS: "91200"
-      CLOCK_SWEEP_WINDOW_JUMP_SECS: "5400"
+      CLOCK_SWEEP_WINDOW_JUMP_SECS: "22200"
       # The HEAD cache TTL every ravel-server runs with: the compiled default,
       # which no flag here and no `gc-config set` in init overrides, and which
       # sys/gc records. Before each clock move the driver holds HEAD still
