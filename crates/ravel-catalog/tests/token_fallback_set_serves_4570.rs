@@ -20,13 +20,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use ravel_catalog::{
-    Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
-    DEFAULT_MAX_FLUSH_LIFETIME_NS, Snapshot,
+    Catalog, CatalogConfig, CatalogError, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS,
+    DEFAULT_FOLD_SAFETY_MARGIN_NS, DEFAULT_MAX_FLUSH_LIFETIME_NS, Snapshot,
 };
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::{erasure, keys, signal};
 use ravel_cpu_gate::MonotonicClock;
-use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence, SequenceStep};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence, SequenceStep,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -106,6 +108,18 @@ fn cold_record_node(store: &Arc<MemoryStore>) -> Catalog {
 }
 
 fn l0_record(signal: Signal, writer: u128, epoch: u64, seq: u64, rows: u64, c: u8) -> CommitRecord {
+    l0_record_in(signal, HOUR, writer, epoch, seq, rows, c)
+}
+
+fn l0_record_in(
+    signal: Signal,
+    hour: u32,
+    writer: u128,
+    epoch: u64,
+    seq: u64,
+    rows: u64,
+    c: u8,
+) -> CommitRecord {
     record::build(NewCommitRecord {
         tenant_hash: tenant(),
         signal,
@@ -117,13 +131,13 @@ fn l0_record(signal: Signal, writer: u128, epoch: u64, seq: u64, rows: u64, c: u
         content_hash: [c; 32],
         sample_count: rows,
         series_count: 1,
-        min_event_ts_ns: hour_start(HOUR),
-        max_event_ts_ns: hour_start(HOUR) + 100,
-        min_ingest_ts_ns: hour_start(HOUR),
-        max_ingest_ts_ns: hour_start(HOUR) + 100,
+        min_event_ts_ns: hour_start(hour),
+        max_event_ts_ns: hour_start(hour) + 100,
+        min_ingest_ts_ns: hour_start(hour),
+        max_ingest_ts_ns: hour_start(hour) + 100,
         segment_format_version: u32::from(VERSION_V7),
-        created_unix_ns: hour_start(HOUR) + 1_000 + i64::from(c),
-        ingest_hour_bucket: HOUR,
+        created_unix_ns: hour_start(hour) + 1_000 + i64::from(c),
+        ingest_hour_bucket: hour,
     })
     .expect("valid record")
 }
@@ -626,6 +640,56 @@ async fn metrics_present_token_replaced_by_a_completed_erasure_serves_the_rewrit
     assert_eq!(rows(&snapshot), A_ROWS - 1);
 }
 
+/// Retention's tombstone for `hour`'s bucket.
+async fn put_tombstone(store: &dyn ObjectStoreBackend, signal: Signal, hour: u32) {
+    let tombstone = RetentionTombstone {
+        format_version: 1,
+        tenant_hash: tenant().0.to_vec(),
+        signal: signal::to_proto(signal) as i32,
+        shard: 0,
+        ingest_hour_bucket: hour,
+        retired_at_ns: 0,
+        retention_window_ns: 0,
+        record_count_observed: 0,
+    };
+    put(
+        store,
+        &keys::retention_tombstone_key_for(&tombstone).expect("tombstone key"),
+        record::encode_tombstone(&tombstone).to_vec(),
+    )
+    .await;
+}
+
+fn tombstone_key(signal: Signal, hour: u32) -> String {
+    keys::retention_tombstone_key(&tenant(), signal, 0, hour).expect("tombstone key")
+}
+
+/// The hour every query below reads: it excludes the tokens' hours, so the
+/// set holds nothing of their buckets.
+const OTHER_HOUR: u32 = HOUR + 5;
+
+async fn try_resolve_elsewhere(
+    catalog: &Catalog,
+    signal: Signal,
+    tokens: &[CommitToken],
+) -> Result<Snapshot, CatalogError> {
+    catalog
+        .resolve(
+            &tenant(),
+            signal,
+            hour_range(OTHER_HOUR),
+            tokens,
+            hour_start(OTHER_HOUR) + 60_000_000_000,
+        )
+        .await
+}
+
+async fn resolve_elsewhere(catalog: &Catalog, signal: Signal, tokens: &[CommitToken]) -> Snapshot {
+    try_resolve_elsewhere(catalog, signal, tokens)
+        .await
+        .expect("resolve")
+}
+
 /// A token whose commit record is still present, in a bucket retention has
 /// tombstoned, on a tenant that has a completed erasure request (`.done`)
 /// unrelated to the bucket. The query window excludes the token's hour, so
@@ -633,51 +697,32 @@ async fn metrics_present_token_replaced_by_a_completed_erasure_serves_the_rewrit
 /// LIST runs only because of the `.done`, and it shows the tombstone. The
 /// token is satisfied with zero segments, as the absent-record fallback
 /// answers a tombstoned bucket, so A, which retention is deleting, is not
-/// added.
+/// added. The LIST answers it: the tombstone key is never read on its own.
 async fn present_token_in_a_tombstoned_bucket_after_a_completed_erasure(signal: Signal) {
-    let store = Arc::new(MemoryStore::new());
+    let inner = Arc::new(MemoryStore::new());
+    let store = RangeLog::new(inner.clone());
     let a = record_a(signal);
-    put_l0(store.as_ref(), &a).await;
+    put_l0(inner.as_ref(), &a).await;
     let q = Uuid::from_u128(0x4573_d001);
     put(
-        store.as_ref(),
+        inner.as_ref(),
         &keys::erasure_completion_key(&tenant(), signal, q).expect("done key"),
         b"done".to_vec(),
     )
     .await;
-    let tombstone = RetentionTombstone {
-        format_version: 1,
-        tenant_hash: tenant().0.to_vec(),
-        signal: signal::to_proto(signal) as i32,
-        shard: 0,
-        ingest_hour_bucket: HOUR,
-        retired_at_ns: 0,
-        retention_window_ns: 0,
-        record_count_observed: 0,
-    };
-    put(
-        store.as_ref(),
-        &keys::retention_tombstone_key_for(&tombstone).expect("tombstone key"),
-        record::encode_tombstone(&tombstone).to_vec(),
-    )
-    .await;
+    put_tombstone(inner.as_ref(), signal, HOUR).await;
 
-    let other_hour = HOUR + 5;
-    let snapshot = catalog_on(store.clone(), None)
-        .resolve(
-            &tenant(),
-            signal,
-            hour_range(other_hour),
-            &[token(&a)],
-            hour_start(other_hour) + 60_000_000_000,
-        )
-        .await
-        .expect("resolve");
+    let snapshot = resolve_elsewhere(&catalog_on(store.clone(), None), signal, &[token(&a)]).await;
     assert!(snapshot.pending_erasure.is_empty(), "nothing is pending");
     assert_eq!(
         sorted_keys(&snapshot),
         Vec::<String>::new(),
         "A's bucket is tombstoned: A is not added"
+    );
+    assert_eq!(
+        store.ranges_of(&tombstone_key(signal, HOUR)),
+        Vec::<GetRange>::new(),
+        "the bucket LIST showed the tombstone: no tombstone GET"
     );
 }
 
@@ -689,4 +734,178 @@ async fn logs_present_token_in_a_tombstoned_bucket_after_a_completed_erasure_add
 #[tokio::test]
 async fn metrics_present_token_in_a_tombstoned_bucket_after_a_completed_erasure_adds_nothing() {
     present_token_in_a_tombstoned_bucket_after_a_completed_erasure(Signal::Metrics).await;
+}
+
+/// The same tombstoned bucket with no `.done`, no pending erasure and no
+/// level-1 part of the bucket in the set, so the bucket is never LISTed: one
+/// GET of its tombstone key answers the token with zero segments, as a plain
+/// read excludes the bucket and the absent-record fallback answers it.
+async fn present_token_in_a_tombstoned_bucket_with_no_erasure(signal: Signal) {
+    let inner = Arc::new(MemoryStore::new());
+    let store = RangeLog::new(inner.clone());
+    let a = record_a(signal);
+    put_l0(inner.as_ref(), &a).await;
+    put_tombstone(inner.as_ref(), signal, HOUR).await;
+
+    let snapshot = resolve_elsewhere(&catalog_on(store.clone(), None), signal, &[token(&a)]).await;
+    assert!(snapshot.pending_erasure.is_empty(), "nothing is pending");
+    assert_eq!(
+        sorted_keys(&snapshot),
+        Vec::<String>::new(),
+        "A's bucket is tombstoned: A is not added"
+    );
+    assert_eq!(
+        store.ranges_of(&tombstone_key(signal, HOUR)),
+        vec![GetRange::Full],
+        "exactly one tombstone GET"
+    );
+}
+
+#[tokio::test]
+async fn logs_present_token_in_a_tombstoned_bucket_with_no_erasure_adds_nothing() {
+    present_token_in_a_tombstoned_bucket_with_no_erasure(Signal::Logs).await;
+}
+
+#[tokio::test]
+async fn metrics_present_token_in_a_tombstoned_bucket_with_no_erasure_adds_nothing() {
+    present_token_in_a_tombstoned_bucket_with_no_erasure(Signal::Metrics).await;
+}
+
+/// Three present tokens in one tombstoned bucket cost one tombstone GET in
+/// one resolve; two tokens in each of two tombstoned buckets cost one GET per
+/// bucket, two in all.
+#[tokio::test]
+async fn tombstone_get_is_issued_once_per_bucket_per_resolve() {
+    let signal = Signal::Logs;
+    let inner = Arc::new(MemoryStore::new());
+    let store = RangeLog::new(inner.clone());
+    let catalog = catalog_on(store.clone(), None);
+    let next = HOUR + 1;
+    let in_hour: Vec<CommitRecord> = (0..3)
+        .map(|i| l0_record_in(signal, HOUR, WRITER_A, 2, 7 + i, A_ROWS, 0xa0 + i as u8))
+        .collect();
+    let in_next: Vec<CommitRecord> = (0..2)
+        .map(|i| l0_record_in(signal, next, WRITER_B, 1, 3 + i, B_ROWS, 0xb0 + i as u8))
+        .collect();
+    for record in in_hour.iter().chain(&in_next) {
+        put_l0(inner.as_ref(), record).await;
+    }
+    put_tombstone(inner.as_ref(), signal, HOUR).await;
+    put_tombstone(inner.as_ref(), signal, next).await;
+
+    let one_bucket: Vec<CommitToken> = in_hour.iter().map(token).collect();
+    let snapshot = resolve_elsewhere(&catalog, signal, &one_bucket).await;
+    assert_eq!(sorted_keys(&snapshot), Vec::<String>::new());
+    assert_eq!(
+        store.ranges_of(&tombstone_key(signal, HOUR)),
+        vec![GetRange::Full],
+        "three tokens in one bucket: one tombstone GET"
+    );
+
+    let two_buckets: Vec<CommitToken> = in_hour[..2].iter().chain(&in_next).map(token).collect();
+    let snapshot = resolve_elsewhere(&catalog, signal, &two_buckets).await;
+    assert_eq!(sorted_keys(&snapshot), Vec::<String>::new());
+    assert_eq!(
+        store.ranges_of(&tombstone_key(signal, HOUR)).len(),
+        2,
+        "the second resolve read HOUR's tombstone once more"
+    );
+    assert_eq!(
+        store.ranges_of(&tombstone_key(signal, next)),
+        vec![GetRange::Full],
+        "two tokens in the next bucket: one tombstone GET"
+    );
+}
+
+/// A present token in a bucket with no tombstone is still added, after one
+/// GET of the bucket's tombstone key; a second token of the same bucket in
+/// the same resolve reads it no more.
+#[tokio::test]
+async fn present_token_in_an_untombstoned_bucket_is_added_after_one_tombstone_get() {
+    let signal = Signal::Logs;
+    let inner = Arc::new(MemoryStore::new());
+    let store = RangeLog::new(inner.clone());
+    let catalog = catalog_on(store.clone(), None);
+    let a = record_a(signal);
+    let b = l0_record(signal, WRITER_B, 1, 3, B_ROWS, 0xb0);
+    put_l0(inner.as_ref(), &a).await;
+    put_l0(inner.as_ref(), &b).await;
+
+    let snapshot = resolve_elsewhere(&catalog, signal, &[token(&a)]).await;
+    assert_eq!(sorted_keys(&snapshot), vec![l0_key(&a)]);
+    assert_eq!(
+        store.ranges_of(&tombstone_key(signal, HOUR)),
+        vec![GetRange::Full],
+        "one token: one tombstone GET"
+    );
+
+    let snapshot = resolve_elsewhere(&catalog, signal, &[token(&a), token(&b)]).await;
+    let mut both = vec![l0_key(&a), l0_key(&b)];
+    both.sort();
+    assert_eq!(sorted_keys(&snapshot), both);
+    assert_eq!(
+        store.ranges_of(&tombstone_key(signal, HOUR)).len(),
+        2,
+        "two tokens of one bucket: one more tombstone GET"
+    );
+}
+
+/// A store error on the tombstone GET fails the resolve with the typed store
+/// error; the token is not added on a guess.
+#[tokio::test]
+async fn a_faulted_tombstone_get_fails_the_resolve() {
+    let signal = Signal::Logs;
+    let inner = Arc::new(MemoryStore::new());
+    let a = record_a(signal);
+    put_l0(inner.as_ref(), &a).await;
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Get,
+            ScriptedFault::Permanent("tombstone GET failed".into()),
+        )
+        .with_key_contains(tombstone_key(signal, HOUR)),
+    );
+    let store = Arc::new(FaultStore::new(inner, plan));
+
+    let err = try_resolve_elsewhere(&catalog_on(store.clone(), None), signal, &[token(&a)])
+        .await
+        .expect_err("a faulted tombstone GET fails the resolve");
+    assert!(
+        matches!(err, CatalogError::Store(StoreError::Permanent(_))),
+        "expected the typed store error, got {err:?}"
+    );
+    assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+}
+
+/// A present token whose tombstoned bucket the window listing covers: the
+/// listing saw the tombstone and left the bucket out, and the token step
+/// answers it from that listing, with zero segments and no tombstone GET.
+#[tokio::test]
+async fn present_token_in_a_listed_tombstoned_bucket_adds_nothing_without_a_get() {
+    let signal = Signal::Logs;
+    let inner = Arc::new(MemoryStore::new());
+    let store = RangeLog::new(inner.clone());
+    let a = record_a(signal);
+    put_l0(inner.as_ref(), &a).await;
+    put_tombstone(inner.as_ref(), signal, HOUR).await;
+
+    let plain = resolve(&catalog_on(store.clone(), None), signal, live_now(), &[]).await;
+    assert_eq!(sorted_keys(&plain), Vec::<String>::new());
+    let snapshot = resolve(
+        &catalog_on(store.clone(), None),
+        signal,
+        live_now(),
+        &[token(&a)],
+    )
+    .await;
+    assert_eq!(
+        sorted_keys(&snapshot),
+        Vec::<String>::new(),
+        "A's bucket is tombstoned: A is not added"
+    );
+    assert_eq!(
+        store.ranges_of(&tombstone_key(signal, HOUR)),
+        Vec::<GetRange>::new(),
+        "the window listing saw the tombstone: no tombstone GET"
+    );
 }
