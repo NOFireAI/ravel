@@ -451,6 +451,9 @@ syntax and exit codes:
   commit touching `crates/` or `services/` needs a `CHANGELOG.md` change
   in the range or a `Changelog: none` trailer. CI's `doc-scripts-rest`
   job only; `gates.sh` does not run it.
+- `check-lockfile-downgrade.sh <base-ref> [head-ref]`: a `Cargo.lock`
+  downgrade needs a `Lockfile-downgrade: <crate> <version>` trailer in the
+  range. CI's `supply-chain` job only; `gates.sh` does not run it.
 - `check-amendment-integrity.sh`, `check-adr-band-sources.sh`: an ADR
   amendment's marker matches the document, and every band table row has a
   source. `docs/adrs/README.md`, "Amending an ADR", has the marker syntax.

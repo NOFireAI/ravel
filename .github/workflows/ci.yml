@@ -492,6 +492,10 @@ jobs:
       # cargo-deny is installed; its cases need jq alone and run here.
       - name: Advisory delta guard cases (issue #4041)
         run: bash scripts/guards/check-advisory-delta.test.sh
+      # The supply-chain job runs the Cargo.lock downgrade guard itself; its
+      # cases need git alone and run here.
+      - name: Cargo.lock downgrade guard cases (issue #4595)
+        run: bash scripts/guards/check-lockfile-downgrade.test.sh
       # A change to an RLOG, RSPAN or RSEG reader version must ship a
       # changelog fragment naming every signal that format carries (issue
       # #2725, ADR-2708 D5d). Same base..head shape and head.sha reasoning as
@@ -2296,6 +2300,36 @@ jobs:
           (cd "$base_dir" && cargo deny --format json check advisories) 2>"$RUNNER_TEMP/advisories-base.json" || rc=$?
           echo "cargo deny check advisories at the base $BASE_SHA exited $rc"
           scripts/guards/check-advisory-delta.sh "$RUNNER_TEMP/advisories-head.json" "$RUNNER_TEMP/advisories-base.json" "$BASE_SHA"
+      # A plain `cargo update` rolls back any locked version still inside the
+      # .cargo/config.toml cooldown (issue #4595), and the advisory delta
+      # above catches that only when the rolled-back version has an advisory.
+      # Every tracked Cargo.lock is compared with the base; a downgrade fails
+      # unless a commit carries `Lockfile-downgrade: <crate> <version>`. Same
+      # base resolution as the step above. The head is the checked-out HEAD:
+      # on pull_request that is the refs/pull/N/merge commit, which carries
+      # no trailers, but the guard reads trailers from `git log BASE_SHA..HEAD`,
+      # and with BASE_SHA = HEAD^1 that range holds the merge commit plus
+      # every pull request commit reachable through HEAD^2. On merge_group it
+      # holds every queued change since the queue's base. fetch-depth: 0
+      # above already fetched both ends and the commits between them.
+      - name: Cargo.lock downgrade guard (issue #4595)
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        env:
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            if ! BASE_SHA=$(git rev-parse --verify HEAD^1); then
+              echo "::error::could not resolve HEAD^1 of the pull request's merge commit"
+              exit 1
+            fi
+          else
+            BASE_SHA="$MERGE_GROUP_BASE_SHA"
+          fi
+          if [ -z "$BASE_SHA" ]; then
+            echo "::error::no base sha for the ${GITHUB_EVENT_NAME} event"
+            exit 1
+          fi
+          scripts/guards/check-lockfile-downgrade.sh "$BASE_SHA" HEAD
       # deny.toml ignores RUSTSEC-2026-0194/-0195 on the premise that no
       # shipped binary's feature set reaches an affected quick-xml version
       # (issue #1718). `cargo tree -i` uses the toolchain installed above.
