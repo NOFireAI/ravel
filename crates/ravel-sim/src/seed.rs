@@ -70,8 +70,11 @@ impl MasterSeed {
 }
 
 /// Pure decision logic behind [`MasterSeed::from_env_or`], split out so it
-/// is testable without mutating process environment state (`env::set_var`
-/// is `unsafe` and this workspace forbids `unsafe_code` outright).
+/// is testable without mutating process environment state: `env::set_var`
+/// is `unsafe` in edition 2024, and this crate's `[lints] workspace = true`
+/// forbids `unsafe_code`, so exercising the override still needs a
+/// subprocess (`tests/env_seed_override_changes_seed.rs` re-runs the test
+/// binary itself as the child, rather than a separate example binary).
 fn resolve_seed(raw: Option<String>, default: u64) -> u64 {
     raw.and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(default)
