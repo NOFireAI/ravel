@@ -3,8 +3,10 @@
 Status: Accepted (2026-11-22). Epic #4583. Refs #4375. Approved by the owner.
 
 Migration classes touched (ADR-0066 decision 4): none. No persistent format,
-proto schema, series identity, commit token or object key changes. Only
-tests and `.github/workflows/ci.yml` change; no production code path does.
+proto schema, series identity, commit token or object key changes. Tests,
+one test-only example (`crates/ravel-sim/examples/print_master_seed.rs`,
+deleted), `.github/workflows/ci.yml`, `CLAUDE.md` and a script under
+`scripts/` change; no production code path does.
 
 ## Context
 
@@ -67,9 +69,11 @@ The per-binary `OnceLock` caches in the ravel-sql tests do nothing under
 nextest, because nextest runs every test in its own process.
 
 A Python copy of nextest's partition rule (`xxh64(test_name, 0) % N`, from
-nextest-runner's `partition.rs`, fixed for the 0.9 series) assigns all
-16,164 `check` tests and all 4,733 `flight-sql` tests to the leg they ran
-on, with no exceptions. With the measured durations it predicts:
+nextest-runner's `partition.rs`, which says the rule is fixed for the 0.9
+series; CI installs nextest unpinned, so a later series could change it)
+assigns all 16,164 `check` tests and all 4,733 `flight-sql` tests to the
+leg they ran on, with no exceptions. With the measured durations it
+predicts:
 
 | Slowest leg, summed test s | `check-shard` | `flight-sql-shard` |
 |---|---|---|
@@ -85,7 +89,9 @@ the shared fixture's 31 s paid once per leg), so they are estimates on top
 of an exact partition. nextest keeps about four tests running at once on a
 four-vCPU runner, so a leg's test wall time is about its summed seconds
 divided by 3.8 (534 s measured against 2,029 summed on `check-shard` leg
-4). In wall time on the slowest leg:
+4). A leg's wall time is its build, plus that, plus, on `check-shard` leg
+1 only, the unpartitioned doctest step (11 to 14 s on five warm runs,
+2026-11-22). In wall time on the slowest leg:
 
 | Change | `check-shard` | `flight-sql-shard` |
 |---|---|---|
@@ -138,30 +144,45 @@ flowchart LR
      by merging the two tests, every assertion kept.
 2. **Share the retry fixtures across test processes.** The ravel-sql
    `bucketed_final_aggregate` tests write the 3,000,000-row and the
-   2,000,000-row string-keyed fixture bytes once per machine under
-   `std::env::temp_dir()`, not under `target/`, so the rust-cache step that
-   saves `target/` on main never stores them. The file name is keyed by the
-   test binary's path, size and modification time, so any rebuild of the
-   generator or the writer changes the key. A test builds under an
-   exclusive file lock, writes to a temporary name and renames it into
-   place, and removes older keys of the same binary path; a test that finds
-   the file reads it, and one that cannot decode it rebuilds it under the
-   lock. The doc comments that say a fixture is "written once per test
-   binary" are corrected to say what holds under nextest.
+   2,000,000-row string-keyed fixture bytes once per target directory under
+   `CARGO_TARGET_TMPDIR` (`target/tmp`). That is the checkout's own volume,
+   not the system temporary directory, which on the amd64 executor class
+   is the harness's capture tmpfs and is shared by every checkout on a
+   host. rust-cache never stores the file: its cleanup before the save on
+   main deletes every file under a target subdirectory that is not a
+   profile (`cleanTargetDir` in its `src/cleanup.ts`, which treats
+   `target/tmp` that way). The file name is keyed by the test binary's
+   path, size and modification time, so any rebuild of the generator or
+   the writer changes the key. A test builds under an exclusive file lock,
+   writes to a temporary name and renames it into place, and removes older
+   keys of the same binary path; a test that finds the file reads it. Any
+   failure on the cache path (open, lock, write, rename, a read that does
+   not decode, a full volume) makes that test build the fixture in its own
+   process as it does today, so the cache can only ever save time. The
+   implementing pull request states the files' size on disk. The doc
+   comments that say a fixture is "written once per test binary" are
+   corrected to say what holds under nextest.
 3. **Split `invariants` into one job per feature set.** A two-entry matrix
    runs the capture-and-mutants pass and the antithesis-alone pass on
    separate runners, each with its clippy step and its test step. The job
-   is not required, so no aggregator is needed; the job name changes to
-   `invariants (<feature set>)`. Expected: about 9 min instead of 17.3 to
-   17.9, at the cost of one more build per run.
+   is not required, so no aggregator is needed; the job key stays
+   `invariants` and the check names become `invariants (<feature set>)`.
+   The same pull request updates the text that names the job: `CLAUDE.md`'s
+   gates section and the ci.yml comments on `invariants` and
+   `invariants-services`. Expected: about 9 min instead of 17.3 to 17.9, at
+   the cost of one more build per run.
 4. **Re-measure, then decide the leg counts.** After decisions 1 and 2
    land, take the per-leg summed test seconds from a warm main push run and
-   simulate four and five legs with the partition copy, which this decision
-   commits under `scripts/` with a self-check that replays a downloaded
-   run's assignment and fails on any misassigned test. Add a fifth leg to
-   `check-shard` or `flight-sql-shard` where it shortens that job's slowest
-   leg by at least 450 summed seconds (about 2 min of wall time) and that
-   job is still the last required check to finish on at least half of the
+   simulate four and five legs with the partition copy. This decision
+   commits the copy under `scripts/` with a self-check that CI's
+   `doc-scripts-rest` job runs, replaying a recorded assignment and failing
+   on any misassigned test. The measurement replays the run it measures the
+   same way and refuses on any misassignment, so a nextest release that
+   changes the rule stops the decision instead of sizing it on a wrong
+   split. Add a fifth leg to `check-shard` or `flight-sql-shard` where it
+   shortens that job's slowest leg wall time (build, tests at summed
+   seconds over 3.8, and leg 1's doctests) by at least 2 min, and that job
+   is still the last required check to finish on at least half of the
    week's warm runs. The denominator stays `strategy.job-total`, so a fifth
    matrix entry is the whole change. Each added leg costs one more build
    per run, about 9 runner-minutes for `check-shard` and 6.5 for
@@ -176,8 +197,9 @@ Pre-registered figures, to check against the measurement in decision 4
 
 | Figure | Expected | A miss | Source |
 |---|---|---|---|
-| `check-shard` slowest leg, summed test s, 4 legs | 1,450 to 1,650 | outside the band | predicted from the partition simulation, timings measured 2026-11-22 |
-| `flight-sql-shard` slowest leg, summed test s, 4 legs | 1,300 to 1,550 | outside the band | predicted from the partition simulation, timings measured 2026-11-22 |
+| `check-shard` slowest leg, summed test s, 4 legs | 1,480 to 1,560 | outside the band | predicted from the partition simulation after decisions 1 and 2, timings measured 2026-11-22 |
+| `flight-sql-shard` slowest leg, summed test s, 4 legs | 1,380 to 1,500 | outside the band | predicted from the partition simulation after decisions 1 and 2, timings measured 2026-11-22 |
+| the 50 `bucketed_final_aggregate` tests on `check`, summed s over all legs | 560 to 720 | 760 or more: decision 2 saved nothing | predicted: 853 to 861 measured 2026-11-22, less about 31 s for each of the about 7 fixture builds a shared file removes |
 | `env_seed_override_changes_resolved_seed` on `check` | under 5 s | 5 s or more | predicted: no nested build remains |
 | `the_widest_long_eval_runs_on_a_worker_stack` on `check` | 40 to 100 s | outside the band | predicted: 2 large prepares instead of about 23, from 213 s measured 2026-11-22 |
 | `invariants (<feature set>)`, each leg, minutes | 8 to 11 | outside the band | predicted: one clippy and one test step, each measured 2026-11-22 |
@@ -217,15 +239,15 @@ Pre-registered figures, to check against the measurement in decision 4
   fifth legs from decision 4 the totals are about 4.8 and 3.4 min, which
   would put `check` at about 15 to 16 min and leave `doc-scripts` and
   `features` (13 to 16 min) close behind.
-- The fixture cache in decision 2 is a file in the system temporary
-  directory, shared by test processes on one machine. A stale file cannot
-  outlive a rebuild of the test binary, and a reader that finds a truncated
-  or unreadable file rebuilds it under the lock. A test waiting on the lock
-  holds a nextest slot for up to the build time, about 31 s on `check`.
-  It is the riskiest change here for the least time saved, and it can be
-  dropped without touching the others.
+- The fixture cache in decision 2 is a file in the target directory's
+  `tmp`, shared by the test processes of one checkout. A stale file cannot
+  outlive a rebuild of the test binary, and any failure on the cache path
+  falls back to today's in-process build. A test waiting on the lock holds
+  a nextest slot for up to the build time, about 31 s on `check`. It is
+  the riskiest change here for the least time saved, and it can be dropped
+  without touching the others.
 - The ravel-sim example `print_master_seed` is removed; nothing else uses it.
-- The `invariants` check name changes, which matters to nothing that names
-  it: it is not in the ruleset.
+- The `invariants` check names change. The ruleset does not list them, and
+  decision 3's pull request updates the text that names the job.
 - Decision 4 may add no leg. The decision and its numbers go on the epic
   ledger either way.
