@@ -285,6 +285,57 @@ connection, a pushed-but-broken main).
   under the directory. On a pass, record the result in a new `VERIFIED`
   file in the release directory (tag, commits, method, result), as
   `corpus/v0.34.0/VERIFIED` does.
+- `scripts/build-pgo.sh check-tools|record|build`: the sample-PGO build of
+  ravel-server that ADR-4523's R3 measured, kept as its reproduction
+  (issue #4527); docs/internal/pgo-runbook.md has the procedure and the
+  decision record. Opt-in: no release or image path calls it, only its
+  test suite does (ADR-4523 decision 4, DEFER). Linux x86_64 only: every
+  subcommand exits 6 on any other host. Each subcommand takes `--help`.
+  `check-tools` reads rustc's LLVM major from `rustc -vV` and finds
+  `llvm-profgen` (`LLVM_PROFGEN`, then the rustup sysroot's
+  `lib/rustlib/x86_64-unknown-linux-gnu/bin`, then
+  `/usr/lib/llvm-<major>/bin`) and `llvm-profdata` (`LLVM_PROFDATA`, then
+  the sysroot, from the `llvm-tools` component), and refuses an
+  `llvm-profgen` of another LLVM major, naming both. `record --pid PID
+  --binary PATH --seconds N --out DIR [--event EVENT]` probes
+  `cpu/branch-brs/`, `br_inst_retired.near_taken:u` and `cycles:u` in
+  that order (or only `--event`) with `perf record -b -e EVENT -- true`,
+  keeps the first perf can open, and runs `perf record -b` with it on a
+  running unstripped ravel-server. It fails when that perf exits non-zero
+  (showing its stderr tail) or `perf report --stats` counts zero samples.
+  It converts with `llvm-profgen` to `DIR/profile.prof`, then requires
+  each of the binary's top 20 self-time symbols in `perf report` (clone
+  suffixes `.llvm.N`, `.constprop.N`, `.isra.N`, `.part.N` and `.cold`
+  stripped) to be a function of the profile with nonzero samples, and the
+  20 to include a `ravel_` and a `datafusion` symbol. It writes
+  `DIR/top-symbols.txt` and `DIR/provenance.txt` (source SHA, binary
+  hash, rustc and llvm-profgen versions, event, host, CPU, time, profile
+  hash, hottest Ravel crate, top-symbols file).
+  `build --profile FILE [--features LIST] [--target-dir DIR]` needs
+  `top-symbols.txt` beside the profile, runs `cargo build --release
+  --locked -p ravel-server` with `-Cprofile-sample-use=<absolute path>`
+  appended to the caller's `RUSTFLAGS`; the default features are read
+  from the root Dockerfile's ravel-server build line. It then emits LLVM
+  IR for the profile's hottest Ravel crate (else ravel-sql) with the same
+  flags and requires a `SampleProfile` summary, a nonzero
+  `function_entry_count` and a top-20 symbol defined with `!prof`, warns
+  when the profile's source SHA is not HEAD, and writes
+  `<binary>.provenance.txt`. Exit 0 success; 1 a cargo command failed;
+  2 bad usage; 3 a tool missing or an LLVM major mismatch; 4 perf record
+  failed or was refused by `perf_event_paranoid`, perf recorded zero
+  samples, `llvm-profgen` failed or wrote an empty profile, a top-20
+  symbol is missing or has zero samples, the top 20 hold no `ravel_` or
+  no `datafusion` symbol, or (build) the profile is missing, empty, lists
+  no functions or has no `top-symbols.txt`; 5 the build could not be
+  shown to use the profile (no `.ll`, no summary, no nonzero count, or no
+  top-20 define with `!prof`); 6 not Linux x86_64, or no perf event can
+  be opened. On 5, and on a failed IR `cargo rustc` (1), the binary is
+  moved to `<target>/release/ravel-server.pgo-unproven`. Environment:
+  `LLVM_PROFGEN`, `LLVM_PROFDATA`, `RUSTFLAGS` (appended to, never
+  replaced) and `CARGO_TARGET_DIR` (where `build` writes without
+  `--target-dir`). `scripts/build-pgo.test.sh` runs it against stubs in
+  CI; `BUILD_PGO_SCRIPT=<path under scripts/>` points the suite at
+  another copy, for a mutation check.
 
 - `scripts/brig.sh new|run|shell|plan|stop|rm|update|path NAME`,
   `scripts/brig.sh login`: the host side of the `make brig*` targets
