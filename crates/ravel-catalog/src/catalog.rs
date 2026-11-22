@@ -2909,6 +2909,10 @@ impl Catalog {
         // means no window was listed (no fan-out to overlap), so the LIST runs
         // standalone after the token loop, exactly as before.
         let mut pending_erasure: Option<ErasureState> = None;
+        // Every bucket the window listing saw a key of, and whether one of
+        // them was its tombstone: the present-token step reads no tombstone
+        // key for these.
+        let mut tombstoned_buckets = TombstonedBuckets::new();
 
         if let Some((window_start_hour, window_end_hour)) = window {
             // A snapshot at watermark W serves every window hour <= W
@@ -3056,6 +3060,8 @@ impl Catalog {
                     pending_erasure = Some(erasure?);
                     listed?
                 };
+                let (listed, listed_buckets) = listed;
+                tombstoned_buckets = listed_buckets;
                 for (key, segment_ref) in listed {
                     if !segments.contains_key(&key) {
                         origin_by_key.insert(key.clone(), SegmentOrigin::Recent);
@@ -3141,6 +3147,7 @@ impl Catalog {
                 segment_ref,
                 &mut segments,
                 &mut origin_by_key,
+                &mut tombstoned_buckets,
                 erasure_pending,
                 erasure_completed,
                 accounting,
@@ -3580,7 +3587,7 @@ impl Catalog {
         range: TimeRange,
         generations: &[crate::provisioning::ShardGeneration],
         accounting: &QueryAccounting,
-    ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
+    ) -> Result<(HashMap<String, SegmentRef>, TombstonedBuckets), CatalogError> {
         // Union scan set over the suffix: the widest per-shard bound any hour
         // in the range needs (a per-shard LIST cannot vary per hour), floored
         // at the signal's writer-pinned shards.
@@ -3637,6 +3644,7 @@ impl Catalog {
         // concurrently. resolve_fanout's final deterministic sort makes the
         // result independent of merge order.
         let mut coords: Vec<((u32, u32), Vec<ListedKey>)> = grouped.into_iter().collect();
+        let listed_buckets = listed_bucket_tombstones(&coords);
         self.cached_commit_records(tenant, signal, &mut coords, accounting)?;
         let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
             stream::iter(coords)
@@ -3653,7 +3661,7 @@ impl Catalog {
                 out.entry(key).or_insert(segment_ref);
             }
         }
-        Ok(out)
+        Ok((out, listed_buckets))
     }
 
     /// List one shard's commit buckets for the hours in
@@ -4078,7 +4086,7 @@ impl Catalog {
         range: TimeRange,
         generations: &[crate::provisioning::ShardGeneration],
         accounting: &QueryAccounting,
-    ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
+    ) -> Result<(HashMap<String, SegmentRef>, TombstonedBuckets), CatalogError> {
         // One recursive LIST per shard, grouping keys by (shard, hour), each
         // shard's scan bounded below the watermark by a `list_after` start
         // marker so it does not page through the shard's whole history before
@@ -4146,6 +4154,7 @@ impl Catalog {
         // collide across buckets, and resolve_impl's final deterministic sort
         // makes the result independent of merge order.
         let mut coords: Vec<((u32, u32), Vec<ListedKey>)> = grouped.into_iter().collect();
+        let listed_buckets = listed_bucket_tombstones(&coords);
         self.cached_commit_records(tenant, signal, &mut coords, accounting)?;
         let bucket_maps: Vec<Result<HashMap<String, SegmentRef>, CatalogError>> =
             stream::iter(coords)
@@ -4162,7 +4171,7 @@ impl Catalog {
                 out.entry(key).or_insert(segment_ref);
             }
         }
-        Ok(out)
+        Ok((out, listed_buckets))
     }
 
     /// One shard's drain for [`Catalog::list_window_by_prefix`]: its pages in
@@ -4702,6 +4711,7 @@ impl Catalog {
         segment_ref: SegmentRef,
         out: &mut HashMap<String, SegmentRef>,
         origin_by_key: &mut HashMap<String, SegmentOrigin>,
+        tombstoned_buckets: &mut TombstonedBuckets,
         erasure_pending: bool,
         erasure_completed: bool,
         accounting: &QueryAccounting,
@@ -4715,6 +4725,7 @@ impl Catalog {
                 signal,
                 token,
                 out,
+                tombstoned_buckets,
                 erasure_pending,
                 erasure_completed,
                 accounting,
@@ -4759,17 +4770,17 @@ impl Catalog {
     ///   is added, since the rewrite's parts would serve that object's rows a
     ///   second time.
     ///
-    /// These checks run, for every signal, only when `out` holds an output
-    /// part of the bucket, an erasure request is pending, or a live rewrite
-    /// names the input. With none of the three the answer is `None` whatever
-    /// the bucket holds, tombstone or not. Whether a live rewrite names the
-    /// input takes the bucket LIST, which runs only when `erasure_completed`
-    /// (the resolve's `del/` LIST found a `.done`): a rewrite outlives its
+    /// The bucket LIST runs, for every signal, only when `out` holds an
+    /// output part of the bucket, an erasure request is pending, or step 6
+    /// listed a `.done` (`erasure_completed`). A rewrite outlives its
     /// request's `.dreq` only after that request completed, so without a
-    /// `.done` and without a pending request no rewrite can name the input
-    /// and the answer is `None` at no store read. Whenever the bucket LIST
-    /// does run, a tombstone it shows answers zero segments, on the
-    /// `.done`-only path too.
+    /// `.done` and without a pending request no rewrite can name the input.
+    /// With none of the three, [`Self::token_bucket_tombstoned`] answers
+    /// whether the bucket is tombstoned, from the window listing when it
+    /// saw the bucket and otherwise from one GET of the bucket's fixed
+    /// tombstone key: a tombstone answers zero segments, and its absence adds
+    /// the input. A tombstone the bucket LIST shows answers zero segments on
+    /// every path.
     #[allow(clippy::too_many_arguments)]
     async fn token_input_replacement(
         &self,
@@ -4777,6 +4788,7 @@ impl Catalog {
         signal: Signal,
         token: &CommitToken,
         out: &HashMap<String, SegmentRef>,
+        tombstoned_buckets: &mut TombstonedBuckets,
         erasure_pending: bool,
         erasure_completed: bool,
         accounting: &QueryAccounting,
@@ -4788,7 +4800,10 @@ impl Catalog {
         });
         let checked = bucket_output_in_out || erasure_pending;
         if !checked && !erasure_completed {
-            return Ok(None);
+            let tombstoned = self
+                .token_bucket_tombstoned(tenant, signal, token, tombstoned_buckets, accounting)
+                .await?;
+            return Ok(tombstoned.then(Vec::new));
         }
         let Some(bucket) = self
             .load_token_bucket(tenant, signal, token, accounting)
@@ -4831,6 +4846,46 @@ impl Catalog {
             .map(|part| build_rewrite_l1_segment_ref(record, part, rkey))
             .collect::<Result<Vec<_>, _>>()
             .map(Some)
+    }
+
+    /// Whether the token's `(shard, ingest_hour)` bucket is tombstoned. A
+    /// bucket in `tombstoned_buckets` (the window listing saw it, or an
+    /// earlier token of this resolve read its tombstone key) is answered
+    /// from there; otherwise one GET of its fixed tombstone key decides, and
+    /// is recorded there. NotFound means no tombstone; any other store error
+    /// fails the resolve. Observing the tombstone by GET invalidates the
+    /// bucket's cached records (ADR-0010 §10), as [`Self::load_token_bucket`]
+    /// does.
+    async fn token_bucket_tombstoned(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        token: &CommitToken,
+        tombstoned_buckets: &mut TombstonedBuckets,
+        accounting: &QueryAccounting,
+    ) -> Result<bool, CatalogError> {
+        let bucket = (token.shard, token.ingest_hour_bucket);
+        if let Some(&tombstoned) = tombstoned_buckets.get(&bucket) {
+            return Ok(tombstoned);
+        }
+        let key =
+            keys::retention_tombstone_key(tenant, signal, token.shard, token.ingest_hour_bucket)?;
+        let tombstoned = match self.guarded_get(&key, GetRange::Full, accounting).await {
+            Ok(_) => true,
+            Err(StoreError::NotFound) => false,
+            Err(e) => return Err(CatalogError::Store(e)),
+        };
+        if tombstoned {
+            let prefix = keys::commit_shard_hour_prefix(
+                tenant,
+                signal,
+                token.shard,
+                token.ingest_hour_bucket,
+            )?;
+            self.invalidate_bucket_cache(tenant, &prefix);
+        }
+        tombstoned_buckets.insert(bucket, tombstoned);
+        Ok(tombstoned)
     }
 
     /// LIST the token's `(shard, ingest_hour)` bucket and load its compaction
@@ -5363,6 +5418,27 @@ struct ErasureState {
     /// only once its `.done` exists, so with neither a `.dreq` nor a `.done`
     /// listed no erasure rewrite can be live without its request pending.
     any_completed: bool,
+}
+
+/// Whether each `(shard, ingest_hour)` bucket a resolve has seen is
+/// tombstoned, from its window listing or from the present-token step's
+/// tombstone GET, so the step reads each bucket's tombstone at most once per
+/// resolve and never for a bucket the listing saw.
+type TombstonedBuckets = HashMap<(u32, u32), bool>;
+
+/// Every bucket the window listing kept a key of, and whether one of those
+/// keys is its tombstone. A bucket it kept no key of is absent, so the
+/// present-token step reads that bucket's tombstone key instead.
+fn listed_bucket_tombstones(coords: &[((u32, u32), Vec<ListedKey>)]) -> TombstonedBuckets {
+    coords
+        .iter()
+        .map(|(bucket, objects)| {
+            let tombstoned = objects
+                .iter()
+                .any(|listed| matches!(listed.kind, BucketKind::Tombstone));
+            (*bucket, tombstoned)
+        })
+        .collect()
 }
 
 /// A token bucket's compaction and rewrite records, as
