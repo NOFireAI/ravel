@@ -569,8 +569,8 @@ fn worst_expecting(kind: Kind, shape: Shape, expected: &Limit) -> Limit {
 }
 
 /// [`worst_in`], its `n` found by [`largest_admitted`] from `expected_n`. The
-/// optimized depth is measured on its own 2 MiB thread while the statement
-/// runs.
+/// optimized depth is measured while the statement runs: [`optimized_depth`]
+/// plans on its own [`WORKER_STACK`] thread through [`in_plan`].
 fn worst_near(
     kind: Kind,
     shape: Shape,
