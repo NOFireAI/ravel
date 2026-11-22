@@ -187,12 +187,9 @@ fn verified_payload_len(file: &[u8]) -> Option<usize> {
 fn checksum(bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let words = bytes.chunks_exact(8);
-    let rest = words.remainder();
+    let (words, rest) = bytes.as_chunks::<8>();
     for word in words {
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(word);
-        hash = (hash ^ u64::from_le_bytes(buf)).wrapping_mul(PRIME);
+        hash = (hash ^ u64::from_le_bytes(*word)).wrapping_mul(PRIME);
     }
     for &byte in rest {
         hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);

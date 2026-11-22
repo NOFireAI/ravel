@@ -423,7 +423,7 @@ fn the_fixture_cache_rebuilds_a_truncated_file_and_survives_io_errors() {
     std::fs::write(&blocker, b"a regular file").expect("write the blocking file");
     let under_a_file = blocker.join("cache");
     same(
-        util::fixture_cache::cached_bytes(&under_a_file, "small", &build),
+        util::fixture_cache::cached_bytes(&under_a_file, "small", build),
         "a cache directory under a regular file",
     );
     assert_eq!(builds.load(Ordering::SeqCst), 3);
