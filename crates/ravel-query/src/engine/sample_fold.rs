@@ -271,6 +271,8 @@ impl<V: FoldValue> RunFold<V> {
         for run in runs {
             self.absorb_run(run.into_run())?;
         }
+        #[cfg(any(test, feature = "test-support"))]
+        support::observe_absorb(|| self.charged());
         Ok(())
     }
 
@@ -609,6 +611,296 @@ fn merge_levels<V: FoldValue>(
         out.shrink_to_fit();
     }
     out
+}
+
+/// Test and bench support only (issue #4530, ADR-4523 decision 6, R5): the
+/// scalar fold driven from outside the crate, the pre-registered fold shapes,
+/// the hash-table size formula, and an observer of the fold's charge after
+/// each absorb. Only tests, `tests/run_fold_accounting.rs` and
+/// `benches/run_fold.rs` call into it; the crate itself reaches it only
+/// through [`RunFold::absorb`]'s observer check, which does nothing unless an
+/// observer was installed with [`set_absorb_observer`](support::set_absorb_observer).
+/// Built only under `cfg(test)` or the `test-support` feature, so a
+/// production build carries neither the module nor the observer check.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod support {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock};
+
+    use ravel_promql::SeriesData;
+    use ravel_types::{Label, LabelSet, SeriesId, TypeError};
+
+    use super::{FoldedSeries, ProvenancePrefix, ScalarFold};
+    use crate::error::QueryError;
+    use crate::fetcher::FetchedSeriesSoa;
+
+    static ABSORB_OBSERVER: OnceLock<fn(u64)> = OnceLock::new();
+
+    /// Installs `observer`, called with [`RunFold::charged`](super::RunFold::charged)
+    /// after every successful absorb of every fold in the process. Returns
+    /// false when an observer was already installed.
+    pub fn set_absorb_observer(observer: fn(u64)) -> bool {
+        ABSORB_OBSERVER.set(observer).is_ok()
+    }
+
+    pub(super) fn observe_absorb(charged: impl FnOnce() -> u64) {
+        if let Some(observer) = ABSORB_OBSERVER.get() {
+            observer(charged());
+        }
+    }
+
+    /// A scalar fold over an unlimited budget with no series cap.
+    pub struct ScalarRunFold(ScalarFold);
+
+    impl Default for ScalarRunFold {
+        fn default() -> Self {
+            Self(ScalarFold::new(
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                usize::MAX,
+            ))
+        }
+    }
+
+    impl ScalarRunFold {
+        pub fn absorb(&mut self, runs: Vec<FetchedSeriesSoa>) -> Result<(), QueryError> {
+            self.0.absorb(runs)
+        }
+
+        pub fn charged(&self) -> u64 {
+            self.0.charged()
+        }
+
+        pub fn into_series(self) -> Result<Vec<SeriesData>, QueryError> {
+            self.0.into_series(usize::MAX)
+        }
+    }
+
+    const BASE_NS: i64 = 1_700_000_000_000_000_000;
+    const STEP_NS: i64 = 15_000_000_000;
+
+    fn series_run(
+        series: usize,
+        slots: std::ops::Range<i64>,
+        prefix: ProvenancePrefix,
+    ) -> Result<FetchedSeriesSoa, TypeError> {
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&(series as u64).to_le_bytes());
+        let labels = LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "m".to_string(),
+            },
+            Label {
+                name: "id".to_string(),
+                value: format!("s{series}"),
+            },
+        ])?;
+        Ok(FetchedSeriesSoa {
+            series_id: SeriesId(id),
+            labels,
+            timestamps: slots.clone().map(|k| BASE_NS + k * STEP_NS).collect(),
+            values: slots
+                .map(|k| (series as f64) + (k as f64) * 0.5 + (prefix.0 as f64) * 0.001)
+                .collect(),
+            created_unix_ns: prefix.0,
+            writer_epoch: prefix.1,
+            writer_seq: prefix.2,
+            per_sample_priorities: None,
+        })
+    }
+
+    /// Shape A: 20,000 series of 4 samples, one run per series, in one
+    /// absorb. Each element of the result is one absorb call's runs.
+    pub fn shape_a() -> Result<Vec<Vec<FetchedSeriesSoa>>, TypeError> {
+        let runs = (0..20_000)
+            .map(|s| series_run(s, 0..4, (1, 1, 1)))
+            .collect::<Result<_, _>>()?;
+        Ok(vec![runs])
+    }
+
+    /// Shape B: 8 series of 200,000 samples, one run per series, in one
+    /// absorb.
+    pub fn shape_b() -> Result<Vec<Vec<FetchedSeriesSoa>>, TypeError> {
+        let runs = (0..8)
+            .map(|s| series_run(s, 0..200_000, (1, 1, 1)))
+            .collect::<Result<_, _>>()?;
+        Ok(vec![runs])
+    }
+
+    /// Shape C: 2,000 series, 64 runs of 16 samples each, absorbed in 64
+    /// calls. Call `k` holds one run per series over slots `8k..8k+16` under
+    /// its own provenance prefix, so each run shares 8 timestamps with the
+    /// run before it.
+    pub fn shape_c() -> Result<Vec<Vec<FetchedSeriesSoa>>, TypeError> {
+        (0..64i64)
+            .map(|k| {
+                (0..2_000)
+                    .map(|s| series_run(s, 8 * k..8 * k + 16, (k + 1, 1, 1)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// hashbrown's group width: the SSE2 group on x86, 8 bytes elsewhere.
+    const GROUP_WIDTH: u64 = if cfg!(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "sse2"
+    )) {
+        16
+    } else {
+        8
+    };
+
+    /// The bytes a `HashMap` whose [`HashMap::capacity`] is `capacity` and
+    /// whose `(key, value)` slot is `slot` bytes allocates, as the R5
+    /// pre-registration defines it: buckets x slot, plus one control byte
+    /// per bucket and the group width. HashMap has no allocation accessor,
+    /// so the bucket count is recovered from the capacity: the fewest buckets,
+    /// a power of two of at least 4, whose hashbrown capacity covers
+    /// `capacity`, where `buckets` hold `buckets - 1` entries up to 8 buckets
+    /// and `buckets / 8 * 7` above. That is exact for every capacity a table
+    /// that never removed an entry reports, which the fold's tables never do.
+    /// A capacity of 0 is a table that never allocated. hashbrown's padding
+    /// of the slot array to the control bytes' alignment is not counted;
+    /// `tests/run_fold_accounting.rs` asserts the formula against jemalloc.
+    pub fn table_bytes(capacity: usize, slot: usize) -> u64 {
+        if capacity == 0 {
+            return 0;
+        }
+        let buckets = table_buckets(capacity) as u64;
+        buckets
+            .saturating_mul(slot as u64)
+            .saturating_add(buckets)
+            .saturating_add(GROUP_WIDTH)
+    }
+
+    /// The entries hashbrown lets a table of `buckets` buckets hold.
+    pub(super) fn bucket_capacity(buckets: usize) -> usize {
+        if buckets <= 8 {
+            buckets - 1
+        } else {
+            buckets / 8 * 7
+        }
+    }
+
+    /// The fewest buckets, a power of two of at least 4, whose
+    /// [`bucket_capacity`] covers `capacity`.
+    pub(super) fn table_buckets(capacity: usize) -> usize {
+        let mut buckets = 4usize;
+        while bucket_capacity(buckets) < capacity {
+            match buckets.checked_mul(2) {
+                Some(next) => buckets = next,
+                None => break,
+            }
+        }
+        buckets
+    }
+
+    /// A table of the fold's key and value types, sized for its entries up
+    /// front so it allocates once, held so that allocation can be measured.
+    pub struct HeldTable {
+        _by_series: HashMap<SeriesId, FoldedSeries<f64>>,
+        _prefix_ids: HashMap<ProvenancePrefix, u32>,
+        capacity: usize,
+        formula: u64,
+    }
+
+    impl HeldTable {
+        /// [`HashMap::capacity`] of the held table.
+        pub fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        /// [`table_bytes`] for the held table.
+        pub fn formula_bytes(&self) -> u64 {
+            self.formula
+        }
+    }
+
+    /// The fold's `by_series` table with `entries` entries whose values own
+    /// no heap memory.
+    pub fn by_series_table(entries: usize) -> HeldTable {
+        let mut table = HashMap::with_capacity(entries);
+        for i in 0..entries {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            table.insert(
+                SeriesId(id),
+                FoldedSeries::<f64> {
+                    labels: LabelSet::default(),
+                    levels: Vec::new(),
+                    sample_bytes: 0,
+                },
+            );
+        }
+        let capacity = table.capacity();
+        HeldTable {
+            _by_series: table,
+            _prefix_ids: HashMap::new(),
+            capacity,
+            formula: table_bytes(
+                capacity,
+                std::mem::size_of::<(SeriesId, FoldedSeries<f64>)>(),
+            ),
+        }
+    }
+
+    /// The fold's `prefix_ids` table with `entries` entries.
+    pub fn prefix_ids_table(entries: usize) -> HeldTable {
+        let mut table = HashMap::with_capacity(entries);
+        for i in 0..entries {
+            table.insert((i as i64, 1u64, 1u64), i as u32);
+        }
+        let capacity = table.capacity();
+        HeldTable {
+            _by_series: HashMap::new(),
+            _prefix_ids: table,
+            capacity,
+            formula: table_bytes(capacity, std::mem::size_of::<(ProvenancePrefix, u32)>()),
+        }
+    }
+
+    /// One R5 figure line: `R5 shape=<shape> charged=.. live=.. ratio=..
+    /// gap_bytes=..`, the ratio to 4 decimals and the gap signed.
+    pub fn r5_line(shape: &str, charged: u64, live: u64) -> String {
+        let ratio = if live == 0 {
+            f64::INFINITY
+        } else {
+            charged as f64 / live as f64
+        };
+        let gap = i128::from(charged) - i128::from(live);
+        format!("R5 shape={shape} charged={charged} live={live} ratio={ratio:.4} gap_bytes={gap}")
+    }
+
+    /// The R5 presence rule over `lines`: each of `shapes` has exactly one
+    /// figure line, with a nonzero charged and live figure. Returns one
+    /// message per violation.
+    pub fn presence_violations(lines: &[String], shapes: &[&str]) -> Vec<String> {
+        let mut violations = Vec::new();
+        for shape in shapes {
+            let prefix = format!("R5 shape={shape} ");
+            let found: Vec<&String> = lines.iter().filter(|l| l.starts_with(&prefix)).collect();
+            if found.len() != 1 {
+                violations.push(format!(
+                    "shape {shape}: {} figure lines, want exactly 1",
+                    found.len()
+                ));
+                continue;
+            }
+            for field in ["charged", "live"] {
+                let value = found
+                    .iter()
+                    .flat_map(|l| l.split(' '))
+                    .find_map(|kv| kv.strip_prefix(&format!("{field}=")).map(str::to_string))
+                    .and_then(|v| v.parse::<u64>().ok());
+                if !matches!(value, Some(v) if v > 0) {
+                    violations.push(format!("shape {shape}: {field} is {value:?}, want > 0"));
+                }
+            }
+        }
+        violations
+    }
 }
 
 #[cfg(test)]
@@ -1042,5 +1334,177 @@ mod tests {
         assert!(budget.reserved() > 0);
         drop(fold);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// What a scalar fold's containers hold allocated, by part, under the R5
+    /// pre-registration's definition (issue #4530): each Vec's
+    /// `capacity() x size_of::<T>()`, and each hash table as
+    /// [`support::table_bytes`] computes it from `HashMap::capacity()` (buckets
+    /// x slot plus one control byte per bucket and the group width, the
+    /// bucket count derived as hashbrown derives it). A label set's outer Vec
+    /// is counted at its length, since `LabelSet` exposes no capacity; the
+    /// fixtures build it with `vec!`, whose capacity is its length.
+    struct LiveBytes {
+        levels: u64,
+        spines: u64,
+        by_series: u64,
+        prefix_ids: u64,
+        prefixes: u64,
+        labels: u64,
+    }
+
+    impl LiveBytes {
+        fn total(&self) -> u64 {
+            self.levels
+                + self.spines
+                + self.by_series
+                + self.prefix_ids
+                + self.prefixes
+                + self.labels
+        }
+    }
+
+    fn live_bytes(fold: &ScalarFold) -> LiveBytes {
+        let sample = std::mem::size_of::<FoldedSample<f64>>() as u64;
+        let level = std::mem::size_of::<Vec<FoldedSample<f64>>>() as u64;
+        let label = std::mem::size_of::<Label>() as u64;
+        let mut live = LiveBytes {
+            levels: 0,
+            spines: 0,
+            by_series: support::table_bytes(
+                fold.by_series.capacity(),
+                std::mem::size_of::<(SeriesId, FoldedSeries<f64>)>(),
+            ),
+            prefix_ids: support::table_bytes(
+                fold.prefix_ids.capacity(),
+                std::mem::size_of::<(ProvenancePrefix, u32)>(),
+            ),
+            prefixes: fold.prefixes.capacity() as u64
+                * std::mem::size_of::<ProvenancePrefix>() as u64,
+            labels: 0,
+        };
+        for series in fold.by_series.values() {
+            live.spines += series.levels.capacity() as u64 * level;
+            for held in &series.levels {
+                live.levels += held.capacity() as u64 * sample
+                    + held.iter().map(|s| s.value.heap_len()).sum::<u64>();
+            }
+            for l in series.labels.iter() {
+                live.labels += label + l.name.capacity() as u64 + l.value.capacity() as u64;
+            }
+        }
+        live
+    }
+
+    /// Folds `calls` one absorb each and returns the result with, at the
+    /// fold's peak charge, the charged and live figures and the live split.
+    fn probed_fold(calls: Vec<Vec<FetchedSeriesSoa>>) -> (Vec<SeriesData>, u64, LiveBytes) {
+        let mut fold = ScalarFold::new(unlimited(), usize::MAX);
+        let mut peak: Option<(u64, LiveBytes)> = None;
+        for call in calls {
+            fold.absorb(call).expect("absorb");
+            let charged = fold.charged();
+            if peak.as_ref().is_none_or(|(c, _)| charged >= *c) {
+                peak = Some((charged, live_bytes(&fold)));
+            }
+        }
+        let (charged, live) = peak.expect("at least one absorb");
+        (fold.into_series(usize::MAX).expect("finish"), charged, live)
+    }
+
+    fn plain_fold(calls: Vec<Vec<FetchedSeriesSoa>>) -> Vec<SeriesData> {
+        let mut fold = ScalarFold::new(unlimited(), usize::MAX);
+        for call in calls {
+            fold.absorb(call).expect("absorb");
+        }
+        fold.into_series(usize::MAX).expect("finish")
+    }
+
+    /// Folds one shape, prints its R5 figure line, asserts probing left the
+    /// fold's result unchanged, and returns every figure line it printed.
+    fn r5_shape(shape: &str, calls: Vec<Vec<FetchedSeriesSoa>>) -> Vec<String> {
+        let mut emitted = Vec::new();
+        let (probed, charged, live) = probed_fold(calls.clone());
+        let line = support::r5_line(shape, charged, live.total());
+        println!("{line}");
+        emitted.push(line);
+        println!(
+            "R5 breakdown shape={shape} levels={} spines={} by_series={} prefix_ids={} \
+             prefixes={} labels={}",
+            live.levels, live.spines, live.by_series, live.prefix_ids, live.prefixes, live.labels
+        );
+        assert_eq!(
+            project_scalar(probed),
+            project_scalar(plain_fold(calls)),
+            "shape {shape}: probing changed the fold's result"
+        );
+        emitted
+    }
+
+    /// Issue #4530 (ADR-4523 R5, step 1): the fold's charged bytes against
+    /// the bytes its containers hold, at its peak charge, for pre-registered
+    /// shapes A, B and C.
+    ///
+    /// This asserts presence only: each shape's run emits exactly one
+    /// figure line with nonzero charged and live figures, checked over the
+    /// lines the shapes actually emitted, and probing the fold leaves its
+    /// result unchanged. The predicted bands are deliberately not asserted.
+    /// They live in the pre-registration (issue #4530 comments 7079576120
+    /// and 7080468122) and the step's report, so an out-of-band figure does
+    /// not fail this test the way a missing line does.
+    #[test]
+    fn r5_run_fold_charged_against_live_bytes() {
+        let shapes = [
+            ("A", support::shape_a().expect("shape A")),
+            ("B", support::shape_b().expect("shape B")),
+            ("C", support::shape_c().expect("shape C")),
+        ];
+        let mut lines = Vec::new();
+        for (shape, calls) in shapes {
+            lines.extend(r5_shape(shape, calls));
+        }
+        let violations = support::presence_violations(&lines, &["A", "B", "C"]);
+        assert!(violations.is_empty(), "R5 presence rule: {violations:?}");
+    }
+
+    /// The presence rule fails a shape with no figure line, two figure
+    /// lines, or a zero figure.
+    #[test]
+    fn r5_presence_rule_fails_missing_duplicate_and_zero_lines() {
+        let a = support::r5_line("A", 10, 20);
+        let b = support::r5_line("B", 30, 40);
+        let shapes = ["A", "B"];
+        assert!(support::presence_violations(&[a.clone(), b.clone()], &shapes).is_empty());
+        assert_eq!(
+            support::presence_violations(std::slice::from_ref(&a), &shapes),
+            vec!["shape B: 0 figure lines, want exactly 1".to_string()]
+        );
+        assert_eq!(
+            support::presence_violations(&[a.clone(), b.clone(), b], &shapes),
+            vec!["shape B: 2 figure lines, want exactly 1".to_string()]
+        );
+        assert_eq!(
+            support::presence_violations(&[a, support::r5_line("B", 30, 0)], &shapes),
+            vec!["shape B: live is Some(0), want > 0".to_string()]
+        );
+    }
+
+    /// `table_bytes`' bucket count inverts hashbrown's capacity exactly: for
+    /// every table size up to 10,000 entries, the capacity a `HashMap`
+    /// reports is exactly the capacity of the bucket count recovered from
+    /// it, so no reported capacity falls between two bucket counts.
+    #[test]
+    fn r5_table_buckets_invert_hashmap_capacity() {
+        for entries in 1..=10_000usize {
+            let table: HashMap<u64, u64> = HashMap::with_capacity(entries);
+            let capacity = table.capacity();
+            let buckets = support::table_buckets(capacity);
+            assert!(buckets.is_power_of_two() && buckets >= 4);
+            assert_eq!(
+                support::bucket_capacity(buckets),
+                capacity,
+                "with_capacity({entries}) reports capacity {capacity}, which no bucket count holds"
+            );
+        }
     }
 }

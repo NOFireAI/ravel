@@ -45,6 +45,9 @@ use crate::segment_admission::{self, RequestBudget};
 
 mod sample_fold;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use sample_fold::support as run_fold_support;
 use sample_fold::{HistogramFold, ScalarFold};
 
 /// Which evaluation shape a prefetch is being computed for: an instant
