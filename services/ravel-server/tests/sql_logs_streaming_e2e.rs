@@ -24,6 +24,12 @@
 //! projected fixed column are exercised: the first is the degenerate case the
 //! ADR's context paragraph names, the second proves a real aggregate over a
 //! projected column still works under the same ceiling.
+//!
+//! Each fixture object is built column by column as one `ColumnarLogBatch`
+//! and written through `RlogWriter::push_columnar`, the call `ravel-ingest`'s
+//! log shard flush makes, with the objects encoded on parallel threads.
+//! [`columnar_fixture_object_equals_the_row_path_object`] pins that this
+//! writes the same bytes as pushing the same records one at a time.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -41,7 +47,10 @@ use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::Clock;
 use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_logseg::{
+    AttrValue, Bitmap, ColumnarLogBatch, DynCells, DynColumn, FieldType, LogRecord, RlogConfig,
+    RlogWriter, StrColumnDict, VarBytes, stream_attrs_bytes,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::http::StaticBearerTokenResolver;
@@ -64,9 +73,10 @@ const NOW_NS: i64 = 4 * NS_PER_HOUR;
 const ATTRS_PER_RECORD: usize = 100;
 /// RLOG objects in the fixture.
 const OBJECTS: usize = 30;
-/// Records per object. Kept modest because `RlogWriter` buffers a whole
-/// object's records before `finish()`, so this, not `TOTAL_RECORDS`, bounds the
-/// fixture builder's own peak memory.
+/// Records per object. Kept modest because each object is built as one
+/// in-memory batch before `finish()`, so this times the build threads (see
+/// [`build_wide_objects`]), not `TOTAL_RECORDS`, bounds the fixture builder's
+/// own peak memory.
 const RECORDS_PER_OBJECT: usize = 10_000;
 /// Total records in the `logs` table under test.
 const TOTAL_RECORDS: usize = OBJECTS * RECORDS_PER_OBJECT;
@@ -77,8 +87,12 @@ const SEVERITIES: &[&str] = &["INFO", "WARN", "ERROR", "DEBUG"];
 
 /// The per-query DataFusion memory-pool ceiling for this test: 8 MiB, a
 /// thirty-second of the 256 MiB default. The fixture's cumulative emitted
-/// bytes are orders of magnitude past this, so a scan whose reservation tracks
-/// cumulative output cannot pass however many batches it splits into.
+/// bytes are about two orders of magnitude past this: the `attrs` map column
+/// alone is 2,504 bytes per row in Arrow form (100 entries of an 8-byte key
+/// and a 9-byte value, each with a 4-byte offset, plus a 4-byte map offset),
+/// about 716 MiB over the table, some 90 times the pool. So a scan whose
+/// reservation tracks cumulative output cannot pass however many batches it
+/// splits into.
 const SMALL_POOL_BYTES: usize = 8 * 1024 * 1024;
 /// The tenant-wide ceiling behind the per-query pool. Above the per-query
 /// ceiling (it is shared across a tenant's concurrent queries) but still small,
@@ -104,53 +118,175 @@ fn identity(index: usize, tenant_hash: [u8; 16], writer_id: Uuid) -> ObjectIdent
     }
 }
 
-/// The [`ATTRS_PER_RECORD`] dynamic attributes every fixture record carries,
-/// built once and cloned per record.
+/// One RLOG object of `count` wide records starting at `first_ts`, as one
+/// [`ColumnarLogBatch`] written through [`RlogWriter::push_columnar`], the
+/// call `ravel-ingest`'s log shard flush makes.
 ///
-/// The attribute *values* are shared across records on purpose (they compress
-/// away, keeping the objects small); what matters to this test is the number of
-/// distinct attribute *columns*, since that is what an unprojected decode has
-/// to materialize per row. Building the vector once is purely a fixture-cost
-/// choice: at 100 attributes over 300,000 records, formatting the keys and
-/// values per record dominates the whole test's wall clock.
-fn wide_attrs() -> Vec<(String, AttrValue)> {
-    (0..ATTRS_PER_RECORD)
+/// Every record has a fixed stream, `severity_num` 9, a severity cycling
+/// through [`SEVERITIES`] by timestamp, a per-record body, no trace or span
+/// id, and the same [`ATTRS_PER_RECORD`] string attributes `attr.NNN =
+/// value-NNN`. The attribute *values* are shared across records on purpose
+/// (they compress away, keeping the objects small); what matters to this test
+/// is the number of distinct attribute *columns*, since that is what an
+/// unprojected decode has to materialize per row. The attribute columns are
+/// filled directly rather than from per-record `LogRecord`s, which would clone
+/// every attribute pair of every record. Each also carries its one-entry
+/// dictionary (`dyn_col_dicts`), with which the writer pays string encoding
+/// and token bloom per distinct value rather than per row. The log shard
+/// flush leaves `dyn_col_dicts` empty; the object written here is still byte
+/// for byte the row path's
+/// ([`columnar_fixture_object_equals_the_row_path_object`]).
+fn wide_object_bytes(identity: ObjectIdentity, first_ts: i64, count: usize) -> Vec<u8> {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    let stream_id = log_stream_id(&resource, "scope", "1.0", &[]);
+    let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
+
+    let ts: Vec<i64> = (0..count).map(|i| first_ts + i as i64).collect();
+    let mut severity_text = VarBytes::new();
+    let mut body = VarBytes::new();
+    for &t in &ts {
+        severity_text.push(SEVERITIES[(t as usize) % SEVERITIES.len()].as_bytes());
+        body.push(format!("request {t} completed").as_bytes());
+    }
+    let mut absent = Bitmap::with_capacity(count);
+    absent.pad_to(count);
+    let mut present = Bitmap::with_capacity(count);
+    for _ in 0..count {
+        present.push(true);
+    }
+    let mut dyn_col_dicts = Vec::with_capacity(ATTRS_PER_RECORD);
+    let dyn_columns = (0..ATTRS_PER_RECORD)
+        .map(|i| {
+            let value = format!("value-{i:03}");
+            let mut cells = VarBytes::with_capacity(count, count * value.len());
+            for _ in 0..count {
+                cells.push(value.as_bytes());
+            }
+            dyn_col_dicts.push(Some(StrColumnDict {
+                distinct: vec![value.clone().into_bytes()],
+                ids: vec![0; count],
+            }));
+            DynColumn {
+                name: format!("attr.{i:03}"),
+                field_type: FieldType::Str,
+                cells: DynCells::Str(cells),
+                validity: present.clone(),
+            }
+        })
+        .collect();
+    let batch = ColumnarLogBatch {
+        num_rows: count,
+        observed_ts_ns: ts.clone(),
+        ts_ns: ts,
+        severity_num: vec![9; count],
+        flags: vec![0; count],
+        severity_text,
+        body,
+        trace_id: Vec::new(),
+        trace_id_validity: absent.clone(),
+        span_id: Vec::new(),
+        span_id_validity: absent,
+        stream_refs: vec![0; count],
+        stream_ids: vec![stream_id],
+        stream_attrs: vec![stream_attrs],
+        dyn_columns,
+        dyn_col_dicts,
+        residual_attrs: vec![Vec::new(); count],
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    writer.push_columnar(batch).expect("push columnar batch");
+    writer.finish().expect("finish rlog object")
+}
+
+/// [`wide_object_bytes`]'s records built one `LogRecord` at a time and
+/// written through the row path ([`RlogWriter::push`]), the reference
+/// [`columnar_fixture_object_equals_the_row_path_object`] compares against.
+fn wide_object_bytes_rows(identity: ObjectIdentity, first_ts: i64, count: usize) -> Vec<u8> {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    let stream_id = log_stream_id(&resource, "scope", "1.0", &[]);
+    let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
+    let attrs: Vec<(String, AttrValue)> = (0..ATTRS_PER_RECORD)
         .map(|i| {
             (
                 format!("attr.{i:03}"),
                 AttrValue::Str(format!("value-{i:03}")),
             )
         })
-        .collect()
-}
-
-/// One record of the wide fixture: a fixed stream, a cycling severity, and
-/// `attrs` (see [`wide_attrs`]).
-fn wide_record(
-    ts: i64,
-    stream_id: ravel_types::logstream::LogStreamId,
-    stream_attrs: &[u8],
-    attrs: &[(String, AttrValue)],
-) -> LogRecord {
-    LogRecord {
-        stream_id,
-        stream_attrs: stream_attrs.to_vec(),
-        ts_ns: ts,
-        observed_ts_ns: ts,
-        severity_num: 9,
-        severity_text: SEVERITIES[(ts as usize) % SEVERITIES.len()].to_string(),
-        body: format!("request {ts} completed"),
-        trace_id: None,
-        span_id: None,
-        flags: 0,
-        attrs: attrs.to_vec(),
+        .collect();
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    for i in 0..count {
+        let ts = first_ts + i as i64;
+        writer
+            .push(LogRecord {
+                stream_id,
+                stream_attrs: stream_attrs.clone(),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: SEVERITIES[(ts as usize) % SEVERITIES.len()].to_string(),
+                body: format!("request {ts} completed"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: attrs.clone(),
+            })
+            .expect("push");
     }
+    writer.finish().expect("finish")
 }
 
-/// Publish one RLOG object of `count` wide records starting at `first_ts`, plus
-/// its `Signal::Logs` commit record, exactly as `ravel-ingest`'s log shard
-/// actor does. Records are generated and pushed one at a time so the fixture
-/// never holds the whole table in row form.
+/// The bytes of all [`OBJECTS`] fixture objects of [`RECORDS_PER_OBJECT`]
+/// records each, object `index` starting at `first_ts(index)`, in index order.
+/// Objects are built on up to `available_parallelism` threads at once, since
+/// encoding them is nearly all of the test's wall clock.
+fn build_wide_objects(
+    tenant: &TenantId,
+    first_ts: impl Fn(usize) -> i64 + Sync,
+) -> Vec<(usize, Vec<u8>)> {
+    let tenant_hash = tenant.hash().0;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(OBJECTS);
+    let first_ts = &first_ts;
+    let mut objects: Vec<(usize, Vec<u8>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|thread| {
+                scope.spawn(move || {
+                    (thread..OBJECTS)
+                        .step_by(threads)
+                        .map(|index| {
+                            let id = identity(index, tenant_hash, writer_id(index));
+                            (
+                                index,
+                                wide_object_bytes(id, first_ts(index), RECORDS_PER_OBJECT),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("fixture build thread"))
+            .collect()
+    });
+    objects.sort_by_key(|(index, _)| *index);
+    objects
+}
+
+/// The writer id of fixture object `index`.
+fn writer_id(index: usize) -> Uuid {
+    Uuid::from_u128(9_000 + index as u128)
+}
+
+/// Build and publish one RLOG object of `count` wide records starting at
+/// `first_ts` (see [`wide_object_bytes`] and [`publish_object`]).
 async fn publish_wide_object(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
@@ -158,24 +294,24 @@ async fn publish_wide_object(
     first_ts: i64,
     count: usize,
 ) {
+    let id = identity(index, tenant.hash().0, writer_id(index));
+    let bytes = wide_object_bytes(id, first_ts, count);
+    publish_object(store, tenant, index, first_ts, count, bytes).await;
+}
+
+/// Publish `bytes`, fixture object `index` of `count` records starting at
+/// `first_ts`, plus its `Signal::Logs` commit record, as `ravel-ingest`'s log
+/// shard actor does.
+async fn publish_object(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    index: usize,
+    first_ts: i64,
+    count: usize,
+    bytes: Vec<u8>,
+) {
     let tenant_hash = tenant.hash();
-    let writer_id = Uuid::from_u128(9_000 + index as u128);
-    let mut writer = RlogWriter::new(
-        RlogConfig::default(),
-        identity(index, tenant_hash.0, writer_id),
-    );
-    let resource = vec![(
-        "service.name".to_string(),
-        AttrValue::Str("api".to_string()),
-    )];
-    let stream_id = log_stream_id(&resource, "scope", "1.0", &[]);
-    let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
-    let attrs = wide_attrs();
-    for i in 0..count {
-        let rec = wide_record(first_ts + i as i64, stream_id, &stream_attrs, &attrs);
-        writer.push(rec).expect("push log record");
-    }
-    let bytes = writer.finish().expect("finish rlog object");
+    let writer_id = writer_id(index);
     let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
     let min_event_ts_ns = first_ts;
     let max_event_ts_ns = first_ts + count as i64 - 1;
@@ -323,9 +459,17 @@ fn peak_intermediate_bytes(value: &Value) -> u64 {
 async fn wide_full_table_aggregates_complete_within_a_small_memory_pool() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
-    for index in 0..OBJECTS {
-        let first_ts = (index * RECORDS_PER_OBJECT) as i64 + 1;
-        publish_wide_object(store.as_ref(), &tenant, index, first_ts, RECORDS_PER_OBJECT).await;
+    let first_ts = |index: usize| (index * RECORDS_PER_OBJECT) as i64 + 1;
+    for (index, bytes) in build_wide_objects(&tenant, first_ts) {
+        publish_object(
+            store.as_ref(),
+            &tenant,
+            index,
+            first_ts(index),
+            RECORDS_PER_OBJECT,
+            bytes,
+        )
+        .await;
     }
     let app = build_router(
         store,
@@ -440,5 +584,22 @@ async fn sql_stats_json_carries_peak_asked_intermediate_bytes() {
     assert!(
         asked <= charged,
         "asked {asked} > charged {charged}: {value}"
+    );
+}
+
+/// The columnar fixture build writes byte for byte the object the same records
+/// pushed one at a time through the row path write, so the scan reads the
+/// fixture exactly as it reads row-built objects.
+#[test]
+fn columnar_fixture_object_equals_the_row_path_object() {
+    let tenant = TenantId::new("acme".to_string());
+    let id = || identity(0, tenant.hash().0, writer_id(0));
+    let columnar = wide_object_bytes(id(), 1, 1_000);
+    let rows = wide_object_bytes_rows(id(), 1, 1_000);
+    assert!(
+        columnar == rows,
+        "columnar build wrote {} bytes, row path {} bytes, and they differ",
+        columnar.len(),
+        rows.len()
     );
 }
