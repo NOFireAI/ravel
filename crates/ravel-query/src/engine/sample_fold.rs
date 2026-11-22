@@ -2056,11 +2056,17 @@ mod tests {
         fold.into_series(usize::MAX).expect("finish")
     }
 
-    /// Folds one shape, prints its R5 figure line and asserts probing left
-    /// the fold's result unchanged.
-    fn r5_shape(shape: &str, calls: Vec<Vec<FetchedSeriesSoa>>) {
+    /// Folds one shape, prints its R5 figure line, asserts charged/live sits
+    /// in `band` and that probing left the fold's result unchanged.
+    fn r5_shape(shape: &str, calls: Vec<Vec<FetchedSeriesSoa>>, band: (f64, f64)) {
         let (probed, charged, live) = probed_fold(calls.clone());
         println!("{}", support::r5_line(shape, charged, live.total()));
+        let ratio = charged as f64 / live.total() as f64;
+        assert!(
+            (band.0..=band.1).contains(&ratio),
+            "shape {shape}: charged {charged} B / live {} B = {ratio:.4}, outside {band:?}",
+            live.total()
+        );
         println!(
             "R5 breakdown shape={shape} levels={} spines={} by_series={} prefix_ids={} \
              prefixes={} labels={}",
@@ -2077,23 +2083,21 @@ mod tests {
     /// the bytes its containers hold, at its peak charge, for pre-registered
     /// shapes A, B and C.
     ///
-    /// This asserts only that probing the fold leaves its result unchanged.
-    /// Each shape prints its one figure line from one `r5_shape` call, so a
-    /// presence check over those lines could not fail here;
+    /// Asserts step 2's adopt bands for charged/live: A and B in 1.00 to
+    /// 1.05, C in 1.00 to 1.10, and that probing the fold leaves its result
+    /// unchanged. Each shape prints its one figure line from one `r5_shape`
+    /// call, so a presence check over those lines could not fail here;
     /// `r5_presence_rule_fails_missing_duplicate_and_zero_lines` covers the
-    /// rule itself. The predicted bands are deliberately not asserted.
-    /// They live in the pre-registration (issue #4530 comments 7079576120
-    /// and 7080468122) and the step's report, so an out-of-band figure does
-    /// not fail this test the way a missing line does.
+    /// rule itself.
     #[test]
     fn r5_run_fold_charged_against_live_bytes() {
         let shapes = [
-            ("A", support::shape_a().expect("shape A")),
-            ("B", support::shape_b().expect("shape B")),
-            ("C", support::shape_c().expect("shape C")),
+            ("A", support::shape_a().expect("shape A"), (1.00, 1.05)),
+            ("B", support::shape_b().expect("shape B"), (1.00, 1.05)),
+            ("C", support::shape_c().expect("shape C"), (1.00, 1.10)),
         ];
-        for (shape, calls) in shapes {
-            r5_shape(shape, calls);
+        for (shape, calls, band) in shapes {
+            r5_shape(shape, calls, band);
         }
     }
 

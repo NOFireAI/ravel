@@ -8924,17 +8924,18 @@ mod prefetch_tests {
 
     /// Issue #3105: a range query's selector-cache entries are charged to the
     /// engine's memory budget. Eight keys of about 2.5 KB each against a
-    /// 17715-byte budget, which also holds the fetch's sample fold: 11721
-    /// bytes, reserved before the fold absorbs the segment's runs (each
-    /// incoming sample, the series' labels, its provenance prefix and the
-    /// level the merge builds) and held through evaluation, since the merged
-    /// series the evaluator reads are the fold's (issue #4118). While the
-    /// fold absorbs, the segment fetch also holds 4487 bytes (the open GET,
-    /// the decoded catalog and the decoded batch), released before
-    /// evaluation. With it the first two are
-    /// cached, the other six are read at every step, the response carries one
+    /// 17715-byte budget, which also holds the fetch's sample fold: 6457
+    /// bytes after the fold absorbs the segment's one run (its 241-sample
+    /// level, the spine and tables, the series' labels and its provenance
+    /// prefix; a series with one run keeps no merge headroom, issue #4530),
+    /// held through evaluation, since the merged series the evaluator reads
+    /// are the fold's (issue #4118). While the fold absorbs, the segment
+    /// fetch also holds 4487 bytes (the open GET, the decoded catalog and the
+    /// decoded batch), released before evaluation. With it the first four
+    /// are cached, the other four are read at every step, the response
+    /// carries one
     /// info naming them, the answer is the unconstrained one, and the budget
-    /// is back to zero afterwards. The six fallbacks are not refusals the
+    /// is back to zero afterwards. The four fallbacks are not refusals the
     /// budget counts: the query succeeded, so
     /// `ravel_memory_budget_refusals_total` and
     /// `ravel_memory_gate_refusals_total` must not move.
@@ -8958,14 +8959,14 @@ mod prefetch_tests {
         assert_eq!(budget.gate_refusals(), 0);
         assert!(annotations.warnings().is_empty());
         assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
-        // The first refusal is the third key, against the fold and the two
+        // The first refusal is the fifth key, against the fold and the four
         // cached entries: `m` reads 141 points and each offset key 140, one
-        // 16-byte `Sample` less, so 11721 + 2505 + 2489 bytes are held.
+        // 16-byte `Sample` less, so 6457 + 2505 + 3 * 2489 bytes are held.
         assert_eq!(
             annotations.infos()[0],
-            "6 selector(s) read at every step instead of once per query: \
-             6 refused by the query memory budget (first refusal: memory exhausted: \
-             requested 2489 bytes, 16715 of 17715 byte limit already reserved)"
+            "4 selector(s) read at every step instead of once per query: \
+             4 refused by the query memory budget (first refusal: memory exhausted: \
+             requested 2489 bytes, 16429 of 17715 byte limit already reserved)"
         );
 
         let unconstrained = Arc::new(ravel_memory::MemoryBudget::unlimited());
