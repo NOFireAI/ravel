@@ -55,6 +55,17 @@
 # or a run whose receipt FLEET_MERGE_SKIP_GATES=1 will reuse); CI's sdk job is
 # then the gate for sdk/typescript. Without it the refusal stands.
 #
+# The merge tier refuses with exit 64 on a host without cargo-nextest, before
+# it builds anything. CI runs every test under nextest, which gives each test its
+# own process; `cargo test` runs a binary's tests as threads of one process,
+# so a test that reads process-global state can fail there and pass in CI, and
+# a merge gate that does not run the tests as CI does is not the merge gate.
+# Install it with `cargo install cargo-nextest --locked`. The executor tier
+# keeps the `cargo test` fallback, with a printed line, because fleet hosts do
+# not all carry nextest and CI runs the full suites anyway.
+# RAVEL_GATES_ALLOW_CARGO_TEST=1 runs the merge tier under `cargo test` with
+# the same printed line. A dry run is never refused.
+#
 #   scripts/gates.sh --flag-doc-guard-only [FILE]
 #                                     # run only the ingest-memory flag-doc
 #                                     # overclaim guard, against FILE or the
@@ -286,11 +297,19 @@ run() {
 # test` (which every dev machine has) otherwise. nextest cannot run
 # doctests, so those always go through `cargo test --doc`, pinned to the
 # `ci` profile for consistency. `command -v` in an `if` condition does not
-# trip `set -e` when nextest is absent.
-if command -v cargo-nextest >/dev/null 2>&1; then
+# trip `set -e` when nextest is absent. Presence is asked of cargo itself, so
+# a cargo-nextest that cargo cannot run counts as absent.
+if cargo nextest --version >/dev/null 2>&1; then
   have_nextest=1
 else
   have_nextest=0
+fi
+if [[ ${have_nextest} -eq 0 ]]; then
+  if [[ "${tier}" == "merge" && ${dry_run} -eq 0 && "${RAVEL_GATES_ALLOW_CARGO_TEST:-0}" != "1" ]]; then
+    echo "gates.sh: cargo-nextest is not installed, and the merge tier runs tests as CI does, one process per test. Install it with: cargo install cargo-nextest --locked. RAVEL_GATES_ALLOW_CARGO_TEST=1 runs this gate under cargo test instead, where a test that reads process-global state can fail without a defect." >&2
+    exit 64
+  fi
+  echo "==> cargo-nextest not installed: tests run under cargo test, one process per test binary, not one per test as in CI"
 fi
 
 run_cargo_gates() {

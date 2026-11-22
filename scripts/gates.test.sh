@@ -101,6 +101,7 @@ pkg() {
 # shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env bash' \
   'if [[ "$1" == "metadata" ]]; then echo "cargo $*" >>"${CARGO_STUB_LOG}"; cat "${CARGO_STUB_METADATA}"; exit 0; fi' \
+  'if [[ "$1" == "nextest" && "$2" == "--version" ]]; then if [[ -n "${CARGO_STUB_NO_NEXTEST:-}" ]]; then exit 101; fi; echo "cargo-nextest 0.9.152"; exit 0; fi' \
   'echo "cargo $*${RAVEL_AGENTS_PAGE_ENTRIES:+ [RAVEL_AGENTS_PAGE_ENTRIES=${RAVEL_AGENTS_PAGE_ENTRIES}]}" >>"${CARGO_STUB_LOG}"' \
   'if [[ -n "${CARGO_STUB_FAIL_ON:-}" && "$*" == *"${CARGO_STUB_FAIL_ON}"* ]]; then exit 3; fi' \
   'exit 0' >"${tmp}/bin/cargo"
@@ -751,6 +752,41 @@ check_eq "affected-tests, mcp lib run fails: exit 3" "3" "${rc}"
 CARGO_STUB_FAIL_ON="--features mcp,agents" run_stubbed at-mcp-agents-fail \
   bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
 check_eq "affected-tests, mcp,agents run fails: exit 3" "3" "${rc}"
+
+# Without cargo-nextest the merge tier refuses before it builds anything: CI
+# runs each test in its own process, and `cargo test` does not.
+nonx_refusal='^gates.sh: cargo-nextest is not installed, and the merge tier runs tests as CI does'
+nonx_fallback='^==> cargo-nextest not installed: tests run under cargo test'
+CARGO_STUB_NO_NEXTEST=1 run_stubbed nonx_merge bash "${SCRIPTS}/gates.sh" -p ravel-query
+check_eq "no nextest, merge tier: exit 64" "64" "${rc}"
+check_eq "no nextest, merge tier: refusal printed" "1" \
+  "$(count_matching "${tmp}/nonx_merge.out" "${nonx_refusal}")"
+check_eq "no nextest, merge tier: nothing built" "0" \
+  "$(count_matching "${tmp}/nonx_merge.calls" '^cargo (fmt|clippy|check|test|nextest run|build)')"
+
+# A dry run is never refused: it prints the cargo test commands a fallback run
+# would execute, with the fallback line.
+CARGO_STUB_NO_NEXTEST=1 run_stubbed nonx_merge_dry bash "${SCRIPTS}/gates.sh" -p ravel-query --dry-run
+check_eq "no nextest, merge tier dry run: exit 0" "0" "${rc}"
+check_eq "no nextest, merge tier dry run: fallback line" "1" \
+  "$(count_matching "${tmp}/nonx_merge_dry.out" "${nonx_fallback}")"
+check_eq "no nextest, merge tier dry run: no nextest commands" "0" \
+  "$(count_matching "${tmp}/nonx_merge_dry.out" '^==> (env [^ ]+ )?cargo nextest run ')"
+check_eq "no nextest, merge tier dry run: cargo test commands" "yes" \
+  "$(if [[ $(count_matching "${tmp}/nonx_merge_dry.out" '^==> cargo test --locked -p ') -gt 0 ]]; then echo yes; else echo no; fi)"
+
+# The executor tier keeps the fallback: fleet hosts do not all carry nextest.
+CARGO_STUB_NO_NEXTEST=1 run_stubbed nonx_exec bash "${SCRIPTS}/gates.sh" --tier executor -p ravel-query --dry-run
+check_eq "no nextest, executor tier: exit 0" "0" "${rc}"
+check_eq "no nextest, executor tier: fallback line" "1" \
+  "$(count_matching "${tmp}/nonx_exec.out" "${nonx_fallback}")"
+check_eq "no nextest, executor tier: no refusal" "0" \
+  "$(count_matching "${tmp}/nonx_exec.out" "${nonx_refusal}")"
+
+# With nextest present the fallback line is not printed.
+run_stubbed withx_merge_dry bash "${SCRIPTS}/gates.sh" -p ravel-query --dry-run
+check_eq "nextest present: no fallback line" "0" \
+  "$(count_matching "${tmp}/withx_merge_dry.out" "${nonx_fallback}")"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]
