@@ -1,0 +1,6 @@
+# negative cfg stem	mutant (inv_mutant! in crates/ or services/)	property it must make false
+appender-skew-unbounded	none: ADR-4326 decision 3 ships no mutant for appender clock skew past TOLERATED_CLOCK_SKEW_HOURS; the clock-jump amendment gives every container one shared offset, so no run skews the appender against the routers, and provisioning.rs nf3_default_scan_slack_hours_includes_clock_skew_term pins the skew term
+lead-one	none: the activation lead is a constant enforced by the CLI (unit tested, ADR-4326 decision 2); provision.rs reshard_refuses_an_activation_lead_below_min_lead_hours and generation.rs min_lead_hours_matches_ceil_c_plus_one own it
+no-writer-fence	resharding/no-writer-fence	resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops
+scan-slack-zero	none: DEFAULT_SCAN_SLACK_HOURS is a constant (unit tested, ADR-4326 decision 2) and decision 3 ships no mutant that removes it; provisioning.rs max_scan_range_decrease_inside_vs_outside_slack and scan_count_decrease_slack_window own the slack window
+token-validated-against-count	resharding/token-validated-against-count	resharding: a commit token whose record is durable resolves across a reshard
