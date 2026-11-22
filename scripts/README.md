@@ -55,7 +55,14 @@ connection, a pushed-but-broken main).
   executor's gate is the scoped form, and `RAVEL_GATES_ALLOW_UNSCOPED=1` is
   the escape hatch for a deliberate workspace gate, which
   `verify-dispatch-gates.sh` and `fleet-result-merge.sh` set for their
-  own runs.
+  own runs. The merge tier refuses with exit 64 on a host without
+  cargo-nextest (install it with `cargo install cargo-nextest --locked`),
+  because CI runs each test in its own process and `cargo test` runs a
+  binary's tests in one, so a test that reads process-global state can fail
+  under `cargo test` with no defect (#4567 did, three gate runs in a row).
+  `RAVEL_GATES_ALLOW_CARGO_TEST=1` runs it under `cargo test` anyway. The
+  executor tier and `--dry-run` fall back to `cargo test` with one printed
+  line.
 - `scripts/disk-reap.sh [-y]`: reclaims disk from merged clean worktrees
   and orphaned cargo target dirs (dry run by default; `-y` applies). Run
   it when free space drops below ~20 GB, and after a land worktree's PR

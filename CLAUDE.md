@@ -223,7 +223,12 @@ runs it with the `ci-opt` profile, which is `ci` with third-party
 dependencies optimised; use `ci` locally, since a cold build pays for that
 optimisation, and `cargo nextest run --locked --workspace --cargo-profile
 ci-opt` to reproduce a failure that appears only in CI); doctests still need
-`cargo test --doc`.
+`cargo test --doc`. The merge gate needs it: `scripts/gates.sh --tier merge`
+refuses with exit 64 on a host without cargo-nextest, because `cargo test`
+runs a binary's tests in one process and CI runs each in its own, so a test
+that reads process-global state fails there with no defect. Install it on
+every host that runs a merge gate (`cargo install cargo-nextest --locked`);
+`RAVEL_GATES_ALLOW_CARGO_TEST=1` overrides the refusal.
 
 One narrowing for commits that can only land through a PR on protected
 `main`: when the exact tree was already taken through the full gate list
