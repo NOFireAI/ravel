@@ -827,16 +827,19 @@ impl<V: FoldValue> RunFold<V> {
     /// reservation together cover the containers, the result Vec and the
     /// merge buffer being built at every point (issue #4118).
     ///
-    /// The scalar conversion maps a held sample to a smaller [`Sample`] of
-    /// the same alignment, which `Vec`'s in-place collect writes into the
-    /// merged level's own buffer. Two histogram allocations stay uncharged,
-    /// because the one reservation taken here is sized for the result Vec
-    /// only and is not grown per series: the converted level, a new buffer of
-    /// its length times the size of a [`ravel_promql::HistogramSample`],
-    /// which is larger than a held histogram sample, allocated while the
-    /// merged level is live; and each converted value's span, bucket and
-    /// custom-value Vecs, each allocated before the held value it replaces is
-    /// dropped.
+    /// Two kinds of bytes stay uncharged, because the one reservation taken
+    /// here is sized for the result Vec and is not grown per series. Each
+    /// conversion maps a held sample to a smaller output sample of the same
+    /// alignment ([`Sample`] or [`ravel_promql::HistogramSample`]), which
+    /// `Vec`'s in-place collect writes into the merged level's own buffer;
+    /// when that buffer is not a whole number of output samples the collect
+    /// shrinks it with a reallocation, and an allocator that serves the
+    /// shrink by moving the buffer holds an uncharged copy while it moves.
+    /// And the histogram conversion allocates each converted value's span,
+    /// bucket and custom-value Vecs before the held value it replaces is
+    /// dropped, so it holds one value's heap bytes beyond the charge at a
+    /// time; in total the converted values' heap bytes equal the held
+    /// values', which the fold charged.
     fn finish<T, S>(
         self,
         max_samples: usize,
@@ -1070,7 +1073,7 @@ fn vec_growth(capacity: usize, need: usize, entry: usize) -> (u64, u64) {
 }
 
 /// hashbrown's group width: the SSE2 group on x86, 8 bytes elsewhere.
-const GROUP_WIDTH: u64 = if cfg!(all(
+pub(super) const GROUP_WIDTH: u64 = if cfg!(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     target_feature = "sse2"
 )) {
@@ -2130,9 +2133,10 @@ mod tests {
         assert_eq!(budget.reserved(), 0);
     }
 
-    /// What a scalar fold's containers hold allocated, by part, under the R5
+    /// What a fold's containers hold allocated, by part, under the R5
     /// pre-registration's definition (issue #4530): each Vec's
-    /// `capacity() x size_of::<T>()`, and each hash table as
+    /// `capacity() x size_of::<T>()`, plus each held histogram value's
+    /// [`FoldValue::heap_len`], and each hash table as
     /// [`support::table_bytes`] computes it from `HashMap::capacity()` (buckets
     /// x slot plus one control byte per bucket and the group width, the
     /// bucket count derived as hashbrown derives it). A label set's outer Vec
@@ -2158,16 +2162,16 @@ mod tests {
         }
     }
 
-    fn live_bytes(fold: &ScalarFold) -> LiveBytes {
-        let sample = std::mem::size_of::<FoldedSample<f64>>() as u64;
-        let level = std::mem::size_of::<Vec<FoldedSample<f64>>>() as u64;
+    fn live_bytes<V: FoldValue>(fold: &RunFold<V>) -> LiveBytes {
+        let sample = std::mem::size_of::<FoldedSample<V>>() as u64;
+        let level = std::mem::size_of::<Vec<FoldedSample<V>>>() as u64;
         let label = std::mem::size_of::<Label>() as u64;
         let mut live = LiveBytes {
             levels: 0,
             spines: 0,
             by_series: support::table_bytes(
                 fold.by_series.capacity(),
-                std::mem::size_of::<(SeriesId, FoldedSeries<f64>)>(),
+                std::mem::size_of::<(SeriesId, FoldedSeries<V>)>(),
             ),
             prefix_ids: support::table_bytes(
                 fold.prefix_ids.capacity(),
@@ -2322,9 +2326,11 @@ mod tests {
     }
 
     /// A histogram fold shape: 50 series, 12 calls, call `k` holding one run
-    /// per series over slots `3k..3k+6` under prefix `(k % 4, 1, 1)`, so a
-    /// slot is written by two calls whose priorities sometimes tie and whose
-    /// values differ.
+    /// per series over slots `3k..3k+6`, every sample of it carrying the
+    /// per-sample priority `(k / 2, 1, 1, 0)`. A slot is written by two
+    /// calls whose values differ: calls `2j` and `2j + 1` carry the same
+    /// priority, so the structural key breaks their tie, and calls `2j + 1`
+    /// and `2j + 2` do not.
     fn histogram_shape() -> Vec<Vec<FetchedHistogramSeries>> {
         (0..12i64)
             .map(|k| {
@@ -2336,6 +2342,7 @@ mod tests {
                             labels: labels(s),
                             timestamps: slots.clone().collect(),
                             values: slots
+                                .clone()
                                 .map(|t| {
                                     histogram_value(
                                         f64::from(s) + t as f64 * 0.25 + k as f64,
@@ -2343,10 +2350,19 @@ mod tests {
                                     )
                                 })
                                 .collect(),
-                            created_unix_ns: k % 4,
+                            created_unix_ns: k / 2,
                             writer_epoch: 1,
                             writer_seq: 1,
-                            per_sample_priorities: None,
+                            per_sample_priorities: Some(
+                                slots
+                                    .map(|_| SamplePriority {
+                                        created_unix_ns: k / 2,
+                                        writer_epoch: 1,
+                                        writer_seq: 1,
+                                        in_page_index: 0,
+                                    })
+                                    .collect(),
+                            ),
                         }
                     })
                     .collect()
@@ -2354,17 +2370,34 @@ mod tests {
             .collect()
     }
 
+    /// The histogram shape's priorities tie where the doc says, so the
+    /// digest below covers the structural tie-break.
+    #[test]
+    fn the_histogram_shape_ties_overlapping_calls_two_by_two() {
+        let shape = histogram_shape();
+        let priority = |k: usize, slot: i64| {
+            let run = &shape[k][0];
+            let pos = run.timestamps.iter().position(|&t| t == slot).expect("slot");
+            run.per_sample_priorities.as_ref().expect("column")[pos].as_tuple()
+        };
+        // Slot 3 is written by calls 0 and 1, slot 6 by calls 1 and 2.
+        assert_eq!(priority(0, 3), priority(1, 3));
+        assert_ne!(priority(1, 6), priority(2, 6));
+        assert_ne!(shape[0][0].values[3].sum, shape[1][0].values[0].sum);
+    }
+
     /// Digests of the scalar fold's output on shapes A, B and C and of the
     /// histogram fold's on [`histogram_shape`], captured from main's code
-    /// (c9ef663) before the R5 step 2 change. The fold must return exactly
-    /// these results.
+    /// (c9ef663) before the R5 step 2 change; on main the histogram digest
+    /// is the same from the fold and from `merge_histogram_soa_runs`. The
+    /// fold must return exactly these results.
     #[test]
     fn fold_outputs_are_bit_identical_to_main() {
         let want = vec![
             ("A", 0x6d85_8021_ceff_5993u64),
             ("B", 0xcda8_6cf8_badf_d242),
             ("C", 0x4974_8c5d_63fc_83d6),
-            ("histogram", 0xf9cb_a304_30a1_9ce4),
+            ("histogram", 0x8ed6_3c00_9ee8_0418),
         ];
         let mut got = Vec::new();
         for (shape, calls) in [
@@ -2549,12 +2582,15 @@ mod tests {
         assert_eq!(budget.reserved(), 0);
     }
 
-    /// A refusal mid-absorb on a budget with no room left cannot shrink the
-    /// call's reservation, since the smaller one is reserved before the
-    /// larger is released: the fold stays charged the call's bound, never
-    /// less than it holds, until it drops.
+    /// A trim reserves its smaller reservation before it releases the call's
+    /// larger one, so a budget the call filled refuses it and the trim gives
+    /// up: the fold stays charged the call's bound, never less than it
+    /// holds, until a later trim succeeds. That happens after a refused
+    /// absorb and after one that succeeded; a later call's trim succeeds
+    /// once the budget has room for the smaller reservation beside the
+    /// larger.
     #[test]
-    fn a_refusal_on_a_full_budget_keeps_the_fold_over_charged_never_under() {
+    fn a_trim_the_budget_refuses_keeps_the_fold_over_charged_until_a_later_trim() {
         let runs = vec![duplicated_run(0, 20)];
         let (bound, _) = ScalarFold::new(unlimited(), usize::MAX).call_bound(&runs);
         let budget = Arc::new(ravel_memory::MemoryBudget::new(bound));
@@ -2572,6 +2608,30 @@ mod tests {
         assert!(fold.ledger.held > 0, "the tables grew before the copy");
         assert_eq!(fold.charged(), bound);
         assert_eq!(budget.reserved(), bound);
+        drop(fold);
+        assert_eq!(budget.reserved(), 0);
+
+        // A call that succeeds and fills the budget: series 1's two runs
+        // merge, so the bound carries the merge's level.
+        let runs = vec![
+            scalar_run(1, &[(1, 1.0), (2, 2.0), (3, 3.0)], (1, 1, 1), None),
+            scalar_run(1, &[(2, 5.0), (3, 6.0), (4, 7.0)], (2, 1, 1), None),
+        ];
+        let (bound, _) = ScalarFold::new(unlimited(), usize::MAX).call_bound(&runs);
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(2 * bound));
+        let filler = budget.reserve(bound).expect("filler");
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        fold.absorb(runs).expect("the bound fits");
+        let keep = fold.ledger.held + fold.finish_headroom;
+        assert!(keep < bound, "the merge room is idle after the call");
+        assert_eq!(fold.charged(), bound, "the trim gave up");
+        assert_eq!(budget.reserved(), 2 * bound);
+
+        drop(filler);
+        fold.absorb(Vec::<FetchedSeriesSoa>::new())
+            .expect("an empty call");
+        assert_eq!(fold.charged(), keep, "the next trim succeeded");
+        assert_eq!(budget.reserved(), keep);
         drop(fold);
         assert_eq!(budget.reserved(), 0);
     }
@@ -2610,59 +2670,336 @@ mod tests {
         [first, second]
     }
 
-    /// Issue #4530: an allocation the allocator refuses, injected at each of
-    /// the second absorb's allocation sites in turn, fails the absorb with
-    /// [`FetchError::FetchMemoryExhausted`], and the charge taken for it is
-    /// released exactly once: afterwards the fold's running count equals
-    /// [`live_bytes`] recomputed from its containers, so a charge kept or
+    /// [`injection_calls`] as histogram runs: each value `v` becomes a
+    /// histogram of sum `v` and one bucket, so every held sample carries 16
+    /// heap bytes, its span and its bucket.
+    fn histogram_injection_calls() -> [Vec<FetchedHistogramSeries>; 2] {
+        injection_calls().map(|call| call.into_iter().map(as_histogram).collect())
+    }
+
+    /// `run` with each value `v` as a histogram of sum `v` and one bucket.
+    fn as_histogram(run: FetchedSeriesSoa) -> FetchedHistogramSeries {
+        FetchedHistogramSeries {
+            series_id: run.series_id,
+            labels: run.labels,
+            timestamps: run.timestamps,
+            values: run
+                .values
+                .iter()
+                .map(|&v| histogram_value(v, v.abs() as u64))
+                .collect(),
+            created_unix_ns: run.created_unix_ns,
+            writer_epoch: run.writer_epoch,
+            writer_seq: run.writer_seq,
+            per_sample_priorities: run.per_sample_priorities,
+        }
+    }
+
+    /// Issue #4530: a budget refusal of a histogram absorb, swept one byte of
+    /// limit at a time from 256 bytes under the second call's bound to the
+    /// smallest limit the call fits, leaves the fold's running count equal to
+    /// [`live_bytes`] recomputed from its containers, heap bytes included,
+    /// the fold charged at least that, and the budget holding exactly the
+    /// charge until the fold drops. The second call ends with series 255,
+    /// whose 100-sample run carries a duplicate timestamp: its exact copy lies
+    /// outside the call's bound and is larger than the merge room the bound
+    /// keeps, so some limits admit the bound and refuse the copy, after the
+    /// call's other series were folded: the series count grew before the
+    /// refusal.
+    #[test]
+    fn a_budget_refusal_of_a_histogram_absorb_keeps_the_count_exact() {
+        let [first, mut second] = histogram_injection_calls();
+        let mut samples: Vec<(i64, f64)> = (0..100).map(|t| (t, t as f64)).collect();
+        samples.insert(1, (0, -1.0));
+        second.push(as_histogram(scalar_run(255, &samples, (1, 1, 1), None)));
+        let mut probe = HistogramFold::new(unlimited(), usize::MAX);
+        probe.absorb(first.clone()).expect("absorb");
+        let mut sorted = second.clone();
+        sorted.sort_unstable_by_key(FoldInput::series_id);
+        let (bound, _) = probe.call_bound(&sorted);
+        let mut refused = 0usize;
+        let mut mid_call = 0usize;
+        for limit in bound - 256.. {
+            let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+            let mut fold = HistogramFold::new(Arc::clone(&budget), usize::MAX);
+            if fold.absorb(first.clone()).is_err() {
+                continue;
+            }
+            let series_before = fold.by_series.len();
+            let Err(err) = fold.absorb(second.clone()) else {
+                break;
+            };
+            refused += 1;
+            assert!(
+                matches!(
+                    err,
+                    QueryError::Fetch(FetchError::FetchMemoryExhausted { .. })
+                ),
+                "limit {limit}: {err:?}"
+            );
+            if fold.by_series.len() > series_before {
+                mid_call += 1;
+            }
+            let live = live_bytes(&fold).total();
+            assert!(live > 0, "limit {limit}");
+            assert_eq!(fold.ledger.held, live, "limit {limit}");
+            assert!(fold.charged() >= live, "limit {limit}");
+            assert_eq!(budget.reserved(), fold.charged(), "limit {limit}");
+            drop(fold);
+            assert_eq!(budget.reserved(), 0, "limit {limit}");
+        }
+        assert!(refused > 256, "only {refused} limits refused the call");
+        assert!(mid_call > 0, "no refusal came after part of the call was folded");
+        println!("histogram budget sweep: {refused} refused, {mid_call} part way through");
+    }
+
+    /// Folds `calls` into a fold on an unlimited budget and checks the #4118
+    /// invariant across [`RunFold::into_series`]: the most it holds live at
+    /// once while it merges, converts and builds the result, by
+    /// [`live_bytes`]' definition plus the result Vec, is at most what the
+    /// fold charged plus the result reservation. Returns the peak and that
+    /// charge.
+    fn finish_peak(calls: Vec<Vec<FetchedSeriesSoa>>) -> (u64, u64) {
+        let budget = unlimited();
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        for call in calls {
+            fold.absorb(call).expect("absorb");
+        }
+        assert_eq!(fold.ledger.held, live_bytes(&fold).total(), "probe start");
+        let charged = fold.charged();
+        let result = result_len::<SeriesData>(fold.by_series.len());
+        let mut held = Vec::new();
+        let series = fold.into_series(usize::MAX, &mut held).expect("finish");
+        let (peak, covered) = support::take_finish_peak().expect("finish recorded");
+        assert_eq!(covered, charged + result);
+        let sizes: u64 = held.iter().map(ravel_memory::Reservation::size).sum();
+        assert_eq!(sizes, result, "the result reservation is handed over");
+        assert_eq!(budget.reserved(), result, "the fold's own are released");
+        drop(series);
+        drop(held);
+        assert_eq!(budget.reserved(), 0);
+        (peak, covered)
+    }
+
+    /// Issue #4118 across finish: for shapes A, B and C, `into_series`
+    /// never holds more than the fold charged plus the result reservation.
+    /// Shape A's 20,000 one-level series hold nothing past their level but
+    /// the result Vec, so without that reservation its peak exceeds the
+    /// charge by exactly the result Vec, 20,000 x 48 bytes.
+    #[test]
+    fn the_fold_holds_no_more_than_it_charged_across_finish() {
+        for (shape, calls) in [
+            ("A", support::shape_a().expect("shape A")),
+            ("B", support::shape_b().expect("shape B")),
+            ("C", support::shape_c().expect("shape C")),
+        ] {
+            let (peak, covered) = finish_peak(calls);
+            println!("R5 finish shape={shape} peak_live={peak} charged={covered}");
+            assert!(
+                peak <= covered,
+                "shape {shape}: peak live {peak} B > charged {covered} B"
+            );
+        }
+        assert_eq!(result_len::<SeriesData>(20_000), 960_000);
+    }
+
+    /// Issue #4530: `into_series` reserves its result Vec before allocating
+    /// it and pushes that reservation to `held`, which holds it with the
+    /// result after the taken reservations; a budget that refuses it fails
+    /// with [`FetchError::FetchMemoryExhausted`] for exactly the result Vec
+    /// and releases everything the fold held.
+    #[test]
+    fn into_series_reserves_its_result_vec_and_hands_it_over() {
+        let budget = unlimited();
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        fold.absorb(three_series()).expect("absorb");
+        let charged = fold.charged();
+        let result = result_len::<SeriesData>(3);
+        assert_eq!(result, 3 * 48);
+        let mut held = fold.take_reservations();
+        let series = fold.into_series(usize::MAX, &mut held).expect("finish");
+        assert_eq!(series.len(), 3);
+        assert_eq!(budget.reserved(), charged + result);
+        drop(series);
+        assert_eq!(budget.reserved(), charged + result, "held keeps both");
+        drop(held);
+        assert_eq!(budget.reserved(), 0);
+
+        let mut fold = ScalarFold::new(unlimited(), usize::MAX);
+        fold.absorb(three_series()).expect("absorb");
+        let before = fold.charged();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(before + result - 1));
+        fold.ledger.budget = Arc::clone(&budget);
+        fold.ledger.reservations.clear();
+        fold.ledger.charged = 0;
+        fold.ledger.cover(before).expect("the held bytes fit");
+        let mut held = Vec::new();
+        let err = fold
+            .into_series(usize::MAX, &mut held)
+            .expect_err("the result Vec does not fit");
+        assert!(
+            matches!(
+                err,
+                QueryError::Fetch(FetchError::FetchMemoryExhausted { requested, .. })
+                    if requested == result
+            ),
+            "{err:?}"
+        );
+        assert!(held.is_empty());
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The conversion claims in [`RunFold::finish`]'s docs: a [`Sample`]
+    /// and a [`ravel_promql::HistogramSample`] are each smaller than the held
+    /// sample they convert and equally aligned, so the collect can reuse the
+    /// held level's buffer; and a converted histogram value's heap bytes
+    /// equal the held value's [`FoldValue::heap_len`].
+    #[test]
+    fn each_conversion_shrinks_a_sample_and_keeps_its_heap_bytes() {
+        use std::mem::{align_of, size_of};
+        type HistogramOut = ravel_promql::HistogramSample;
+        assert!(size_of::<Sample>() < size_of::<FoldedSample<f64>>());
+        assert_eq!(align_of::<Sample>(), align_of::<FoldedSample<f64>>());
+        assert!(size_of::<HistogramOut>() < size_of::<FoldedSample<HistogramValue>>());
+        assert_eq!(
+            align_of::<HistogramOut>(),
+            align_of::<FoldedSample<HistogramValue>>()
+        );
+        let mut value = histogram_value(2.0, 3);
+        value.custom_values = Some(vec![1.0, 2.0]);
+        value.negative_spans = vec![HistogramSpan {
+            offset: 1,
+            length: 2,
+        }];
+        let float = histogram_value_to_float(&value);
+        let heap = (float.positive_spans.capacity() + float.negative_spans.capacity())
+            * size_of::<ravel_promql::Span>()
+            + (float.positive_buckets.capacity()
+                + float.negative_buckets.capacity()
+                + float.custom_values.capacity())
+                * size_of::<f64>();
+        assert_eq!(heap as u64, value.heap_len());
+    }
+
+    /// Issue #4530: the finish headroom a series raises when it ends a call
+    /// as more than one level lies outside the call's bound when the bound
+    /// did not predict the series to merge, so a budget that admits the
+    /// bound can refuse it after the run was folded. The run stays folded,
+    /// and the fold is charged at least what it holds.
+    #[test]
+    fn finish_headroom_for_a_series_not_predicted_to_merge_is_refused_after_folding() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        let first: Vec<(i64, f64)> = (0..60).map(|t| (t, t as f64)).collect();
+        fold.absorb(vec![scalar_run(1, &first, (1, 1, 1), None)])
+            .expect("absorb");
+        // 60 held samples against 21 incoming do not merge.
+        let later: Vec<(i64, f64)> = (100..121).map(|t| (t, t as f64)).collect();
+        let runs = vec![scalar_run(1, &later, (1, 1, 1), None)];
+        let (bound, _) = fold.call_bound(&runs);
+        let filler = budget
+            .reserve(budget.limit() - budget.reserved() - (bound - fold.charged()))
+            .expect("filler");
+
+        let err = fold.absorb(runs).expect_err("the headroom does not fit");
+        assert!(
+            matches!(
+                err,
+                QueryError::Fetch(FetchError::FetchMemoryExhausted { requested, .. })
+                    if requested == fold.finish_headroom
+            ),
+            "{err:?}"
+        );
+        assert_eq!(fold.by_series[&SeriesId([1; 16])].levels.len(), 2, "folded");
+        assert_eq!(fold.finish_headroom, 81 * 24);
+        assert_eq!(fold.ledger.held, live_bytes(&fold).total());
+        assert_eq!(fold.charged(), bound);
+        assert_eq!(fold.charged(), fold.ledger.held, "the bound held no headroom");
+        drop(fold);
+        drop(filler);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Folds `first`, arms an allocation failure after `skip` allocations,
+    /// folds `second`, and checks what an injected failure leaves: the absorb
+    /// fails with [`QueryError::AllocationRefused`] and the charge taken for
+    /// it is released exactly once, so afterwards the fold's running count
+    /// equals [`live_bytes`] recomputed from its containers (a charge kept or
     /// released twice shows as a difference of the failed allocation's
-    /// size; it charges exactly that plus its headroom, and the budget holds
-    /// exactly the charge.
+    /// size), it charges exactly that plus its headroom, and the budget holds
+    /// exactly the charge and returns to 0 when the fold drops. Returns
+    /// whether a failure was injected.
+    fn inject_once<V: FoldValue, R: FoldInput<V>>(
+        first: Vec<R>,
+        second: Vec<R>,
+        skip: usize,
+    ) -> bool {
+        let budget = unlimited();
+        let mut fold = RunFold::<V>::new(Arc::clone(&budget), usize::MAX);
+        fold.absorb(first).expect("absorb");
+        support::fail_allocation_after(skip);
+        let result = fold.absorb(second);
+        let Some(charge) = support::injected_failure_charge() else {
+            support::clear_allocation_failure();
+            result.expect("no failure was injected");
+            return false;
+        };
+        let err = result.expect_err("the injected failure fails the absorb");
+        assert!(
+            matches!(err, QueryError::AllocationRefused { .. }),
+            "allocation {skip}: {err:?}"
+        );
+        let live = live_bytes(&fold).total();
+        assert_eq!(fold.ledger.held, live, "allocation {skip}");
+        assert_eq!(
+            fold.charged(),
+            live + fold.finish_headroom,
+            "allocation {skip}"
+        );
+        assert!(charge >= fold.charged(), "allocation {skip}: charged first");
+        assert_eq!(budget.reserved(), fold.charged(), "allocation {skip}");
+        assert_eq!(budget.accounted_refusals(), 0, "allocation {skip}");
+        drop(fold);
+        assert_eq!(budget.reserved(), 0, "allocation {skip}");
+        true
+    }
+
+    /// Issue #4530: an allocation the allocator refuses, injected at each of
+    /// the second absorb's allocation sites in turn, is released exactly
+    /// once ([`inject_once`]).
     #[test]
     fn an_injected_allocation_failure_releases_its_charge_exactly_once() {
         let mut fired = 0usize;
         for skip in 0.. {
-            let budget = unlimited();
-            let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
             let [first, second] = injection_calls();
-            fold.absorb(first).expect("absorb");
-            support::fail_allocation_after(skip);
-            let result = fold.absorb(second);
-            let Some(charge) = support::injected_failure_charge() else {
-                support::clear_allocation_failure();
-                result.expect("no failure was injected");
+            if !inject_once(first, second, skip) {
                 break;
-            };
+            }
             fired += 1;
-            let err = result.expect_err("the injected failure fails the absorb");
-            assert!(
-                matches!(
-                    err,
-                    QueryError::Fetch(FetchError::FetchMemoryExhausted {
-                        cause: ravel_memory::ExhaustionCause::Accounted,
-                        ..
-                    })
-                ),
-                "allocation {skip}: {err:?}"
-            );
-            let live = live_bytes(&fold).total();
-            assert_eq!(fold.ledger.held, live, "allocation {skip}");
-            assert_eq!(
-                fold.charged(),
-                live + fold.finish_headroom,
-                "allocation {skip}"
-            );
-            assert!(charge >= fold.charged(), "allocation {skip}: charged first");
-            assert_eq!(budget.reserved(), fold.charged(), "allocation {skip}");
-            drop(fold);
-            assert_eq!(budget.reserved(), 0, "allocation {skip}");
+        }
+        assert!(fired >= 20, "only {fired} allocation sites failed");
+    }
+
+    /// The same sweep over the histogram fold, whose held samples carry
+    /// heap bytes: a failure at a merge, a spine growth, an exact copy or a
+    /// table growth releases the heap bytes of the level it drops, and a
+    /// merge's dropped samples' heap bytes, exactly once.
+    #[test]
+    fn an_injected_allocation_failure_in_the_histogram_fold_releases_its_charge_exactly_once() {
+        let mut fired = 0usize;
+        for skip in 0.. {
+            let [first, second] = histogram_injection_calls();
+            if !inject_once(first, second, skip) {
+                break;
+            }
+            fired += 1;
         }
         assert!(fired >= 20, "only {fired} allocation sites failed");
     }
 
     /// An allocation refused while `into_series` merges is
-    /// [`FetchError::FetchMemoryExhausted`], and the fold's reservation is
-    /// released with it.
+    /// [`QueryError::AllocationRefused`], and the fold's reservation and the
+    /// result reservation are released with it.
     #[test]
     fn an_injected_allocation_failure_in_into_series_is_typed_and_releases() {
         for skip in [0, 1] {
@@ -2673,17 +3010,41 @@ mod tests {
             }
             assert!(fold.finish_headroom > 0, "series 13 is two levels");
             support::fail_allocation_after(skip);
-            let err = fold.into_series(usize::MAX, &mut Vec::new()).expect_err("refused");
+            let mut held = Vec::new();
+            let err = fold
+                .into_series(usize::MAX, &mut held)
+                .expect_err("refused");
             assert!(support::injected_failure_charge().is_some(), "fired");
             assert!(
-                matches!(
-                    err,
-                    QueryError::Fetch(FetchError::FetchMemoryExhausted { .. })
-                ),
+                matches!(err, QueryError::AllocationRefused { .. }),
                 "allocation {skip}: {err:?}"
             );
+            assert!(held.is_empty(), "allocation {skip}");
             assert_eq!(budget.reserved(), 0, "allocation {skip}");
         }
+    }
+
+    /// Issue #4530: an allocator refusal is its own typed error, not the
+    /// budget's: its message says the allocator refused, and it moves no
+    /// budget refusal counter.
+    #[test]
+    fn an_allocator_refusal_says_so_and_counts_no_budget_refusal() {
+        let budget = unlimited();
+        let mut fold = ScalarFold::new(Arc::clone(&budget), usize::MAX);
+        support::fail_allocation_after(0);
+        let err = fold
+            .absorb(vec![scalar_run(1, &[(1, 1.0)], (1, 1, 1), None)])
+            .expect_err("refused");
+        assert!(support::injected_failure_charge().is_some(), "fired");
+        let QueryError::AllocationRefused { requested } = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("query memory exhausted: the allocator refused a {requested}-byte allocation")
+        );
+        assert_eq!(budget.accounted_refusals(), 0);
+        assert_eq!(budget.gate_refusals(), 0);
     }
 
     /// Issue #4530: a fold dropped between absorbs, as a cancelled query
@@ -2729,7 +3090,7 @@ mod tests {
     }
 
     /// Issue #4530: the charge is released when its last holder drops,
-    /// whichever of the fold, its result and the taken reservations that is.
+    /// whichever of the fold and the taken reservations that is.
     #[test]
     fn the_charge_is_released_on_its_last_holders_drop() {
         let budget = unlimited();

@@ -8925,12 +8925,12 @@ mod prefetch_tests {
 
     /// Issue #3105: a range query's selector-cache entries are charged to the
     /// engine's memory budget. Eight keys of about 2.5 KB each against a
-    /// 17715-byte budget, which also holds the fetch's sample fold: 6457
-    /// bytes after the fold absorbs the segment's one run (its 241-sample
-    /// level, the spine and tables, the series' labels and its provenance
-    /// prefix; a series with one run keeps no merge headroom, issue #4530),
-    /// held through evaluation, since the merged series the evaluator reads
-    /// are the fold's (issue #4118). While the fold absorbs, the segment
+    /// 17715-byte budget, which also holds the fetch's sample fold and its
+    /// result Vec, [`eight_offsets_fold_charge`] bytes (6505 where hashbrown's
+    /// group width is 16, 6489 where it is 8; a series with one run keeps no
+    /// merge headroom, issue #4530), held through evaluation, since the
+    /// merged series the evaluator reads are the fold's (issue #4118). While
+    /// the fold absorbs, the segment
     /// fetch also holds 4487 bytes (the open GET, the decoded catalog and the
     /// decoded batch), released before evaluation. With it the first four
     /// are cached, the other four are read at every step, the response
@@ -8960,14 +8960,9 @@ mod prefetch_tests {
         assert_eq!(budget.gate_refusals(), 0);
         assert!(annotations.warnings().is_empty());
         assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
-        // The first refusal is the fifth key, against the fold and the four
-        // cached entries: `m` reads 141 points and each offset key 140, one
-        // 16-byte `Sample` less, so 6457 + 2505 + 3 * 2489 bytes are held.
         assert_eq!(
             annotations.infos()[0],
-            "4 selector(s) read at every step instead of once per query: \
-             4 refused by the query memory budget (first refusal: memory exhausted: \
-             requested 2489 bytes, 16429 of 17715 byte limit already reserved)"
+            eight_offsets_refusal_info(sample_fold::GROUP_WIDTH)
         );
 
         let unconstrained = Arc::new(ravel_memory::MemoryBudget::unlimited());
@@ -8981,6 +8976,54 @@ mod prefetch_tests {
         };
         assert_eq!(matrix.len(), 1);
         assert_eq!(format!("{value:?}"), format!("{reference:?}"));
+    }
+
+    /// The bytes the budget holds for the sample fold of
+    /// [`eight_offsets_range`]'s one series once its result is built, where
+    /// hashbrown's group width is `group_width` (the fold's
+    /// `sample_fold::GROUP_WIDTH`): the 241-sample level of 24-byte held
+    /// samples, a spine of 4 levels, the `by_series` table of 4 64-byte slots
+    /// and the `prefix_ids` table of 4 32-byte slots (each plus a control byte
+    /// per bucket and the group width), a prefix Vec of 4 24-byte prefixes,
+    /// the label `__name__="m"` (48 bytes plus 9 of strings), and the result
+    /// Vec of one 48-byte `SeriesData`.
+    fn eight_offsets_fold_charge(group_width: u64) -> u64 {
+        let tables = (4 * 64 + 4 + group_width) + (4 * 32 + 4 + group_width);
+        241 * 24 + 4 * 24 + tables + 4 * 24 + (48 + 9) + 48
+    }
+
+    /// The info [`a_range_query_over_its_memory_budget_reads_per_step_and_says_so`]
+    /// expects. The first refusal is the fifth key, against the fold and the
+    /// four cached entries: `m` reads 141 points and each offset key 140, one
+    /// 16-byte `Sample` less, so the fold's charge plus 2505 + 3 * 2489 bytes
+    /// are held.
+    fn eight_offsets_refusal_info(group_width: u64) -> String {
+        let reserved = eight_offsets_fold_charge(group_width) + 2505 + 3 * 2489;
+        format!(
+            "4 selector(s) read at every step instead of once per query: \
+             4 refused by the query memory budget (first refusal: memory exhausted: \
+             requested 2489 bytes, {reserved} of 17715 byte limit already reserved)"
+        )
+    }
+
+    /// The selector-cache test's expected figures at both of hashbrown's
+    /// group widths: the fold's charge differs by the two tables' group
+    /// bytes, and at either width the fourth key fits in the 17715-byte
+    /// budget and the fifth does not, so four keys are cached and four read
+    /// at every step on every architecture.
+    #[test]
+    fn the_selector_cache_test_expects_each_group_width_s_figures() {
+        assert_eq!(eight_offsets_fold_charge(16), 6505);
+        assert_eq!(eight_offsets_fold_charge(8), 6489);
+        for (width, reserved) in [(16, 16477), (8, 16461)] {
+            let info = eight_offsets_refusal_info(width);
+            assert!(
+                info.ends_with(&format!("{reserved} of 17715 byte limit already reserved)")),
+                "{info}"
+            );
+            assert!(reserved <= 17715, "the fourth key fits");
+            assert!(reserved + 2489 > 17715, "the fifth key is refused");
+        }
     }
 
     /// Issue #3105: the engine caps a range query's selector cache at two float
