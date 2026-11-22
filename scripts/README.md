@@ -323,7 +323,8 @@ connection, a pushed-but-broken main).
   `<binary>.provenance.txt`. Exit 0 success; 1 a cargo command failed;
   2 bad usage; 3 a tool missing or an LLVM major mismatch; 4 perf record
   failed or was refused by `perf_event_paranoid`, perf recorded zero
-  samples, `llvm-profgen` failed or wrote an empty profile, a top-20
+  samples, `perf report` shows fewer than 20 symbols of the binary,
+  `llvm-profgen` failed or wrote an empty profile, a top-20
   symbol is missing or has zero samples, the top 20 hold no `ravel_` or
   no `datafusion` symbol, or (build) the profile is missing, empty, lists
   no functions or has no `top-symbols.txt`; 5 the build could not be
