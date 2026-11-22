@@ -42,6 +42,32 @@ Read the relevant specifications and ADRs in `docs/` before changing storage, co
 
 For AI-assisted contributions, see [AI_POLICY.md](AI_POLICY.md).
 
+## Dependency updates
+
+The repository's [`.cargo/config.toml`](.cargo/config.toml) sets a three-day cooldown on crate versions. Cargo reads it from every directory in the tree, including the standalone workspaces under `crates/` and `antithesis/`.
+
+When cargo resolves dependencies, it holds back versions published less than three days ago and picks the newest older version that fits. This happens on `cargo update`, on `cargo add`, and on a build after you change a version requirement in `Cargo.toml`. Cargo says when it does this, for example:
+
+```text
+Adding cc v1.11.2 (available: v1.11.3, published 47 hours ago)
+```
+
+The cooldown has gaps:
+
+* A version already in `Cargo.lock` is kept by `cargo build`, by `cargo add` of another crate, and by `cargo update -p <other-crate>`. A plain `cargo update` re-resolves everything, though, and downgrades a locked version that is still inside the cooldown.
+* Cargo's documentation states that a version whose index entry has no publish time is never held back.
+* `cargo install` ignores the cooldown and installs the newest version. Pin tool installs to a version: `cargo install <tool>@<version>`.
+
+For an urgent fix that needs a version inside the cooldown, take that one version explicitly:
+
+```sh
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>
+```
+
+Without the variable, `cargo update --precise` refuses a version inside the cooldown with `version <version> is too new`.
+
+The cooldown does not replace review. `cargo deny` and review of the `Cargo.lock` diff still apply to every change.
+
 ## Building and testing
 
 ### Prerequisites
