@@ -151,14 +151,18 @@ flowchart LR
    host. rust-cache never stores the file: its cleanup before the save on
    main deletes every file under a target subdirectory that is not a
    profile (`cleanTargetDir` in its `src/cleanup.ts`, which treats
-   `target/tmp` that way). The file name is keyed by the test binary's
-   path, size and modification time, so any rebuild of the generator or
-   the writer changes the key. A test builds under an exclusive file lock,
-   writes to a temporary name and renames it into place, and removes older
-   keys of the same binary path; a test that finds the file reads it. Any
-   failure on the cache path (open, lock, write, rename, a read that does
-   not decode, a full volume) makes that test build the fixture in its own
-   process as it does today, so the cache can only ever save time. The
+   `target/tmp` that way). The file name names the fixture (the
+   3,000,000-row one and the string-keyed one are separate files, since
+   both decode as valid RLOGs and a reader could not tell them apart) and
+   is keyed by the test binary's path, size and modification time, so any
+   rebuild of the generator or the writer changes the key. A test builds
+   under an exclusive file lock, writes to a temporary name and renames it
+   into place, and removes older keys of the same binary path and fixture;
+   a test that finds the file reads it. Any failure on the cache path
+   (open, lock, write, rename, a read that does not decode, a full volume)
+   makes that test build the fixture in its own process as it does today,
+   so a failure costs no more than today's build; the wait on the lock is
+   a cost of its own, stated under Consequences. The
    implementing pull request states the files' size on disk. The doc
    comments that say a fixture is "written once per test binary" are
    corrected to say what holds under nextest.
