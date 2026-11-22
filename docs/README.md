@@ -244,6 +244,10 @@ rule as every other page.
 - [internal/bench-reports.md](internal/bench-reports.md): report-only
   measurement tools in `ravel-bench`, starting with `logbody_report` (log
   body substring selectivity, template split, FastLanes integer pages).
+- [internal/pgo-runbook.md](internal/pgo-runbook.md): recording a sample
+  profile of ravel-server and building with it through
+  `scripts/build-pgo.sh`, and the measurement behind keeping release
+  builds on the ordinary build.
 - [guides/formal-verification.md](guides/formal-verification.md): what the
   TLA+ suite under `formal/tla/` checks, what it does not establish, and
   how to run it, read its results, and add a model.

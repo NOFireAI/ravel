@@ -379,7 +379,9 @@ source is found.
   self-time functions from `perf report` must appear in the profile with
   samples, and Ravel and DataFusion functions must be among them.
 - **Arm C.** C is B's source and settings plus
-  `-Cprofile-sample-use=<absolute path>`. Proof that the profile was used:
+  `-Cprofile-sample-use=<absolute path>`. Proof that the profile was used
+  (R3 used an LLVM IR probe instead of a remark; see the proof-of-use
+  amendment below):
   - C's binary hash differs from B's while every other input is identical;
   - an LLVM remark or coverage switch passed through `-Cllvm-args` reports
     that the profile's functions matched;
@@ -669,3 +671,30 @@ checkpoint corrected three statements in this ADR.
   is the only automated resolver in the tree: a search of `.github/` and
   `scripts/` for `cargo update`, `cargo add` and `generate-lockfile` finds
   no other.
+
+## Amendment (2026-11-22): R3's proof that the profile was used
+
+<!-- amendment-applies: sections="4. R3: sample PGO as an opt-in build, judged on held-out statements" pointer="proof-of-use amendment" -->
+
+Decision 4 named an LLVM remark or coverage switch through `-Cllvm-args` as
+the proof that arm C used its profile. The R3 pre-registration (epic #4523
+comment 7055806818) replaced it with an LLVM IR probe, and that is what
+the box ran and what `scripts/build-pgo.sh build` runs:
+
+- The crate holding the hottest Ravel symbol in perf's top 20 is emitted as
+  LLVM IR with C's flags.
+- The IR must carry the `SampleProfile` summary and at least one nonzero
+  `function_entry_count`, and at least one top-20 function must be
+  defined with `!prof`.
+
+The other two proof bullets change as follows:
+
+- **Binary hash.** The box compared C's sha256 with B's. The script does
+  not build a plain B, so it does not make that comparison. The runbook
+  (`docs/internal/pgo-runbook.md`) tells an operator to make it by hand.
+- **A profile that matches nothing.** The script exits 5. It then moves the
+  built binary to `ravel-server.pgo-unproven`, so no unproven binary is
+  left where a plain build would be. It does not fall back to a plain
+  build.
+
+The adopt-or-defer rule and R3's DEFER decision are unchanged.
