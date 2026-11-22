@@ -28,7 +28,7 @@
 //! the coalescer's finish rebuilds the dictionary over the surviving values,
 //! so at N = 256 the flushed output measured 18,700 bytes, 73 per matched row,
 //! against the registered `N x (8192 x L + 4 x 8193)` = 142,607,360. The pin
-//! is on the coalescer's input before it flushes, which p5 measures; p4
+//! is on the coalescer's input before it flushes, which p5 measures; p1 also
 //! reports a `Utf8` rebuild's size.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -489,7 +489,9 @@ fn within_ten_percent(got: usize, want: usize) -> bool {
 /// The coalescer's finish rebuilds the dictionary over the surviving values,
 /// so the flushed output holds a few bytes per matched row rather than one
 /// block's values array per block. Prints the output's bytes per matched row
-/// beside the registered band; asserts only the matched-row count.
+/// beside the registered band, and the size the filtered `URL` column holds
+/// rebuilt as a plain `Utf8` array of the surviving values; asserts only the
+/// matched-row count.
 #[tokio::test]
 async fn p1_report_one_match_per_block_output_size() {
     let _serial = SERIAL.lock().await;
@@ -500,11 +502,12 @@ async fn p1_report_one_match_per_block_output_size() {
         let charge = block_charge(&fx, SELECT_URL).await;
         assert_eq!(m.matched_rows, n, "one matching row per block");
         println!(
-            "  p1: output {} bytes, {} per matched row; registered band {} +/- 10%; pool {} against one block's charge {charge}",
+            "  p1: output {} bytes, {} per matched row; registered band {} +/- 10%; pool {} against one block's charge {charge}; Utf8 rebuild {} bytes",
             m.emitted,
             m.emitted / m.matched_rows,
             n * block_values_bytes(),
-            m.reserved_exhausted
+            m.reserved_exhausted,
+            m.cast_utf8_bytes
         );
     }
 }
@@ -560,20 +563,6 @@ async fn p3_flushed_batches_hold_at_most_128_blocks() {
     assert!(
         within_ten_percent(b256, b128),
         "prediction 3 missed: the largest batch grew from N=128 to N=256: {largest:?}"
-    );
-}
-
-/// Report only: the size the filtered `URL` column holds rebuilt as a plain
-/// `Utf8` array of the surviving values, at N = 256, one match per block.
-#[tokio::test]
-async fn p4_report_utf8_rebuild_size() {
-    let _serial = SERIAL.lock().await;
-    let fx = fixture(256, 1).await;
-    let m = measure(&fx, SELECT_URL).await;
-    report("p4 SELECT URL rebuilt as Utf8", &fx, &m);
-    println!(
-        "  p4: dictionary output {} bytes, Utf8 rebuild {} bytes",
-        m.emitted, m.cast_utf8_bytes
     );
 }
 
