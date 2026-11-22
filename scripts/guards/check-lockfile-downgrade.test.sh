@@ -170,6 +170,59 @@ Lockfile-downgrade: ccx 1.11.2"
 check "a trailer naming the wrong crate exits 1" "${d}" HEAD~1 HEAD 1 \
   "    Lockfile-downgrade: cc 1.11.2"
 
+# --- trailer key case and spacing ---------------------------------------------
+#
+# git matches trailer keys case-insensitively and prints them as written.
+
+d="$(new_repo trailer-key-lower "cc@1.11.3@${REG}")"
+lock "${d}/Cargo.lock" "app@0.1.0@path" "cc@1.11.2@${REG}"
+commit_all "${d}" "chore(deps): roll cc back
+
+lockfile-downgrade: cc 1.11.2"
+check "a lower-case trailer key accepts the downgrade" "${d}" HEAD~1 HEAD 0 \
+  "accepted by trailer"
+
+d="$(new_repo trailer-key-upper "cc@1.11.3@${REG}")"
+lock "${d}/Cargo.lock" "app@0.1.0@path" "cc@1.11.2@${REG}"
+commit_all "${d}" "chore(deps): roll cc back
+
+LOCKFILE-DOWNGRADE: cc 1.11.2"
+check "an upper-case trailer key accepts the downgrade" "${d}" HEAD~1 HEAD 0 \
+  "accepted by trailer"
+
+d="$(new_repo trailer-name-case "cc@1.11.3@${REG}")"
+lock "${d}/Cargo.lock" "app@0.1.0@path" "cc@1.11.2@${REG}"
+commit_all "${d}" "chore(deps): roll cc back
+
+Lockfile-downgrade: CC 1.11.2"
+check "a trailer naming the crate in the wrong case exits 1" "${d}" HEAD~1 HEAD 1 \
+  "    Lockfile-downgrade: cc 1.11.2"
+
+# Spacing around the colon and inside the value: the guard must agree with
+# git interpret-trailers --parse. git normalises the separator to ": " and
+# keeps the value as written, so the expected exit is read from its output.
+spacing_n=0
+for line in "Lockfile-downgrade:cc 1.11.2" "Lockfile-downgrade:   cc 1.11.2" \
+  "Lockfile-downgrade : cc 1.11.2" $'Lockfile-downgrade:\tcc 1.11.2' \
+  "Lockfile-downgrade: cc  1.11.2" "Lockfile-downgrade: cc 1.11.2  "; do
+  spacing_n=$((spacing_n + 1))
+  msg="chore(deps): roll cc back
+
+${line}"
+  parsed="$(printf '%s\n' "${msg}" | git interpret-trailers --parse)" || {
+    printf 'FAIL  git interpret-trailers --parse failed on %q\n' "${line}"
+    fails=$((fails + 1))
+    continue
+  }
+  want=1
+  [[ "${parsed}" == "Lockfile-downgrade: cc 1.11.2" ]] && want=0
+  d="$(new_repo "trailer-spacing-${spacing_n}" "cc@1.11.3@${REG}")"
+  lock "${d}/Cargo.lock" "app@0.1.0@path" "cc@1.11.2@${REG}"
+  commit_all "${d}" "${msg}"
+  check "trailer line $(printf '%q' "${line}") agrees with git's parse $(printf '%q' "${parsed}")" \
+    "${d}" HEAD~1 HEAD "${want}"
+done
+
 # A trailer written in the body, not the trailer block, is not a trailer.
 d="$(new_repo trailer-in-body "cc@1.11.3@${REG}")"
 lock "${d}/Cargo.lock" "app@0.1.0@path" "cc@1.11.2@${REG}"

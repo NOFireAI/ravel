@@ -583,11 +583,16 @@ than passing for "no pull request open".
   finding prints `<lockfile>: <name> <V> -> <W> (<source>)`. A commit in the
   range carrying the trailer line `Lockfile-downgrade: <name> <W>`, in its
   trailer block, accepts that crate's downgrade to that exact version; a
-  refused finding prints the trailer that would accept it. Exit 2 is a
+  refused finding prints the trailer that would accept it. The key matches
+  in any case, as git matches trailer keys (`lockfile-downgrade:` works);
+  the crate name and version match exactly. Spacing around the colon is
+  read as `git interpret-trailers --parse` reads it. Exit 2 is a
   usage error. Exit 70 is could-not-check (an unresolvable ref, a git
   failure, a lockfile that does not parse), never a pass. Wired into ci.yml's
   `supply-chain` job on pull_request and merge_group, with the same base
-  the advisory delta uses and the checked-out head. Cases in
+  the advisory delta uses and the checked-out head. The step runs under
+  `!cancelled()`, so a failing step before it does not hide a downgrade.
+  Cases in
   `scripts/guards/check-lockfile-downgrade.test.sh`, run in ci.yml's
   `doc-scripts-rest` job.
 - `scripts/guards/check-compat-corpus-append-only.sh <base-ref> [head-ref]`:
