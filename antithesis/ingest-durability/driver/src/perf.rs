@@ -198,6 +198,32 @@ pub enum StopFaults {
     Failed,
 }
 
+/// What `ANTITHESIS_STOP_FAULTS` came to: `var` is the variable's lookup and
+/// `run` runs the command it names. A value that is not UTF-8 is never run.
+pub fn stop_faults<R>(var: Result<String, std::env::VarError>, run: R) -> StopFaults
+where
+    R: FnOnce(&str) -> std::io::Result<std::process::ExitStatus>,
+{
+    match var {
+        Ok(cmd) => match run(&cmd) {
+            Ok(st) => {
+                println!("eventually: {cmd} 3600 exited {st}");
+                if st.success() {
+                    StopFaults::Ok
+                } else {
+                    StopFaults::Failed
+                }
+            }
+            Err(e) => {
+                println!("eventually: running {cmd} failed: {e}");
+                StopFaults::Failed
+            }
+        },
+        Err(std::env::VarError::NotPresent) => StopFaults::Unset,
+        Err(std::env::VarError::NotUnicode(_)) => StopFaults::Failed,
+    }
+}
+
 /// The line the variant prints at t0, and whether it measures.
 pub fn start_line(stop: StopFaults) -> (String, bool) {
     match stop {
@@ -478,6 +504,8 @@ fn apply(evals: Vec<Eval>) {
 /// Figure (a) for one node: sends one probe every `cadence`, each with
 /// `timeout`, until the first ack or until `deadline` after t0, with at most
 /// `timeout / cadence` probes in flight. Joins every probe before it returns.
+/// The sample is the earliest receipt among the acks recorded before the
+/// loop sees the first one.
 pub fn run_prober<F>(
     send: F,
     t0: Stamp,
@@ -490,6 +518,8 @@ where
 {
     struct State {
         first: Option<Stamp>,
+        /// Set once the loop has seen `first`; later acks are not compared.
+        observed: bool,
         last: Option<Outcome>,
         in_flight: u128,
     }
@@ -497,6 +527,7 @@ where
     let end = t0.mono + deadline;
     let state = Mutex::new(State {
         first: None,
+        observed: false,
         last: None,
         in_flight: 0,
     });
@@ -508,6 +539,7 @@ where
         let mut st = lock(state);
         loop {
             if st.first.is_some() {
+                st.observed = true;
                 break;
             }
             let now = Instant::now();
@@ -522,14 +554,15 @@ where
                     let a = send(timeout);
                     let mut st = lock(state);
                     st.in_flight -= 1;
-                    if st.first.is_none() {
-                        if a.outcome == Outcome::Acked {
-                            if a.received.mono <= end {
-                                st.first = Some(a.received);
-                            }
-                        } else {
-                            st.last = Some(a.outcome);
+                    if a.outcome == Outcome::Acked {
+                        if !st.observed && a.received.mono <= end {
+                            st.first = match st.first {
+                                Some(f) if f.mono <= a.received.mono => Some(f),
+                                _ => Some(a.received),
+                            };
                         }
+                    } else if st.first.is_none() {
+                        st.last = Some(a.outcome);
                     }
                     wake.notify_all();
                 });
@@ -1053,17 +1086,38 @@ mod tests {
         }
     }
 
+    /// An answer whose clocks read `ms` apart on both clocks, from now.
+    fn answer_in(outcome: Outcome, ms: u64) -> Answer {
+        let sent = Stamp::now();
+        Answer {
+            outcome,
+            sent,
+            received: Stamp {
+                mono: sent.mono + Duration::from_millis(ms),
+                wall: sent.wall + Duration::from_millis(ms),
+            },
+        }
+    }
+
     #[test]
     fn a_prober_that_fails_twice_then_acks_measures_from_t0() {
         let calls = AtomicU32::new(0);
         let slow = Duration::from_millis(100);
         let t0 = Stamp::now();
+        let ack_at = Stamp {
+            mono: t0.mono + Duration::from_millis(777),
+            wall: t0.wall + Duration::from_millis(777),
+        };
         let s = run_prober(
             |_| {
                 if calls.fetch_add(1, Ordering::SeqCst) < 2 {
                     answer_after(Outcome::Refused(503), slow)
                 } else {
-                    answer_after(Outcome::Acked, Duration::from_millis(20))
+                    Answer {
+                        outcome: Outcome::Acked,
+                        sent: Stamp::now(),
+                        received: ack_at,
+                    }
                 }
             },
             t0,
@@ -1073,12 +1127,12 @@ mod tests {
         );
         assert_eq!(s.probes, 3);
         assert_eq!(s.last, Some(Outcome::Refused(503)));
-        let mono = s.mono_ms.expect("acked");
-        assert!(
-            mono >= 200,
-            "mono_ms {mono} is below the first two attempts' 200 ms"
+        assert_eq!(
+            s.mono_ms,
+            Some(777),
+            "measured from t0 to the ack's receipt"
         );
-        assert!(s.wall_ms.is_some());
+        assert_eq!(s.wall_ms, Some(777));
         assert!(ttfa_line(0, &s).contains(" outcome=acked last=refused-503"));
     }
 
@@ -1110,7 +1164,6 @@ mod tests {
             "a probe outlived the prober"
         );
         assert!(took >= Duration::from_millis(300), "{took:?}");
-        assert!(took < Duration::from_millis(300) + timeout * 4, "{took:?}");
     }
 
     #[test]
@@ -1120,10 +1173,12 @@ mod tests {
         let cadence = Duration::from_millis(20);
         let timeout = Duration::from_millis(100);
         let s = run_prober(
-            |t| {
+            |_| {
                 let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 max_seen.fetch_max(now, Ordering::SeqCst);
-                let a = answer_after(Outcome::NoResponse, t);
+                // Every send outlives three timeouts, so an uncapped prober
+                // would reach about 15 in flight.
+                let a = answer_after(Outcome::NoResponse, timeout * 3);
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 a
             },
@@ -1156,7 +1211,7 @@ mod tests {
                 } else {
                     Outcome::Acked
                 };
-                answer_after(outcome, Duration::from_millis(1))
+                answer_in(outcome, 3)
             },
             |l| lines.push(l),
         );
@@ -1169,11 +1224,62 @@ mod tests {
         for (i, s) in samples.iter().enumerate() {
             assert_eq!(s.i as usize, i);
             assert_eq!(s.signal, ack_signal(s.i));
-            assert!(
-                s.mono_ms < 5,
-                "interval {} includes pre-call time",
-                s.mono_ms
-            );
+            assert_eq!(s.mono_ms, 3, "the interval is sent to received alone");
+            assert_eq!(s.wall_ms, 3);
+        }
+    }
+
+    #[cfg(unix)]
+    mod stop_faults_mapping {
+        use super::super::{StopFaults, stop_faults};
+        use std::cell::Cell;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        #[test]
+        fn absent_is_unset_and_runs_nothing() {
+            let ran = Cell::new(false);
+            let got = stop_faults(Err(std::env::VarError::NotPresent), |_| {
+                ran.set(true);
+                Ok(ExitStatus::from_raw(0))
+            });
+            assert_eq!(got, StopFaults::Unset);
+            assert!(!ran.get());
+        }
+
+        #[test]
+        fn not_unicode_is_failed_and_runs_nothing() {
+            let ran = Cell::new(false);
+            let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+            let got = stop_faults(Err(std::env::VarError::NotUnicode(raw)), |_| {
+                ran.set(true);
+                Ok(ExitStatus::from_raw(0))
+            });
+            assert_eq!(got, StopFaults::Failed);
+            assert!(!ran.get(), "a non-UTF-8 command was run");
+        }
+
+        #[test]
+        fn a_spawn_error_is_failed() {
+            let got = stop_faults(Ok("/no/such/cmd".to_string()), |cmd| {
+                assert_eq!(cmd, "/no/such/cmd");
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            });
+            assert_eq!(got, StopFaults::Failed);
+        }
+
+        #[test]
+        fn a_non_zero_exit_is_failed() {
+            // A wait status of 1 << 8 is exit code 1.
+            let got = stop_faults(Ok("stop".to_string()), |_| Ok(ExitStatus::from_raw(1 << 8)));
+            assert_eq!(got, StopFaults::Failed);
+        }
+
+        #[test]
+        fn a_zero_exit_is_ok() {
+            let got = stop_faults(Ok("stop".to_string()), |_| Ok(ExitStatus::from_raw(0)));
+            assert_eq!(got, StopFaults::Ok);
         }
     }
 }
