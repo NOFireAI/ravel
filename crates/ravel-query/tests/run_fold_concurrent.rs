@@ -217,7 +217,11 @@ fn is_budget_refusal(err: &QueryError) -> bool {
     )
 }
 
-fn engine_on(catalog: &Arc<Catalog>, backend: &Arc<dyn ObjectStoreBackend>, budget: &Arc<MemoryBudget>) -> Arc<QueryEngine> {
+fn engine_on(
+    catalog: &Arc<Catalog>,
+    backend: &Arc<dyn ObjectStoreBackend>,
+    budget: &Arc<MemoryBudget>,
+) -> Arc<QueryEngine> {
     Arc::new(
         QueryEngine::new(
             Arc::clone(catalog),

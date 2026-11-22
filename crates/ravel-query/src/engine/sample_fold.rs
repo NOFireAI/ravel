@@ -1943,7 +1943,9 @@ mod tests {
         let mut fold = ScalarFold::new(unlimited(), usize::MAX);
         fold.absorb(old).expect("absorb");
         fold.absorb(new).expect("absorb");
-        let series = fold.into_series(usize::MAX, &mut Vec::new()).expect("finish");
+        let series = fold
+            .into_series(usize::MAX, &mut Vec::new())
+            .expect("finish");
         assert_eq!(series[0].samples[0].value.to_bits(), 2.0f64.to_bits());
     }
 
@@ -2017,7 +2019,9 @@ mod tests {
         assert_eq!(fold.charged(), held, "the merged level replaced both");
         assert_eq!(budget.reserved(), held);
 
-        let series = fold.into_series(usize::MAX, &mut Vec::new()).expect("finish");
+        let series = fold
+            .into_series(usize::MAX, &mut Vec::new())
+            .expect("finish");
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].samples.len(), 3);
         assert_eq!(budget.reserved(), 0, "released once the result is built");
@@ -2093,7 +2097,9 @@ mod tests {
         let charged = fold.charged();
         assert!(charged > 0);
         let held = fold.take_reservations();
-        let series = fold.into_series(usize::MAX, &mut Vec::new()).expect("finish");
+        let series = fold
+            .into_series(usize::MAX, &mut Vec::new())
+            .expect("finish");
         assert_eq!(series.len(), 1);
         assert_eq!(budget.reserved(), charged, "held with the series");
         drop(held);
@@ -2207,7 +2213,12 @@ mod tests {
             }
         }
         let (charged, live) = peak.expect("at least one absorb");
-        (fold.into_series(usize::MAX, &mut Vec::new()).expect("finish"), charged, live)
+        (
+            fold.into_series(usize::MAX, &mut Vec::new())
+                .expect("finish"),
+            charged,
+            live,
+        )
     }
 
     fn plain_fold(calls: Vec<Vec<FetchedSeriesSoa>>) -> Vec<SeriesData> {
@@ -2215,7 +2226,8 @@ mod tests {
         for call in calls {
             fold.absorb(call).expect("absorb");
         }
-        fold.into_series(usize::MAX, &mut Vec::new()).expect("finish")
+        fold.into_series(usize::MAX, &mut Vec::new())
+            .expect("finish")
     }
 
     /// Folds one shape, prints its R5 figure line, asserts charged/live sits
@@ -2377,7 +2389,11 @@ mod tests {
         let shape = histogram_shape();
         let priority = |k: usize, slot: i64| {
             let run = &shape[k][0];
-            let pos = run.timestamps.iter().position(|&t| t == slot).expect("slot");
+            let pos = run
+                .timestamps
+                .iter()
+                .position(|&t| t == slot)
+                .expect("slot");
             run.per_sample_priorities.as_ref().expect("column")[pos].as_tuple()
         };
         // Slot 3 is written by calls 0 and 1, slot 6 by calls 1 and 2.
@@ -2411,7 +2427,10 @@ mod tests {
         for call in histogram_shape() {
             fold.absorb(call).expect("absorb");
         }
-        let histograms = project_histograms(fold.into_series(usize::MAX, &mut Vec::new()).expect("finish"));
+        let histograms = project_histograms(
+            fold.into_series(usize::MAX, &mut Vec::new())
+                .expect("finish"),
+        );
         got.push(("histogram", fnv(&format!("{histograms:?}"))));
         for (shape, digest) in &got {
             println!("R5 digest shape={shape} {digest:#018x}");
@@ -2477,7 +2496,10 @@ mod tests {
             if shape != "C" {
                 assert_eq!(fold.finish_headroom, 0, "shape {shape}");
             }
-            let got = project_scalar(fold.into_series(usize::MAX, &mut Vec::new()).expect("finish"));
+            let got = project_scalar(
+                fold.into_series(usize::MAX, &mut Vec::new())
+                    .expect("finish"),
+            );
             assert_eq!(got, want, "shape {shape}");
             assert_eq!(budget.reserved(), 0, "shape {shape}");
         }
@@ -2749,7 +2771,10 @@ mod tests {
             assert_eq!(budget.reserved(), 0, "limit {limit}");
         }
         assert!(refused > 256, "only {refused} limits refused the call");
-        assert!(mid_call > 0, "no refusal came after part of the call was folded");
+        assert!(
+            mid_call > 0,
+            "no refusal came after part of the call was folded"
+        );
         println!("histogram budget sweep: {refused} refused, {mid_call} part way through");
     }
 
@@ -2912,7 +2937,11 @@ mod tests {
         assert_eq!(fold.finish_headroom, 81 * 24);
         assert_eq!(fold.ledger.held, live_bytes(&fold).total());
         assert_eq!(fold.charged(), bound);
-        assert_eq!(fold.charged(), fold.ledger.held, "the bound held no headroom");
+        assert_eq!(
+            fold.charged(),
+            fold.ledger.held,
+            "the bound held no headroom"
+        );
         drop(fold);
         drop(filler);
         assert_eq!(budget.reserved(), 0);
@@ -3080,7 +3109,9 @@ mod tests {
         assert_eq!(sizes, charged);
         assert_eq!(fold.charged(), 0);
         assert_eq!(budget.reserved(), charged);
-        let series = fold.into_series(usize::MAX, &mut Vec::new()).expect("finish");
+        let series = fold
+            .into_series(usize::MAX, &mut Vec::new())
+            .expect("finish");
         assert_eq!(budget.reserved(), charged, "held with the series");
         drop(series);
         drop(taken);
