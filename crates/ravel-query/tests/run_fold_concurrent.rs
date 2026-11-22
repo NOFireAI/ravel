@@ -242,6 +242,10 @@ fn concurrent_range_queries_sharing_one_budget_answer_as_sequential_ones_and_rel
                 answered += 1;
             }
             assert_eq!(answered, COPIES * QUERIES.len());
-            assert_eq!(budget.reserved(), 0, "the concurrent pass released the budget");
+            assert_eq!(
+                budget.reserved(),
+                0,
+                "the concurrent pass released the budget"
+            );
         });
 }

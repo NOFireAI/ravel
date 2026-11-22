@@ -548,9 +548,9 @@ impl<V: FoldValue> RunFold<V> {
         self.ledger.grow(0, (n as u64).saturating_mul(inline), || {
             level.try_reserve_exact(n)
         })?;
-        let mut heap = 0u64;
-        let filled = self.fill_level(&mut level, &mut heap, &timestamps, values, &priorities);
+        let filled = self.fill_level(&mut level, &timestamps, values, &priorities);
         let capacity = (level.capacity() as u64).saturating_mul(inline);
+        let heap = heap_len(&level);
         if let Err(e) = filled.and_then(|()| self.ledger.take(heap)) {
             self.ledger.release(capacity);
             return Err(e);
@@ -574,11 +574,11 @@ impl<V: FoldValue> RunFold<V> {
     }
 
     /// Fills `level` with `values` in timestamp order, one sample per
-    /// timestamp, and adds the heap bytes of the samples it keeps to `heap`.
+    /// timestamp.
+    #[inline(always)]
     fn fill_level(
         &mut self,
         level: &mut Vec<FoldedSample<V>>,
-        heap: &mut u64,
         timestamps: &[i64],
         values: Vec<V>,
         priorities: &RunPriorities,
@@ -615,16 +615,10 @@ impl<V: FoldValue> RunFold<V> {
                 }
                 Some(last) if ts == last.ts => {
                     if self.sample_serves_over(&sample, last) {
-                        *heap = heap
-                            .saturating_sub(last.value.heap_len())
-                            .saturating_add(sample.value.heap_len());
                         *last = sample;
                     }
                 }
-                _ => {
-                    *heap = heap.saturating_add(sample.value.heap_len());
-                    level.push(sample);
-                }
+                _ => level.push(sample),
             }
         }
         Ok(())
@@ -633,6 +627,7 @@ impl<V: FoldValue> RunFold<V> {
     /// Adds `level`, whose samples hold `heap` heap bytes and which the fold
     /// already charges, to its series, merging it with the series' smaller
     /// levels. On an error the level is dropped and its charge released.
+    #[inline(always)]
     fn place(
         &mut self,
         series_id: SeriesId,
@@ -647,7 +642,9 @@ impl<V: FoldValue> RunFold<V> {
             .saturating_add(heap);
         // `entry` reserves room for a vacant key, so a full table grows here,
         // charged, before it would grow there.
-        if !self.by_series.contains_key(&series_id) {
+        if self.by_series.len() == self.by_series.capacity()
+            && !self.by_series.contains_key(&series_id)
+        {
             let need = self.by_series.len().saturating_add(1);
             if let Err(e) = grow_table(&mut self.ledger, &mut self.by_series, need) {
                 self.ledger.release(level_bytes);
@@ -732,6 +729,7 @@ impl<V: FoldValue> RunFold<V> {
     /// The prefix table index of `prefix`, adding it if new. Each distinct
     /// prefix came from at least one sample, so a table past `u32::MAX`
     /// entries is a read past `u32::MAX` samples, refused as one.
+    #[inline(never)]
     fn intern(&mut self, prefix: ProvenancePrefix) -> Result<u32, QueryError> {
         if let Some(&id) = self.prefix_ids.get(&prefix) {
             return Ok(id);
@@ -901,9 +899,7 @@ fn heap_len<V: FoldValue>(level: &[FoldedSample<V>]) -> u64 {
 fn label_len(labels: &LabelSet) -> u64 {
     labels
         .iter()
-        .map(|l| {
-            (std::mem::size_of::<Label>() + l.name.capacity() + l.value.capacity()) as u64
-        })
+        .map(|l| (std::mem::size_of::<Label>() + l.name.capacity() + l.value.capacity()) as u64)
         .fold(0u64, u64::saturating_add)
 }
 
@@ -1075,10 +1071,7 @@ fn merged_len<V>(a: &[FoldedSample<V>], b: &[FoldedSample<V>]) -> usize {
         return total;
     }
     let window = |run: &[FoldedSample<V>]| -> (usize, usize) {
-        (
-            run.partition_point(|s| s.ts < lo),
-            run.partition_point(|s| s.ts <= hi),
-        )
+        (first_at_least(run, lo), first_after(run, hi))
     };
     let ((mut i, a_end), (mut j, b_end)) = (window(a), window(b));
     let mut shared = 0usize;
@@ -1097,6 +1090,56 @@ fn merged_len<V>(a: &[FoldedSample<V>], b: &[FoldedSample<V>]) -> usize {
         }
     }
     total - shared
+}
+
+/// The first index of sorted `run` whose timestamp is at least `lo`. A
+/// level's overlap with the next lies at its end, so the search gallops back
+/// from there rather than bisecting the whole level, which touches cold
+/// cache lines across it.
+fn first_at_least<V>(run: &[FoldedSample<V>], lo: i64) -> usize {
+    if run.first().is_none_or(|s| s.ts >= lo) {
+        return 0;
+    }
+    // Every sample in `run[found..]` is at or after `lo`.
+    let mut found = run.len();
+    let mut step = 1usize;
+    loop {
+        let probe = found.saturating_sub(step);
+        match run.get(probe) {
+            Some(s) if s.ts >= lo => {
+                found = probe;
+                step = step.saturating_mul(2);
+            }
+            _ => {
+                let span = run.get(probe..found).unwrap_or_default();
+                return probe + span.partition_point(|s| s.ts < lo);
+            }
+        }
+    }
+}
+
+/// The first index of sorted `run` whose timestamp is after `hi`, galloping
+/// forward from its start, where a level's overlap with the one before lies.
+fn first_after<V>(run: &[FoldedSample<V>], hi: i64) -> usize {
+    if run.last().is_none_or(|s| s.ts <= hi) {
+        return run.len();
+    }
+    // Every sample in `run[..found]` is at or before `hi`.
+    let mut found = 0usize;
+    let mut step = 1usize;
+    loop {
+        let bound = found.saturating_add(step).min(run.len());
+        match run.get(bound - 1) {
+            Some(s) if s.ts <= hi => {
+                found = bound;
+                step = step.saturating_mul(2);
+            }
+            _ => {
+                let span = run.get(found..bound).unwrap_or_default();
+                return found + span.partition_point(|s| s.ts <= hi);
+            }
+        }
+    }
 }
 
 /// Merges two sorted runs of one sample per timestamp into `out`, sized by
@@ -1648,6 +1691,46 @@ mod tests {
             order.swap(i, ((state >> 33) as usize) % (i + 1));
         }
         order
+    }
+
+    /// A sorted level of one sample per timestamp at `timestamps`, deduped.
+    fn level_at(
+        timestamps: &std::collections::BTreeSet<i64>,
+        prefix: u32,
+    ) -> Vec<FoldedSample<f64>> {
+        timestamps
+            .iter()
+            .map(|&ts| FoldedSample {
+                ts,
+                prefix,
+                in_page_index: 0,
+                value: ts as f64,
+            })
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// Issue #4530: `merged_len`, which sizes each merge's buffer
+        /// exactly, is the length `merge_into` produces, and the galloping
+        /// window searches agree with a bisection of the whole level.
+        #[test]
+        fn merged_len_is_the_merge_output_length(
+            a in prop::collection::btree_set(-40i64..40, 0..40),
+            b in prop::collection::btree_set(-40i64..40, 0..40),
+            bound in -45i64..45,
+        ) {
+            let (a, b) = (level_at(&a, 0), level_at(&b, 1));
+            prop_assert_eq!(first_at_least(&a, bound), a.partition_point(|s| s.ts < bound));
+            prop_assert_eq!(first_after(&a, bound), a.partition_point(|s| s.ts <= bound));
+            let prefixes = vec![(1, 1, 1), (2, 1, 1)];
+            let len = merged_len(&a, &b);
+            let mut out = Vec::new();
+            let mut dropped = 0u64;
+            merge_into(&prefixes, a, b, &mut out, &mut dropped);
+            prop_assert_eq!(out.len(), len);
+        }
     }
 
     proptest! {
@@ -2208,8 +2291,7 @@ mod tests {
     /// Three series that fill a `by_series` table of 4 buckets.
     fn three_series() -> Vec<FetchedSeriesSoa> {
         (1..=3)
-            .map(|s| scalar_run(s, &[(1, 1.0), (2, 2.0)], (1, 1, 1), None)
-            )
+            .map(|s| scalar_run(s, &[(1, 1.0), (2, 2.0)], (1, 1, 1), None))
             .collect()
     }
 
