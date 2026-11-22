@@ -773,8 +773,8 @@ pub mod support {
             .saturating_add(GROUP_WIDTH)
     }
 
-    /// A table of the fold's key and value types, grown by insertion as the
-    /// fold grows its own, held so its allocation can be measured.
+    /// A table of the fold's key and value types, sized for its entries up
+    /// front so it allocates once, held so that allocation can be measured.
     pub struct HeldTable {
         _by_series: HashMap<SeriesId, FoldedSeries<f64>>,
         _prefix_ids: HashMap<ProvenancePrefix, u32>,
@@ -797,7 +797,7 @@ pub mod support {
     /// The fold's `by_series` table with `entries` entries whose values own
     /// no heap memory.
     pub fn by_series_table(entries: usize) -> HeldTable {
-        let mut table = HashMap::new();
+        let mut table = HashMap::with_capacity(entries);
         for i in 0..entries {
             let mut id = [0u8; 16];
             id[..8].copy_from_slice(&(i as u64).to_le_bytes());
@@ -824,7 +824,7 @@ pub mod support {
 
     /// The fold's `prefix_ids` table with `entries` entries.
     pub fn prefix_ids_table(entries: usize) -> HeldTable {
-        let mut table = HashMap::new();
+        let mut table = HashMap::with_capacity(entries);
         for i in 0..entries {
             table.insert((i as i64, 1u64, 1u64), i as u32);
         }
