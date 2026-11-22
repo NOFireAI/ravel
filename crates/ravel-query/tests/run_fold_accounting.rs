@@ -15,6 +15,12 @@
 //! `stats.allocated` after every absorb; the figure kept is the one read at
 //! the fold's peak charge, as a delta over what the process held before the
 //! engine call.
+//!
+//! D's figure line therefore reads `process_delta=`, not `live=`: it counts
+//! every byte the process allocated across the engine call (decoded objects,
+//! the catalog, the evaluator), where shapes A to C's `live=` in
+//! `sample_fold.rs` counts only the fold's own containers. D's ratio is not
+//! comparable with A to C's.
 
 #![cfg(not(target_env = "msvc"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -40,7 +46,7 @@ use ravel_segment::{
     VERSION_V7, decode_catalog_v5, open_from_full,
 };
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange};
-use tikv_jemalloc_ctl::{epoch, stats};
+use tikv_jemalloc_ctl::{Access, AsName, epoch, stats};
 use uuid::Uuid;
 
 #[global_allocator]
@@ -59,7 +65,6 @@ const SAMPLES_PER_SERIES: i64 = NS_PER_HOUR / INTERVAL_NS;
 const FLUSHES: i64 = 4;
 const QUERY: &str = "rate(m[5m])";
 const MIB: u64 = 1_048_576;
-const PAGE: u64 = 4_096;
 /// The query's step.
 const STEP_MS: i64 = 60_000;
 /// Points per series of `rate(m[5m])` at a 60 s step over the hour: 61
@@ -292,8 +297,10 @@ fn jemalloc_check(lines: &mut Vec<String>) {
 
 /// `run_fold_support::table_bytes` against jemalloc for one table of each of
 /// the fold's key and value types: jemalloc's figure is at least the
-/// formula's and less than one 4 KiB page above it.
+/// formula's and within jemalloc's size-class rounding of it
+/// ([`within_size_class`]).
 fn table_formula_check() {
+    let page = jemalloc_page();
     for (name, build) in [
         (
             "by_series",
@@ -312,15 +319,52 @@ fn table_formula_check() {
             table.capacity(),
             error as f64 * 100.0 / measured.max(1) as f64
         );
-        // The slack is jemalloc rounding the table's one allocation up to
-        // whole 4 KiB pages.
         assert!(
-            formula <= measured && measured < formula + PAGE,
+            within_size_class(formula, measured, page),
             "table {name}: formula {formula} B against jemalloc {measured} B, \
-             want formula <= jemalloc < formula + {PAGE}"
+             want formula <= jemalloc <= formula + formula / 4 + {page}"
         );
         drop(table);
     }
+}
+
+/// jemalloc's page size, which the size-class bound adds as its last step.
+fn jemalloc_page() -> u64 {
+    let page: usize = b"arenas.page\0"
+        .name()
+        .read()
+        .expect("jemalloc arenas.page");
+    page as u64
+}
+
+/// Whether `measured`, jemalloc's figure for one allocation the formula sizes
+/// at `formula` bytes, is what jemalloc's size classes allow. jemalloc spaces
+/// its size classes four per doubling, so it rounds a large request up by at
+/// most a quarter of the power of two below it, which is at most a quarter of
+/// the request, plus one page for the extent. Which class a request lands in
+/// varies by build and host, so a one-page bound holds on some hosts and not
+/// others.
+fn within_size_class(formula: u64, measured: u64, page: u64) -> bool {
+    formula <= measured && measured <= formula + formula / 4 + page
+}
+
+/// The size-class bound accepts both hosts' measured tables, which the
+/// one-page bound did not, and still refuses a figure above the bound or
+/// below the formula.
+#[test]
+fn r5_table_bound_is_jemalloc_size_class_spacing() {
+    let one_page = |formula: u64, measured: u64| formula <= measured && measured < formula + 4_096;
+    // x86_64 Linux: rounded to the next page.
+    assert!(within_size_class(299_024, 303_104, 4_096));
+    assert!(one_page(299_024, 303_104));
+    // The reviewer's host: rounded to the 327,680 B size class.
+    assert!(within_size_class(299_016, 327_680, 4_096));
+    assert!(
+        !one_page(299_016, 327_680),
+        "the one-page bound refuses the reviewer's figure"
+    );
+    assert!(!within_size_class(299_024, 400_000, 4_096));
+    assert!(!within_size_class(299_024, 290_000, 4_096));
 }
 
 #[test]
