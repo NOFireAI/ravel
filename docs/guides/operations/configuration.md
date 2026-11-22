@@ -1398,6 +1398,12 @@ and defaults to its shipped value.
     writer has elapsed. The erasure completion gate can then report a pending
     erasure request complete while a flush that can still publish into that
     bucket is in flight.
+  - With the late-commit fence on (`--late-commit-fence on`, the default), a
+    `--mode maintain` process also refuses to start with any value other than
+    the default. The fence derives each hour's late-commit cutoff from this
+    value, and every maintainer of a store must share it. See
+    [commit records that land after the seal](maintenance.md#commit-records-that-land-after-the-seal)
+    for how to run another value.
 
 Each flag feeds both the startup validation and the real compactor or query
 engine, so a value that passes validation is the value enforced.
