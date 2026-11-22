@@ -44,6 +44,10 @@ pub use dedup_order::{DedupKey, serves_over};
 pub use engine::{
     Coverage, LiveQueryAccounting, QueryEngine, QueryStats, snapshot_erasure_predicates,
 };
+/// Test and bench support only: the sample fold's R5 measurement hooks
+/// (issue #4530).
+#[doc(hidden)]
+pub use engine::run_fold_support;
 pub use error::{FOLD_LAST_SUCCESS_GAUGE, FoldLag, QueryError};
 pub use fetcher::{
     CacheFetchError, DEFAULT_SUFFIX_LEN, DEFAULT_WHOLE_OBJECT_THRESHOLD, FetchError, FetchStats,
