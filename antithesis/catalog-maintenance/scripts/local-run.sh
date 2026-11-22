@@ -16,13 +16,13 @@
 #             driver counts one returned record twice in every token read it
 #             judges, so the exactly-once token-read assertion must fail, and
 #             nothing else may.
-#   RAVEL_ANTITHESIS_MUTANT=catalog/<stem>  a mutant control run (ADR-4326
-#             decision 3): the stack runs the config copy
-#             scripts/mutant-config.sh writes, over the
-#             catalog-maintenance-mutants images, with that mutant selected on
-#             every ravel-server container. The property the mutant must make
-#             false is the one formal/tla/catalog/antithesis-mutants.tsv names
-#             for it.
+#   RAVEL_ANTITHESIS_MUTANT=<area>/<stem>  a mutant control run (ADR-4326
+#             decision 3) of a catalog, resharding or maintenance mutant: the
+#             stack runs the config copy scripts/mutant-config.sh writes, over
+#             the catalog-maintenance-mutants images, with that mutant
+#             selected on every ravel-server container. The property the
+#             mutant must make false is the one its own area's
+#             formal/tla/<area>/antithesis-mutants.tsv names for it.
 #
 # Exit 0: every gate passed (or, in the self-check, exactly the injected
 # failure appeared; in a mutant run, the mutant's property was evaluated
@@ -36,7 +36,9 @@ WL="$(cd "$HERE/.." && pwd)"
 OUT="${1:?out dir}"
 SECS="${2:-240}"
 MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
-TSV="$(cd "$WL/../.." && pwd)/formal/tla/catalog/antithesis-mutants.tsv"
+OWNED_TSV="$(cd "$WL/../.." && pwd)/formal/tla/catalog/antithesis-mutants.tsv"
+# shellcheck source=mutant-tsv.sh
+. "$HERE/mutant-tsv.sh"
 COMPOSE_BASE="$WL/config/docker-compose.yaml"
 GATE=FAIL
 if [ "${WORKLOAD_INJECT_SWAPPED_RECORD:-}" = 1 ] && [ "${WORKLOAD_INJECT_STALE_TOKEN_RESULT:-}" = 1 ]; then
@@ -50,9 +52,10 @@ if [ -n "$MUTANT" ]; then
     fi
     mkdir -p "$OUT"
     rm -rf "$OUT/mutant-config"
-    # Refuses a name that is not one of the catalog mutants.
+    # Refuses a name that is not one of the mutants mutant-tsv.sh lists.
     "$HERE/mutant-config.sh" "$MUTANT" "$OUT/mutant-config" || exit 1
     COMPOSE_BASE="$OUT/mutant-config/docker-compose.yaml"
+    TSV=$(mutant_tsv "$MUTANT") || { echo "refused: no mutant tsv for $MUTANT"; exit 1; }
     expected=$(awk -F '\t' -v m="$MUTANT" '$2 == m { print $3 }' "$TSV")
     case "$expected" in
         '' | *$'\n'*) echo "refused: $TSV names not exactly one property for $MUTANT"; exit 1 ;;
@@ -385,11 +388,12 @@ jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
     | .[0].message' "$OUT"/sdk-*.jsonl | sort > "$OUT/never-hit.tsv"
 # The ravel-server binary carries every area's assertions, and this workload
 # drives only the areas it owns (ADR-4326, per-workload amendment): the areas
-# whose mutants the .tsv names, as the literal prefix `<area>: `, and every
-# assertion of this workload's own driver (the `clock: ` ones among them). An
-# unreached always-assertion of another area is listed, never failed.
-owned_areas=$(awk -F '\t' '!/^#/ && $2 ~ /^[a-z0-9-]+\// { sub(/\/.*/, "", $2); print $2 }' "$TSV" | sort -u)
-[ -n "$owned_areas" ] || abort "could not read the owned areas from $TSV"
+# whose mutants the catalog .tsv names, as the literal prefix `<area>: `, and
+# every assertion of this workload's own driver (the `clock: ` ones among
+# them). An unreached always-assertion of another area is listed, never
+# failed.
+owned_areas=$(awk -F '\t' '!/^#/ && $2 ~ /^[a-z0-9-]+\// { sub(/\/.*/, "", $2); print $2 }' "$OWNED_TSV" | sort -u)
+[ -n "$owned_areas" ] || abort "could not read the owned areas from $OWNED_TSV"
 jq -r '.antithesis_assert.message // empty' "$OUT/sdk-driver.jsonl" | sort -u > "$OUT/driver-assertions.txt" \
     || abort "could not read the driver's assertions"
 [ -s "$OUT/driver-assertions.txt" ] || abort "the driver declared no assertions"
