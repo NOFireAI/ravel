@@ -149,7 +149,8 @@ flowchart LR
   main's 1.97.1 pin). Bookworm keeps the glibc 2.36 match with the distroless
   runtime. `Dockerfile.prebuilt` comment, README badge and
   `getting-started.md` follow. The seven Antithesis stages move to
-  `rust:1.100.0-trixie` by tag, as they are pinned today. Historical
+  `rust:1.100.0-trixie` by tag, as they are pinned today (eight since
+  lifecycle-gc landed; see the lifecycle-gc amendment below). Historical
   benchmark provenance (`benchmarks/metrics/`, `benchmarks/rlog-compaction/`,
   ADR text, `docs/internal/` readouts, `bench/baselines/s3-envelope.json`)
   stays as recorded.
@@ -215,7 +216,9 @@ released-binary drill run in `compat-tests`.
 Beyond the pull request:
 
 - Release images and the prebuilt path are smoke-built for amd64 and arm64.
-- The three Antithesis images are rebuilt on the existing GCP build VM. The
+- The three Antithesis images are rebuilt on the existing GCP build VM (four
+  workloads' images since lifecycle-gc landed; see the lifecycle-gc
+  amendment below). The
   `build.sh` instrumentation checks must pass: `nm` for
   `antithesis_load_libvoidstar`, `readelf` for `__sancov_guards`, and
   `--build-id` present. The new LLVM keeps the sancov flags (verified, not
@@ -516,7 +519,7 @@ source is found.
 
 | Change | Rollback |
 |---|---|
-| R1 | Revert the one R1 commit: pins, digests and the source fixes, all of which compile on 1.97.1. The previous image digests are in that commit's diff. |
+| R1 | Revert the one R1 commit: pins, digests and the source fixes, all of which compile on 1.97.1. The previous image digests are in that commit's diff. Also revert the lifecycle-gc driver commit (see the lifecycle-gc amendment below). |
 | R3 | Build without `scripts/build-pgo.sh`. Release images never depend on it in this epic. |
 | R4a | Revert the removal commit. The lockfile delta is removals only. |
 | R4b | Delete `.cargo/config.toml`'s `[registry]` table. |
@@ -603,3 +606,30 @@ rollback.
 
   The box self-terminates at +720 min. Antithesis rebuilds use the existing
   GCP build VM.
+
+## Amendment (2026-11-22): the lifecycle-gc Antithesis driver is an eighth stage
+
+<!-- amendment-applies: sections="1. R1: pin 1.100.0 everywhere live, change source only where it breaks|7. Rollback" pointer="lifecycle-gc amendment" -->
+
+The lifecycle-gc workload (#4554) landed on main after this ADR was
+accepted and after the R1 pull request (#4539) branched. Its driver
+Dockerfile adds an eighth Antithesis builder stage on
+`rust:1.97.1-trixie`, which #4539 does not move. Its server image is built
+from the catalog-maintenance server Dockerfile, which #4539 does move, so the
+driver stage is the only new one.
+
+- Decision 1 now covers eight Antithesis stages, not seven, and the rebuild
+  on the GCP build VM covers the images of four workloads (catalog-maintenance,
+  ingest-durability, lifecycle-gc and store-contract), not three. The
+  lifecycle-gc driver moves to `rust:1.100.0-trixie` by tag in its own pull
+  request (#4569), which lands right after #4539.
+- The discovery sweep ran on three driver crates. The fourth, lifecycle-gc,
+  was checked by a separate fleet task on main plus #4539 plus #4569: release
+  build with the Dockerfile's sancov flags, the `nm` and `readelf`
+  instrumentation checks, clippy `-D warnings`, and its 19 tests (epic #4523
+  comment 7068564454).
+- Rolling R1 back is now two reverts: the lifecycle-gc driver commit and the
+  R1 commit. Each compiles on its own, because the driver crate is its own
+  workspace with no path dependencies.
+- "What main does today" stays as written. It describes main at d766815c0,
+  before lifecycle-gc existed.
