@@ -10,6 +10,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WL="$(cd "$HERE/.." && pwd)"
 ROOT="$(cd "$WL/../.." && pwd)"
+# shellcheck source=mutant-tsv.sh
+. "$HERE/mutant-tsv.sh"
 REG="${REGISTRY:-819709950457.dkr.ecr.us-east-1.amazonaws.com/ravel-antithesis}"
 case "${MUTANTS:-}" in
     '' | 0)
@@ -65,6 +67,35 @@ if [ "$WHAT" = all ] || [ "$WHAT" = driver ]; then
         -t "$DRIVER" -t "$REG/driver:$TAG" "$WL/.."
 fi
 
+# The binary must register every mutant name mutant-tsv.sh lists, and the
+# per-area counts must be exactly the mutants ADR-4326 decision 3 ships, so a
+# tsv that lost or gained a mutant line, or a reader that skips an area or
+# counts none: lines, fails here rather than in a run.
+EXPECTED_MUTANTS="catalog=5 resharding=2 maintenance=2"
+check_registered_mutants() {
+    local image="$1" binary="$2" shown="${3:-$2}" names name pair area want got total=0 bad="" summary=""
+    names=$(mutant_names) || { echo "FAIL $image: could not read the mutant names"; return 1; }
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if ! grep -qaF "$name" "$binary"; then
+            echo "FAIL $image: $shown does not register the mutant $name"; return 1
+        fi
+    done <<< "$names"
+    for pair in $EXPECTED_MUTANTS; do
+        area="${pair%%=*}"
+        want="${pair#*=}"
+        got=$(printf '%s\n' "$names" | grep -c "^$area/") || got=0
+        echo "$area: $got mutants (expected $want)"
+        [ "$got" -eq "$want" ] || bad="$bad $area=$got"
+        total=$((total + got))
+        summary="${summary:+$summary, }$area $got"
+    done
+    if [ -n "$bad" ]; then
+        echo "FAIL $image: expected the mutants $EXPECTED_MUTANTS, read$bad"; return 1
+    fi
+    echo "ok $image: $shown registers the $total mutants ($summary)"
+}
+
 # Instrumentation checks (snouty docs: /docs/reference/sdk/rust/instrumentation/):
 # the runtime shim is linked in, and the sancov sections exist.
 check() {
@@ -88,21 +119,10 @@ check() {
     # The registered mutant names exist in the binary only when
     # antithesis-mutants compiled ravel_invariant::mutant in.
     if [ "${3:-}" = mutants ]; then
-        local name n=0
-        while IFS= read -r name; do
-            if ! grep -qaF "$name" "$dir/$bin"; then
-                echo "FAIL $image: /symbols/$bin does not register the mutant $name"; return 1
-            fi
-            n=$((n + 1))
-        done < <(awk -F '\t' '$2 ~ /^catalog\// { print $2 }' "$TSV")
-        if [ "$n" -ne 5 ]; then
-            echo "FAIL $image: expected the 5 catalog mutants in $TSV, read $n"; return 1
-        fi
-        echo "ok $image: /symbols/$bin registers the $n catalog mutants"
+        check_registered_mutants "$image" "$dir/$bin" "/symbols/$bin" || return 1
     fi
     rm -rf "$dir"
 }
-TSV="$ROOT/formal/tla/catalog/antithesis-mutants.tsv"
 MODE=plain
 [ "$FEATURES" = sql,antithesis ] || MODE=mutants
 rc=0
