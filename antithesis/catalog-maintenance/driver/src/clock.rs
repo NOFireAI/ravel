@@ -54,7 +54,7 @@ pub const STORE_REQUEST_TIMEOUT_S: u64 = 20;
 /// jump moves. A jump makes the wall-clock window pass in seconds, so before
 /// each one the driver waits until no server can still hold, or still be
 /// reading, a HEAD older than the current one: the TTL plus
-/// [`STORE_REQUEST_TIMEOUT_S`]. No driver query is in flight meanwhile, since
+/// [`STORE_REQUEST_TIMEOUT_S`]. The driver sends no query meanwhile, since
 /// every move runs under the gate's write guard.
 pub fn head_quiet_s(head_cache_ttl_s: u64) -> u64 {
     head_cache_ttl_s + STORE_REQUEST_TIMEOUT_S

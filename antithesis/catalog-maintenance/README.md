@@ -356,12 +356,16 @@ forced-race nudge, the driver:
    frozen until one more reread passed, so every process moved before any
    fold can move HEAD again (`thaw-key`).
 
-No driver query is in flight across a move, since every move runs under the
-write gate, so the TTL and the late read are the whole wait. Each move's
+The driver sends no query across a move, since every move runs under the
+write gate. The wait does not cover a query that the driver's 30 s client
+timeout gave up on but that its server is still running. Each move's
 `clock: jumped` line records `head_quiet_s` and whether a read after the
 landing found HEAD changed anyway (`head_moved_while_landing`; only a proxy
 restarted inside the landing's 3 s lets a fold through then), which a
-`clock: HEAD changed while the move landed` line also reports. The wait
+`clock: HEAD changed while the move landed` line also reports.
+`local-run.sh` fails a run with a move whose `head_quiet_s` is below the
+span or that saw HEAD change while it landed, and checks that there is one
+such line per move. The wait
 adds about 56 s to each move, so up to 18 moves add about 1000 s to an
 eventually.
 
