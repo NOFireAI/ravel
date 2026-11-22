@@ -856,6 +856,44 @@ impl Shared {
             })
         );
         self.settle("pinned-window jump");
+        self.wait_for_server_sweep();
+    }
+
+    /// After the window jump: the servers' first sweep is a full pass that
+    /// deletes the superseded inputs (`clock::window_jump_floor_s`). Give it
+    /// the wait the unfolded sweep gives the servers' sweeps before any sweep
+    /// of the driver's own can delete them first, since the driver's reports
+    /// no SDK assertions and the SUT's `catalog: a sweep never deletes an
+    /// object the current HEAD names` is evaluated only on a server's. The
+    /// caller holds the gate's write guard, so no driver sweep runs
+    /// meanwhile. The first input a LIST shows gone ends the wait; returns
+    /// whether one did.
+    fn wait_for_server_sweep(&self) -> bool {
+        let Some(prefix) = self.tenant_prefix() else {
+            return false;
+        };
+        let started = Instant::now();
+        while started.elapsed() < UNFOLDED_PASS_WAIT {
+            std::thread::sleep(Duration::from_secs(10));
+            let Ok(keys) = self.store.list(&prefix) else {
+                continue;
+            };
+            let listed: BTreeSet<String> = keys.into_iter().collect();
+            let inputs: Vec<InputKeys> =
+                lock(&self.inputs_of).values().flatten().cloned().collect();
+            if !lock(&self.sweeps).unconfirmed(&inputs, &listed).is_empty() {
+                println!(
+                    "sweep jump: a superseded input was gone {} s after the window jump",
+                    started.elapsed().as_secs()
+                );
+                return true;
+            }
+        }
+        println!(
+            "sweep jump: no superseded input gone within {} s of the window jump",
+            UNFOLDED_PASS_WAIT.as_secs()
+        );
+        false
     }
 
     /// One raw read of the object at `key`, for the quiet wait.

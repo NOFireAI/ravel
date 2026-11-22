@@ -98,8 +98,9 @@ SETUP_LIMIT=900
 # 18 clock moves (the jump, the 11 race nudges, three moves of the unfolded
 # sweep, one of the unreadable-HEAD sweep, the two sweep jumps) first holds
 # HEAD still for 50 s and keeps it frozen through one reread (README.md, "HEAD
-# holds still before every move"): 60 s each.
-END_LIMIT=$((SECS + 4800 + 18 * 60))
+# holds still before every move"): 60 s each. After the window jump the
+# driver waits up to 150 s more for a server sweep to delete an input.
+END_LIMIT=$((SECS + 4800 + 18 * 60 + 150))
 SERVERS="ravel1 ravel2 maint1 maint2"
 MULTISET="catalog: compaction preserves the acked multiset"
 UPPER="catalog: no scan shows a phantom or an excess copy"

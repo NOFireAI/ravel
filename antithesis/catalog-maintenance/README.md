@@ -427,7 +427,10 @@ window jump would leave their next full pass 6 h of wall time away, so only
 the driver's own `ravel-cli` sweep would delete the inputs. That sweep
 reports no SDK assertions, so `catalog: a sweep never deletes an object the
 current HEAD names` would go unevaluated in a timeline whose sweep jumps
-are its last moves.
+are its last moves. For the same reason the driver, still holding its write
+gate after the window jump, waits up to 150 s (the wait the unfolded sweep
+gives the servers' sweeps) for a LIST to show a superseded input gone before
+any sweep of its own can run, and prints how long that took.
 
 The next sweep, from `maint1`/`maint2`, the `sweep` rule or the
 `eventually`, deletes the inputs. The driver refuses to start if either
