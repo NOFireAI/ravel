@@ -8,7 +8,7 @@ name: ci-budget-nightly
 #
 # The guard's --raise-check (a `timeout-minutes` increase in a pull
 # request's ci.yml with no `# budget: p90 <N> min on <YYYY-MM-DD>` comment)
-# runs in ci.yml's required `doc-scripts` job, not here (issue #4041).
+# runs in ci.yml's `doc-scripts-rest` job, not here (issue #4041).
 #
 # Two jobs beyond `cases`:
 #   budgets       schedule and workflow_dispatch only: the live p50/p90/growth

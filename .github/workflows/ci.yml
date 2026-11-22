@@ -715,14 +715,28 @@ jobs:
         with:
           persist-credentials: false
       - name: MetricsBench end-to-end driver cases (issue #940)
+        id: metricsbench
         if: matrix.suite == 'metricsbench'
         run: bash deploy/metricsbench/tests/run.test.sh
       - name: ClickBench kit cases
+        id: clickbench-kit
         if: matrix.suite == 'clickbench-kit'
         run: bash benchmarks/clickbench/kit/kit.test.sh
       - name: Investigations harness cases (issue #3699)
+        id: investigations
         if: matrix.suite == 'investigations'
         run: bash benchmarks/investigations/investigations.test.sh
+      # A matrix value that no step's `if:` matches would otherwise be a green
+      # leg that ran nothing.
+      - name: A suite ran on this leg
+        env:
+          SUITE: ${{ matrix.suite }}
+          RAN: ${{ steps.metricsbench.outcome }} ${{ steps.clickbench-kit.outcome }} ${{ steps.investigations.outcome }}
+        run: |
+          case " $RAN " in
+            *" success "*) ;;
+            *) echo "::error::no suite step ran for matrix value $SUITE ($RAN)"; exit 1 ;;
+          esac
 
   # The required check, under the name the protect-main ruleset lists. Same
   # shape as `check`: a skipped required check passes, so it always runs.
@@ -732,6 +746,8 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    # Seconds. Until ci-budget-nightly's window rolls past the pre-split
+    # runs, it compares 35 to 50 minute rows of this key against this cap.
     timeout-minutes: 5
     steps:
       - name: Decide the doc-scripts lane
