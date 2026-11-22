@@ -1,0 +1,4 @@
+# Hold back crate versions published less than three days ago when cargo
+# resolves. See "Dependency updates" in CONTRIBUTING.md for gaps and override.
+[registry]
+global-min-publish-age = "3 days"
