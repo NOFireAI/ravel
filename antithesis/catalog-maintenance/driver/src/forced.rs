@@ -126,6 +126,21 @@ pub fn present_inputs(inputs: &[InputKeys], listed: &BTreeSet<String>) -> Vec<St
     present
 }
 
+/// The keys of `inputs` deleted since `before`, the LIST taken just before
+/// a jump: held by `before` ([`present_inputs`]) and absent from `listed`, a
+/// later LIST. An input already gone at `before`, deleted earlier in the
+/// timeline, never counts.
+pub fn deleted_since(
+    inputs: &[InputKeys],
+    before: &BTreeSet<String>,
+    listed: &BTreeSet<String>,
+) -> Vec<String> {
+    present_inputs(inputs, before)
+        .into_iter()
+        .filter(|k| !listed.contains(k))
+        .collect()
+}
+
 /// Whether the unfolded-record sweep reached what it exists for: HEAD held
 /// the bytes it held before the compaction for the whole sequence, so no
 /// fold folded the record, the record is still there, and the store held
@@ -286,6 +301,40 @@ mod tests {
             ]
         );
         assert!(present_inputs(&inputs, &BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn only_a_deletion_after_the_snapshot_counts() {
+        let inputs = vec![
+            InputKeys {
+                commit: key(0, HOUR, "w1.1.00000000000000000001.cmt"),
+                data_prefix: format!("{PREFIX}l/l0/0000/w1.1.00000000000000000001."),
+            },
+            InputKeys {
+                commit: key(0, HOUR, "w1.1.00000000000000000002.cmt"),
+                data_prefix: format!("{PREFIX}l/l0/0000/w1.1.00000000000000000002."),
+            },
+        ];
+        let data2 = format!("{}ef01{DATA_SUFFIX}", inputs[1].data_prefix);
+        // The first input was deleted earlier in the timeline: the LIST
+        // just before the jump holds only the second.
+        let before = listing(&[inputs[1].commit.clone(), data2.clone()]);
+        // A poll that still holds the second sees no deletion since then,
+        // though the first stays gone.
+        assert!(deleted_since(&inputs, &before, &before).is_empty());
+        // Without the snapshot, the ledger that saw both inputs reports the
+        // earlier deletion at once.
+        let mut ledger = crate::audit::SweepLedger::default();
+        let mut both = before.clone();
+        both.insert(inputs[0].commit.clone());
+        ledger.observe(both.iter().cloned());
+        assert!(!ledger.unconfirmed(&inputs, &before).is_empty());
+        // The second input deleted after the jump counts.
+        let after = listing(&[data2]);
+        assert_eq!(
+            deleted_since(&inputs, &before, &after),
+            vec![inputs[1].commit.clone()]
+        );
     }
 
     #[test]
