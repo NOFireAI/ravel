@@ -298,6 +298,30 @@ fn largest(admitted: impl Fn(usize) -> bool) -> usize {
     low
 }
 
+/// The largest `n` that `admitted` accepts, what `admitted` returns at it, and
+/// its refusal of `n + 1`. When `admitted` accepts `expected` and refuses
+/// `expected + 1`, that is `n` with no search: the shortcut relies on the same
+/// precondition as [`largest`]. Otherwise [`largest`] searches, so a limit
+/// that moved from `expected` is still the one returned.
+fn largest_admitted<T, E: std::fmt::Display>(
+    expected: Option<usize>,
+    admitted: impl Fn(usize) -> Result<T, E>,
+) -> (usize, T, E) {
+    if let Some(n) = expected
+        && let Ok(at) = admitted(n)
+        && let Err(past) = admitted(n + 1)
+    {
+        return (n, at, past);
+    }
+    let n = largest(|n| admitted(n).is_ok());
+    let past = match admitted(n + 1) {
+        Ok(_) => panic!("n + 1 = {} is refused", n + 1),
+        Err(past) => past,
+    };
+    let at = admitted(n).unwrap_or_else(|e| panic!("n = {n} prepares: {e}"));
+    (n, at, past)
+}
+
 /// What refused a statement.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
@@ -534,7 +558,27 @@ fn worst_at(kind: Kind, shape: Shape, depth: Option<usize>) -> Limit {
 /// [`worst_at`], each statement prepared with the request time range
 /// [`RANGE`] when `ranged`.
 fn worst_in(kind: Kind, shape: Shape, depth: Option<usize>, ranged: bool) -> Limit {
-    let (k, n, longer, counted) = on_stack(WORKER_STACK, move || async move {
+    worst_near(kind, shape, depth, ranged, None)
+}
+
+/// [`worst`], its `n` taken from `expected` by [`largest_admitted`] when the
+/// shape admits `expected.n` and refuses one more, and searched for
+/// otherwise.
+fn worst_expecting(kind: Kind, shape: Shape, expected: &Limit) -> Limit {
+    worst_near(kind, shape, None, false, Some(expected.n))
+}
+
+/// [`worst_in`], its `n` found by [`largest_admitted`] from `expected_n`. The
+/// optimized depth is measured while the statement runs: [`optimized_depth`]
+/// plans on its own [`WORKER_STACK`] thread through [`in_plan`].
+fn worst_near(
+    kind: Kind,
+    shape: Shape,
+    depth: Option<usize>,
+    ranged: bool,
+    expected_n: Option<usize>,
+) -> Limit {
+    let (k, n, longer, counted, optimized) = on_stack(WORKER_STACK, move || async move {
         let admitted = |k, n| prepare_in(&shape.statement(kind, k, n), ranged);
         let (k, counted) = match depth {
             Some(k) => (k, None),
@@ -545,10 +589,10 @@ fn worst_in(kind: Kind, shape: Shape, depth: Option<usize>, ranged: bool) -> Lim
                 (k, Some(counted_at(|k| shape.statement(kind, k, 1), k)))
             }
         };
-        let n = largest(|n| admitted(k, n).is_ok());
-        let longer = admitted(k, n + 1).expect_err("n + 1 is refused");
+        let (n, prepared, longer) = largest_admitted(expected_n, |n| admitted(k, n));
+        let source = shape.statement(kind, k, n);
+        let optimizing = std::thread::spawn(move || optimized_depth(source, ranged));
 
-        let prepared = admitted(k, n).expect("prepares");
         let fixture = fixture().await;
         let outcome = run_prepared(&fixture, &prepared)
             .await
@@ -562,9 +606,11 @@ fn worst_in(kind: Kind, shape: Shape, depth: Option<usize>, ranged: bool) -> Lim
         assert_eq!(found, expected, "{kind:?} {shape:?} at k = {k}, n = {n}");
         drop(outcome);
         drop(prepared);
-        (k, n, refusal(&longer), counted)
+        let optimized = optimizing
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (k, n, refusal(&longer), counted, optimized)
     });
-    let optimized = optimized_depth(shape.statement(kind, k, n), ranged);
     eprintln!(
         "{kind:?} {shape:?} ranged={ranged}: k = {k}, n = {n}, {longer:?}, counted {counted:?}, optimized {optimized}"
     );
@@ -1225,29 +1271,31 @@ fn the_deepest_double_chain_runs_on_a_worker_stack() {
 
 #[test]
 fn the_widest_long_eval_runs_on_a_worker_stack() {
+    let expected = Limit {
+        k: 7,
+        n: 3640,
+        longer: Refusal::Parse,
+        counted: Some(23),
+        optimized: 23 - FOLDED_DIVISOR - SHARED_CAST,
+    };
     assert_eq!(
-        worst(Kind::Long, Shape::EvalFields),
-        Limit {
-            k: 7,
-            n: 3640,
-            longer: Refusal::Parse,
-            counted: Some(23),
-            optimized: 23 - FOLDED_DIVISOR - SHARED_CAST,
-        }
+        worst_expecting(Kind::Long, Shape::EvalFields, &expected),
+        expected
     );
 }
 
 #[test]
 fn the_widest_double_eval_runs_on_a_worker_stack() {
+    let expected = Limit {
+        k: 19,
+        n: 1340,
+        longer: Refusal::Parse,
+        counted: Some(24),
+        optimized: 24 - SHARED_FINITE - SHARED_CAST,
+    };
     assert_eq!(
-        worst(Kind::Double, Shape::EvalFields),
-        Limit {
-            k: 19,
-            n: 1340,
-            longer: Refusal::Parse,
-            counted: Some(24),
-            optimized: 24 - SHARED_FINITE - SHARED_CAST,
-        }
+        worst_expecting(Kind::Double, Shape::EvalFields, &expected),
+        expected
     );
 }
 
