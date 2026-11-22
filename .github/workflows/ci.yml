@@ -364,8 +364,8 @@ jobs:
       - name: ADR-4314 replicas-handover check cases (issue #4324)
         run: bash scripts/kind-autoscaling-check.test.sh
       # The opt-in sample-PGO script's cases (ADR-4523 decision 4), against
-      # stub perf, llvm-profgen, llvm-profdata, rustc, cargo and git; no
-      # toolchain, no PMU and no build.
+      # stub perf, llvm-profgen, llvm-profdata, rustc, cargo, git and uname;
+      # no toolchain, no PMU and no build.
       - name: Sample-PGO build script cases (issue #4527)
         run: bash scripts/build-pgo.test.sh
       # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is

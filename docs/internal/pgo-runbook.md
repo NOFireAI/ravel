@@ -13,8 +13,9 @@ against the same source built without one. The profile was used and saved
 CPU repeatably, but less than the 5% the ADR set for adoption, and the
 query tail guard of the mixed run missed. Release images keep the ordinary
 build. The script stays in the repository as the reproduction of R3 and for
-anyone who wants to repeat it; nothing in the repository calls it, and
-arm64 is not qualified.
+anyone who wants to repeat it. No release or image path calls it; only
+its own test suite, `scripts/build-pgo.test.sh`, does, from a `ci.yml`
+step. arm64 is not qualified.
 
 ## Decision record
 
@@ -29,21 +30,22 @@ Arm B is rustc 1.100.0 with no profile; arm C is B plus
 | Profile-used gate | C's binary differs from B; the ravel_sql IR carries the SampleProfile summary; 8 functions have nonzero entry counts; 1 top-20 function is defined with `!prof` (thin coverage evidence) | PASS | epic #4523 comment 7062870942 |
 | Arm B build | rustc 1.100.0 (LLVM 23.1.5), 551 s, 970,704,664 bytes | reported | epic #4523 comment 7062870942 |
 | Arm C build | 654 s, 1,041,292,216 bytes (7.3% larger) | reported | epic #4523 comment 7062870942 |
-| CPU-s per correct query, held-out warm suite of 13 statements | 0.977 (rounds 0.977, 0.985, 0.983, 0.972, 0.973); 0 of 5 rounds at or under 0.95 | MISS against "at most 0.95 in at least 4 of 5" | epic #4523 comment 7062870942 |
+| CPU-s per correct query, held-out warm suite of 13 statements | median 0.977 (rounds 0.977, 0.985, 0.983, 0.972, 0.973); 0 of 5 rounds at or under 0.95 | MISS against "at most 0.95 in at least 4 of 5" | epic #4523 comment 7062870942 |
 | Query p99, mixed run | rounds 1.088, 1.024, 0.966, 1.053, 1.077; spread within arm 0.257 | MISS (3 of 5 above 1.05) | epic #4523 comment 7062870942 |
 | Acknowledged ingest rate | rounds 0.997, 1.027, 0.978, 1.017, 1.032 | INCONCLUSIVE | epic #4523 comment 7062870942 |
 | Peak RSS | rounds 1.004, 1.023, 0.953, 1.035, 0.994 | INCONCLUSIVE | epic #4523 comment 7062870942 |
-| Rows | 9 differences over 150 comparisons, all `q18_user_phrase_limit` | not a wrong result | epic #4523 comment 7062870942 |
+| Rows | 9 differences over 150 comparisons, all `q18_user_phrase_limit` | MISS as computed (an unordered `LIMIT`, below) | epic #4523 comment 7062870942 |
 | Per-phase GETs and wire bytes | 0 of 3,350 values outside the rule | PASS | epic #4523 comment 7062870942 |
 | Best per-statement CPU | q39 0.942, q18 0.944, q30 0.966, q21 0.967 | reported | epic #4523 comment 7062870942 |
 
-The row differences are not a wrong result. `q18_user_phrase_limit` is
-`GROUP BY ... LIMIT 10` with no `ORDER BY`, so any 10 groups are a valid
-answer, and B differs from its own round 1 the same way C does. The
-comparator has no rule for an unordered `LIMIT`.
+Rows: MISS as computed. All nine differences are in
+`q18_user_phrase_limit`, which is `GROUP BY ... LIMIT 10` with no
+`ORDER BY`: an unordered `LIMIT`, for which any 10 groups are a valid
+answer. B differs from its own round 1 the same way C does. The comparator
+has no rule for an unordered `LIMIT`, so it counts each such difference.
 
-Decision: DEFER. The profile saved 2.3% CPU per query on the held-out
-suite, repeatably, which is below the 5% adoption target, and the mixed-run
+Decision: DEFER. The profile saved a median 2.3% CPU per query on the
+held-out suite (1 - 0.977), in all five rounds, which is below the 5% adoption target, and the mixed-run
 tail guard missed. Release builds do not change. arm64 is not qualified.
 
 Any one of these would reopen it, each as a new issue that links here:
@@ -55,11 +57,14 @@ Any one of these would reopen it, each as a new issue that links here:
 
 ## Host requirements
 
-- Bare-metal Linux x86_64 with branch-stack sampling. AMD BRS on Zen 3
-  bare metal worked on c6a.metal; Intel LBR is the alternative.
-  Virtualised c6a.4xlarge exposes no PMU at all (#4232), so `record`
-  finds no event that writes samples and exits 6.
-- `perf`.
+- Bare-metal Linux x86_64 with branch-stack sampling. Every subcommand
+  exits 6 on any other OS or architecture. AMD BRS on Zen 3 bare metal
+  worked on c6a.metal; Intel LBR is the alternative. Virtualised
+  c6a.4xlarge exposes no PMU at all (#4232), so `record` finds no event
+  perf can open and exits 6.
+- `perf`, allowed to open the event: a refusal that names
+  `perf_event_paranoid` exits 4, not 6. Lower
+  `kernel.perf_event_paranoid` or grant `CAP_PERFMON`.
 - `llvm-profgen` for rustc's LLVM major. `scripts/build-pgo.sh
   check-tools` prints rustc's major and the tools it found. Use rustup's
   `llvm-tools` component if it ships `llvm-profgen` for this toolchain;
@@ -93,12 +98,21 @@ Any one of these would reopen it, each as a new issue that links here:
    ```
 
    `--binary` must be the exact binary the pid is running. Without
-   `--event`, the script tries `cpu/branch-brs/`, then
-   `br_inst_retired.near_taken:u`, then `cycles:u`, and keeps the first
-   that writes a non-empty `perf.data`. It then converts the samples with
-   `llvm-profgen` into `pgo/profile.prof` and checks resolution: each of
-   the binary's top 20 self-time symbols in `perf report` must be a
-   function of the profile. Exit 4 lists the symbols that are missing.
+   `--event`, the script probes `cpu/branch-brs/`, then
+   `br_inst_retired.near_taken:u`, then `cycles:u`, each with
+   `perf record -b -e <event> -- true`, and keeps the first that perf can
+   open. It then records the pid with that event. It exits 4 when that
+   `perf record` exits non-zero (a wrong `--pid`, for example; the tail of
+   perf's stderr is printed) or when `perf report --stats` counts zero
+   `SAMPLE` events: perf writes a non-empty `perf.data` header even then.
+
+   It converts the samples with `llvm-profgen` into `pgo/profile.prof` and
+   checks resolution, R3's gate: each of the binary's top 20 self-time
+   symbols in `perf report`, clone suffixes stripped, must be a function
+   of the profile with nonzero total samples, and the 20 must include a
+   `ravel_` symbol and a `datafusion` symbol. Exit 4 lists the symbols
+   that are missing or have zero samples. On success it writes the 20
+   symbols to `pgo/top-symbols.txt`, which `build` needs.
 
 ## Building with a profile
 
@@ -112,15 +126,27 @@ The features default to the release image's set, read from the root
 Dockerfile; `--features` overrides them and `--target-dir` moves the
 output.
 
-After the build, the script emits LLVM IR for the hottest Ravel crate named
-in the profile's `provenance.txt` (ravel-sql if there is none) with the
-same flags, and checks it for a `SampleProfile` summary and at least one
-nonzero `function_entry_count`.
+It refuses a profile with no `top-symbols.txt` beside it (exit 4). After
+the build, the script emits LLVM IR for the hottest Ravel crate named in
+the profile's `provenance.txt` (ravel-sql if there is none) with the same
+flags, and checks it for a `SampleProfile` summary, at least one nonzero
+`function_entry_count`, and at least one `define` of a `top-symbols.txt`
+symbol that carries `!prof`.
 
-Exit 5 means the build did not use the profile: the flag did not reach
-rustc, or the profile matched none of the crate's functions. Do not use
-that binary. The fallback is the ordinary build with no flag, `cargo build
---release --locked -p ravel-server`, which is what the release images run.
+Exit 5 means the build could not be shown to use the profile: no `.ll`
+file for the crate appeared, the flag did not reach rustc, the profile
+matched none of the crate's functions, or it matched none of the top-20
+functions defined there. Exit 1 after the build means the `cargo rustc`
+that emits the IR failed. On either, the script moves the binary to
+`<target>/release/ravel-server.pgo-unproven`, so nothing picks it up as a
+plain build; do not use it. The fallback is the ordinary build with no
+flag. The root Dockerfile, which builds the release images, runs `cargo
+build --release --locked -p ravel-server --features
+sql,flight-sql,otap,agents,mcp`, then splits out the debug info and strips
+the shipped binary.
+
+The script does not compare the PGO binary's hash with a plain build's, a
+gate R3's harness also ran; do that by hand when you have both binaries.
 
 ## Refreshing
 
@@ -153,7 +179,8 @@ line:
 | `cpu_model` | `model name` from `/proc/cpuinfo` |
 | `recorded_at` | UTC time |
 | `profile_sha256` | hash of `profile.prof` |
-| `hottest_ravel_crate` | the first Ravel crate among the top 20 symbols, else `ravel_sql` |
+| `hottest_ravel_crate` | the first Ravel crate among the top 20 symbols (a symbol naming several takes the longest crate name), else `ravel_sql` |
+| `top_symbols` | `top-symbols.txt`, the file beside it holding the 20 stripped symbols, hottest first |
 
 The training mix is not in the file: write it down beside the profile
 when you record.
