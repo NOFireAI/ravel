@@ -291,7 +291,7 @@ for lock in "${locks[@]}"; do
 done
 
 if [[ "${refused}" -gt 0 ]]; then
-  echo "${me}: ${refused} of ${found} Cargo.lock downgrade(s) in ${merge_base:0:12}..${head_sha:0:12} carry no Lockfile-downgrade trailer" >&2
+  echo "${me}: ${refused} of ${found} Cargo.lock downgrade(s) in ${merge_base:0:12}..${head_sha:0:12} carry no Lockfile-downgrade trailer (${checked} lockfile(s) compared)" >&2
   exit 1
 fi
 if [[ "${found}" -gt 0 ]]; then
