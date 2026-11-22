@@ -256,8 +256,7 @@ struct Jump {
 /// HEAD held still by the proxy for a clock move, thawed on drop.
 struct Frozen<'a> {
     shared: &'a Shared,
-    /// `None` when no HEAD key was known, so nothing was frozen.
-    key: Option<String>,
+    key: String,
     /// HEAD as read at the end of the quiet wait.
     head: clock::HeadRead,
     /// How long HEAD had held still when the wait ended.
@@ -266,9 +265,7 @@ struct Frozen<'a> {
 
 impl Drop for Frozen<'_> {
     fn drop(&mut self) {
-        if let Some(key) = &self.key {
-            let _ = self.shared.proxy_cmd(&format!("thaw-key {key}"));
-        }
+        let _ = self.shared.proxy_cmd(&format!("thaw-key {}", self.key));
     }
 }
 
@@ -297,8 +294,11 @@ struct Shared {
     clock: ClockPlan,
     /// The jump that seals the live hours.
     jump: Mutex<Option<Jump>>,
-    /// Set when the sweep jumps start; once per timeline.
-    sweep_jump_started: AtomicBool,
+    /// Where the two sweep jumps stand; each is written once per timeline.
+    sweep_jumps: Mutex<clock::SweepJumps>,
+    /// The horizon jump once it reached the driver, with the shards swept
+    /// after it, for the window jump's details.
+    sweep_horizon: Mutex<Option<(Jump, usize)>>,
     /// The horizon and window jumps, once both reached the driver.
     sweep_jump: Mutex<Option<(Jump, Jump)>>,
     /// The offset the file holds: every jump and nudge so far.
@@ -786,35 +786,57 @@ impl Shared {
     fn sweep_jump(&self, reason: &str) {
         if lock(&self.jump).is_none_or(|j| !j.reached_driver)
             || !self.compacted.load(Ordering::SeqCst)
-            || self.sweep_jump_started.swap(true, Ordering::SeqCst)
         {
             return;
         }
-        // A deleted input counts only if a LIST held it before the delete.
-        match self.tenant_prefix() {
-            Some(prefix) => match self.store.list(&prefix) {
-                Ok(keys) => lock(&self.sweeps).observe(keys),
-                Err(e) => println!("sweep jump: the listing before the jump failed: {e}"),
-            },
-            None => println!("sweep jump: no HEAD key known, so nothing listed before the jump"),
-        }
-        let horizon = match self.shift_clock(reason, &|_| self.clock.horizon_jump_s) {
-            Ok(jump) => jump,
-            Err(_) => {
-                // Nothing moved: a later rule or the eventually retries.
-                self.sweep_jump_started.store(false, Ordering::SeqCst);
+        // The caller holds the gate's write guard, so no other call runs
+        // between reading the state and recording the step's outcome. A jump
+        // the quiet wait gave up leaves the state as it was, so the next call
+        // (a later rule or the eventually) takes that jump.
+        let state = *lock(&self.sweep_jumps);
+        if state.next() == clock::SweepStep::Horizon {
+            // A deleted input counts only if a LIST held it before the delete.
+            match self.tenant_prefix() {
+                Some(prefix) => match self.store.list(&prefix) {
+                    Ok(keys) => lock(&self.sweeps).observe(keys),
+                    Err(e) => println!("sweep jump: the listing before the jump failed: {e}"),
+                },
+                None => {
+                    println!("sweep jump: no HEAD key known, so nothing listed before the jump")
+                }
+            }
+            let horizon = self.shift_clock(reason, &|_| self.clock.horizon_jump_s);
+            let state = state.after(
+                clock::SweepStep::Horizon,
+                horizon.as_ref().map(|j| j.reached_driver).map_err(|_| ()),
+            );
+            *lock(&self.sweep_jumps) = state;
+            let Ok(horizon) = horizon else {
+                return;
+            };
+            if !horizon.reached_driver {
                 return;
             }
-        };
-        if !horizon.reached_driver {
+            self.settle("protection-horizon jump");
+            if !self.fold() {
+                println!("sweep jump: the fold after the horizon jump failed");
+            }
+            let marked = (0..SHARDS).filter(|&shard| self.sweep(shard)).count();
+            *lock(&self.sweep_horizon) = Some((horizon, marked));
+        }
+        let state = *lock(&self.sweep_jumps);
+        if state.next() != clock::SweepStep::Window {
             return;
         }
-        self.settle("protection-horizon jump");
-        if !self.fold() {
-            println!("sweep jump: the fold after the horizon jump failed");
-        }
-        let marked = (0..SHARDS).filter(|&shard| self.sweep(shard)).count();
-        let Ok(window) = self.shift_clock(reason, &|_| self.clock.window_jump_s) else {
+        let Some((horizon, marked)) = *lock(&self.sweep_horizon) else {
+            return;
+        };
+        let window = self.shift_clock(reason, &|_| self.clock.window_jump_s);
+        *lock(&self.sweep_jumps) = state.after(
+            clock::SweepStep::Window,
+            window.as_ref().map(|j| j.reached_driver).map_err(|_| ()),
+        );
+        let Ok(window) = window else {
             return;
         };
         if !window.reached_driver {
@@ -850,56 +872,48 @@ impl Shared {
     /// proxy refuses every server's PUT of HEAD until the returned freeze is
     /// dropped; the freeze is renewed with every read, so a restarted proxy
     /// gets it back, and a changed or unreadable HEAD, or a freeze the proxy
-    /// did not confirm, starts the wait again. `Err` after
-    /// [`QUIET_HEAD_TRIES`] quiet spans without one.
+    /// did not confirm, starts the wait again (`clock::wait_quiet`). `Err`
+    /// when no inspect has shown the HEAD key, since HEAD can then be neither
+    /// frozen nor read, and after [`QUIET_HEAD_TRIES`] quiet spans without
+    /// one.
     fn quiet_head(&self, reason: &str) -> Result<Frozen<'_>, String> {
-        let need = Duration::from_secs(clock::head_quiet_s(self.clock.head_cache_ttl_s));
-        let start = Instant::now();
+        let w = clock::QuietWait {
+            need: Duration::from_secs(clock::head_quiet_s(self.clock.head_cache_ttl_s)),
+            tries: QUIET_HEAD_TRIES,
+            poll: QUIET_HEAD_POLL,
+        };
         if lock(&self.head_key).is_none() {
             let _ = self.inspect_json();
         }
-        let Some(key) = lock(&self.head_key).clone() else {
-            // No inspect could show HEAD: nothing to freeze or read.
-            std::thread::sleep(need);
-            return Ok(Frozen {
-                shared: self,
-                key: None,
-                head: clock::HeadRead::Failed,
-                quiet: need,
-            });
-        };
-        let read = |key: &str| self.head_read(key);
-        let freeze = || self.proxy_cmd(&format!("freeze-key {key}")).is_ok();
-        let mut frozen = Frozen {
+        let key = lock(&self.head_key).clone();
+        // Built before the first freeze, so dropping it thaws on every path.
+        let mut frozen = key.as_ref().map(|key| Frozen {
             shared: self,
-            key: Some(key.clone()),
+            key: key.clone(),
             head: clock::HeadRead::Failed,
             quiet: Duration::ZERO,
-        };
-        let confirmed = freeze();
-        let mut quiet = clock::Quiet::new(start.elapsed(), read(&key));
-        if !confirmed {
-            quiet.sample(start.elapsed(), clock::HeadRead::Failed, false);
-        }
-        loop {
-            let now = start.elapsed();
-            if quiet.quiet_for(now) >= need {
-                frozen.head = quiet.head().clone();
-                frozen.quiet = quiet.quiet_for(now);
-                return Ok(frozen);
+        });
+        let key = key.unwrap_or_default();
+        let start = Instant::now();
+        let waited = clock::wait_quiet(
+            frozen.is_some(),
+            w,
+            &mut || start.elapsed(),
+            &mut std::thread::sleep,
+            &mut || self.proxy_cmd(&format!("freeze-key {key}")).is_ok(),
+            &mut || self.head_read(&key),
+        );
+        match (waited, frozen.take()) {
+            (Ok((head, quiet)), Some(mut f)) => {
+                f.head = head;
+                f.quiet = quiet;
+                Ok(f)
             }
-            if now >= need * QUIET_HEAD_TRIES {
-                let e = format!(
-                    "HEAD did not hold still for {} s within {} s",
-                    need.as_secs(),
-                    now.as_secs()
-                );
+            (Ok(_), None) => Err("the quiet wait ended with no HEAD key".to_string()),
+            (Err(e), _) => {
                 println!("clock: giving the move up ({reason}): {e}");
-                return Err(e);
+                Err(e)
             }
-            std::thread::sleep(QUIET_HEAD_POLL);
-            let confirmed = freeze();
-            quiet.sample(start.elapsed(), read(&key), confirmed);
         }
     }
 
@@ -952,13 +966,8 @@ impl Shared {
         std::thread::sleep(Duration::from_secs(clock::reach_wait_s(
             self.clock.reread_s,
         )));
-        let landed_head = frozen.key.as_deref().map(|key| self.head_read(key));
-        // Only a read that succeeded can show HEAD moved while the move landed.
-        let head_moved_while_landing = landed_head.as_ref().map(|h| {
-            *h != clock::HeadRead::Failed
-                && frozen.head != clock::HeadRead::Failed
-                && *h != frozen.head
-        });
+        let head_moved_while_landing =
+            clock::moved_while_landing(&frozen.head, &self.head_read(&frozen.key));
         let details = json!({
             "reason": reason,
             "offset_s": offset_s,
@@ -976,6 +985,7 @@ impl Shared {
                 "clock: HEAD changed while the move landed, so a server may serve a HEAD older \
                  than the delete gate assumes ({reason})"
             );
+            assert_unreachable!("clock: HEAD changed while a clock move landed", &details);
         }
         if !reached_driver {
             assert_unreachable!("clock: the clock jump did not reach the driver", &details);
@@ -2426,7 +2436,8 @@ impl Workload {
         let s = &self.0;
         let sealed = lock(&s.jump).is_some();
         if sealed
-            && (!s.compacted.load(Ordering::SeqCst) || s.sweep_jump_started.load(Ordering::SeqCst))
+            && (!s.compacted.load(Ordering::SeqCst)
+                || lock(&s.sweep_jumps).next() == clock::SweepStep::Nothing)
         {
             return;
         }
@@ -3001,7 +3012,8 @@ fn main(tc: TestCase) {
         compacted: AtomicBool::new(false),
         clock,
         jump: Mutex::new(None),
-        sweep_jump_started: AtomicBool::new(false),
+        sweep_jumps: Mutex::new(clock::SweepJumps::default()),
+        sweep_horizon: Mutex::new(None),
         sweep_jump: Mutex::new(None),
         offset_s: Mutex::new(0),
         admin,
