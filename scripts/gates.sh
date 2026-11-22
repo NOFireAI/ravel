@@ -61,9 +61,11 @@
 # so a test that reads process-global state can fail there and pass in CI, and
 # a merge gate that does not run the tests as CI does is not the merge gate.
 # Install it with `cargo install cargo-nextest@0.9.143 --locked`. That version
-# and the `tool: nextest@0.9.143` pins on taiki-e/install-action in
-# .github/workflows/ci.yml and interop-nightly.yml move together, and only to
-# a version the pinned install-action's manifest lists. The executor tier
+# moves together with the `tool: nextest@0.9.143` pins on
+# taiki-e/install-action in .github/workflows/ci.yml and interop-nightly.yml,
+# and with .brig/Dockerfile's NEXTEST_VERSION and its per-arch sha256 case
+# arms, which must be replaced too. It moves only to a version the pinned
+# install-action's manifest lists. The executor tier
 # keeps the `cargo test` fallback, with a printed line, because fleet hosts do
 # not all carry nextest and CI runs the full suites anyway.
 # RAVEL_GATES_ALLOW_CARGO_TEST=1 runs the merge tier under `cargo test` with
