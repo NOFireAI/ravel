@@ -245,6 +245,10 @@ jobs:
         id: try
         env:
           ISSUE: ${{ needs.report.outputs.issue }}
+          # .cargo/config.toml holds back versions published less than three
+          # days ago. An advisory fix should not wait for that, and the pull
+          # request this lane opens is still reviewed (CONTRIBUTING.md).
+          CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE: allow
         run: |
           work="$RUNNER_TEMP/supply-chain-fix"
           fixes="$RUNNER_TEMP/supply-chain-fixes"
@@ -495,7 +499,7 @@ jobs:
                 if [ "$locked" != "-" ]; then
                   spec="$krate@$locked"
                 fi
-                echo "    cargo update -p $spec --precise $fixed"
+                echo "    CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p $spec --precise $fixed"
               done <"$dir/updates.tsv"
               echo
               echo "With it cargo deny reports none of $ids on any locked version,"

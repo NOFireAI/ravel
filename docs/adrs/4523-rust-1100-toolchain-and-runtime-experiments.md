@@ -80,7 +80,8 @@ From the 1.100.0 announcement and the release notes for 1.98.0 to 1.100.0:
   held back, versions without an index `pubtime` are never held back,
   `cargo install` ignores it, and
   `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow` overrides it for one
-  command.
+  command. (R4b found the lockfile and `pubtime` statements do not hold as
+  written; see the cooldown amendment below.)
 - `-Cprofile-sample-use` is stable. The 1.99 notes record an update to
   LLVM 23; main's 1.97.1 is LLVM 22.1.6. R1 records the LLVM version of the
   1.100.0 toolchain from `rustc -vV`, since the 1.100 notes do not state it.
@@ -437,7 +438,8 @@ source is found.
   merges with it.
 
   Ravel has no Dependabot or automated `cargo update`, so dependency updates
-  are resolved by hand, in sessions and fleet tasks. The policy is verified
+  are resolved by hand, in sessions and fleet tasks (wrong: supply-chain-nightly
+  runs one; see the cooldown amendment below). The policy is verified
   on that path, an executor with cargo 1.100. The verification shows that:
   - `cargo build --locked` is unaffected;
   - `cargo update -p <crate> --dry-run` holds back a version published less
@@ -446,7 +448,8 @@ source is found.
     --precise <version>` takes it, on a disposable branch;
   - cargo 1.97.1 accepts the file (for rollback).
 
-  `CONTRIBUTING.md` documents three gaps and the override:
+  `CONTRIBUTING.md` documents three gaps and the override (the first two as
+  corrected in the cooldown amendment below):
   - existing lockfile entries are not held back;
   - versions without `pubtime` are not held back;
   - `cargo install` ignores the policy, so tools are pinned with
@@ -572,7 +575,8 @@ rollback.
   would turn every false positive into a red build.
 - **Cooldown through a Dependabot `cooldown` setting.** It lost because
   Ravel has no Dependabot, and resolution happens in local and fleet
-  sessions, which the Cargo setting covers.
+  sessions and in supply-chain-nightly (see the cooldown amendment below),
+  which the Cargo setting covers.
 
 ## Consequences
 
@@ -633,3 +637,35 @@ driver stage is the only new one.
   workspace with no path dependencies.
 - "What main does today" stays as written. It describes main at d766815c0,
   before lifecycle-gc existed.
+
+## Amendment (2026-11-22): what the R4b cooldown does to locked versions and the automated lane
+
+<!-- amendment-applies: sections="What Rust 1.98 through 1.100 change that matters here|5. R4: two independent Cargo changes|Rejected alternatives" pointer="cooldown amendment" -->
+
+R4b's verification on cargo 1.100.0 (task 6e6ac5d3) and the wave 2
+checkpoint corrected three statements in this ADR.
+
+- **Locked versions.** A locked version is kept by `cargo build`, by `cargo
+  add` of another crate and by `cargo update -p <other-crate>`. A plain
+  `cargo update` re-resolves the whole graph and downgrades a locked version
+  that is still inside the cooldown: the executor's run printed `Downgrading
+  cc v1.11.3 -> v1.11.2`. So "versions already in `Cargo.lock` are never held
+  back" is wrong for a full re-resolve. `CONTRIBUTING.md` states the
+  corrected behaviour.
+- **Versions without `pubtime`.** Cargo's configuration and resolver pages
+  describe the cooldown only for versions that have a `pubtime`. They do not
+  say a version without one is never held back, and R4b did not test that
+  case. `CONTRIBUTING.md` says so instead of stating it as fact.
+- **The automated lane.** Decision 5 said Ravel has no automated `cargo
+  update`. The `fix-candidates` job in `supply-chain-nightly.yml` runs `cargo
+  update -p <crate> --precise <fixed>` from the repository root on the pinned
+  toolchain every six hours, so the cooldown reaches it. Without an override
+  it would refuse a fixed version younger than three days, and no fix pull
+  request would open until the version aged. R4b sets
+  `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow` on that step and in the
+  reproduction command the job writes into its commit message, so the lane
+  behaves as it did before the cooldown. Its output is still a pull request
+  that goes through review, `cargo deny` and the advisory delta check. That
+  is the only automated resolver in the tree: a search of `.github/` and
+  `scripts/` for `cargo update`, `cargo add` and `generate-lockfile` finds
+  no other.
