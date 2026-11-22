@@ -189,7 +189,8 @@ ravel-ingest, ravel-catalog, ravel-maintain and ravel-fleet with
 `--features ravel-invariant/capture,ravel-invariant/antithesis-mutants`, then
 a clippy of the six with `--features ravel-invariant/antithesis` alone, and
 tests of the six that way; the executor tier leaves those tests to CI) runs
-whenever one of those six is in scope, matching CI's `invariants` job. An
+whenever one of those six is in scope, matching CI's two `invariants` legs
+(one per feature set, on separate runners). An
 `invariants-services` lane runs the capture and mutants clippy and tests for
 ravel-server and ravel-cli whenever either is in scope, matching CI's
 `invariants-services` job. Both depend on each of the six and on
