@@ -1599,7 +1599,7 @@ async fn swept_token_beside_a_compaction_its_live_rewrite_replaced_is_evaluated_
 /// already held R's part would be served before it): the property holds and
 /// the snapshot serves R's part once.
 #[tokio::test]
-async fn swept_token_with_its_rewrite_part_in_head_is_evaluated_true() {
+async fn swept_token_with_its_rewrite_part_outside_the_set_is_evaluated_true() {
     let store = Arc::new(MemoryStore::new());
     let start = hour_start(HOUR);
     let p = l0(Signal::Logs, 45, HOUR, start, L_ROWS);
