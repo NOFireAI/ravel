@@ -171,6 +171,11 @@ flowchart LR
    separate runners, each with its clippy step and its test step. The job
    is not required, so no aggregator is needed; the job key stays
    `invariants` and the check names become `invariants (<feature set>)`.
+   Each leg gets its own rust-cache key (`ci-profile-<pass>`), as
+   `sql-shard` keys by suite: the legs build different feature sets, only
+   the antithesis pass links the Antithesis SDK, rust-cache leaves the
+   matrix out of its key, and under one shared entry whichever leg saved
+   first on main would leave the other building cold.
    The same pull request updates the text that names the job: `CLAUDE.md`'s
    gates section and the ci.yml comments on `invariants` and
    `invariants-services`. Expected: about 9 min instead of 17.3 to 17.9, at
