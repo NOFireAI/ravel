@@ -3168,8 +3168,8 @@ jobs:
   # evaluation recorded in process (`ravel-invariant/capture`) and every
   # mutant compiled in (`ravel-invariant/antithesis-mutants`), with no
   # Antithesis SDK, and, on a runner of its own so the two passes run side by
-  # side (ADR-4583 decision 3), clippied and tested with
-  # `ravel-invariant/antithesis` alone.
+  # side (#4583), clippied and tested with `ravel-invariant/antithesis`
+  # alone.
   # The workspace jobs build none of these features, so a site or mutant test
   # that only exists under them runs nowhere else.
   invariants:
@@ -3184,12 +3184,14 @@ jobs:
       matrix:
         include:
           - pass: capture and mutants
+            slug: capture-mutants
             features: ravel-invariant/capture,ravel-invariant/antithesis-mutants
           # Every assertion condition compiles under `antithesis`, but neither
           # the capture nor the mutant module does without its own feature
           # (#4497). The test step runs ravel-invariant's test_support
           # fallbacks, which no other job compiles.
           - pass: antithesis alone
+            slug: antithesis
             features: ravel-invariant/antithesis
     name: invariants (${{ matrix.pass }})
     steps:
@@ -3209,8 +3211,12 @@ jobs:
           # Restore everywhere, save only on main, as in `features-otap`
           # (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # Names the cargo profile, as in `sql-shard` above.
-          key: ci-profile
+          # Names the cargo profile and the pass, as `sql-shard` names its
+          # suite: the two passes build different feature sets (only
+          # `antithesis` links the Antithesis SDK), rust-cache leaves the
+          # matrix out of its key, and under one shared entry whichever leg
+          # saved first would leave the other building cold.
+          key: ci-profile-${{ matrix.slug }}
       - name: Clippy the invariant crates with ${{ matrix.pass }}
         env:
           FEATURES: ${{ matrix.features }}
@@ -3229,7 +3235,7 @@ jobs:
   # `invariants-services` lane, issue #4487). Both carry assertion sites and
   # tests whose expectations depend on them (a fold's GET budget counts the
   # HEAD re-read an evaluated site issues, #4485), and no other job builds
-  # them with these features. A job of its own so the `invariants` job's
+  # them with these features. A job of its own so the `invariants` legs'
   # runtime is unchanged: ravel-cli's dev-dependency turns on ravel-server's
   # `sql` feature, so this builds the SQL engine and links every test binary
   # of both crates, the size of `sql-shard`'s endpoint suite plus ravel-cli.
