@@ -4,11 +4,12 @@
 # (scripts/import-images.sh). Check the task's compute budget before running.
 #
 # Usage: scripts/launch.sh <max-compute-hours> [description]
-#   RAVEL_ANTITHESIS_MUTANT=catalog/<stem>  launch a mutant control run: a
-#             copy of the config (scripts/mutant-config.sh) selects that
-#             mutant on every ravel-server container, over the
-#             catalog-maintenance-mutants images (MUTANTS=1 scripts/build.sh).
-#             Unset or empty launches the plain run.
+#   RAVEL_ANTITHESIS_MUTANT=<area>/<stem>  launch a mutant control run of a
+#             catalog, resharding or maintenance mutant: a copy of the config
+#             (scripts/mutant-config.sh) selects that mutant on every
+#             ravel-server container, over the catalog-maintenance-mutants
+#             images (MUTANTS=1 scripts/build.sh). Unset or empty launches
+#             the plain run.
 set -euo pipefail
 HOURS="${1:?max compute hours}"
 DESC="${2:-ravel catalog maintenance}"
@@ -21,8 +22,8 @@ TEST_NAME=ravel-catalog-maintenance
 if [ -n "$MUTANT" ]; then
     TAG=catalog-maintenance-mutants
     TEST_NAME=ravel-catalog-maintenance-mutant
-    # Refuses a name that is not one of the catalog mutants before anything
-    # else is checked.
+    # Refuses a name that is not one of the mutants mutant-tsv.sh lists,
+    # before anything else is checked.
     tmp=$(mktemp -d)
     trap 'rm -rf "${tmp:-}"' EXIT
     "$HERE/mutant-config.sh" "$MUTANT" "$tmp/config" || exit 1
