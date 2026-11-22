@@ -66,6 +66,8 @@ CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise 
 
 Without the variable, `cargo update --precise` refuses a version inside the cooldown with `version <version> is too new`.
 
+A version taken this way stays only while you use `cargo update -p` for other crates. A plain `cargo update` in the next three days downgrades it. CI refuses a `Cargo.lock` downgrade unless a commit in the pull request carries a trailer line `Lockfile-downgrade: <crate> <version>` naming the crate and the version it goes down to.
+
 The `fix-candidates` job in `.github/workflows/supply-chain-nightly.yml` sets the same variable, so it still tries an advisory's fixed version when that version is inside the cooldown. The pull request it opens goes through the same review as any other.
 
 The cooldown does not replace review. `cargo deny` and review of the `Cargo.lock` diff still apply to every change.

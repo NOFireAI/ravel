@@ -563,6 +563,33 @@ than passing for "no pull request open".
   branch allowlist, because a guard with a cutoff stops being one. Wired into
   ci.yml's `doc-scripts` job with the pull request's base SHA. Cases in
   `scripts/guards/check-changelog-touched.test.sh`.
+- `scripts/guards/check-lockfile-downgrade.sh <base-ref> [head-ref]`: exits 1
+  when a tracked `Cargo.lock` (the root one, the fuzz, compat-tests and
+  Antithesis driver ones, any path git lists at head) downgrades a crate in
+  the range and no commit in the range names it. `.cargo/config.toml` holds
+  back versions published less than three days ago (#4582), so a version
+  taken early with `cargo update -p <crate> --precise` is rolled back by the
+  next plain `cargo update` in those three days. The advisory delta in the
+  supply-chain job catches that only when the rolled-back version has a
+  published advisory. Each lockfile is compared with the same path at the
+  MERGE BASE of the two refs, like `check-changelog-touched.sh`; a lockfile
+  new or removed at head is skipped. Packages are keyed by name and source
+  (a git and a registry source of one name are judged apart) and path
+  packages are skipped. A downgrade is a version the base did not have,
+  below a version the base had and head no longer has: a lower version added
+  beside every base version, and a crate removed entirely, are not
+  downgrades. Versions are ordered by SemVer precedence (`1.2.0-rc.1` is
+  below `1.2.0`, `1.9.0` below `1.10.0`, build metadata ignored). Each
+  finding prints `<lockfile>: <name> <V> -> <W> (<source>)`. A commit in the
+  range carrying the trailer line `Lockfile-downgrade: <name> <W>`, in its
+  trailer block, accepts that crate's downgrade to that exact version; a
+  refused finding prints the trailer that would accept it. Exit 2 is a
+  usage error. Exit 70 is could-not-check (an unresolvable ref, a git
+  failure, a lockfile that does not parse), never a pass. Wired into ci.yml's
+  `supply-chain` job on pull_request and merge_group, with the same base
+  the advisory delta uses and the checked-out head. Cases in
+  `scripts/guards/check-lockfile-downgrade.test.sh`, run in ci.yml's
+  `doc-scripts-rest` job.
 - `scripts/guards/check-compat-corpus-append-only.sh <base-ref> [head-ref]`:
   exits 1 when a published fixture under
   `crates/ravel-compat-tests/corpus/` is MODIFIED or DELETED in the range
