@@ -227,9 +227,9 @@ LargeUtf8, Utf8View, Binary, LargeBinary or BinaryView.
   or offsets (16 B per variable-width column per row), its validity and its
   copied string bytes all come out of `B`. A chunk seals when the next row
   would take it past `B`, or at 8,192 rows (and earlier, when a buffer's
-  doubling would pass `B`: see the chunk growth amendment below). The rows a chunk holds and the
-  bytes its strings take are what the data gives; `B` is the only parameter
-  the derivation sets.
+  doubling would pass `B`: see the chunk growth amendment below). The rows
+  a chunk holds and the bytes its strings take are what the data gives; `B`
+  is the only parameter the derivation sets.
 - **Copies, not views.** Strings longer than the 12-byte inline limit are
   copied into the chunk's own data block. A view into the source batch would
   keep that batch's buffers alive without a charge.
@@ -430,6 +430,11 @@ append, for any `B` and row shape: each growth copies at most the capacity
 it grows from and at least doubles it. The cost is fill. A chunk sealed by
 a doubling holds rows that, with the refused row, measure more than half of
 `B`, so the floor bullet's "about 118 rows" of a 16 KiB chunk is what the
-budget's measure admits, not what every chunk holds. The retry's INFO line
+budget's measure admits, not what every chunk holds. Lower fill also
+raises the pool charge per retained row: a sealed chunk stays charged `B`
+in full whatever it holds, so the retry reaches its spill threshold on
+fewer rows, and an input that used to finish in memory can spill. The
+charge never falls below what a chunk holds. The acceptance run wrote 0.7%
+more spill bytes (#3231 comment 7112466282). The retry's INFO line
 reports the copies as `bucket_route_resize_bytes` and the chunks sealed as
 `bucket_route_chunks_sealed`.
