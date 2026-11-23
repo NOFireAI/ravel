@@ -5,9 +5,9 @@ Two specifications over the shared object-store contract
 
 - **MaintenanceOwnership** models the shipped maintenance ownership protocol
   (ADR-0065 decisions 1 to 3, ADR-0048 ownership and coverage).
-- **CompactionClaims** models a **proposed design** (ADR-1029) layered on a
-  landed CreateIfAbsent/CasVersion claim primitive that nothing in the
-  repository calls yet.
+- **CompactionClaims** models the advisory compaction claim (ADR-1029): a
+  CreateIfAbsent/CasVersion claim primitive, which the server maintenance tick
+  and the CLI take through ravel-maintain's `ClaimGuard`.
 
 TLC checked these finite models under the bounds and assumptions recorded in
 `results.md`. This model verifies the protocol design; implementation
@@ -191,10 +191,14 @@ parameter.
 
 ## CompactionClaims
 
-CompactionClaims is a proposed design (ADR-1029) over a landed primitive: the
-claim key and its CreateIfAbsent/CasVersion operations exist in
-`crates/ravel-fleet/src/claim.rs`, but no caller wires them into the compaction
-pipeline, so this model checks the design, not shipped behaviour.
+CompactionClaims models the advisory compaction claim (ADR-1029). The claim key
+and its CreateIfAbsent/CasVersion operations are in
+`crates/ravel-fleet/src/claim.rs`. The compaction pipeline takes the claim
+through `ClaimGuard` (`crates/ravel-maintain/src/claim_guard.rs`), whose
+`checkpoint` renews it and cancels the run once it is lost or gone. The server
+maintenance tick installs it unless `--maintain-claims off` sets coordination
+off, and the CLI installs it unless `--no-claim` is given.
+The model checks the protocol that guard implements.
 
 ### What it establishes
 
