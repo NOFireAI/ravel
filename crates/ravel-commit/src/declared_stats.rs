@@ -21,17 +21,24 @@
 //!   half-present min/max pair, a min above its max, an empty name, a null
 //!   count that disagrees with the carrying record's row count, or a
 //!   duplicate column all leave that one column uncovered for that segment
-//!   and are counted for the caller's defect metric. The record itself still
-//!   decodes: a bad statistic must not make a durable commit record
-//!   unreadable.
-//! - **Two clauses belong to the record, not to the entry.** Clauses 4 and 5
+//!   and are counted for the caller's defect metric. So does an ADR-4628
+//!   decision 2 defect in the sum or zero count (fields 6 to 8): both sum
+//!   fields present, a `sum_wide` that is not 16 bytes or holds a value that
+//!   fits i64, a sum on a column that is not I64, a nonzero sum or zero
+//!   count over no non-null value, a nonzero zero count when the type's zero
+//!   lies outside `[min, max]`, a sum outside the bounds the non-null count
+//!   allows, or a zero count above the non-null count or, when min and max
+//!   are both the zero, below it. The record itself still decodes: a bad
+//!   statistic must not make a durable commit record unreadable.
+//! - **Some clauses belong to the record, not to the entry.** Clauses 4 and 5
 //!   of the predicate compare `null_count` against the segment's row count,
 //!   which no `DeclaredColumnMinMax` carries: for a stamp it is the carrying
 //!   record's own `sample_count` (`CommitRecord` field 11, `CompactionPart`
-//!   field 6). So [`decode`] stays carrier-agnostic and [`read_commit_record`],
-//!   [`read_compaction_part`], and [`read_snapshot_entry_twin`] are where those
-//!   two clauses bind, and because those two clauses are exactly the row-count
-//!   gate, they are the
+//!   field 6). The ADR-4628 clauses that compare the sum and the zero count
+//!   with the non-null count need that row count too. So [`decode`] stays
+//!   carrier-agnostic and [`read_commit_record`], [`read_compaction_part`],
+//!   and [`read_snapshot_entry_twin`] are where those clauses bind, and
+//!   because clauses 4 and 5 are exactly the row-count gate, they are the
 //!   only functions that produce a [`ValidatedDeclaredStats`] (ADR-0873
 //!   decision 2, "where the predicate binds": coverage is unconstructable
 //!   without the full predicate).
