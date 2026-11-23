@@ -31,7 +31,8 @@ use ravel_proto::commit::v1::{
     declared_column_stat_value::Kind,
 };
 use ravel_types::declared_stats::{
-    DeclaredColumnStat, DeclaredStatType, DeclaredStatValue, TYPED_ATTR_COLUMN_TYPE_F64,
+    DeclaredColumnStat, DeclaredStatError, DeclaredStatType, DeclaredStatValue,
+    TYPED_ATTR_COLUMN_TYPE_F64,
 };
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
@@ -165,6 +166,9 @@ fn f64_tagged_entry(name: &str) -> DeclaredColumnMinMax {
             kind: Some(Kind::I64(9)),
         }),
         null_count: 0,
+        sum: None,
+        sum_wide: Vec::new(),
+        zero_count: None,
     }
 }
 
@@ -387,4 +391,278 @@ fn both_read_routes_yield_the_validated_form() {
     let from_record: ValidatedDeclaredStats = read_commit_record(&decoded_record(entries.clone()));
     let from_part: ValidatedDeclaredStats = read_compaction_part(&decoded_part(entries));
     assert_eq!(from_record.covered(), from_part.covered());
+}
+
+// ADR-4628 decision 2: one corrupt-input case per validity clause of the sum
+// (fields 6 and 7) and the zero count (field 8). Each asserts the entry is
+// dropped whole with the clause's reason, the counter moves by exactly one
+// under the label of the carrier read, and no other label moves.
+
+/// Read `entry` alone through `carrier`'s read function on a carrier of
+/// [`SAMPLE_COUNT`] rows, and assert it is dropped for `reason` and counted
+/// once under that carrier.
+fn assert_counted_drop(
+    carrier: StatCarrier,
+    entry: DeclaredColumnMinMax,
+    reason: DeclaredStatDefect,
+) {
+    let name = entry.name.clone();
+    let (read, delta, others) = with_delta(carrier, || match carrier {
+        StatCarrier::CommitRecord => read_commit_record(&decoded_record(vec![entry])),
+        StatCarrier::CompactionPart => read_compaction_part(&decoded_part(vec![entry])),
+        StatCarrier::SnapshotEntry => read_snapshot_entry_twin(&decoded_record(vec![entry])),
+        StatCarrier::Cstat => unreachable!("no stamp reader reads under cstat"),
+    });
+    assert!(read.covered().is_empty(), "covered: {:?}", read.covered());
+    assert_eq!(read.dropped().len(), 1);
+    assert_eq!(read.dropped()[0].name, name);
+    assert_eq!(read.dropped()[0].reason, reason);
+    assert_eq!(delta, 1, "one drop under {}", carrier.label());
+    assert_eq!(others, 0, "no drop under any other label");
+}
+
+/// An I64 entry over [`SAMPLE_COUNT`] rows with `null_count` NULLs.
+fn i64_entry(min: i64, max: i64, null_count: u64) -> DeclaredColumnMinMax {
+    encode(&i64_stat("UserID", min, max, null_count))
+}
+
+fn bool_entry(min: bool, max: bool) -> DeclaredColumnMinMax {
+    encode(
+        &DeclaredColumnStat::new(
+            "IsRefresh",
+            DeclaredStatType::Bool,
+            Some(DeclaredStatValue::Bool(min)),
+            Some(DeclaredStatValue::Bool(max)),
+            0,
+        )
+        .expect("valid bool stat"),
+    )
+}
+
+fn wide(sum: i128) -> Vec<u8> {
+    sum.to_le_bytes().to_vec()
+}
+
+/// Each field alone would be valid here: the narrow sum and the wide one
+/// both lie inside `[100 * 1, 100 * i64::MAX]`. So a decoder that silently
+/// preferred either field would cover the entry.
+#[test]
+fn sum_clause_both_sum_fields_present_is_a_counted_drop() {
+    let mut entry = i64_entry(1, i64::MAX, 0);
+    entry.sum = Some(1_000);
+    entry.sum_wide = wide(i128::from(i64::MAX) + 1);
+    let alone_narrow = DeclaredColumnMinMax {
+        sum_wide: Vec::new(),
+        ..entry.clone()
+    };
+    let alone_wide = DeclaredColumnMinMax {
+        sum: None,
+        ..entry.clone()
+    };
+    for alone in [alone_narrow, alone_wide] {
+        let read = read_commit_record(&decoded_record(vec![alone]));
+        assert_eq!(read.covered().len(), 1, "each field alone is valid");
+    }
+    assert_counted_drop(
+        StatCarrier::CommitRecord,
+        entry,
+        DeclaredStatDefect::BothSumFields {
+            name: "UserID".to_string(),
+        },
+    );
+}
+
+#[test]
+fn sum_clause_sum_wide_length_other_than_16_is_a_counted_drop() {
+    for len in [1usize, 8, 15, 17, 32] {
+        let mut entry = i64_entry(1, i64::MAX, 0);
+        entry.sum_wide = vec![0x7f; len];
+        assert_counted_drop(
+            StatCarrier::CompactionPart,
+            entry,
+            DeclaredStatDefect::SumWideLength {
+                name: "UserID".to_string(),
+                len,
+            },
+        );
+    }
+}
+
+#[test]
+fn sum_clause_sum_wide_holding_a_value_that_fits_i64_is_a_counted_drop() {
+    for sum in [0, 100, i128::from(i64::MAX), i128::from(i64::MIN)] {
+        let mut entry = i64_entry(i64::MIN, i64::MAX, 0);
+        entry.sum_wide = wide(sum);
+        assert_counted_drop(
+            StatCarrier::SnapshotEntry,
+            entry,
+            DeclaredStatDefect::SumWideFitsI64 {
+                name: "UserID".to_string(),
+                sum,
+            },
+        );
+    }
+}
+
+#[test]
+fn sum_clause_sum_on_a_column_that_is_not_i64_is_a_counted_drop() {
+    let mut narrow = bool_entry(false, true);
+    narrow.sum = Some(1);
+    let mut wide_sum = bool_entry(false, true);
+    wide_sum.sum_wide = wide(i128::from(i64::MAX) + 1);
+    for entry in [narrow, wide_sum] {
+        assert_counted_drop(
+            StatCarrier::CommitRecord,
+            entry,
+            DeclaredStatDefect::Invalid(DeclaredStatError::SumOnNonI64 {
+                name: "IsRefresh".to_string(),
+                declared: DeclaredStatType::Bool,
+            }),
+        );
+    }
+}
+
+/// 90 non-null values in `[-3, 7]` sum to at least -270 and at most 630.
+#[test]
+fn sum_clause_sum_below_non_null_times_min_is_a_counted_drop() {
+    let mut entry = i64_entry(-3, 7, 10);
+    entry.sum = Some(-271);
+    assert_counted_drop(
+        StatCarrier::CompactionPart,
+        entry,
+        DeclaredStatDefect::SumOutsideBounds {
+            name: "UserID".to_string(),
+            sum: -271,
+            non_null: 90,
+            low: -270,
+            high: 630,
+        },
+    );
+    let mut edge = i64_entry(-3, 7, 10);
+    edge.sum = Some(-270);
+    assert_eq!(
+        read_compaction_part(&decoded_part(vec![edge]))
+            .covered()
+            .len(),
+        1,
+        "the bound itself is valid"
+    );
+}
+
+#[test]
+fn sum_clause_sum_above_non_null_times_max_is_a_counted_drop() {
+    let mut entry = i64_entry(-3, 7, 10);
+    entry.sum = Some(631);
+    assert_counted_drop(
+        StatCarrier::SnapshotEntry,
+        entry,
+        DeclaredStatDefect::SumOutsideBounds {
+            name: "UserID".to_string(),
+            sum: 631,
+            non_null: 90,
+            low: -270,
+            high: 630,
+        },
+    );
+    // A wide sum past the bound of a column that spans the i64 range.
+    let mut entry = i64_entry(i64::MIN, i64::MAX, 0);
+    let high = 100 * i128::from(i64::MAX);
+    entry.sum_wide = wide(high + 1);
+    assert_counted_drop(
+        StatCarrier::CommitRecord,
+        entry,
+        DeclaredStatDefect::SumOutsideBounds {
+            name: "UserID".to_string(),
+            sum: high + 1,
+            non_null: 100,
+            low: 100 * i128::from(i64::MIN),
+            high,
+        },
+    );
+}
+
+#[test]
+fn sum_clause_nonzero_sum_with_zero_non_null_rows_is_a_counted_drop() {
+    let mut entry = encode(
+        &DeclaredColumnStat::new("UserID", DeclaredStatType::I64, None, None, SAMPLE_COUNT)
+            .expect("all-null stat"),
+    );
+    entry.sum = Some(5);
+    assert_counted_drop(
+        StatCarrier::CommitRecord,
+        entry,
+        DeclaredStatDefect::Invalid(DeclaredStatError::NonzeroSumWithoutValues {
+            name: "UserID".to_string(),
+            sum: 5,
+        }),
+    );
+}
+
+#[test]
+fn zero_count_clause_zero_count_above_the_non_null_count_is_a_counted_drop() {
+    let mut entry = i64_entry(-3, 7, 10);
+    entry.zero_count = Some(91);
+    assert_counted_drop(
+        StatCarrier::CompactionPart,
+        entry,
+        DeclaredStatDefect::ZeroCountAboveNonNull {
+            name: "UserID".to_string(),
+            zero_count: 91,
+            non_null: 90,
+        },
+    );
+}
+
+#[test]
+fn zero_count_clause_nonzero_zero_count_with_zero_outside_min_max_is_a_counted_drop() {
+    let mut above = i64_entry(1, 7, 0);
+    above.zero_count = Some(1);
+    let mut below = i64_entry(-7, -1, 0);
+    below.zero_count = Some(1);
+    for entry in [above, below] {
+        assert_counted_drop(
+            StatCarrier::SnapshotEntry,
+            entry,
+            DeclaredStatDefect::Invalid(DeclaredStatError::ZeroCountOutsideRange {
+                name: "UserID".to_string(),
+                zero_count: 1,
+            }),
+        );
+    }
+    let mut all_true = bool_entry(true, true);
+    all_true.zero_count = Some(1);
+    assert_counted_drop(
+        StatCarrier::CommitRecord,
+        all_true,
+        DeclaredStatDefect::Invalid(DeclaredStatError::ZeroCountOutsideRange {
+            name: "IsRefresh".to_string(),
+            zero_count: 1,
+        }),
+    );
+}
+
+#[test]
+fn zero_count_clause_zero_count_below_non_null_when_min_max_are_zero_is_a_counted_drop() {
+    let mut entry = i64_entry(0, 0, 10);
+    entry.zero_count = Some(89);
+    assert_counted_drop(
+        StatCarrier::CommitRecord,
+        entry,
+        DeclaredStatDefect::ZeroCountBelowNonNullAllZero {
+            name: "UserID".to_string(),
+            zero_count: 89,
+            non_null: 90,
+        },
+    );
+    let mut all_false = bool_entry(false, false);
+    all_false.zero_count = Some(99);
+    assert_counted_drop(
+        StatCarrier::CompactionPart,
+        all_false,
+        DeclaredStatDefect::ZeroCountBelowNonNullAllZero {
+            name: "IsRefresh".to_string(),
+            zero_count: 99,
+            non_null: 100,
+        },
+    );
 }

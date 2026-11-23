@@ -15,6 +15,14 @@
 //! unrepresentable: [`DeclaredColumnStat::new`] is the only constructor, and
 //! it refuses an ineligible declared type, a value whose kind disagrees with
 //! the declared type, a half-present min/max pair, and a min above its max.
+//!
+//! The sum and zero count of ADR-4628 are set afterwards through
+//! [`DeclaredColumnStat::with_sum`] and [`DeclaredColumnStat::with_zero_count`],
+//! which refuse what the stat alone can show is inconsistent: a sum on a
+//! column that is not I64, a nonzero sum or zero count over a column with no
+//! non-null value, and a nonzero zero count when the type's zero lies outside
+//! `[min, max]`. The clauses that need the object's row count bind where that
+//! count is known, in the commit-family reader.
 
 use std::fmt;
 
@@ -149,6 +157,19 @@ pub enum DeclaredStatError {
         min: DeclaredStatValue,
         max: DeclaredStatValue,
     },
+    #[error(
+        "declared column {name:?} is declared {declared} but carries a sum; only I64 columns carry one (ADR-4628 decision 2)"
+    )]
+    SumOnNonI64 {
+        name: String,
+        declared: DeclaredStatType,
+    },
+    #[error("declared column {name:?} has no non-null value but carries the nonzero sum {sum}")]
+    NonzeroSumWithoutValues { name: String, sum: i128 },
+    #[error(
+        "declared column {name:?}: zero count {zero_count} is nonzero but the type's zero lies outside [min, max]"
+    )]
+    ZeroCountOutsideRange { name: String, zero_count: u64 },
 }
 
 /// Exact whole-object statistics for one declared typed attribute column: the
@@ -166,6 +187,8 @@ pub struct DeclaredColumnStat {
     min: Option<DeclaredStatValue>,
     max: Option<DeclaredStatValue>,
     null_count: u64,
+    sum: Option<i128>,
+    zero_count: Option<u64>,
 }
 
 impl DeclaredColumnStat {
@@ -219,7 +242,53 @@ impl DeclaredColumnStat {
             min,
             max,
             null_count,
+            sum: None,
+            zero_count: None,
         })
+    }
+
+    /// Attach the exact sum of the column's non-null values (ADR-4628
+    /// decision 2). Refused on a column that is not I64, and when the stat
+    /// states zero non-null values (absent extrema) but the sum is nonzero.
+    pub fn with_sum(mut self, sum: i128) -> Result<Self, DeclaredStatError> {
+        if self.declared_type != DeclaredStatType::I64 {
+            return Err(DeclaredStatError::SumOnNonI64 {
+                name: self.name,
+                declared: self.declared_type,
+            });
+        }
+        if self.min.is_none() && sum != 0 {
+            return Err(DeclaredStatError::NonzeroSumWithoutValues {
+                name: self.name,
+                sum,
+            });
+        }
+        self.sum = Some(sum);
+        Ok(self)
+    }
+
+    /// Attach the count of non-null rows equal to the type's zero: 0 for I64,
+    /// `false` for BOOL (ADR-4628 decision 2). A nonzero count is refused when
+    /// the zero lies outside `[min, max]`, which includes a stat with no
+    /// non-null value.
+    pub fn with_zero_count(mut self, zero_count: u64) -> Result<Self, DeclaredStatError> {
+        if zero_count != 0 && !self.zero_in_range() {
+            return Err(DeclaredStatError::ZeroCountOutsideRange {
+                name: self.name,
+                zero_count,
+            });
+        }
+        self.zero_count = Some(zero_count);
+        Ok(self)
+    }
+
+    /// Whether the type's zero lies inside `[min, max]`. False when the
+    /// extrema are absent.
+    pub fn zero_in_range(&self) -> bool {
+        match (self.min, self.max) {
+            (Some(min), Some(max)) => min.order_rank() <= 0 && 0 <= max.order_rank(),
+            _ => false,
+        }
     }
 
     /// The declared column's name: the attribute key verbatim, which is also
@@ -250,6 +319,19 @@ impl DeclaredColumnStat {
     /// type).
     pub const fn null_count(&self) -> u64 {
         self.null_count
+    }
+
+    /// The exact sum of the column's non-null values, or `None` when the
+    /// writer recorded none. Only an I64 column carries one. Absence means
+    /// the sum is unknown, never zero.
+    pub const fn sum(&self) -> Option<i128> {
+        self.sum
+    }
+
+    /// The count of non-null rows equal to the type's zero, or `None` when
+    /// the writer recorded none. Absence means unknown, never zero.
+    pub const fn zero_count(&self) -> Option<u64> {
+        self.zero_count
     }
 }
 
@@ -403,5 +485,104 @@ mod tests {
         assert_eq!(stat.min(), Some(DeclaredStatValue::I64(i64::MIN)));
         assert_eq!(stat.max(), Some(DeclaredStatValue::I64(i64::MAX)));
         assert_eq!(stat.null_count(), u64::MAX);
+    }
+
+    #[test]
+    fn sum_and_zero_count_start_absent_and_are_set_by_their_methods() {
+        let stat = DeclaredColumnStat::new(
+            "UserID",
+            DeclaredStatType::I64,
+            Some(DeclaredStatValue::I64(-1)),
+            Some(DeclaredStatValue::I64(i64::MAX)),
+            3,
+        )
+        .expect("valid stat");
+        assert_eq!(stat.sum(), None);
+        assert_eq!(stat.zero_count(), None);
+        let wide = i128::from(i64::MAX) * 3;
+        let stat = stat
+            .with_sum(wide)
+            .expect("i64 sum")
+            .with_zero_count(2)
+            .expect("zero in range");
+        assert_eq!(stat.sum(), Some(wide));
+        assert_eq!(stat.zero_count(), Some(2));
+        assert_eq!(stat.min(), Some(DeclaredStatValue::I64(-1)));
+        assert_eq!(stat.max(), Some(DeclaredStatValue::I64(i64::MAX)));
+        assert_eq!(stat.null_count(), 3);
+    }
+
+    #[test]
+    fn with_sum_refuses_a_bool_column() {
+        let stat = DeclaredColumnStat::new(
+            "flag",
+            DeclaredStatType::Bool,
+            Some(DeclaredStatValue::Bool(false)),
+            Some(DeclaredStatValue::Bool(true)),
+            0,
+        )
+        .expect("valid bool stat");
+        assert_eq!(
+            stat.clone().with_sum(1),
+            Err(DeclaredStatError::SumOnNonI64 {
+                name: "flag".to_string(),
+                declared: DeclaredStatType::Bool,
+            })
+        );
+        assert_eq!(stat.with_zero_count(4).map(|s| s.zero_count()), Ok(Some(4)));
+    }
+
+    #[test]
+    fn with_sum_refuses_a_nonzero_sum_over_no_values() {
+        let stat = DeclaredColumnStat::new("UserID", DeclaredStatType::I64, None, None, 7)
+            .expect("all-null stat");
+        assert_eq!(
+            stat.clone().with_sum(-1),
+            Err(DeclaredStatError::NonzeroSumWithoutValues {
+                name: "UserID".to_string(),
+                sum: -1,
+            })
+        );
+        let stat = stat
+            .with_sum(0)
+            .expect("zero sum")
+            .with_zero_count(0)
+            .expect("zero count");
+        assert_eq!(stat.sum(), Some(0));
+        assert_eq!(stat.zero_count(), Some(0));
+    }
+
+    #[test]
+    fn with_zero_count_refuses_a_nonzero_count_when_zero_is_outside_min_max() {
+        let cases = [
+            (
+                DeclaredStatType::I64,
+                Some(DeclaredStatValue::I64(1)),
+                Some(DeclaredStatValue::I64(9)),
+            ),
+            (
+                DeclaredStatType::I64,
+                Some(DeclaredStatValue::I64(-9)),
+                Some(DeclaredStatValue::I64(-1)),
+            ),
+            (
+                DeclaredStatType::Bool,
+                Some(DeclaredStatValue::Bool(true)),
+                Some(DeclaredStatValue::Bool(true)),
+            ),
+            (DeclaredStatType::I64, None, None),
+        ];
+        for (ty, min, max) in cases {
+            let stat = DeclaredColumnStat::new("c", ty, min, max, 0).expect("valid stat");
+            assert!(!stat.zero_in_range());
+            assert_eq!(
+                stat.clone().with_zero_count(1),
+                Err(DeclaredStatError::ZeroCountOutsideRange {
+                    name: "c".to_string(),
+                    zero_count: 1,
+                })
+            );
+            assert_eq!(stat.with_zero_count(0).map(|s| s.zero_count()), Ok(Some(0)));
+        }
     }
 }

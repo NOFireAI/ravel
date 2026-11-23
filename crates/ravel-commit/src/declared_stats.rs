@@ -234,6 +234,48 @@ pub enum DeclaredStatDefect {
     /// name carries this reason, including the first.
     #[error("duplicate entry for declared column {0:?}")]
     DuplicateName(String),
+    /// ADR-4628 decision 2: fields 6 (`sum`) and 7 (`sum_wide`) are both
+    /// present. A sum has one encoding, and a reader that preferred either
+    /// field would be picking between two claims.
+    #[error("declared column {name:?}: sum and sum_wide are both present")]
+    BothSumFields { name: String },
+    /// `sum_wide` (field 7) is present with a length other than 16 bytes.
+    #[error("declared column {name:?}: sum_wide is {len} bytes, not 16")]
+    SumWideLength { name: String, len: usize },
+    /// `sum_wide` (field 7) holds a value that fits i64, which belongs in
+    /// field 6.
+    #[error("declared column {name:?}: sum_wide holds {sum}, which fits i64 and belongs in sum")]
+    SumWideFitsI64 { name: String, sum: i128 },
+    /// The sum lies outside `[non_null * min, non_null * max]`.
+    #[error(
+        "declared column {name:?}: sum {sum} lies outside [{low}, {high}], the bounds {non_null} non-null values between min and max allow"
+    )]
+    SumOutsideBounds {
+        name: String,
+        sum: i128,
+        non_null: u64,
+        low: i128,
+        high: i128,
+    },
+    /// More zero-valued rows than non-null rows.
+    #[error(
+        "declared column {name:?}: zero_count {zero_count} exceeds the non-null count {non_null}"
+    )]
+    ZeroCountAboveNonNull {
+        name: String,
+        zero_count: u64,
+        non_null: u64,
+    },
+    /// `min == max == 0` (or `false`) states every non-null row is the zero,
+    /// so a zero count below the non-null count contradicts the extrema.
+    #[error(
+        "declared column {name:?}: min and max are both the zero, so zero_count {zero_count} must equal the non-null count {non_null}"
+    )]
+    ZeroCountBelowNonNullAllZero {
+        name: String,
+        zero_count: u64,
+        non_null: u64,
+    },
 }
 
 /// One dropped entry, with its position in the record's list so a defect
@@ -312,13 +354,27 @@ fn value_from_proto(value: &DeclaredColumnStatValue) -> Option<DeclaredStatValue
 
 /// Encode one typed stat for the wire. Infallible: a [`DeclaredColumnStat`]
 /// cannot hold an ineligible type or an inconsistent pair.
+///
+/// A sum that fits i64 goes to field 6 and one that does not goes to field 7
+/// as 16 bytes little-endian two's complement, never both (ADR-4628
+/// decision 1).
 pub fn encode(stat: &DeclaredColumnStat) -> DeclaredColumnMinMax {
+    let (sum, sum_wide) = match stat.sum() {
+        None => (None, Vec::new()),
+        Some(sum) => match i64::try_from(sum) {
+            Ok(narrow) => (Some(narrow), Vec::new()),
+            Err(_) => (None, sum.to_le_bytes().to_vec()),
+        },
+    };
     DeclaredColumnMinMax {
         name: stat.name().to_string(),
         declared_type: stat.declared_type().tag(),
         min: stat.min().map(value_to_proto),
         max: stat.max().map(value_to_proto),
         null_count: stat.null_count(),
+        sum,
+        sum_wide,
+        zero_count: stat.zero_count(),
     }
 }
 
@@ -345,14 +401,52 @@ pub fn decode(entry: &DeclaredColumnMinMax) -> Result<DeclaredColumnStat, Declar
     };
     let min = extremum(&entry.min, "min")?;
     let max = extremum(&entry.max, "max")?;
-    DeclaredColumnStat::new(
+    let sum = decode_sum(entry)?;
+    let mut stat = DeclaredColumnStat::new(
         entry.name.clone(),
         declared_type,
         min,
         max,
         entry.null_count,
-    )
-    .map_err(DeclaredStatDefect::from)
+    )?;
+    if let Some(sum) = sum {
+        stat = stat.with_sum(sum)?;
+    }
+    if let Some(zero_count) = entry.zero_count {
+        stat = stat.with_zero_count(zero_count)?;
+    }
+    Ok(stat)
+}
+
+/// Fields 6 and 7 as one optional sum, refusing the encodings ADR-4628
+/// decision 2 rules out: both fields, a wide field that is not 16 bytes, and
+/// a wide field holding a value field 6 could carry.
+fn decode_sum(entry: &DeclaredColumnMinMax) -> Result<Option<i128>, DeclaredStatDefect> {
+    if entry.sum_wide.is_empty() {
+        return Ok(entry.sum.map(i128::from));
+    }
+    if entry.sum.is_some() {
+        return Err(DeclaredStatDefect::BothSumFields {
+            name: entry.name.clone(),
+        });
+    }
+    let bytes: [u8; 16] =
+        entry
+            .sum_wide
+            .as_slice()
+            .try_into()
+            .map_err(|_| DeclaredStatDefect::SumWideLength {
+                name: entry.name.clone(),
+                len: entry.sum_wide.len(),
+            })?;
+    let sum = i128::from_le_bytes(bytes);
+    if i64::try_from(sum).is_ok() {
+        return Err(DeclaredStatDefect::SumWideFitsI64 {
+            name: entry.name.clone(),
+            sum,
+        });
+    }
+    Ok(Some(sum))
 }
 
 /// Clauses 4 and 5 of the predicate, checked against the row count of the
@@ -378,7 +472,7 @@ fn row_count_defect(stat: &DeclaredColumnStat, sample_count: u64) -> Option<Decl
     let extrema = match (stat.min(), stat.max()) {
         (None, None) if null_count != sample_count => "absent",
         (Some(_), Some(_)) if null_count == sample_count => "present",
-        _ => return None,
+        _ => return aggregate_defect(stat, sample_count - null_count),
     };
     Some(DeclaredStatDefect::PresenceDisagreesWithNullCount {
         name: stat.name().to_string(),
@@ -386,6 +480,61 @@ fn row_count_defect(stat: &DeclaredColumnStat, sample_count: u64) -> Option<Decl
         null_count,
         sample_count,
     })
+}
+
+/// The ADR-4628 decision 2 clauses that compare the sum and the zero count
+/// with the non-null count. Runs only after clauses 4 and 5 hold, so
+/// `non_null` is exact and is zero exactly when the extrema are absent.
+fn aggregate_defect(stat: &DeclaredColumnStat, non_null: u64) -> Option<DeclaredStatDefect> {
+    let name = || stat.name().to_string();
+    if let Some(sum) = stat.sum() {
+        let rank = |value: Option<DeclaredStatValue>| match value {
+            Some(DeclaredStatValue::I64(v)) => i128::from(v),
+            Some(DeclaredStatValue::Bool(b)) => i128::from(b),
+            None => 0,
+        };
+        // |non_null| <= 2^64 - 1 and |extremum| <= 2^63, so neither product
+        // leaves i128.
+        let n = i128::from(non_null);
+        let low = n.saturating_mul(rank(stat.min()));
+        let high = n.saturating_mul(rank(stat.max()));
+        if sum < low || sum > high {
+            return Some(DeclaredStatDefect::SumOutsideBounds {
+                name: name(),
+                sum,
+                non_null,
+                low,
+                high,
+            });
+        }
+    }
+    if let Some(zero_count) = stat.zero_count() {
+        if zero_count > non_null {
+            return Some(DeclaredStatDefect::ZeroCountAboveNonNull {
+                name: name(),
+                zero_count,
+                non_null,
+            });
+        }
+        let all_zero = matches!(
+            (stat.min(), stat.max()),
+            (
+                Some(DeclaredStatValue::I64(0)),
+                Some(DeclaredStatValue::I64(0))
+            ) | (
+                Some(DeclaredStatValue::Bool(false)),
+                Some(DeclaredStatValue::Bool(false))
+            )
+        );
+        if all_zero && zero_count < non_null {
+            return Some(DeclaredStatDefect::ZeroCountBelowNonNullAllZero {
+                name: name(),
+                zero_count,
+                non_null,
+            });
+        }
+    }
+    None
 }
 
 /// The shared read pass, and the sole constructor of [`ValidatedDeclaredStats`].
@@ -765,6 +914,9 @@ mod tests {
                 min: None,
                 max: None,
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             DeclaredColumnMinMax {
                 name: "Payload".to_string(),
@@ -772,6 +924,9 @@ mod tests {
                 min: None,
                 max: None,
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             DeclaredColumnMinMax {
                 name: "Ratio".to_string(),
@@ -779,6 +934,9 @@ mod tests {
                 min: None,
                 max: None,
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             DeclaredColumnMinMax {
                 name: "Unset".to_string(),
@@ -786,6 +944,9 @@ mod tests {
                 min: None,
                 max: None,
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             encode(&i64_stat("EventDate", 1, 2, 0)),
         ];
@@ -853,6 +1014,9 @@ mod tests {
                     kind: Some(Kind::B(true)),
                 }),
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             // min present, max absent.
             DeclaredColumnMinMax {
@@ -863,6 +1027,9 @@ mod tests {
                 }),
                 max: None,
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             // min above max.
             DeclaredColumnMinMax {
@@ -875,6 +1042,9 @@ mod tests {
                     kind: Some(Kind::I64(8)),
                 }),
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             // Present value message with no kind set.
             DeclaredColumnMinMax {
@@ -883,6 +1053,9 @@ mod tests {
                 min: Some(DeclaredColumnStatValue { kind: None }),
                 max: Some(DeclaredColumnStatValue { kind: None }),
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             // Empty column name.
             DeclaredColumnMinMax {
@@ -891,6 +1064,9 @@ mod tests {
                 min: None,
                 max: None,
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
         ];
         let read = decode_all(&entries);
@@ -1527,6 +1703,9 @@ mod tests {
                 min: min.map(|v| DeclaredColumnStatValue { kind: Some(Kind::I64(v)) }),
                 max: max.map(|v| DeclaredColumnStatValue { kind: Some(Kind::I64(v)) }),
                 null_count,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             };
             match decode(&entry) {
                 Ok(stat) => {
@@ -1588,5 +1767,354 @@ mod tests {
             3,
             "three observations under cstat must land on the cstat pair exactly"
         );
+    }
+
+    // ADR-4628: the sum (fields 6 and 7) and the zero count (field 8).
+
+    /// The bounds ADR-4628 decision 2 gives for a sum: an object holds at
+    /// most 2^64 - 1 rows of i64 values.
+    const MAX_ROWS: u64 = u64::MAX;
+
+    /// A valid I64 stat over `rows` rows, all non-null, with the given sum
+    /// and zero count.
+    fn i64_sum_stat(
+        min: i64,
+        max: i64,
+        null_count: u64,
+        sum: Option<i128>,
+        zero_count: Option<u64>,
+    ) -> DeclaredColumnStat {
+        let mut stat = i64_stat("UserID", min, max, null_count);
+        if let Some(sum) = sum {
+            stat = stat.with_sum(sum).expect("sum is entry-locally valid");
+        }
+        if let Some(zero_count) = zero_count {
+            stat = stat
+                .with_zero_count(zero_count)
+                .expect("zero count is entry-locally valid");
+        }
+        stat
+    }
+
+    /// The field that carries the sum on the wire: `Some(false)` for field 6,
+    /// `Some(true)` for field 7, `None` for no sum. Panics on both, which the
+    /// encoder must never write.
+    fn sum_field(wire: &DeclaredColumnMinMax) -> Option<bool> {
+        match (wire.sum.is_some(), !wire.sum_wide.is_empty()) {
+            (false, false) => None,
+            (true, false) => Some(false),
+            (false, true) => Some(true),
+            (true, true) => panic!("encoder wrote both sum fields"),
+        }
+    }
+
+    /// Encode `stat` onto a commit record of `sample_count` rows, through the
+    /// commit wire and through the catalog mirror's wire, and read it back
+    /// through both. Returns the commit-side wire entry for field assertions.
+    fn round_trip_both_mirrors(
+        stat: &DeclaredColumnStat,
+        sample_count: u64,
+    ) -> Result<DeclaredColumnMinMax, TestCaseError> {
+        let mut record = base_record();
+        record.sample_count = sample_count;
+        stamp_commit_record(&mut record, std::slice::from_ref(stat));
+        let decoded = record::decode(&record::encode(&record)).expect("record decodes");
+        let read = read_commit_record(&decoded);
+        prop_assert!(read.dropped().is_empty(), "dropped: {:?}", read.dropped());
+        prop_assert_eq!(read.covered(), std::slice::from_ref(stat));
+
+        // The catalog mirror has the same field numbers, so the commit
+        // entry's bytes decode as it and its bytes decode back unchanged.
+        let wire = decoded.declared_column_stats[0].clone();
+        let mirror =
+            ravel_proto::catalog::v1::DeclaredColumnMinMax::decode(wire.encode_to_vec().as_slice())
+                .expect("catalog mirror decodes");
+        prop_assert_eq!(mirror.sum, wire.sum);
+        prop_assert_eq!(&mirror.sum_wide, &wire.sum_wide);
+        prop_assert_eq!(mirror.zero_count, wire.zero_count);
+        let back = DeclaredColumnMinMax::decode(mirror.encode_to_vec().as_slice())
+            .expect("commit entry decodes from the mirror's bytes");
+        prop_assert_eq!(&back, &wire);
+        let twin = CommitRecord {
+            sample_count,
+            declared_column_stats: vec![back],
+            ..Default::default()
+        };
+        let read = read_snapshot_entry_twin(&twin);
+        prop_assert!(read.dropped().is_empty(), "dropped: {:?}", read.dropped());
+        prop_assert_eq!(read.covered(), std::slice::from_ref(stat));
+        Ok(wire)
+    }
+
+    /// Asserts field 6 carries a sum exactly when it fits i64, and field 7
+    /// carries it as 16 bytes little-endian otherwise.
+    fn assert_sum_field(wire: &DeclaredColumnMinMax, sum: i128) -> Result<(), TestCaseError> {
+        match i64::try_from(sum) {
+            Ok(narrow) => {
+                prop_assert_eq!(
+                    sum_field(wire),
+                    Some(false),
+                    "sum {} belongs in field 6",
+                    sum
+                );
+                prop_assert_eq!(wire.sum, Some(narrow));
+            }
+            Err(_) => {
+                prop_assert_eq!(
+                    sum_field(wire),
+                    Some(true),
+                    "sum {} belongs in field 7",
+                    sum
+                );
+                prop_assert_eq!(wire.sum_wide.len(), 16);
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&wire.sum_wide);
+                prop_assert_eq!(i128::from_le_bytes(bytes), sum);
+            }
+        }
+        Ok(())
+    }
+
+    /// The sum boundaries the property test must cover, each with the stat it
+    /// is valid on and the field that must carry it.
+    #[test]
+    fn sum_boundaries_pick_field_six_or_seven_and_round_trip() {
+        let low_extreme = -i128::from(MAX_ROWS) * (1i128 << 63);
+        let high_extreme = i128::from(MAX_ROWS) * i128::from(i64::MAX);
+        let cases: [(i128, bool); 7] = [
+            (0, false),
+            (i128::from(i64::MAX), false),
+            (i128::from(i64::MIN), false),
+            (i128::from(i64::MAX) + 1, true),
+            (i128::from(i64::MIN) - 1, true),
+            (low_extreme, true),
+            (high_extreme, true),
+        ];
+        for (sum, wide) in cases {
+            // Over u64::MAX rows spanning the whole i64 range, every case
+            // lies inside [n * min, n * max].
+            let stat = i64_sum_stat(i64::MIN, i64::MAX, 0, Some(sum), Some(1));
+            let wire = round_trip_both_mirrors(&stat, MAX_ROWS).expect("round trip");
+            assert_eq!(sum_field(&wire), Some(wide), "sum {sum}");
+            assert_sum_field(&wire, sum).expect("field choice");
+        }
+        assert_eq!(low_extreme, -(i128::from(u64::MAX) << 63));
+        assert!(low_extreme > i128::MIN && high_extreme < i128::MAX);
+    }
+
+    /// A sum drawn from the boundary points and from anywhere in the range.
+    fn sum_in(low: i128, high: i128) -> impl Strategy<Value = i128> {
+        let specials = vec![
+            0,
+            i128::from(i64::MAX),
+            i128::from(i64::MIN),
+            i128::from(i64::MAX) + 1,
+            i128::from(i64::MIN) - 1,
+            low,
+            high,
+        ];
+        prop_oneof![
+            prop::sample::select(specials),
+            any::<i128>(),
+            any::<i64>().prop_map(i128::from),
+        ]
+        .prop_map(move |s| s.clamp(low, high))
+    }
+
+    /// A row count, with u64::MAX and the small counts weighted in.
+    fn rows_strategy() -> impl Strategy<Value = u64> {
+        prop_oneof![Just(MAX_ROWS), 1u64..4, any::<u64>().prop_map(|n| n.max(1)),]
+    }
+
+    fn special_i64() -> impl Strategy<Value = i64> {
+        prop_oneof![
+            prop::sample::select(vec![
+                i64::MIN,
+                i64::MIN + 1,
+                -1,
+                0,
+                1,
+                i64::MAX - 1,
+                i64::MAX
+            ]),
+            any::<i64>(),
+        ]
+    }
+
+    /// A valid I64 or BOOL stat carrying any combination of the new fields,
+    /// with the row count of the record that carries it.
+    fn summed_stat_strategy() -> impl Strategy<Value = (DeclaredColumnStat, u64)> {
+        let i64_entry = (
+            rows_strategy(),
+            any::<u64>(),
+            special_i64(),
+            special_i64(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<u64>(),
+        )
+            .prop_flat_map(|(rows, nulls, a, b, has_sum, has_zero, zero_seed)| {
+                let null_count = nulls % rows;
+                let non_null = rows - null_count;
+                let (min, max) = if a <= b { (a, b) } else { (b, a) };
+                let low = i128::from(non_null) * i128::from(min);
+                let high = i128::from(non_null) * i128::from(max);
+                sum_in(low, high).prop_map(move |sum| {
+                    let zero_count = if min == 0 && max == 0 {
+                        non_null
+                    } else if min <= 0 && 0 <= max {
+                        zero_seed % (non_null.saturating_add(1)).max(1)
+                    } else {
+                        0
+                    };
+                    let stat = i64_sum_stat(
+                        min,
+                        max,
+                        null_count,
+                        has_sum.then_some(sum),
+                        has_zero.then_some(zero_count),
+                    );
+                    (stat, rows)
+                })
+            });
+        let bool_entry = (
+            rows_strategy(),
+            any::<u64>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<u64>(),
+        )
+            .prop_map(|(rows, nulls, a, b, zero_seed)| {
+                let null_count = nulls % rows;
+                let non_null = rows - null_count;
+                let (min, max) = if a <= b { (a, b) } else { (b, a) };
+                let zero_count = match (min, max) {
+                    (false, false) => non_null,
+                    (false, true) => zero_seed % non_null.saturating_add(1).max(1),
+                    _ => 0,
+                };
+                let stat = DeclaredColumnStat::new(
+                    "IsRefresh",
+                    DeclaredStatType::Bool,
+                    Some(DeclaredStatValue::Bool(min)),
+                    Some(DeclaredStatValue::Bool(max)),
+                    null_count,
+                )
+                .expect("valid bool stat")
+                .with_zero_count(zero_count)
+                .expect("valid zero count");
+                (stat, rows)
+            });
+        let all_null = (rows_strategy(), any::<bool>(), any::<bool>()).prop_map(
+            |(rows, has_sum, has_zero)| {
+                let mut stat =
+                    DeclaredColumnStat::new("UserID", DeclaredStatType::I64, None, None, rows)
+                        .expect("all-null stat");
+                if has_sum {
+                    stat = stat.with_sum(0).expect("zero sum over no values");
+                }
+                if has_zero {
+                    stat = stat.with_zero_count(0).expect("zero count over no values");
+                }
+                (stat, rows)
+            },
+        );
+        prop_oneof![4 => i64_entry, 2 => bool_entry, 1 => all_null]
+    }
+
+    proptest! {
+        /// T1 of issue #4664: every valid entry carrying the new fields
+        /// encodes and decodes to itself through both mirrors, with the sum
+        /// on field 6 exactly when it fits i64 and on field 7 otherwise.
+        #[test]
+        fn summed_stats_round_trip_through_both_mirrors(
+            (stat, rows) in summed_stat_strategy()
+        ) {
+            let wire = round_trip_both_mirrors(&stat, rows)?;
+            match stat.sum() {
+                Some(sum) => assert_sum_field(&wire, sum)?,
+                None => prop_assert_eq!(sum_field(&wire), None),
+            }
+            prop_assert_eq!(wire.zero_count, stat.zero_count());
+            if stat.declared_type() == DeclaredStatType::Bool {
+                prop_assert_eq!(sum_field(&wire), None);
+            }
+        }
+    }
+
+    /// The bytes the encoder wrote for this entry before ADR-4628, derived
+    /// from the proto encoding of fields 1 to 5: name "EventDate", I64 (2),
+    /// min -5 (zigzag 9), max 19,000 (zigzag 38,000), null count 12.
+    const PRE_4628_ENTRY_BYTES: &[u8] = &[
+        0x0a, 0x09, b'E', b'v', b'e', b'n', b't', b'D', b'a', b't', b'e', // name
+        0x10, 0x02, // declared_type
+        0x1a, 0x02, 0x08, 0x09, // min { i64: -5 }
+        0x22, 0x04, 0x08, 0xf0, 0xa8, 0x02, // max { i64: 19000 }
+        0x28, 0x0c, // null_count
+    ];
+
+    /// T3 of issue #4664, older writer: an entry with no field 6 to 8 decodes
+    /// to the same typed entry as before, with the new fields absent, and an
+    /// entry without them still encodes to the same bytes.
+    #[test]
+    fn an_entry_without_the_new_fields_decodes_as_before() {
+        let expected = i64_stat("EventDate", -5, 19_000, 12);
+        let wire = DeclaredColumnMinMax::decode(PRE_4628_ENTRY_BYTES).expect("entry decodes");
+        assert_eq!(wire.sum, None);
+        assert!(wire.sum_wide.is_empty());
+        assert_eq!(wire.zero_count, None);
+        let stat = decode(&wire).expect("entry is valid");
+        assert_eq!(stat, expected);
+        assert_eq!(stat.sum(), None);
+        assert_eq!(stat.zero_count(), None);
+        assert_eq!(encode(&expected).encode_to_vec(), PRE_4628_ENTRY_BYTES);
+    }
+
+    /// `DeclaredColumnMinMax` as a reader that predates ADR-4628 decodes it:
+    /// fields 1 to 5 only, so fields 6 to 8 are skipped as unknown.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Pre4628DeclaredColumnMinMax {
+        #[prost(string, tag = "1")]
+        name: String,
+        #[prost(uint32, tag = "2")]
+        declared_type: u32,
+        #[prost(message, optional, tag = "3")]
+        min: Option<DeclaredColumnStatValue>,
+        #[prost(message, optional, tag = "4")]
+        max: Option<DeclaredColumnStatValue>,
+        #[prost(uint64, tag = "5")]
+        null_count: u64,
+    }
+
+    /// T3 of issue #4664, older reader: an entry written with the new fields,
+    /// decoded by a schema without them, gives the same min, max and null
+    /// count and is still covered.
+    #[test]
+    fn an_older_reader_sees_the_same_min_max_and_null_count() {
+        let wide = i128::from(i64::MAX) + 7;
+        for stat in [
+            i64_sum_stat(1, i64::MAX, 0, Some(wide), Some(0)),
+            i64_sum_stat(-5, 19_000, 12, Some(-60), Some(3)),
+        ] {
+            let bytes = encode(&stat).encode_to_vec();
+            let old = Pre4628DeclaredColumnMinMax::decode(bytes.as_slice()).expect("old decode");
+            assert_eq!(old.null_count, stat.null_count());
+            // What the old reader holds, as the message it would decode.
+            let seen = DeclaredColumnMinMax::decode(old.encode_to_vec().as_slice())
+                .expect("old fields decode");
+            assert_eq!(seen.sum, None);
+            assert!(seen.sum_wide.is_empty());
+            assert_eq!(seen.zero_count, None);
+            let mut record = base_record();
+            record.sample_count = 1_000;
+            record.declared_column_stats = vec![seen];
+            let read = read_commit_record(&record::decode(&record::encode(&record)).expect("rec"));
+            assert!(read.dropped().is_empty());
+            let old_view = read.column("UserID").expect("covered for the old reader");
+            assert_eq!(old_view.min(), stat.min());
+            assert_eq!(old_view.max(), stat.max());
+            assert_eq!(old_view.null_count(), stat.null_count());
+            assert_eq!(old_view.sum(), None);
+        }
     }
 }

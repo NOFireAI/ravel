@@ -48,6 +48,9 @@ fn arb_declared_stat() -> impl Strategy<Value = DeclaredColumnMinMax> {
             min,
             max,
             null_count,
+            sum: None,
+            sum_wide: Vec::new(),
+            zero_count: None,
         },
     )
 }
