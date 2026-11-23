@@ -368,6 +368,10 @@ jobs:
       # no toolchain, no PMU and no build.
       - name: Sample-PGO build script cases (issue #4527)
         run: bash scripts/build-pgo.test.sh
+      # The copy of nextest's `hash:M/N` partition rule that sizes the shard
+      # matrices (ADR-4583 decision 4), against recorded CI log lines.
+      - name: nextest partition simulator cases (issue #4593)
+        run: bash scripts/nextest-partition-sim.test.sh
       # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is
       # the last stage's, so a real failure piped through tail/grep would report
       # as a pass. No cargo toolchain, matching this job.
