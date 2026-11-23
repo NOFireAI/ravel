@@ -465,7 +465,7 @@ pub struct FoldReport {
     /// is on. Equal to the length of `metrics_series_index_over_cap_parts`.
     pub metrics_series_index_parts_over_cap: u64,
     /// One element per part `metrics_series_index_parts_over_cap` counts, in
-    /// the order the publishing attempt built them: its leaf bytes against
+    /// part order: its leaf bytes against
     /// its cap, the bytes and pairs of each of the three fields, and its
     /// class and series counts. Empty when that counter is zero.
     pub metrics_series_index_over_cap_parts: Vec<SeriesIndexOverCapPart>,

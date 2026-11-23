@@ -228,8 +228,10 @@ pub struct SeriesIndexOverCapPart {
     /// The encoded leaf bytes of each of the three fields, summing to
     /// `leaf_bytes`. `None` exactly when `leaf_bytes` is.
     pub field_bytes: Option<BTreeMap<String, u64>>,
-    /// The body bytes of the leaf slice the encoder refused because one key
-    /// passed the leaf body ceiling; `None` on the byte-cap branch.
+    /// The body bytes that passed the leaf body ceiling: one key's run when
+    /// the slice split refuses it, which is the usual path, or a whole leaf
+    /// slice when that leaf's encode refuses it. `None` on the byte-cap
+    /// branch.
     pub body_bytes: Option<u64>,
     /// The leaf body ceiling that key passed; `None` on the byte-cap branch.
     pub body_ceiling: Option<u64>,

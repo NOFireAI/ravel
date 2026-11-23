@@ -574,12 +574,9 @@ fn fixture_series_pairs() -> BTreeMap<String, u64> {
 const FIXTURE_CLASSES: u64 = 5;
 const FIXTURE_SERIES: u64 = 6;
 
-/// An over-cap part is reported with its sizes: the published part's hash,
-/// the 1,026 leaf bytes against the 1,025-byte cap, each field's bytes equal
-/// to the leaves a fold under a cap it fits publishes for that field, and
-/// the fixture's pairs, class and series counts.
-#[tokio::test]
-async fn a_part_over_the_series_cap_reports_each_field_and_its_classes() {
+/// Each series field's leaf bytes, summed per field, as a fold under a cap
+/// the fixture fits (5,350 ppm) publishes them.
+async fn fixture_published_series_bytes() -> BTreeMap<String, u64> {
     let (_, built_report, built_head) = fold_fixture_at_ppm(5_350).await;
     assert_eq!(built_report.metrics_series_index_over_cap_parts, Vec::new());
     let mut published_bytes: BTreeMap<String, u64> = BTreeMap::new();
@@ -589,6 +586,21 @@ async fn a_part_over_the_series_cap_reports_each_field_and_its_classes() {
         }
     }
     assert_eq!(published_bytes.len(), 3, "{published_bytes:?}");
+    assert_eq!(
+        published_bytes.values().sum::<u64>(),
+        FIXTURE_SERIES_LEAF_BYTES,
+        "{published_bytes:?}"
+    );
+    published_bytes
+}
+
+/// An over-cap part is reported with its sizes: the published part's hash,
+/// the 1,026 leaf bytes against the 1,025-byte cap, each field's bytes equal
+/// to the leaves a fold under a cap it fits publishes for that field, and
+/// the fixture's pairs, class and series counts.
+#[tokio::test]
+async fn a_part_over_the_series_cap_reports_each_field_and_its_classes() {
+    let published_bytes = fixture_published_series_bytes().await;
 
     let (_, report, head) = fold_fixture_at_ppm(5_349).await;
     assert_eq!(report.metrics_series_index_parts_over_cap, 1, "{report:?}");
@@ -1161,6 +1173,11 @@ async fn rebuild_key_index_defers_a_failed_read_and_counts_a_part_over_the_cap()
     assert_eq!(detail.part_blake3, hex_encode(&head.parts[0].blake3));
     assert_eq!(detail.leaf_bytes, Some(FIXTURE_SERIES_LEAF_BYTES));
     assert_eq!(detail.cap, FIXTURE_SERIES_LEAF_BYTES - 1);
+    assert_eq!(
+        detail.field_bytes,
+        Some(fixture_published_series_bytes().await)
+    );
+    assert_eq!((detail.body_bytes, detail.body_ceiling), (None, None));
     assert_eq!(detail.field_pairs, fixture_series_pairs());
     assert_eq!(
         (detail.classes, detail.series),
