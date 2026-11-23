@@ -1407,7 +1407,11 @@ async fn merge_catalogs_with_geometry(
     // Resolve the merged attribute view's stream-level half once for the whole
     // output (ADR-0873 decision 3, issue #1057): every stream's blob is right
     // here, decoded once, rather than re-derived per record in the fold.
-    let declared = Arc::new(DeclaredSchema::build(&declared, &merged));
+    let declared = Arc::new(DeclaredSchema::build(
+        &declared,
+        &merged,
+        config.emit_declared_stat_aggregates,
+    ));
 
     // The output descriptor, generation, and bloom scope all come from one
     // input, the highest-generation one (ADR-2135 decisions 2 and 5).
@@ -4148,7 +4152,7 @@ async fn merge_in_unit(
         block_target_records: config.rlog_run_block_target_records,
         write_version: output.writer.write_version,
     });
-    let run_declared = Arc::new(DeclaredSchema::build(&[], &BTreeMap::new()));
+    let run_declared = Arc::new(DeclaredSchema::build(&[], &BTreeMap::new(), false));
     let group_len = usize::try_from(layout.group_size).unwrap_or(usize::MAX);
     let runs_count = inputs.div_ceil(group_len);
     if let Some(l) = &ledger {
@@ -6305,23 +6309,62 @@ fn declared_columns_from_inputs(inputs: &[InputRecord]) -> Vec<(String, Declared
     seen.into_iter().collect()
 }
 
-/// Running min/max and non-null row count for one declared column over the
-/// records pushed to the part. `min <= max` holds by construction (both start at
-/// the first value and only widen), so a stamp built from it never trips the
-/// reader's `min <= max` clause.
+/// A value kind a declared column's [`Running`] folds: what it sums (nothing
+/// for BOOL) and which value is its zero (ADR-4628 decision 2).
+trait RunningValue: Ord + Copy {
+    type Sum: Copy;
+    fn sum_of(self) -> Self::Sum;
+    fn add_to(self, sum: &mut Self::Sum);
+    fn is_zero(self) -> bool;
+}
+
+impl RunningValue for i64 {
+    type Sum = i128;
+    fn sum_of(self) -> i128 {
+        i128::from(self)
+    }
+    // A part holds at most u64::MAX rows, and (2^64 - 1) * 2^63 fits i128,
+    // so the exact sum cannot overflow (ADR-4628 decision 2).
+    fn add_to(self, sum: &mut i128) {
+        *sum += i128::from(self);
+    }
+    fn is_zero(self) -> bool {
+        self == 0
+    }
+}
+
+impl RunningValue for bool {
+    type Sum = ();
+    fn sum_of(self) {}
+    fn add_to(self, _sum: &mut ()) {}
+    fn is_zero(self) -> bool {
+        !self
+    }
+}
+
+/// Running min/max, non-null row count, zero count and (I64 only) exact sum
+/// for one declared column over the records pushed to the part. `min <= max`
+/// holds by construction (both start at the first value and only widen), so a
+/// stamp built from it never trips the reader's `min <= max` clause. Every
+/// value enters through [`Self::start`] or [`Self::observe`], so the sum and
+/// the zero count cover exactly the rows `non_null` counts.
 #[derive(Clone, Copy)]
-struct Running<T> {
+struct Running<T: RunningValue> {
     min: T,
     max: T,
     non_null: u64,
+    zero_count: u64,
+    sum: T::Sum,
 }
 
-impl<T: Ord + Copy> Running<T> {
+impl<T: RunningValue> Running<T> {
     fn start(v: T) -> Self {
         Running {
             min: v,
             max: v,
             non_null: 1,
+            zero_count: u64::from(v.is_zero()),
+            sum: v.sum_of(),
         }
     }
 
@@ -6333,6 +6376,10 @@ impl<T: Ord + Copy> Running<T> {
             self.max = v;
         }
         self.non_null += 1;
+        if v.is_zero() {
+            self.zero_count += 1;
+        }
+        v.add_to(&mut self.sum);
     }
 }
 
@@ -6400,6 +6447,9 @@ struct DeclaredSchema {
     /// then stamps nothing rather than an affirmative statement over a view the
     /// fold could not resolve.
     unresolved: bool,
+    /// Whether stamps carry the sum and zero count
+    /// ([`CompactorConfig::emit_declared_stat_aggregates`]).
+    emit_aggregates: bool,
 }
 
 impl DeclaredSchema {
@@ -6409,6 +6459,7 @@ impl DeclaredSchema {
     fn build(
         declared: &[(String, DeclaredStatType)],
         streams: &BTreeMap<LogStreamId, Vec<u8>>,
+        emit_aggregates: bool,
     ) -> Self {
         let mut schema = DeclaredSchema {
             cols: declared.to_vec(),
@@ -6419,6 +6470,7 @@ impl DeclaredSchema {
                 .collect(),
             fallbacks: HashMap::new(),
             unresolved: false,
+            emit_aggregates,
         };
         if declared.is_empty() {
             return schema;
@@ -6632,34 +6684,70 @@ impl DeclaredStatAccum {
     /// returned stat is valid by construction (`min <= max` from [`Running`],
     /// `null_count = sample_count - non_null`), so `read_compaction_part` drops
     /// none of them.
+    ///
+    /// Unless the schema withholds them, every stamp also carries the zero
+    /// count and, for I64, the exact sum, both over this part's rows only
+    /// (ADR-4628 decision 3); an I64 column with no non-null row stamps sum 0
+    /// and zero count 0.
     fn build_stamps(&self, sample_count: u64) -> Vec<DeclaredColumnStat> {
         if self.schema.unresolved {
             return Vec::new();
         }
         let mut out = Vec::new();
         for (c, (name, ty)) in self.cols.iter().zip(self.schema.cols.iter()) {
-            let observed = match ty {
-                DeclaredStatType::I64 => c.i64_run.map(|r| {
-                    (
-                        DeclaredStatValue::I64(r.min),
-                        DeclaredStatValue::I64(r.max),
-                        r.non_null,
-                    )
-                }),
-                DeclaredStatType::Bool => c.bool_run.map(|r| {
-                    (
-                        DeclaredStatValue::Bool(r.min),
-                        DeclaredStatValue::Bool(r.max),
-                        r.non_null,
-                    )
-                }),
+            let (observed, sum, zero_count) = match ty {
+                DeclaredStatType::I64 => (
+                    c.i64_run.map(|r| {
+                        (
+                            DeclaredStatValue::I64(r.min),
+                            DeclaredStatValue::I64(r.max),
+                            r.non_null,
+                        )
+                    }),
+                    Some(c.i64_run.map_or(0, |r| r.sum)),
+                    c.i64_run.map_or(0, |r| r.zero_count),
+                ),
+                DeclaredStatType::Bool => (
+                    c.bool_run.map(|r| {
+                        (
+                            DeclaredStatValue::Bool(r.min),
+                            DeclaredStatValue::Bool(r.max),
+                            r.non_null,
+                        )
+                    }),
+                    None,
+                    c.bool_run.map_or(0, |r| r.zero_count),
+                ),
             };
-            if let Some(stat) = build_one(name, *ty, observed, sample_count) {
+            let Some(stat) = build_one(name, *ty, observed, sample_count) else {
+                continue;
+            };
+            let stat = if self.schema.emit_aggregates {
+                with_aggregates(stat, sum, zero_count)
+            } else {
+                Some(stat)
+            };
+            if let Some(stat) = stat {
                 out.push(stat);
             }
         }
         out
     }
+}
+
+/// Attach the sum (I64 only) and the zero count to `stat`, or `None` when the
+/// typed form refuses either, which drops the column's stamp exactly as
+/// [`build_one`] drops a refused triple.
+fn with_aggregates(
+    stat: DeclaredColumnStat,
+    sum: Option<i128>,
+    zero_count: u64,
+) -> Option<DeclaredColumnStat> {
+    let stat = match sum {
+        Some(sum) => stat.with_sum(sum).ok()?,
+        None => stat,
+    };
+    stat.with_zero_count(zero_count).ok()
 }
 
 /// Build one declared-column stamp, or `None` when the accumulated non-null
@@ -9539,7 +9627,11 @@ mod tests {
         // `DeclaredSchema` indexes by name, so each declared type is folded in
         // its own pass rather than declaring `k` twice in one schema.
         let stamp_at = |ty: DeclaredStatType| -> DeclaredColumnStat {
-            let schema = Arc::new(DeclaredSchema::build(&[("k".to_string(), ty)], &streams));
+            let schema = Arc::new(DeclaredSchema::build(
+                &[("k".to_string(), ty)],
+                &streams,
+                true,
+            ));
             let mut accum = DeclaredStatAccum::new(schema);
             for r in &rebuilt {
                 accum.observe_record(r);
@@ -9572,6 +9664,11 @@ mod tests {
             3,
             "the Bool, Bytes and Str winners are NULL for a declared I64"
         );
+        assert_eq!(
+            (i64_stat.sum(), i64_stat.zero_count()),
+            (Some(10), Some(0)),
+            "the sum covers the two winning 5s only"
+        );
         let bool_stat = stamps
             .iter()
             .find(|s| s.declared_type() == DeclaredStatType::Bool)
@@ -9582,6 +9679,11 @@ mod tests {
             bool_stat.null_count(),
             4,
             "only the record whose winner is a Bool is non-null"
+        );
+        assert_eq!(
+            (bool_stat.sum(), bool_stat.zero_count()),
+            (None, Some(0)),
+            "a BOOL column carries no sum"
         );
     }
 
