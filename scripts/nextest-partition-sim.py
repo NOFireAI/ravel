@@ -20,8 +20,8 @@ codes and a leading timestamp are stripped.
   simulate ... --band N:LO:HI      also exit 1 when the slowest leg's summed
                                    seconds at N legs fall outside [LO, HI]
 
-Exit codes: 0 ok, 1 a misassignment or a band miss, 2 no test lines found
-or unreadable input, 64 usage.
+Exit codes: 0 ok, 1 a misassignment or a band miss, 2 a leg log with no
+result line or an unreadable one, 64 usage.
 """
 
 import argparse
@@ -94,8 +94,11 @@ def xxh64(data, seed=0):
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # `PASS [   1.234s] (  12/4102) ravel-sql::esql stack::the_widest...`; the
 # binary id never contains a space, the test name follows it.
+# Any terminal status nextest prints with a duration and a `(k/n)` count:
+# PASS, FAIL, TIMEOUT, SIGSEGV, LEAK, ABORT and the like, so a test that
+# timed out or crashed still counts on its leg.
 RESULT = re.compile(
-    r"\b(?:PASS|FAIL)\s+\[\s*([0-9.]+)s\]\s+\(\s*\d+/\d+\)\s+(\S+)\s+(\S.*?)\s*$"
+    r"\b([A-Z][A-Z0-9-]+)\s+\[\s*([0-9.]+)s\]\s+\(\s*\d+/\d+\)\s+(\S+)\s+(\S.*?)\s*$"
 )
 
 
@@ -113,16 +116,20 @@ def read_leg(path):
     for line in text.splitlines():
         m = RESULT.search(ANSI.sub("", line))
         if m:
-            secs, binary, name = m.groups()
+            _, secs, binary, name = m.groups()
             tests[(binary, name)] = float(secs)
     return [(b, n, s) for (b, n), s in tests.items()]
 
 
 def read_legs(paths):
+    """Every leg's tests; a leg whose log holds no result line (missing,
+    truncated, or the wrong job) stops the run rather than passing as a leg
+    with nothing on it."""
     legs = [read_leg(p) for p in paths]
-    total = sum(len(t) for t in legs)
-    if total == 0:
-        print("nextest-partition-sim: no nextest result lines in the input", file=sys.stderr)
+    empty = [p for p, tests in zip(paths, legs) if not tests]
+    if empty:
+        for p in empty:
+            print(f"nextest-partition-sim: no nextest result lines in {p}", file=sys.stderr)
         sys.exit(2)
     return legs
 
@@ -168,6 +175,9 @@ def cmd_simulate(args):
         return 64
     if not counts or min(counts) < 1:
         print("nextest-partition-sim: --legs wants positive counts", file=sys.stderr)
+        return 64
+    if args.parallelism <= 0:
+        print("nextest-partition-sim: --parallelism wants a positive number", file=sys.stderr)
         return 64
     bands = [parse_band(b) for b in args.band]
     slowest = {}

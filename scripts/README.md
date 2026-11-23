@@ -147,7 +147,9 @@ connection, a pushed-but-broken main).
   and the slowest leg's estimated wall time (summed seconds over
   `--parallelism`, 3.8 by default for a four-vCPU runner), and `--band
   N:LO:HI` exits 1 when the slowest leg at N legs falls outside the band.
-  Exit 2 is input with no nextest result lines. Cases in
+  Every terminal status nextest prints with a duration counts (PASS, FAIL,
+  TIMEOUT, a signal). Exit 2 is a leg log with no result line, which is how
+  a missing or truncated log shows up. Cases in
   `scripts/nextest-partition-sim.test.sh`, run by CI's `doc-scripts-rest`.
 - `scripts/fleet-result-inspect.sh <task-id>`: fetches a dispatched
   task's result branch and prints its commits and diff scope vs `main`,
