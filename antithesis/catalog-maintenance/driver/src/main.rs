@@ -32,7 +32,7 @@ mod token;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -66,8 +66,6 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WINDOW_SLACK_NS: u64 = 600 * 1_000_000_000;
 const NS_PER_HOUR: u64 = 3_600_000_000_000;
 const CLI_TIMEOUT_S: u32 = 300;
-/// The shard count the servers and every `ravel-cli` call use.
-const SHARDS: u32 = 4;
 /// Compaction records one audit decodes for their inputs, at most.
 const DECODES_PER_AUDIT: usize = 16;
 /// Everything setup waits on, the seeded load included, finishes within
@@ -288,6 +286,12 @@ struct Shared {
     max_writes: usize,
     /// The HEAD key, learned from the first `catalog inspect --json`.
     head_key: Mutex<Option<String>>,
+    /// The tenant's logs provisioning record, `t/<tenant hash>/l/prov`.
+    prov_key: String,
+    /// The tenant's shard ceiling as of `shards_hour` ([`Shared::shards`]).
+    shards: AtomicU32,
+    /// The unix hour, by the driver's clock, `shards` was read for.
+    shards_hour: AtomicU64,
     /// Whether an audit has seen a compaction record, for the multiset
     /// check's details.
     compacted: AtomicBool,
@@ -821,7 +825,7 @@ impl Shared {
             if !self.fold() {
                 println!("sweep jump: the fold after the horizon jump failed");
             }
-            let marked = (0..SHARDS).filter(|&shard| self.sweep(shard)).count();
+            let marked = self.sweep_all("sweep jump");
             *lock(&self.sweep_horizon) = Some((horizon, marked));
         }
         let state = *lock(&self.sweep_jumps);
@@ -1101,6 +1105,41 @@ impl Shared {
             .and_then(audit::tenant_prefix)
     }
 
+    /// The tenant's shard ceiling at the driver's current hour, which bounds
+    /// every sweep pass, bucket scan and shard draw. A reshard activates at
+    /// least two hours after it is appended, so the ceiling of an hour never
+    /// changes within it: the cache is read again from the provisioning
+    /// record only once the hour moves, by a clock move or in real time. A
+    /// record that cannot be read keeps the ceiling the cache had, and the
+    /// next call reads it again.
+    fn shards(&self) -> u32 {
+        let hour = now_ns() / NS_PER_HOUR;
+        if self.shards_hour.load(Ordering::SeqCst) != hour {
+            let was = self.shards.load(Ordering::SeqCst);
+            let read = self.store.get(&self.prov_key);
+            match audit::shard_ceiling(&self.prov_key, read, hour, seed::SHARDS) {
+                Ok(ceiling) => {
+                    self.shards.store(ceiling, Ordering::SeqCst);
+                    self.shards_hour.store(hour, Ordering::SeqCst);
+                    if ceiling != was {
+                        println!("shards: the ceiling at hour {hour} is {ceiling}, was {was}");
+                    }
+                }
+                Err(e) => println!("shards: keeping the ceiling {was} at hour {hour}: {e}"),
+            }
+        }
+        self.shards.load(Ordering::SeqCst)
+    }
+
+    /// One sweep of every shard below the ceiling; returns how many
+    /// succeeded.
+    fn sweep_all(&self, what: &str) -> usize {
+        let shards = self.shards();
+        let swept: Vec<u32> = (0..shards).filter(|&shard| self.sweep(shard)).collect();
+        println!("{what}: swept shards {swept:?} of the ceiling {shards}");
+        swept.len()
+    }
+
     /// `ravel-cli maintain sweep` over one shard: every GC rule, deleting.
     fn sweep(&self, shard: u32) -> bool {
         let shard = shard.to_string();
@@ -1190,10 +1229,9 @@ impl Shared {
     }
 
     fn fold(&self) -> bool {
-        let out = self.cli.run(
-            &self.args(&["catalog", "fold", "--shards", "4"]),
-            CLI_TIMEOUT_S,
-        );
+        let out = self
+            .cli
+            .run(&self.args(&["catalog", "fold"]), CLI_TIMEOUT_S);
         if !out.ok() {
             println!("catalog fold: {}", out.summary());
             return false;
@@ -1205,7 +1243,7 @@ impl Shared {
 
     fn compact(&self) -> bool {
         let out = self.cli.run(
-            &self.args(&["maintain", "compact-tenant", "--shards", "4"]),
+            &self.args(&["maintain", "compact-tenant"]),
             CLI_TIMEOUT_S * 2,
         );
         if !out.ok() {
@@ -1315,7 +1353,7 @@ impl Shared {
                 // proxy, so its CAS lands while the server PUT is held.
                 let started = Instant::now();
                 let cli_out = self.cli.run_env(
-                    &self.args(&["catalog", "fold", "--shards", "4", "--json"]),
+                    &self.args(&["catalog", "fold", "--json"]),
                     CLI_TIMEOUT_S,
                     &[("FAKETIME", skewed.as_str())],
                 );
@@ -1419,9 +1457,10 @@ impl Shared {
         for writes in 0..=FILL_WRITES {
             let hour = now_ns() / NS_PER_HOUR;
             let hours = [hour.saturating_sub(1), hour];
+            let shards = self.shards();
             let mut listed = BTreeSet::new();
             for h in hours {
-                for shard in 0..SHARDS {
+                for shard in 0..shards {
                     match self.store.list(&keys::bucket_prefix(prefix, shard, h)) {
                         Ok(keys) => listed.extend(keys),
                         Err(e) => {
@@ -1431,7 +1470,7 @@ impl Shared {
                     }
                 }
             }
-            if let Some(found) = forced::compactable_bucket(prefix, hours, SHARDS, &listed) {
+            if let Some(found) = forced::compactable_bucket(prefix, hours, shards, &listed) {
                 return Some(found);
             }
             if writes == FILL_WRITES {
@@ -1953,8 +1992,6 @@ impl Shared {
                 "footprint",
                 "--tenant",
                 self.tenant.as_str(),
-                "--shards",
-                "4",
                 "--json",
             ],
             CLI_TIMEOUT_S,
@@ -2484,7 +2521,8 @@ impl Workload {
         self.0.halt_if_stopping();
         let s = &self.0;
         let _g = s.enter();
-        let shard = tc.draw(gs::integers::<u32>().min_value(0).max_value(SHARDS - 1));
+        let last = s.shards().saturating_sub(1);
+        let shard = tc.draw(gs::integers::<u32>().min_value(0).max_value(last));
         s.sweep(shard);
     }
 
@@ -2765,9 +2803,7 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     }
     // Past the pinned-query window this sweep deletes the superseded inputs;
     // the audit and the multiset below then run after the deletion.
-    for shard in 0..SHARDS {
-        s.sweep(shard);
-    }
+    s.sweep_all("eventually");
     if !s.fold() {
         println!("eventually: the fold after the sweep failed");
     }
@@ -2981,6 +3017,44 @@ fn seed(cfg: &Config, store: &Store, cli: &Cli, deadline: Instant) -> Plan {
     plan
 }
 
+/// The tenant's provisioning-record key, found through the HEAD key `catalog
+/// inspect --json` prints, with its shard ceiling and the hour it was read
+/// for. Setup gives up rather than start on a guessed ceiling.
+fn read_ceiling(tenant: &str, store: &Store, cli: &Cli, deadline: Instant) -> (String, u32, u64) {
+    let mut found = None;
+    wait_for(
+        "the shard ceiling is read from the provisioning record",
+        deadline,
+        || {
+            let out = cli.run(
+                &[
+                    "catalog", "inspect", "--json", "--tenant", tenant, "--signal", "logs",
+                ],
+                seconds_left(deadline),
+            );
+            if !out.ok() {
+                return Err(format!("catalog inspect --json: {}", out.summary()));
+            }
+            let v: serde_json::Value = serde_json::from_str(&out.stdout)
+                .map_err(|e| format!("catalog inspect --json printed no JSON: {e}"))?;
+            let head_key = v
+                .get("head_key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "catalog inspect --json printed no head_key".to_string())?;
+            let prefix = audit::tenant_prefix(head_key)
+                .ok_or_else(|| format!("unexpected HEAD key {head_key}"))?;
+            let key = audit::provisioning_key(&prefix);
+            let hour = now_ns() / NS_PER_HOUR;
+            let ceiling = audit::shard_ceiling(&key, store.get(&key), hour, seed::SHARDS)
+                .map_err(|e| e.to_string())?;
+            println!("shards: the ceiling at hour {hour} is {ceiling} ({key})");
+            found = Some((key, ceiling, hour));
+            Ok(())
+        },
+    );
+    found.unwrap_or_else(|| die("setup read no shard ceiling"))
+}
+
 /// Refuse to start unless the offset file every container reads holds the
 /// starting offset and the planned jump seals the live hours.
 fn check_clock(plan: &ClockPlan) {
@@ -3024,6 +3098,7 @@ fn main(tc: TestCase) {
         store.list("antithesis/").map(|_| ())
     });
     let plan = seed(&cfg, &store, &cli, setup_deadline);
+    let (prov_key, shards, shards_hour) = read_ceiling(&cfg.tenant, &store, &cli, setup_deadline);
     let seeded = plan.expected(cfg.inject_swap);
     let ravel = Ravel::new(cfg.nodes.clone(), cfg.token.clone()).unwrap_or_else(|e| die(&e));
     let maint = Ravel::new(cfg.maint_nodes.clone(), cfg.token.clone()).unwrap_or_else(|e| die(&e));
@@ -3067,6 +3142,9 @@ fn main(tc: TestCase) {
         acked_hours: Mutex::new(BTreeSet::new()),
         max_writes,
         head_key: Mutex::new(None),
+        prov_key,
+        shards: AtomicU32::new(shards),
+        shards_hour: AtomicU64::new(shards_hour),
         compacted: AtomicBool::new(false),
         clock,
         jump: Mutex::new(None),

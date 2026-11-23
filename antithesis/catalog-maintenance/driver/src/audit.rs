@@ -319,6 +319,152 @@ pub fn tenant_prefix(head_key: &str) -> Option<String> {
     Some(format!("{}/", &head_key[..i]))
 }
 
+/// `t/<tenant_hash>/l/prov`, the tenant's logs provisioning record
+/// (`provisioning_key` in crates/ravel-catalog/src/provisioning.rs).
+pub fn provisioning_key(tenant_prefix: &str) -> String {
+    format!("{tenant_prefix}l/prov")
+}
+
+/// The fields of `ProvisioningRecord` (proto/ravel/sys.proto) the shard
+/// ceiling needs; prost skips the rest.
+#[derive(Clone, PartialEq, prost::Message)]
+struct ProvisioningRecord {
+    #[prost(uint32, tag = "1")]
+    format_version: u32,
+    #[prost(uint32, tag = "4")]
+    shard_count: u32,
+    #[prost(message, repeated, tag = "6")]
+    generations: Vec<ShardGeneration>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ShardGeneration {
+    #[prost(uint32, tag = "1")]
+    generation: u32,
+    #[prost(uint32, tag = "2")]
+    shard_count: u32,
+    #[prost(uint32, tag = "3")]
+    activation_hour: u32,
+}
+
+/// The record format versions ravel-catalog reads.
+const PROVISIONING_READ_VERSIONS: std::ops::RangeInclusive<u32> = 1..=4;
+/// The 4-digit shard field of every object key caps the count.
+const MAX_SHARD_COUNT: u32 = 10_000;
+
+/// Why the shard ceiling could not be read. The driver keeps the ceiling it
+/// had rather than guess one.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CeilingError {
+    /// The GET of the record failed.
+    Read { key: String, detail: String },
+    /// The bytes are not a `ProvisioningRecord`.
+    Decode { key: String, detail: String },
+    /// A `format_version` ravel-catalog does not read.
+    Version { key: String, version: u32 },
+    /// A generation history ravel-catalog's `read_generations` refuses.
+    Generations { key: String, defect: &'static str },
+}
+
+impl std::fmt::Display for CeilingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CeilingError::Read { key, detail } => write!(f, "{key}: the GET failed: {detail}"),
+            CeilingError::Decode { key, detail } => write!(f, "{key}: does not decode: {detail}"),
+            CeilingError::Version { key, version } => {
+                write!(
+                    f,
+                    "{key}: format_version {version} is not one ravel-catalog reads"
+                )
+            }
+            CeilingError::Generations { key, defect } => {
+                write!(
+                    f,
+                    "{key}: the shard-generation history is corrupt: {defect}"
+                )
+            }
+        }
+    }
+}
+
+/// The tenant's shard ceiling at unix hour `hour`: the largest shard count of
+/// any generation activated at or before it, so a decrease keeps the retired
+/// shards in range (`shard_ceiling` in crates/ravel-catalog, which
+/// `maintain compact-tenant` checks `--shards` against). `read` is the GET of
+/// `key`; a record that does not exist is a tenant still at `missing`, the
+/// count the seed loads it at.
+pub fn shard_ceiling(
+    key: &str,
+    read: Result<Option<Vec<u8>>, String>,
+    hour: u64,
+    missing: u32,
+) -> Result<u32, CeilingError> {
+    use prost::Message;
+    let bytes = match read {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(missing),
+        Err(detail) => {
+            return Err(CeilingError::Read {
+                key: key.to_string(),
+                detail,
+            });
+        }
+    };
+    let record =
+        ProvisioningRecord::decode(bytes.as_slice()).map_err(|e| CeilingError::Decode {
+            key: key.to_string(),
+            detail: e.to_string(),
+        })?;
+    if !PROVISIONING_READ_VERSIONS.contains(&record.format_version) {
+        return Err(CeilingError::Version {
+            key: key.to_string(),
+            version: record.format_version,
+        });
+    }
+    let corrupt = |defect| CeilingError::Generations {
+        key: key.to_string(),
+        defect,
+    };
+    let in_range = |count: u32| (1..=MAX_SHARD_COUNT).contains(&count);
+    if record.generations.is_empty() {
+        return if in_range(record.shard_count) {
+            Ok(record.shard_count)
+        } else {
+            Err(corrupt("shard_count out of range"))
+        };
+    }
+    if record.generations[0].shard_count != record.shard_count {
+        return Err(corrupt(
+            "generation 0's count is not the scalar shard_count",
+        ));
+    }
+    let mut ceiling = 0;
+    for (i, g) in record.generations.iter().enumerate() {
+        if usize::try_from(g.generation).ok() != Some(i) {
+            return Err(corrupt("generations are not dense from 0"));
+        }
+        if !in_range(g.shard_count) {
+            return Err(corrupt("a generation's count is out of range"));
+        }
+        match i.checked_sub(1).map(|p| &record.generations[p]) {
+            None if g.activation_hour != 0 => {
+                return Err(corrupt("generation 0 does not activate at hour 0"));
+            }
+            Some(prev) if g.activation_hour <= prev.activation_hour => {
+                return Err(corrupt("activation hours do not increase"));
+            }
+            Some(prev) if g.shard_count == prev.shard_count => {
+                return Err(corrupt("adjacent generations have the same count"));
+            }
+            _ => {}
+        }
+        if u64::from(g.activation_hour) <= hour {
+            ceiling = ceiling.max(g.shard_count);
+        }
+    }
+    Ok(ceiling)
+}
+
 /// Compaction records (`l1.<input_set_hash16>.cmt`) among the listed logs
 /// commit keys under `tenant_prefix`.
 pub fn compaction_records<'a>(
@@ -720,5 +866,144 @@ parts: 1
                 "t/0a0b/l/c/0000/20261117T16/5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1.00000000000000000007.cmt"
             ]
         );
+    }
+
+    const PROV: &str = "t/0a0b/l/prov";
+    const SEED: u32 = 4;
+
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+
+    fn uint_field(tag: u64, v: u64, out: &mut Vec<u8>) {
+        varint(tag << 3, out);
+        varint(v, out);
+    }
+
+    fn bytes_field(tag: u64, b: &[u8], out: &mut Vec<u8>) {
+        varint((tag << 3) | 2, out);
+        varint(b.len() as u64, out);
+        out.extend_from_slice(b);
+    }
+
+    /// A `ProvisioningRecord` on the wire with every field of
+    /// proto/ravel/sys.proto set, so the decode is shown to skip the fields
+    /// it does not declare. `gens` is `(shard_count, activation_hour)` per
+    /// generation; empty is a record from before generations existed, at
+    /// `scalar` shards.
+    fn record(version: u32, scalar: u32, gens: &[(u32, u32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        uint_field(1, u64::from(version), &mut out);
+        bytes_field(2, &[0xab; 16], &mut out);
+        uint_field(3, 2, &mut out);
+        uint_field(4, u64::from(scalar), &mut out);
+        varint((5 << 3) | 1, &mut out);
+        out.extend_from_slice(&1_764_000_000_000_000_000_i64.to_le_bytes());
+        for (i, (count, activation)) in gens.iter().enumerate() {
+            let mut g = Vec::new();
+            uint_field(1, i as u64, &mut g);
+            uint_field(2, u64::from(*count), &mut g);
+            uint_field(3, u64::from(*activation), &mut g);
+            uint_field(4, 1_764_000_000_000_000_000, &mut g);
+            bytes_field(6, &g, &mut out);
+        }
+        bytes_field(
+            7,
+            &[0x0a, 0x04, b'r', b'l', b'o', b'g', 0x10, 0x02],
+            &mut out,
+        );
+        uint_field(8, 3, &mut out);
+        out
+    }
+
+    fn ceiling_at(bytes: Vec<u8>, hour: u32) -> Result<u32, CeilingError> {
+        shard_ceiling(PROV, Ok(Some(bytes)), u64::from(hour), SEED)
+    }
+
+    #[test]
+    fn provisioning_key_is_the_tenants_logs_record() {
+        assert_eq!(provisioning_key("t/0a0b/"), PROV);
+    }
+
+    #[test]
+    fn ceiling_follows_the_generations_activated_by_the_hour() {
+        let up = 498_721;
+        let down = up + 3;
+        let history = record(3, 4, &[(4, 0), (6, up), (4, down)]);
+        // Before the increase activates, after it, and after the decrease back
+        // to 4: shards 4 and 5 keep their data, so the ceiling stays 6.
+        assert_eq!(ceiling_at(history.clone(), up - 1), Ok(4));
+        assert_eq!(ceiling_at(history.clone(), up), Ok(6));
+        assert_eq!(ceiling_at(history.clone(), down), Ok(6));
+        assert_eq!(ceiling_at(history, down + 100), Ok(6));
+        assert_eq!(ceiling_at(record(4, 4, &[(4, 0), (6, up)]), up + 1), Ok(6));
+        // A record from before generations existed: its scalar count.
+        assert_eq!(ceiling_at(record(1, 4, &[]), up), Ok(4));
+        assert_eq!(ceiling_at(record(2, 6, &[]), up), Ok(6));
+    }
+
+    #[test]
+    fn missing_record_is_the_seed_count() {
+        assert_eq!(shard_ceiling(PROV, Ok(None), 498_721, SEED), Ok(SEED));
+    }
+
+    #[test]
+    fn unreadable_record_is_a_typed_error() {
+        let hour = 498_721;
+        assert_eq!(
+            shard_ceiling(PROV, Err("503 SlowDown".to_string()), 498_721, SEED),
+            Err(CeilingError::Read {
+                key: PROV.to_string(),
+                detail: "503 SlowDown".to_string()
+            })
+        );
+        assert!(matches!(
+            ceiling_at(
+                b"antithesis: not a provisioning record \xff\xff\xff".to_vec(),
+                hour
+            ),
+            Err(CeilingError::Decode { .. })
+        ));
+        assert!(matches!(
+            ceiling_at(vec![0x08, 0xff, 0xff], hour),
+            Err(CeilingError::Decode { .. })
+        ));
+        assert_eq!(
+            ceiling_at(record(5, 4, &[(4, 0)]), hour),
+            Err(CeilingError::Version {
+                key: PROV.to_string(),
+                version: 5
+            })
+        );
+        for (scalar, gens) in [
+            (0, vec![]),
+            (6, vec![(4, 0), (6, hour)]),
+            (4, vec![(4, 5), (6, hour)]),
+            (4, vec![(4, 0), (6, hour), (8, hour)]),
+            (4, vec![(4, 0), (4, hour)]),
+            (4, vec![(4, 0), (10_001, hour)]),
+        ] {
+            assert!(
+                matches!(
+                    ceiling_at(record(3, scalar, &gens), hour + 1),
+                    Err(CeilingError::Generations { .. })
+                ),
+                "{scalar} {gens:?}"
+            );
+        }
+        let mut sparse = record(3, 4, &[(4, 0)]);
+        let mut g = Vec::new();
+        uint_field(1, 2, &mut g);
+        uint_field(2, 6, &mut g);
+        uint_field(3, u64::from(hour), &mut g);
+        bytes_field(6, &g, &mut sparse);
+        assert!(matches!(
+            ceiling_at(sparse, hour + 1),
+            Err(CeilingError::Generations { .. })
+        ));
     }
 }
