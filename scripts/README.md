@@ -57,7 +57,7 @@ connection, a pushed-but-broken main).
   `verify-dispatch-gates.sh` and `fleet-result-merge.sh` set for their
   own runs. The merge tier refuses with exit 64 on a host without
   cargo-nextest (install it with
-  `cargo install cargo-nextest@0.9.143 --locked`), because CI runs each
+  `cargo install cargo-nextest@0.9.152 --locked`), because CI runs each
   test in its own process and `cargo test` runs a
   binary's tests in one, so a test that reads process-global state can fail
   under `cargo test` with no defect (#4567 did, three gate runs in a row).

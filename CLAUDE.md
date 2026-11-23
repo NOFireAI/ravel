@@ -228,7 +228,7 @@ ci-opt` to reproduce a failure that appears only in CI); doctests still need
 refuses with exit 64 on a host without cargo-nextest, because `cargo test`
 runs a binary's tests in one process and CI runs each in its own, so a test
 that reads process-global state fails there with no defect. Install it on
-every host that runs a merge gate (`cargo install cargo-nextest@0.9.143
+every host that runs a merge gate (`cargo install cargo-nextest@0.9.152
 --locked`, the version CI pins; `scripts/gates.sh` says where);
 `RAVEL_GATES_ALLOW_CARGO_TEST=1` overrides the refusal.
 
