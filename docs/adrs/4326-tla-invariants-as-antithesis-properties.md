@@ -571,9 +571,12 @@ A step of this kind is legitimate only when all of these hold:
 - It changes only an object that the driver's own concurrent maintenance run
   published inside the race, never a server's in-flight write. No fold,
   query or audit reads the tampered state. The driver holds its write gate
-  for the whole race, a const assertion keeps the race with its waits and
-  undo retries inside the 900 s fold safety margin, and every clock move is
-  refused while an undo is pending.
+  for the whole race. The race ends, undo included, before its hour can
+  seal for the fold, counting the time the clocks advance on their own.
+  The driver bounds every wait, request timeout and undo retry the race
+  makes, and checks their sum against the fold safety margin less the slack
+  its clock nudge already used. Every clock move is refused while an undo is
+  pending.
 - The change is one that the system's contract requires a reader to detect
   and fail closed on, and every assertion the tamper can falsify is named.
   For the first step these are `maintenance: a loser observing a divergent
