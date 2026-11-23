@@ -4,16 +4,18 @@ Status: Proposed. Issue #4628, epic #3231. Builds on ADR-0873 (the
 declared-column stamp on commit records, compaction parts, snapshot entries
 and `SegmentRef`), ADR-0850, ADR-0942 and ADR-1413 (the fold-built `.cstat`),
 ADR-0825 (exact `i128` integer `avg`) and ADR-4233 (the retained-data
-compatibility contract).
+compatibility contract). Depends on issue #4651, a planner change with no
+format change, for Q2 and Q29.
 
 Migration classes touched (ADR-0066 decision 4): class C for three additive
 fields on `DeclaredColumnMinMax`, the message `CommitRecord` field 20 and
 `CompactionPart` field 12 already carry, and the same three fields on its
 mirror in `proto/ravel/catalog.proto`, which `SnapshotEntry` field 15
 carries inside a class B `.csnap` part. No version is bumped: not the commit
-record's `format_version`, not the `.csnap` envelope, not the RLOG trailer.
-Decision 1 states why the two-condition rule for an unversioned proto field
-holds.
+record's `format_version` (`commit-record` family), not the compaction
+record's (`compaction-record` family, versions 1 and 2 by content), not the
+`.csnap` envelope, not the RLOG trailer. Decision 1 states why the
+two-condition rule for an unversioned proto field holds, path by path.
 
 This document and its index row are the whole change. The normative docs
 (`docs/catalog-and-mvcc.md`, `docs/ingest.md`, `docs/query-engine.md`) are
@@ -24,10 +26,12 @@ amended by the tasks that land the code, in the same commits.
 ### The problem
 
 On an unfolded catalog, an aggregate over a whole declared integer column is
-a full scan. The ClickBench entry queries an unfolded catalog (owner
-decision of 2026-10-25, #3243 comment 6397195913), so four statements decode
-a whole column on every call. Statement numbers below are 0-indexed, as in
-the result files:
+a full scan. The ClickBench entry does not fold as part of its load (owner
+decision of 2026-10-25, #3243 comment 6397195913), so a statement that runs
+before the loaded hour seals reads an unfolded catalog, and four statements
+decode a whole column on every call. Statement numbers below are 0-indexed,
+as in the result files; Q1, Q2, Q3 and Q29 are lines 2, 3, 4 and 30 of
+ClickBench's `queries.sql`, the numbering #3231 and #4651 use:
 
 - Q1: `COUNT(*) WHERE "AdvEngineID" <> 0`
 - Q2: `SUM("AdvEngineID"), COUNT(*), AVG("ResolutionWidth")`
@@ -40,6 +44,39 @@ from a `_statistics_projection` fed by `statistics.packed`, and Q1 from a
 count of the column's default value (#3231 comment 7086477633). On
 2026-11-22 the owner reopened the 2026-10-25 ruling for statistics written
 at write time, conditional on that measurement.
+
+**Expected effect (predicted, a what-if).** With Q1, Q2, Q3 and Q29 at the
+time of line 1 (Q0), the hot geomean ratio against ClickHouse's 2026-11-22
+rows goes from 6.60 to 4.71 on c6a.large and from 3.95 to 3.38 on
+c6a.4xlarge (#4651, recomputed 2026-11-23 from `ravel/results/20261122` and
+`clickhouse/results/20261122` at ClickBench commit `7ab6f8df0`; the ratio is
+the geometric mean of (Ravel + 10 ms) / (ClickHouse + 10 ms) over 43
+statements, and hot is the lower of tries 2 and 3). This ADR alone does not
+reach that figure: Q2 and Q29 also need #4651, and Q3 needs the wide sum of
+decision 1.
+
+### Why folding does not stand in for write time
+
+Whether a run reads a folded catalog depends on wall time, not on
+configuration: the entry's server runs the scheduled fold every 300 s, and
+an hour seals 80 minutes after it ends (#3231 comment 7094007593). A run
+that starts inside those 80 minutes reads the loaded hour unfolded. Which
+state each published run was in is not recorded (#3231 comment 7105934607).
+So a statistic that exists only after a fold cannot be counted on for a
+benchmark run, and one written with the data can.
+
+Folding also leaves most of the cost in place (measured 2026-11-23 on
+c6a.4xlarge, box r1):
+
+- The per-statement resolve does not get cheaper. Its median over the
+  eleven floor statements is 12.61 ms unfolded and 12.43 ms folded, with
+  the same 5 LISTs and 1 GET on all 43 statements (comments 7103964581 and
+  7105787527).
+- Q1 falls from 0.098 s to 0.022 s once folded (comment 7105787527), where
+  it is answered from statistics with 0 scans (#4651).
+- Q2 and Q3 do not change, from 0.198 to 0.203 s and from 0.156 to 0.167 s
+  (comment 7105787527), and Q29 still opens all 222 segments in 0.179 s
+  (#4651). Gaps 1 to 3 below give the reasons.
 
 ### What exists today
 
@@ -85,26 +122,43 @@ SQL returns, and `.cstat` is a second source that needs reconciling.
 
 ### Three gaps found while reading the code
 
-These shape the decision. The first two are also reported under
-"Contradictions found".
+These shape the decision. All three are also reported under
+"Contradictions found" (items 2 and 5).
 
 1. **Q2 is not answerable today, folded or not.** `classify_aggregate` in
    `crates/ravel-sql/src/metadata_agg.rs` declines any aggregate node with
-   more than one call, and `logical_aggregate_answerable` matches
-   single-call shapes only. The test
+   more than one aggregate expression (the `aggr_exprs.len() != 1` check,
+   line 274 on `origin/main` `476b3ad1b`), and
+   `logical_aggregate_answerable` matches single-call shapes only. The test
    `sum_plus_literal_beside_a_second_aggregate_scans_exactly`
    (`crates/ravel-sql/tests/logs_metadata_agg.rs`) pins that. Q2 has three
-   calls over two columns.
+   calls over two columns. Measured on the folded entry tenant, where both
+   columns have a `.cstat` sum on all 222 objects, Q2 opens all 222
+   segments (0.203 s, #4651; comment 7105787527). Issue #4651 changes the
+   rule with no format change, and decision 5 depends on it.
 2. **The `.cstat` sum is `optional int64` and is omitted when one object's
    sum leaves `i64`** (`proto/ravel/catalog.proto`, `ColumnStat.sum`). The
    scan computes integer `avg` and `sum` in `i128` (ADR-0825,
    `crates/ravel-sql/src/sum_plus.rs`). `docs/query-engine.md` quotes a
    `"UserID"` value of 435090932899640449; twenty-two rows of that size
-   leave `i64`. Whether real objects of the entry tenant overflow is
-   inferred, not measured, and decision 6 names the measurement.
-3. **Q29 is already one call.** `ExactSumPlusLiteral` rewrites the ninety
-   terms to one `exact_sum_count` aggregate under a projection, which the
-   rule classifies as `SumCount`.
+   leave `i64`. Real objects do overflow (measured 2026-11-23, #3231
+   comment 7105787527): on the entry tenant, folded, all 222 objects carry
+   no `.cstat` sum for `UserID`, and none for `WatchID`, `FUniqID` and
+   `URLHash`; `RefererHash` lacks it on 221 of 222; every other integer
+   column has a sum on all 222. One missing per-object sum declines the
+   whole answer (comment 7094007593), so Q3 cannot be answered from
+   `.cstat` as stored, and the wide sum of decision 1 is required for Q3.
+3. **Q29 is one call by the source, and still scans.**
+   `ExactSumPlusLiteral` rewrites the ninety terms to one `exact_sum_count`
+   aggregate under a projection, which the rule classifies as `SumCount`;
+   `q30_shape_runs_one_aggregate` (`crates/ravel-sql/src/sum_plus.rs`, line
+   1123 on `origin/main` `476b3ad1b`) pins one aggregate on a plain table.
+   Measured on the folded entry tenant with every `ResolutionWidth` sum
+   present, Q29
+   still opens all 222 segments (0.179 s, #4651). #4651 attributes that to
+   more than one aggregate expression reaching the rule; this ADR did not
+   trace the plan the logs table produces. It is a planner matter with no
+   format change, and #4651 owns it.
 
 ## Decision
 
@@ -135,7 +189,7 @@ The three placements compared, for the read on an unfolded catalog:
 | | A: new RLOG section | B: the stamp (chosen) | C: sidecar object |
 |---|---|---|---|
 | Requests per statement, cold | at least one suffix GET per object | none beyond the resolve | one GET per object |
-| Bytes read per statement | the footer and one section per object; not measured | the growth of the commit records: at most about 3.0 KB each (derived, decision 7) | one sidecar per object; not measured |
+| Bytes read per statement | the footer and one section per object; not measured | the growth of the commit records: at most about 2.2 KB each for the entry tenant (derived, decision 7) | one sidecar per object; not measured |
 | Phase that pays | plan | resolve, already paid | plan |
 | Meets "exactly zero data GETs" | no: the read is a GET on the data object | yes | zero data GETs, but one sidecar GET per object |
 | Write cost | bytes in the object | bytes in the commit record | one more PUT per flush, and a third object in a two-object commit |
@@ -145,15 +199,16 @@ The three placements compared, for the read on an unfolded catalog:
 | Basis | what the writer encoded per column | the merged view | whichever producer writes it |
 | Fold reuse | the fold still decodes or fetches per object | the fold copies the entry it already carries | the fold fetches per object |
 
-The entry tenant has 222 objects of about 37 MB each (the figure given in
-the task for this ADR, not re-measured here). A and C each add at least 222
+The entry tenant has 222 l0 objects (#3231 comment 7105787527) holding
+8,328,210,617 bytes (comment 7103964581), about 37.5 MB each (derived). A
+and C each add at least 222
 plan-phase requests to a cold statement that ClickHouse answers from one
 row. Their byte cost is not measured; for A it would be read from
 `ravel-cli`'s RLOG footprint report on one loaded object. B adds no
 request: an unfolded resolve already lists and reads every commit record (5
 LISTs and 1.0 MB of records served from the record cache with 409 records
 resolved, #3243 comment 6392034172, arm A). For 222 records B's upper bound
-is about 0.67 MB of added record bytes per resolve (derived).
+is about 0.49 MB of added record bytes per resolve (derived, decision 7).
 
 A has a second defect. The writer's per-column statistics are not the
 merged view: a row whose value comes from its stream's resource or scope
@@ -169,15 +224,40 @@ things to leave query answers, durability, retention and fencing unchanged.
 - *An older reader that ignores the fields.* It sees the stamp it sees
   today. Statements that need a sum or a zero count scan, as they do today.
 - *An older writer that rewrites the record without them.* A commit record
-  is immutable and never rewritten. The processes that re-encode a stamp
-  are the fold and the compactor. An older fold copies min, max and null
-  count through the typed form and drops fields 6 to 8; an older compactor
-  writes an L1 part without them. Either leaves segments whose statements
-  scan. No answer changes, and nothing durable, retained or fenced depends
-  on the fields.
+  and a compaction record are immutable and are not rewritten in place; a
+  stamp reaches a new object only through the paths below (read on
+  `origin/main` `476b3ad1b`; decision 3 has the producer side).
+  - The fold and a HEAD rebuild, onto `SnapshotEntry` field 15:
+    `carry_commit_record` and `carry_compaction_part`
+    (`crates/ravel-catalog/src/declared_stats.rs:283`, `:308`) decode the
+    stamp to the typed form and re-encode the validated entries. An older
+    fold drops fields 6 to 8.
+  - Compaction, the migrate primitive (`migrate_bucket_format`,
+    `crates/ravel-maintain/src/rewrite.rs:809`) and the force-2 re-encode
+    (`reencode_compaction_parts`, `rewrite.rs:1246`), onto `CompactionPart`
+    field 12 of a new compaction record: each recomputes the stamp from the
+    rows of the part it writes, in the one `DeclaredStatAccum` of
+    `crates/ravel-maintain/src/rlog.rs` (`:6504`, stamped at `:8284`),
+    through `build_parts` (`:501`; the migrate primitive calls it at
+    `rewrite.rs:627`) or `merge_catalogs` (`:1274`; force 2
+    passes the predecessor's covered columns, `rewrite.rs:1620`, `:1734`).
+    None copies an input stamp, so an older build writes parts without the
+    fields.
+  - The erasure rewrite, metrics parts and span parts write empty stamps
+    (`erasure_rewrite.rs:1595`, `:1746`; `build.rs:1310`;
+    `rspan_codec.rs:1038-1044`, all in `crates/ravel-maintain/src`).
+
+  Every drop leaves segments whose statements scan; no path carries a
+  field 6 to 8 forward with a changed meaning. No answer changes, and
+  nothing durable, retained or fenced depends on the fields.
 
 So `CommitRecord.format_version` stays 1 and the `commit-record` family in
-`sys/compat` is untouched. `SnapshotEntry` is a proto record carried inside
+`sys/compat` is untouched. The compaction record's version is set by
+whether the record supersedes another (1, or 2 for a force-2 record,
+`crates/ravel-commit/src/record.rs:14-20`; `docs/compatibility.md` lists
+the `compaction-record` family as versions 1 and 2 "by content"), not by
+stamp content, so the new fields leave that family untouched as well.
+`SnapshotEntry` is a proto record carried inside
 a `.csnap` part and follows the same rule, as field 15 did (ADR-0873
 decision 1), so the `.csnap` envelope stays at 1. No new exported
 format-version constant exists, so `docs/compatibility.md`'s inventory
@@ -201,7 +281,10 @@ another type is null.
   object's row count is a `u64` and each value an `i64`, so the sum cannot
   leave `i128`. This departs from ADR-0850, which omits a sum that leaves
   `i64`: the scan's own `avg` and `sum` run in `i128`, and a statistic
-  narrower than the scan cannot answer what the scan answers.
+  narrower than the scan cannot answer what the scan answers. On the entry
+  tenant the `.cstat` sum of Q3's column leaves `i64` on all 222 objects
+  (gap 2, measured 2026-11-23, #3231 comment 7105787527), so field 7 is
+  what makes Q3 answerable at all.
 - **Zero count.** For an I64 or BOOL column, the count of non-null rows
   whose value is 0 or false. This is the one value-to-count entry
   ClickHouse's default-value count corresponds to. No dictionary is
@@ -228,11 +311,11 @@ metric under its carrier label, as any defective entry is today.
 **Absent means scan.** Each field has its own presence. An entry with no
 sum cannot answer `SUM` or `AVG` for that segment; an entry with no zero
 count cannot answer a count against the zero. Every record written before
-this ADR is in that state forever, and so is every entry an older fold or
-compactor re-encoded. A reader never treats an absent field as zero. The
-existing absences carry over unchanged: no entry at all (column declared
-after the flush opened, a stream blob that did not decode, a rewrite part),
-and an ineligible type.
+this ADR is in that state forever, and so is every entry an older fold,
+compactor, migrate or force-2 re-encode wrote. A reader never treats an
+absent field as zero. The existing absences carry over unchanged: no entry
+at all (column declared after the flush opened, a stream blob that did not
+decode, a rewrite part), and an ineligible type.
 
 ### 3. Producers
 
@@ -247,9 +330,13 @@ and an ineligible type.
   holds. It never merges input stamps, as today.
 - **Erasure rewrite.** Unchanged: a rewrite part carries no stamp, so it
   carries none of the new fields.
-- **Every other producer of a stamp** (migrate, the force-2 re-encode)
-  keeps whatever it does for stamps today. Task T4 audits them and states
-  the result; this ADR did not read them.
+- **Migrate and the force-2 re-encode.** No change of their own. Both
+  build parts through the compactor's accumulator in `rlog.rs` (decision
+  1, older-writer paths), so T4's change to that accumulator teaches them
+  the fields with compaction. Metrics and span parts keep empty stamps.
+  The audit covered `crates/ravel-maintain` and the fold's carry
+  functions; a writer outside those that re-encodes a stamp was not looked
+  for beyond the stamp-field grep that found these.
 
 ### 4. Carriage and the fold
 
@@ -315,13 +402,25 @@ gate they already call (`metadata_rewrite_stats_are_exact`).
   result is the sum of `non_null - equal` over the segments.
 - `GROUP BY col` counts are not answered from the stamp. They keep the
   `.cstat` dictionary path.
+- A filter-free `COUNT(*)`, as in Q2, needs no new field: it is the sum of
+  `sample_count` over the touched segments, which every `SegmentRef`
+  already carries (`crates/ravel-catalog/src/snapshot.rs:56` on
+  `origin/main` `476b3ad1b`). On its own it is answered today by
+  DataFusion's `AggregateStatistics` rule from
+  `LogsScanExec::statistics_from_inputs`; beside other aggregates, reading
+  it is part of #4651.
 
-**Several aggregates in one ungrouped statement (Q2).** The rule accepts an
-ungrouped, filter-free aggregate whose every call is one of `COUNT(*)`,
-`SUM(col + k)`, `AVG(col)` or `exact_sum_count(col)` over declared I64
-columns, and emits one row. `COUNT(*)` is the sum of `sample_count`. If any
-call declines, the whole statement scans. `logical_aggregate_answerable`
-mirrors the shape, as the two are required to stay in step.
+**Several aggregates in one statement (Q2, and Q29 as measured).** Not
+specified here. Today `classify_aggregate` declines a statement with more
+than one aggregate expression (`crates/ravel-sql/src/metadata_agg.rs`, line
+274 on `origin/main` `476b3ad1b`). Issue #4651 lets the rule answer a
+statement whose every aggregate expression the existing
+`stats_aggregate` classifies, with `logical_aggregate_answerable` changed
+in step, and declines the whole
+statement when any aggregate or any touched segment cannot answer. It
+needs no format change and does not depend on this ADR. This ADR depends
+on it for Q2 and Q29: the readers above supply the per-segment figures,
+and #4651 decides which statement shapes reach them.
 
 **No statistics load when the stamps answer.** `logs_column_stats_eligible`
 skips the `.cstat` load when every touched segment's stamp carries what the
@@ -340,25 +439,53 @@ counter and not only as a slow statement.
 | Condition | Enforced by |
 |---|---|
 | A pending erasure on the snapshot | `metadata_rewrite_stats_are_exact` (`self.erasure.is_empty()`) in `logs_scan/mod.rs`, and `logs_column_stats_eligible` in `executor.rs` before any plan is built |
-| A stale statistic that could hold an erased row | rewrite parts carry no stamp: forced empty in `fold.rs` (the rewrite snapshot entry) and in `catalog.rs` (the live rewrite `SegmentRef`). That the pre-rewrite input's own stamp never answers after the erasure completes is inferred, not traced; see the paragraph below |
+| A stale statistic that could hold an erased row | the pending-erasure gate of the first row. No erasure step recomputes or removes `.cstat`, the commit-record stamps or the `.csnap` stamps, and the old values leave only when the sweep deletes the old objects (`ravel-maintain/src/sweep.rs:1306`). Rewrite outputs carry no stamp: written empty (`ravel-maintain/src/erasure_rewrite.rs:1595`, `:1746`) and forced empty in `ravel-catalog/src/fold.rs:911` (the rewrite snapshot entry) and `ravel-catalog/src/catalog.rs:6215` (the live rewrite `SegmentRef`). Read in #3231 comment 7094007593; line numbers re-checked on `origin/main` `476b3ad1b`. See the paragraph below |
 | A pinned commit token admitting a segment the statistics do not cover | coverage is per segment of the snapshot being queried: `derive_l0` stamps a token-resolved record from itself, and the reader loops return `None` at the first segment with no usable figure |
 | A total that leaves the result type | `sum_scalar` (`checked_mul`, `checked_add`, then the `i64` conversion) and `count_to_i64` in `metadata_agg.rs` decline; for `exact_sum_count` the projection's own check raises the same `IntegerSumOverflow` on both paths |
 | A ts bound that clips a segment, a content predicate, a row filter, a key equality, a prune arm other than `NumNotEq` | `metadata_rewrite_stats_are_exact`, unchanged |
 | A defective entry | dropped at decode by the clauses in decision 2, counted, and the segment reads as uncovered |
 
-On the stale statistic: the stamp of a pre-rewrite input holds figures
-that include the erased rows. It can answer only if that input is still in
-the resolved segment list while no erasure is pending. This ADR did not
-trace the code that rules that out. `docs/catalog-and-mvcc.md` ("Targeted
-re-fold requests") says a sealed part can keep naming pre-rewrite inputs
-for an hour no reconcile pass re-lists, and
+On the stale statistic: the stamp of a pre-rewrite input, on its commit
+record or on a `.csnap` entry, holds figures that include the erased rows,
+and no erasure step removes it. It can answer only if that input is still
+in the resolved segment list while no erasure is pending. The normative
+doc states the mechanism that rules that out:
+`docs/deletion-and-gc.md:1366-1368` on `origin/main` `476b3ad1b` says the
+request stays live for as long as any held input does, so the filter does
+not retire under a snapshot that can still resolve one, and
+`docs/deletion-and-gc.md:1389-1398` applies the same condition to a stale
+`.cstat` the live HEAD still names. The code sites, from #3231 comment
+7094007593 with line numbers re-checked on `476b3ad1b`:
+
+- The live resolver leaves out the inputs a listed rewrite record
+  supersedes (`crates/ravel-catalog/src/catalog.rs:3964`).
+- Every `.dreq` under `del/` becomes a pending erasure on the resolved
+  snapshot (`list_pending_erasure`, `catalog.rs:4656`), and a pending
+  erasure refuses the metadata-only answers this ADR's readers give
+  (`logs_column_stats_eligible`, `executor.rs:5585`;
+  `metadata_rewrite_stats_are_exact`, `logs_scan/mod.rs:2549`; both in
+  `crates/ravel-sql/src`).
+- The sweep's documentation states that it keeps a `.dreq` until its
+  `.done` record is older than the protection horizon and no superseded
+  input of its rewrites is still held, for example by the live HEAD
+  snapshot (`crates/ravel-maintain/src/sweep.rs:4405-4440`).
+
+The doc and the gates were traced. The code path that keeps the request
+live while an input is held (the sweep's rule-2 holds feeding the `.dreq`
+decision) was read only as that function's documentation, not traced
+through its body. A folded snapshot can name a pre-rewrite input outside
+the 26 h reconcile window (`crates/ravel-catalog/src/fold.rs:1381`; #3231
+comment 7094007593); by the doc, the live HEAD's reference is a hold, so
+the request stays live for that case too. A Flight ticket pinned past the
+horizon was not read; a Flight `SegmentPin` carries no stamp (decision 4),
+so a statement on that path scans.
 `crates/ravel-catalog/tests/token_cache_erasure_4570.rs` asserts that an
-erased row is never served on the token paths. The same exposure exists
-today for `MIN`, `MAX` and `COUNT(col)` from the stamp, so it is not new,
-but a sum widens what it would misstate. T5 owes a test for it (test 6
-below), and if the test shows the input can be resolved, the readers must
-decline for any segment a listed rewrite record supersedes. Open question
-8.
+erased row is not served on the token paths. The same exposure exists
+today for `MIN`, `MAX` and `COUNT(col)` from the stamp and for `.cstat`,
+so it is not new, but a sum widens what it would misstate. T5 owes test
+6 below, which checks the code against the doc; a failure there is a
+defect against `docs/deletion-and-gc.md`, and the readers would then have
+to decline for any segment a listed rewrite record supersedes.
 
 On the sum overflow of #3847: a per-object sum can no longer overflow,
 because it is kept in `i128`. What can overflow is the statement's total
@@ -368,17 +495,23 @@ the scan produces the error. #3847's open defect (the scan's per-row
 `SUM(col + k)` shapes here go through `exact_sum_count`, which does not
 evaluate `col + k` per row.
 
-On #1848: the new fields add no verbatim attribute value to any object. A
-zero count is a count. A sum equals a value only for an object with one
-non-null row, which the stamp's min and max already state. See
-"Contradictions found", item 3, for the part of #1848 this does not
-settle.
+On #1848: the new fields store no attribute value as such, but a sum makes
+values recoverable. With one non-null row the sum is that value, and with
+two the min and max already state both. With three, the sum minus the min
+minus the max is the third value exactly, which no field of today's stamp
+states; with more rows a sum and a zero count still narrow what the values
+can be. Commit records and `.csnap` parts are immutable and outlive an
+erasure until the sweep removes them (decision 6, second row), so a stored
+sum adds recoverable value information to objects that survive an
+erasure. Whether that is acceptable, and whether #1848 has to widen to
+cover stamps first, is open question 6. See "Contradictions found", item
+3.
 
-**Measurement owed.** The share of the entry tenant's objects whose
-`"UserID"` sum leaves `i64`, read from the stamps after a load with this
-change (count of entries carrying field 7). It decides nothing in the
-design, which is exact either way; it says whether Q3 could ever have been
-answered from the `int64` sum of `.cstat`.
+**Measured 2026-11-23.** Q3 could not have been answered from the `int64`
+sum of `.cstat`: no folded object of the entry tenant carries a `UserID`
+sum (222 of 222 without, #3231 comment 7105787527; gap 2). After a load
+with this change, the count of `UserID` stamp entries carrying field 7 is
+the A/B's check of the same fact on the stamp (decision 7).
 
 ### 7. Cost
 
@@ -389,10 +522,13 @@ and are marked derived.
   bytes or field 7 costs 18, and field 8 costs 2 to 11. Per BOOL column:
   field 8 only. The upper bound is 29 bytes per I64 column and 11 per BOOL
   column per commit record, and the same again on the `SnapshotEntry` once
-  sealed. For the entry tenant's 104 declared columns the upper bound is
-  about 3.0 KB per record; today's records are about 2.5 KB each (1.0 MB
-  over 409 records, #3243 comment 6392034172). Nothing is added to the data
-  object.
+  sealed. Of the entry tenant's 104 declared columns, 76 are I64, 28 are
+  STR and none is BOOL (`benchmarks/clickbench/hits.mapping.toml` on
+  `origin/main` `476b3ad1b`, the mapping `typed-attr-column set
+  --from-mapping` declares from), so the upper bound is 76 x 29 = 2,204
+  bytes, about 2.2 KB per record; today's records are about 2.5 KB each
+  (1.0 MB over 409 records, #3243 comment 6392034172). Nothing is added to
+  the data object.
 - **Flush and load CPU.** One `i128` add and one compare per observed
   declared value, in loops that already run. Not measured. The measurement
   is `ravel-bench`'s ingest stage timing (`--features stage-timing`) before
@@ -420,7 +556,8 @@ and are marked derived.
 | Q1, Q2, Q3, Q29: plan-phase GETs | exactly 0 | predicted |
 | Q1, Q2, Q3, Q29: segments answered from the stamp | equal to segments touched | predicted |
 | Q2, Q3, Q29 hot wall today | 0.14 to 0.20 s | measured 2026-11-22 |
-| Resolve record bytes per statement, every statement | at most arm A plus 3.0 KB per record | predicted |
+| `UserID` stamp entries carrying field 7 | 222 of 222 | predicted, from the `.cstat` census of #3231 comment 7105787527 |
+| Resolve record bytes per statement, every statement | at most arm A plus 2.2 KB per record | predicted |
 | Answers, all 43 statements | equal to arm A | predicted |
 
 Bands for the four statements' walls, the hot total, the cold total, the
@@ -438,8 +575,9 @@ pre-registration comment, not here.
   hours stay without them until the records are recompacted or a rebuild
   fold re-reads commit records that still exist. Until then those segments
   fall to `.cstat` behind a matching stamp, or scan.
-- **Older compactor, newer ingest.** The L1 part lacks the fields, and the
-  L0 records it replaces are swept. Same consequence.
+- **Older compactor, migrate or force-2 re-encode, newer ingest.** The L1
+  part lacks the fields, and the L0 records or the record it replaces are
+  swept. Same consequence.
 - **Order.** Upgrade fold and maintain processes before ingest, the order
   ADR-0873 decision 6 already requires for the stamp. The per-carrier
   coverage counter of decision 5 is how a wrong order shows up. Whether to
@@ -463,21 +601,30 @@ pre-registration comment, not here.
 Plan-shape tests, not timings, in `crates/ravel-sql/tests/`, over objects
 written by the real writer and stamped by the real fold of records.
 
-1. For each of Q1, Q2, Q3 and Q29 in its ClickBench form, on a snapshot
-   resolved from commit records with no fold: the plan holds
-   `MetadataOnlyExec` and no `LogsScanExec`, and a counting store reports
-   exactly zero data GETs. Paired with the same statement on the same
-   objects with the fields stripped from the stamps: the plan scans and the
-   answer is byte-identical.
+Acceptance, for each of the four statements: an exact answer with zero
+data-block GETs on freshly written, unfolded data (tests 1 and 9), and an
+answer equal to a forced scan of the same objects in three cases: old
+formats, objects whose stamps lack the new fields (test 1); missing
+coverage, one segment without the statistic (test 4); and a pending
+erasure (test 2). Q2 and Q29 meet it once #4651 has landed.
+
+1. For each of Q1, Q2, Q3 and Q29 in its ClickBench form (Q2 and Q29 after
+   #4651), on a snapshot resolved from commit records with no fold: the
+   plan holds `MetadataOnlyExec` and no `LogsScanExec`, and a counting
+   store reports exactly zero data GETs. Paired with the same statement on
+   the same objects with the fields stripped from the stamps: the plan
+   scans and the answer is byte-identical.
 2. A pending erasure forces the scan for each shape, asserted on the plan
-   and on a nonzero data GET count.
+   and on a nonzero data GET count, and the answer equals a forced scan of
+   the same objects under the same erasure.
 3. A total that leaves `i64` forces the scan: `SUM(col)` over objects whose
    stamp sums add past `i64::MAX`: the rewrite declines and the scan raises
    `IntegerSumOverflow`. A second case has one object whose own sum
    leaves `i64` (field 7), and `AVG(col)` answers from the stamp with the
    scan's exact value.
 4. A token-resolved snapshot holding one segment without the fields forces
-   the scan, and the same snapshot with the fields answers from the stamp.
+   the scan, with an answer equal to a forced scan, and the same snapshot
+   with the fields answers from the stamp with the same answer.
 5. Composition: a folded snapshot where some segments carry the fields and
    others have only a reconciled `.cstat` entry answers from statistics,
    equals the scan, and reports the per-carrier split exactly. A segment
@@ -486,7 +633,9 @@ written by the real writer and stamped by the real fold of records.
 6. A rewrite part carries none of the fields, and a statement over it
    scans. After the erasure completes, with a sealed part and a warm record
    cache that still name the pre-rewrite input, no statement answers from
-   that input's stamp.
+   that input's stamp: the request is still live, as
+   `docs/deletion-and-gc.md:1366-1368` states, and the answer equals a
+   forced scan.
 7. Codec: property tests for encode and decode of the three fields in both
    proto mirrors, and one corrupt-input case per validity clause of
    decision 2, each producing a counted drop and never a panic. The
@@ -526,7 +675,9 @@ Then the A/B of decision 7.
   bound the size but not the other two points.
 - **An `int64` sum omitted on overflow, as `.cstat` has.** A statement
   whose objects overflow would scan with no way to fix it short of smaller
-  objects, while the scan itself computes in `i128`.
+  objects, while the scan itself computes in `i128`. On the entry tenant
+  that is Q3 on every object (222 of 222, measured 2026-11-23, #3231
+  comment 7105787527).
 - **One 16-byte sum field always.** Simpler to validate, but 18 bytes per
   I64 column per record for sums that mostly fit two to five.
 - **Copying the stamp's sum into `.cstat` at fold time.** It would make a
@@ -541,7 +692,8 @@ Then the A/B of decision 7.
 
 - On an unfolded catalog, the four statements answer from the commit
   records the resolve already holds, with no data GET, for every tenant
-  with declared I64 or BOOL columns, not only the benchmark entry.
+  with declared I64 or BOOL columns, not only the benchmark entry. Q2 and
+  Q29 do so once #4651 has landed.
 - `SUM` and `AVG` over a declared integer column, and a count against the
   zero, are answered for the live tail and for token-resolved segments,
   which no fold-built object reaches.
@@ -558,26 +710,34 @@ Then the A/B of decision 7.
 1. **Value counts: the zero count only, or a bounded dictionary?**
    Recommended: the zero count only. It is what the measured ClickHouse
    behaviour corresponds to and it stays clear of the 2026-10-25 objection
-   to dictionaries.
+   to dictionaries. An independent review of the draft proposes the same
+   answer; the owner approves.
 2. **Does a sum and a zero count stamped during the load meet the
    ClickBench rules as the reopening intended?** Recommended: yes. They are
    written for every tenant with declared columns, during the write, with
    no entry-specific setting.
-3. **Sum width: `i128` in two fields, or `int64` omitted on overflow as
-   ADR-0850 has?** Recommended: `i128`, because the scan is `i128` and Q3
-   likely needs it (inferred).
+3. Answered 2026-11-23: the sum width question (`i128` in two fields, or
+   `int64` omitted on overflow) is settled by the `.cstat` census of #3231
+   comment 7105787527, where no object carries a `UserID` sum, so Q3 needs
+   the `i128` field. An independent review proposes the same answer.
 4. **Rollout: deployment order plus the coverage counter, or an explicit
    switch that starts emission?** Recommended: deployment order. A wrong
-   order costs coverage on some hours and never an answer.
+   order costs coverage on some hours and never an answer. An independent
+   review proposes the same answer; the owner approves.
 5. **Should the fold stop tallying `.cstat` sums for segments whose stamp
-   carries one?** Recommended: not in this epic. Decide after the A/B.
-6. **Is #1848 widened to cover stamps before this ships?** Recommended:
-   widen #1848, do not block on it. See "Contradictions found", item 3.
+   carries one?** Recommended: not in this epic. Decide after the A/B. An
+   independent review proposes the same answer; the owner approves.
+6. **May sums sit on records that survive an erasure, and does #1848 have
+   to widen to cover stamps first?** A sum, with the min and max already
+   stamped, recovers a third value exactly (decision 6, "On #1848"), and
+   commit records and `.csnap` parts keep it until the sweep removes them.
+   No recommendation: this is the owner's call. See "Contradictions
+   found", item 3.
 7. **The A/B box.** One c6a.4xlarge, one same-box run, needs approval.
-8. **If test 6 shows a pre-rewrite input can be resolved after an erasure
-   completes, is that fixed here or in its own issue?** Recommended: its
-   own issue, landed before T5, because it already affects `MIN`, `MAX`
-   and `COUNT(col)` from the stamp.
+8. Withdrawn 2026-11-23: whether a pre-rewrite input can be resolved after
+   an erasure completes is answered by `docs/deletion-and-gc.md:1366-1368`
+   (the request stays live while any held input does); test 6 checks the
+   code against it, and a failure there is a defect, not a design choice.
 
 ## Contradictions found, reported and not fixed
 
@@ -589,16 +749,26 @@ Then the A/B of decision 7.
 2. **ADR-0850 and #861 say q03 and q04 answer from the fold-time sum.** By
    the code, the three-aggregate statement is declined in every case (gap 1
    above), and `AVG("UserID")` needs every object's sum to fit `i64` (gap
-   2), which is unlikely for that column (inferred, not measured).
+   2). Measured 2026-11-23 on the folded entry tenant, neither is answered
+   from statistics: the three-aggregate statement opens all 222 segments
+   (#4651), and no object carries a `UserID` sum (#3231 comment
+   7105787527).
 3. **#1848 names `.cstat` only.** The stamp has put exact I64 and BOOL
    extrema on commit records and snapshot entries since ADR-0873. A
    superseded commit record, and a `.csnap` part a later fold replaced,
    hold the pre-erasure extrema until a sweep removes them, the same shape
    #1848 describes. This ADR adds a sum and a zero count to those objects.
-   No STR or BYTES value is involved.
+   No STR or BYTES value is involved, but with the min and max a sum
+   recovers a third I64 value exactly (decision 6, "On #1848"; open
+   question 6).
 4. **#4628 asks for a fallback "when a sum overflowed `i64`".** Under this
    ADR a per-object sum does not overflow; the fallback applies to the
    statement's total. The acceptance test is written against the total.
+5. **#4651 and the source disagree on why Q29 scans.** #4651 says the
+   `sum_plus` rewrite turns Q29 into more than one aggregate expression;
+   `q30_shape_runs_one_aggregate` (`crates/ravel-sql/src/sum_plus.rs`)
+   pins one aggregate on a plain table. The measured scan is not in
+   question; its cause on the logs table is, and #4651 owns it (gap 3).
 
 ## Task decomposition
 
@@ -615,8 +785,9 @@ sized for one executor in under four hours. Every spec declares its
   `sys_proto_format_version_classification` test still classifies the
   records. The generated structs are built with exhaustive literals, so
   this task also adds the three fields, absent, to every literal of the
-  two messages: up to 29 sites in 8 files across `ravel-commit`, `ravel-catalog`
-  and `crates/ravel-sql/tests/logs_declared_minmax_from_stamps.rs`. That
+  two messages: up to 29 sites in 8 files across `ravel-commit`,
+  `ravel-catalog` and
+  `crates/ravel-sql/tests/logs_declared_minmax_from_stamps.rs`. That
   edit is mechanical and keeps every later task compiling alone.
 - **T2, catalog carriage.** `crates/ravel-catalog`: the mirror codec, the
   fold's carry functions, the record-cache charge and its test,
@@ -626,18 +797,20 @@ sized for one executor in under four hours. Every spec declares its
   observe paths, `fold_fallbacks`, `tests/declared_column_stamps.rs`,
   `docs/ingest.md`. After T1, beside T2.
 - **T4, compaction producer.** `crates/ravel-maintain`: the per-part
-  accumulator, a test that a rewrite part stays empty, and the audit of
-  migrate and the force-2 re-encode. After T1, beside T2 and T3.
+  accumulator, a test that a rewrite part stays empty, and a test that a
+  migrate output and a force-2 re-encode carry the fields, since both use
+  the same accumulator (decision 1). After T1, beside T2 and T3.
 - **T5, stamp-first readers.** `crates/ravel-sql`: the sum and not-equal
   readers, the load gate in the executor, the per-carrier counter, tests 1
-  (Q1, Q3, Q29), 2, 3, 4, 5 and 6, `docs/query-engine.md`. After T2.
-- **T6, several aggregates in one statement.** `crates/ravel-sql`: the
-  rule's multi-call shape and its logical mirror, test 1 for Q2, and the
+  (Q1 and Q3), 2, 3, 4, 5 and 6, `docs/query-engine.md`. After T2.
+- **T6, several aggregates in one statement.** Not a task of this ADR:
+  issue #4651, which needs no format change and can land before T1. It
+  carries the rule's multi-aggregate shape, its logical mirror and the
   re-pin of `sum_plus_literal_beside_a_second_aggregate_scans_exactly`.
-  After T5, same crate, so not beside it.
+  Test 1 for Q2 and Q29 lands with whichever of T5 and #4651 is second.
 - **T7, inspectors and the loader test.** `services/ravel-cli`: print the
-  fields, and test 9. After T3 and T6.
+  fields, and test 9. After T3, T5 and #4651.
 - **T8, the A/B.** Pre-registration on #4628, one run, readout. After T7,
   on the owner's box approval.
 
-Refs: #4628, #3231, #850, #861, #873, #3243, #3244, #1848, #3847
+Refs: #4628, #3231, #4651, #850, #861, #873, #3243, #3244, #1848, #3847
