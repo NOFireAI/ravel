@@ -42,6 +42,7 @@ use crate::config::CatalogConfig;
 use crate::declared_stats::DeclaredColumnStats;
 use crate::error::CatalogError;
 use crate::provisioning::ShardGeneration;
+use crate::resolve_timings::{ResolveTimings, between};
 use crate::snapshot::{
     SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentPartOrigin, SegmentRef, Snapshot,
     SnapshotParts,
@@ -2564,6 +2565,37 @@ impl Catalog {
         .map(|(snapshot, origins, _generations)| (snapshot, origins))
     }
 
+    /// [`Catalog::resolve_pruned_with_admission`], also returning where the
+    /// resolve's wall time went ([`ResolveTimings`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_pruned_with_admission_timed(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+    ) -> Result<(Snapshot, SegmentOrigins, ResolveTimings), CatalogError> {
+        let mut timings = ResolveTimings::default();
+        let (snapshot, origins, _generations, _parts) = self
+            .resolve_traced(
+                tenant,
+                signal,
+                range,
+                min_tokens,
+                now_ns,
+                name_filter,
+                accounting,
+                false,
+                self.window_hour_bounds(range, now_ns),
+                &mut timings,
+            )
+            .await?;
+        Ok((snapshot, origins, timings))
+    }
+
     /// Like [`Catalog::resolve_pruned_with_admission`], with the same
     /// parameters, but also returns the parts the sealed segments came from
     /// and each segment's place in them (ADR-3692 decision 1): what the
@@ -2596,6 +2628,35 @@ impl Catalog {
         .map(|(snapshot, origins, _generations, parts)| (snapshot, origins, parts))
     }
 
+    /// [`Catalog::resolve_pruned_with_parts`], also returning where the
+    /// resolve's wall time went ([`ResolveTimings`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_pruned_with_parts_timed(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+    ) -> Result<(Snapshot, SegmentOrigins, SnapshotParts, ResolveTimings), CatalogError> {
+        let mut timings = ResolveTimings::default();
+        let (snapshot, origins, _generations, parts) = self
+            .resolve_with_charged_parts(
+                tenant,
+                signal,
+                range,
+                min_tokens,
+                now_ns,
+                name_filter,
+                accounting,
+                &mut timings,
+            )
+            .await?;
+        Ok((snapshot, origins, parts, timings))
+    }
+
     /// [`Catalog::resolve_pruned_with_parts`] and
     /// [`Catalog::resolve_pruned_with_generations`] in one resolve: the parts
     /// the key-index router reads and the generation history the ADR-0103
@@ -2619,6 +2680,41 @@ impl Catalog {
         ),
         CatalogError,
     > {
+        self.resolve_with_charged_parts(
+            tenant,
+            signal,
+            range,
+            min_tokens,
+            now_ns,
+            name_filter,
+            accounting,
+            &mut ResolveTimings::default(),
+        )
+        .await
+    }
+
+    /// The resolve behind the `*_with_parts*` entry points: the part handles
+    /// are charged to the memory budget once the resolve returns.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_with_charged_parts(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+        timings: &mut ResolveTimings,
+    ) -> Result<
+        (
+            Snapshot,
+            SegmentOrigins,
+            Vec<ShardGeneration>,
+            SnapshotParts,
+        ),
+        CatalogError,
+    > {
         let (snapshot, origins, generations, parts) = self
             .resolve_traced(
                 tenant,
@@ -2630,6 +2726,7 @@ impl Catalog {
                 accounting,
                 true,
                 self.window_hour_bounds(range, now_ns),
+                timings,
             )
             .await?;
         let parts = parts
@@ -2717,6 +2814,7 @@ impl Catalog {
             accounting,
             false,
             self.window_hour_bounds(range, now_ns),
+            &mut ResolveTimings::default(),
         )
         .await
         .map(|(snapshot, origins, generations, _parts)| (snapshot, origins, generations))
@@ -2762,6 +2860,7 @@ impl Catalog {
             accounting,
             false,
             window,
+            &mut ResolveTimings::default(),
         )
         .await
         .map(|(snapshot, _origins, _generations, _parts)| snapshot)
@@ -2769,7 +2868,9 @@ impl Catalog {
 
     /// [`Self::resolve_impl`]'s span and fan-out over the ingest-hour
     /// `window` (`None`: list nothing); `want_parts` also builds the part
-    /// handles and per-segment part origins.
+    /// handles and per-segment part origins. `timings` receives this resolve's
+    /// parts, `other` being what the fan-out's three timed parts leave of the
+    /// whole call.
     #[allow(clippy::too_many_arguments)]
     async fn resolve_traced(
         &self,
@@ -2782,7 +2883,9 @@ impl Catalog {
         accounting: &QueryAccounting,
         want_parts: bool,
         window: Option<(u32, u32)>,
+        timings: &mut ResolveTimings,
     ) -> Result<Resolved, CatalogError> {
+        let started_ns = self.monotonic_clock.now_nanos();
         // Idle-tenant eviction last-touch (ADR-0069 decision 2):
         // stamp this tenant's activity with the caller's injected `now_ns`
         // before the fan-out. Every resolve entry point funnels through here,
@@ -2798,6 +2901,7 @@ impl Catalog {
             segments_pruned = tracing::field::Empty,
         );
         let before = accounting.snapshot();
+        let mut parts = ResolveTimings::default();
         let result = self
             .resolve_fanout(
                 tenant,
@@ -2808,6 +2912,7 @@ impl Catalog {
                 accounting,
                 want_parts,
                 window,
+                &mut parts,
             )
             .instrument(span.clone())
             .await;
@@ -2832,6 +2937,9 @@ impl Catalog {
         if let Ok((snapshot, _origins, _generations, _parts)) = &result {
             span.record("segments_pruned", snapshot.segments_pruned);
         }
+        let whole = between(started_ns, self.monotonic_clock.now_nanos());
+        parts.other = whole.saturating_sub(parts.total());
+        *timings = parts;
         result
     }
 
@@ -2849,7 +2957,9 @@ impl Catalog {
         accounting: &QueryAccounting,
         want_parts: bool,
         window: Option<(u32, u32)>,
+        timings: &mut ResolveTimings,
     ) -> Result<Resolved, CatalogError> {
+        let generations_started = self.monotonic_clock.now_nanos();
         // Durable shard_count enforcement on the read path (ADR-0050 section 5): fail before the `0..shard_count` listing loop below if this
         // catalog's configured shard_count disagrees with the (tenant, signal)'s
         // provisioning record, so a lower value never silently drops the shards
@@ -2884,6 +2994,10 @@ impl Catalog {
         let mut generations = self
             .read_scan_generations(tenant, signal, accounting)
             .await?;
+        timings.generations = between(generations_started, self.monotonic_clock.now_nanos());
+        // Where the records part starts: when the last LIST of the wave
+        // returned. Unset until a LIST has run.
+        let mut records_from: Option<u64> = None;
 
         let mut segments: HashMap<String, SegmentRef> = HashMap::new();
         let mut segments_pruned = 0u64;
@@ -2936,6 +3050,7 @@ impl Catalog {
                     window_end_hour,
                     &generations,
                     accounting,
+                    &mut timings.list_wave,
                 )
                 .await?;
             // When head validation performed a one-shot record
@@ -3019,7 +3134,11 @@ impl Catalog {
             // instead of the erasure LIST following the buckets. The joined
             // future is awaited before the Snapshot is built, so ADR-0064's
             // visibility bound is unchanged.
-            let erasure_fut = self.list_erasure_state(tenant, signal, accounting);
+            let erasure_fut = async {
+                let state = self.list_erasure_state(tenant, signal, accounting).await;
+                (state, self.monotonic_clock.now_nanos())
+            };
+            let wave_started = self.monotonic_clock.now_nanos();
             if listing_start_hour > window_end_hour {
                 // Empty listing suffix: a folded snapshot's watermark covers
                 // the whole window, so there is nothing above it to list. The
@@ -3027,10 +3146,13 @@ impl Catalog {
                 // range was empty here and issued no LIST; issue none either,
                 // so a fully-folded resolve stays entirely GET-based. Only the
                 // erasure LIST runs.
-                pending_erasure = Some(erasure_fut.await?);
+                let (erasure, erasure_done) = erasure_fut.await;
+                pending_erasure = Some(erasure?);
+                timings.list_wave += between(wave_started, erasure_done);
+                records_from = Some(erasure_done);
             } else {
                 let listed = if use_prefix {
-                    let (listed, erasure) = tokio::join!(
+                    let (listed, (erasure, erasure_done)) = tokio::join!(
                         self.list_window_by_prefix(
                             tenant,
                             signal,
@@ -3043,9 +3165,9 @@ impl Catalog {
                         erasure_fut,
                     );
                     pending_erasure = Some(erasure?);
-                    listed?
+                    (listed?, erasure_done)
                 } else {
-                    let (listed, erasure) = tokio::join!(
+                    let (listed, (erasure, erasure_done)) = tokio::join!(
                         self.list_window_bounded(
                             tenant,
                             signal,
@@ -3058,9 +3180,15 @@ impl Catalog {
                         erasure_fut,
                     );
                     pending_erasure = Some(erasure?);
-                    listed?
+                    (listed?, erasure_done)
                 };
-                let (listed, listed_buckets) = listed;
+                let ((listed, listed_buckets, lists_done), erasure_done) = listed;
+                // The wave ends with its last LIST. Record processing that ran
+                // while the `del/` LIST was still out is inside the wave; the
+                // records part is what follows it.
+                let wave_done = lists_done.max(erasure_done);
+                timings.list_wave += between(wave_started, wave_done);
+                records_from = Some(wave_done);
                 tombstoned_buckets = listed_buckets;
                 for (key, segment_ref) in listed {
                     if !segments.contains_key(&key) {
@@ -3085,7 +3213,14 @@ impl Catalog {
             any_completed: erasure_completed,
         } = match pending_erasure {
             Some(state) => state,
-            None => self.list_erasure_state(tenant, signal, accounting).await?,
+            None => {
+                let started = self.monotonic_clock.now_nanos();
+                let state = self.list_erasure_state(tenant, signal, accounting).await?;
+                let done = self.monotonic_clock.now_nanos();
+                timings.list_wave += between(started, done);
+                records_from = Some(done);
+                state
+            }
         };
 
         // Record-absent tokens run first: their fallback adds a replacement's
@@ -3173,6 +3308,8 @@ impl Catalog {
         // separates the two tiebreak families). L0 ordering is unchanged: the
         // appended L1-only key components are constant across L0 refs.
         segments.sort_by_key(segment_sort_key);
+        let sorted_at = self.monotonic_clock.now_nanos();
+        timings.records += between(records_from.unwrap_or(sorted_at), sorted_at);
         // Every key in `segments` was tagged by the exact same insertion
         // gate that put it there (extract_into's first-population window,
         // or the `!segments.contains_key` checks above), so the lookup
@@ -3587,7 +3724,7 @@ impl Catalog {
         range: TimeRange,
         generations: &[crate::provisioning::ShardGeneration],
         accounting: &QueryAccounting,
-    ) -> Result<(HashMap<String, SegmentRef>, TombstonedBuckets), CatalogError> {
+    ) -> Result<(HashMap<String, SegmentRef>, TombstonedBuckets, u64), CatalogError> {
         // Union scan set over the suffix: the widest per-shard bound any hour
         // in the range needs (a per-shard LIST cannot vary per hour), floored
         // at the signal's writer-pinned shards.
@@ -3615,6 +3752,7 @@ impl Catalog {
             .buffered(self.config.resolve_get_concurrency)
             .collect()
             .await;
+        let lists_done = self.monotonic_clock.now_nanos();
         let mut grouped: ShardBuckets = HashMap::new();
         for shard_group in shard_groups {
             for ((shard, hour), objs) in shard_group? {
@@ -3661,7 +3799,7 @@ impl Catalog {
                 out.entry(key).or_insert(segment_ref);
             }
         }
-        Ok((out, listed_buckets))
+        Ok((out, listed_buckets, lists_done))
     }
 
     /// List one shard's commit buckets for the hours in
@@ -4086,7 +4224,7 @@ impl Catalog {
         range: TimeRange,
         generations: &[crate::provisioning::ShardGeneration],
         accounting: &QueryAccounting,
-    ) -> Result<(HashMap<String, SegmentRef>, TombstonedBuckets), CatalogError> {
+    ) -> Result<(HashMap<String, SegmentRef>, TombstonedBuckets, u64), CatalogError> {
         // One recursive LIST per shard, grouping keys by (shard, hour), each
         // shard's scan bounded below the watermark by a `list_after` start
         // marker so it does not page through the shard's whole history before
@@ -4142,6 +4280,7 @@ impl Catalog {
             .buffer_unordered(self.config.resolve_get_concurrency)
             .try_collect()
             .await?;
+        let lists_done = self.monotonic_clock.now_nanos();
         let mut grouped: ShardBuckets = HashMap::new();
         for buckets in shard_groups {
             for (coord, objs) in buckets {
@@ -4171,7 +4310,7 @@ impl Catalog {
                 out.entry(key).or_insert(segment_ref);
             }
         }
-        Ok((out, listed_buckets))
+        Ok((out, listed_buckets, lists_done))
     }
 
     /// One shard's drain for [`Catalog::list_window_by_prefix`]: its pages in

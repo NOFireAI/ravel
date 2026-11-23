@@ -16,6 +16,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use ravel_commit::{keys, signal};
@@ -34,6 +35,7 @@ use crate::error::CatalogError;
 use crate::fold::head_object_key;
 use crate::provisioning::{ShardGeneration, shard_ceiling};
 use crate::read_gate::run_snapshot_decode;
+use crate::resolve_timings::between;
 use crate::snapshot::{SegmentLevel, SegmentPartOrigin, SegmentRef, SnapshotPartHandle};
 use crate::snapshot_format::{self, PartLimits, PostingsLimits};
 
@@ -427,10 +429,19 @@ impl Catalog {
         window_end_hour: u32,
         generations: &[ShardGeneration],
         accounting: &QueryAccounting,
+        head_wait: &mut Duration,
     ) -> Result<(Option<SnapshotWindow>, Option<Vec<ShardGeneration>>), CatalogError> {
         let head_key = head_object_key(tenant, signal);
         let Some((head, revalidated)) = self
-            .read_head(tenant, signal, &head_key, false, generations, accounting)
+            .timed_read_head(
+                tenant,
+                signal,
+                &head_key,
+                false,
+                generations,
+                accounting,
+                head_wait,
+            )
             .await?
         else {
             return Ok((None, None));
@@ -470,7 +481,15 @@ impl Catalog {
                 // At most one HEAD re-read: bypass the TTL cache so a part GC'd since the
                 // cached HEAD was read is not raced again.
                 let Some((fresh_head, fresh_revalidated)) = self
-                    .read_head(tenant, signal, &head_key, true, generations, accounting)
+                    .timed_read_head(
+                        tenant,
+                        signal,
+                        &head_key,
+                        true,
+                        generations,
+                        accounting,
+                        head_wait,
+                    )
                     .await?
                 else {
                     return Ok((None, revalidated));
@@ -639,6 +658,37 @@ impl Catalog {
             self.config().postings_cache_entries,
         );
         Ok(Some(decoded))
+    }
+
+    /// [`Catalog::read_head`], adding its wall time to `head_wait` when it
+    /// issued a store request. A lookup the HEAD cache answered adds nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn timed_read_head(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        head_key: &str,
+        bypass_cache: bool,
+        generations: &[ShardGeneration],
+        accounting: &QueryAccounting,
+        head_wait: &mut Duration,
+    ) -> Result<Option<(Arc<SnapshotHead>, Option<Vec<ShardGeneration>>)>, CatalogError> {
+        let requests_before = accounting.snapshot().total_s3_requests();
+        let started = self.monotonic_clock().now_nanos();
+        let head = self
+            .read_head(
+                tenant,
+                signal,
+                head_key,
+                bypass_cache,
+                generations,
+                accounting,
+            )
+            .await;
+        if accounting.snapshot().total_s3_requests() > requests_before {
+            *head_wait += between(started, self.monotonic_clock().now_nanos());
+        }
+        head
     }
 
     /// Read HEAD, through the TTL cache unless `bypass_cache`. Any failure
