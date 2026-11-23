@@ -31,6 +31,9 @@ pub struct ListPage {
     pub next: Option<String>,
 }
 
+/// The longest one request may take: curl's `--max-time`.
+pub const MAX_TIME_S: u64 = 30;
+
 /// How often one listing page is requested before the listing fails.
 const LIST_PAGE_ATTEMPTS: u32 = 3;
 
@@ -57,7 +60,8 @@ impl Store {
         let out = std::env::temp_dir().join(format!("s3-{}-{n}.out", std::process::id()));
         let input = std::env::temp_dir().join(format!("s3-{}-{n}.in", std::process::id()));
         let mut cmd = Command::new("curl");
-        cmd.args(["-s", "--max-time", "30", "-X", method])
+        let max_time = MAX_TIME_S.to_string();
+        cmd.args(["-s", "--max-time", &max_time, "-X", method])
             .args(["--aws-sigv4", &self.sigv4, "--user", &self.user])
             .arg("-o")
             .arg(&out)

@@ -1653,22 +1653,65 @@ impl Shared {
         Ok(format!("{key}: put back"))
     }
 
-    /// Put back what a tamper changed, retrying for [`forced::UNDO_FOR`],
-    /// and say what happened. An undo the store kept refusing is left
+    /// Put back what a tamper in bucket hour `hour` changed, starting
+    /// attempts for [`forced::UNDO_FOR`] ([`forced::undo_step`]), and say
+    /// what happened. An attempt that starts past [`forced::undo_by_s`]
+    /// fires an unreachable assertion and still runs: the hour seals for
+    /// the fold in real time, with or without a clock move, so a late undo
+    /// may come after a fold, and giving it up would leave the tamper in
+    /// the store. An undo the store kept refusing fires another and is left
     /// pending: every later clock move and the eventually retry it first.
-    fn undo_tamper(&self, undo: Undo) -> String {
-        let deadline = Instant::now() + forced::UNDO_FOR;
+    fn undo_tamper(&self, undo: Undo, hour: u64) -> String {
+        let started = Instant::now();
+        let mut attempts = 0u32;
+        let mut overran = false;
+        let mut last = String::new();
         loop {
+            let now_s = now_ns() / NS_PER_SECOND;
+            match forced::undo_step(now_s, hour, started.elapsed(), attempts) {
+                forced::UndoStep::GiveUp => break,
+                forced::UndoStep::Attempt { overran: late } => {
+                    if late && !overran {
+                        overran = true;
+                        println!(
+                            "record race: the undo of {} starts past its deadline",
+                            undo.key()
+                        );
+                        assert_unreachable!(
+                            "catalog: a record race's undo started past its fold-seal deadline",
+                            &json!({
+                                "key": undo.key(),
+                                "bucket_hour": hour,
+                                "undo_by_s": forced::undo_by_s(hour),
+                                "fold_seal_s": forced::fold_seal_s(hour),
+                                "now_s": now_s,
+                            })
+                        );
+                    }
+                }
+            }
+            attempts += 1;
             match self.undo_once(&undo) {
                 Ok(done) => return done,
-                Err(e) if Instant::now() >= deadline => {
-                    println!("record race: could not undo the tamper, left pending: {e}");
-                    lock(&self.pending_undos).push(undo);
-                    return format!("pending: {e}");
-                }
-                Err(_) => std::thread::sleep(Duration::from_secs(5)),
+                Err(e) => last = e,
             }
+            std::thread::sleep(Duration::from_secs(5));
         }
+        println!("record race: could not undo the tamper, left pending: {last}");
+        let details = json!({
+            "key": undo.key(),
+            "bucket_hour": hour,
+            "fold_seal_s": forced::fold_seal_s(hour),
+            "now_s": now_ns() / NS_PER_SECOND,
+            "attempts": attempts,
+            "last_error": last,
+        });
+        assert_unreachable!(
+            "catalog: a record race's tamper was still in the store at its undo deadline",
+            &details
+        );
+        lock(&self.pending_undos).push(undo);
+        format!("pending: {last}")
     }
 
     /// Retry every undo left pending once; keep those the store still
@@ -1704,7 +1747,11 @@ impl Shared {
         if !self.nudge(what, &nudge_s) || self.proxy_cmd("hold-record").is_err() {
             return false;
         }
-        let deadline = Instant::now() + HELD_WAIT;
+        let held_wait = match tamper {
+            Tamper::None => HELD_WAIT,
+            Tamper::Diverge | Tamper::DeletePart => forced::TAMPER_HELD_WAIT,
+        };
+        let deadline = Instant::now() + held_wait;
         let (key, record, age) = loop {
             let Ok(reply) = self.proxy_cmd("held") else {
                 return false;
@@ -1726,7 +1773,7 @@ impl Shared {
             if Instant::now() >= deadline {
                 println!(
                     "{what}: no server sent a compaction record PUT within {} s of the nudge",
-                    HELD_WAIT.as_secs()
+                    held_wait.as_secs()
                 );
                 return false;
             }
@@ -1756,12 +1803,19 @@ impl Shared {
                 }
                 let before = self.store.get(&key);
                 // Only once the compaction exited, so nothing of it still
-                // writes or checks its parts, and only over the record it
-                // published.
+                // writes or checks its parts, only over the record it
+                // published, and only while the rest of the race at its
+                // bounds still ends before the hour seals for the fold.
+                let fits = forced::tamper_fits(now_ns() / NS_PER_SECOND, record.hour);
                 let tampered = match &before {
-                    Ok(Some(record)) if tamper != Tamper::None && cli.is_finished() => {
-                        Some(self.tamper(tamper, &key, record))
+                    Ok(Some(bytes)) if tamper != Tamper::None && cli.is_finished() && fits => {
+                        Some(self.tamper(tamper, &key, bytes))
                     }
+                    Ok(Some(_)) if tamper != Tamper::None && !fits => Some(Err(format!(
+                        "no tamper: the race would not end {} s before hour {}'s fold seal",
+                        forced::UNDO_ATTEMPT_S,
+                        record.hour
+                    ))),
                     _ => None,
                 };
                 let in_place = match &tampered {
@@ -1812,22 +1866,42 @@ impl Shared {
                 in_place == Some(true),
             ),
         };
+        let changed = forced::record_changed(
+            before.as_ref().ok().and_then(Option::as_deref),
+            after.as_ref().ok().and_then(Option::as_deref),
+            match &tampered {
+                Some(Ok((undo, _))) => Some(undo),
+                _ => None,
+            },
+        );
         // Undone whether or not the race reached its situation, once the
-        // loser has had its GET, HEAD and GET of the record answered.
+        // loser has had its GET, HEAD and GET of the record answered, and
+        // before the hour seals for the fold.
         let faults_may_run = !self.faults_stopped.load(Ordering::SeqCst);
         let (tamper_key, tamper_error, undone) = match tampered {
             None => (None, None, None),
             Some(Err(e)) => (None, Some(e), None),
             Some(Ok((undo, error))) => {
-                std::thread::sleep(forced::restore_after(faults_may_run));
+                let wait =
+                    forced::restore_wait(now_ns() / NS_PER_SECOND, record.hour, faults_may_run);
+                if wait < forced::restore_after(faults_may_run) {
+                    println!(
+                        "{what}: the undo waits {} s, not {} s, to start before hour {}'s fold seal",
+                        wait.as_secs(),
+                        forced::restore_after(faults_may_run).as_secs(),
+                        record.hour
+                    );
+                }
+                std::thread::sleep(wait);
                 let key = undo.key().to_string();
-                (Some(key), error, Some(self.undo_tamper(undo)))
+                (Some(key), error, Some(self.undo_tamper(undo, record.hour)))
             }
         };
-        let changed = match (&before, &after) {
-            (Ok(Some(b)), Ok(Some(a))) => Some(a != b),
-            _ => None,
-        };
+        // How far the race ran on the driver's clock, from the nudge to the
+        // end of the undo, against the 870 s before the fold seal.
+        let done_s = now_ns() / NS_PER_SECOND;
+        let race_s = forced::race_elapsed_s(done_s, record.hour);
+        let fold_seal_in_s = forced::fold_seal_s(record.hour) as i64 - done_s as i64;
         let details = json!({
             "reason": reason,
             "race": n,
@@ -1849,6 +1923,9 @@ impl Shared {
             "tamper_error": tamper_error,
             "tamper_in_place_at_release": in_place,
             "undo": undone,
+            "race_s": race_s,
+            "race_budget_s": forced::FOLD_SEAL_AFTER_NUDGE_S,
+            "fold_seal_in_s": fold_seal_in_s,
         });
         println!("{what}: {details}");
         match tamper {

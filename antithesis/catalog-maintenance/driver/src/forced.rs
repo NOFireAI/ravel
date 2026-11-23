@@ -40,18 +40,165 @@ pub const RESTORE_AFTER: Duration = Duration::from_secs(3 * crate::clock::STORE_
 /// names that residual.
 pub const RESTORE_AFTER_FAULTS: Duration = Duration::from_secs(200);
 
-/// How long the driver keeps retrying an undo the store refused before it
-/// leaves it pending for the next clock move or the eventually.
-pub const UNDO_FOR: Duration = Duration::from_secs(120);
+/// How long the driver keeps starting undo attempts the store refused
+/// before it leaves the undo pending for the next clock move or the
+/// eventually.
+pub const UNDO_FOR: Duration = Duration::from_secs(60);
 
-// The whole race after the nudge (the held wait, the tamper budget, the
-// held-result wait, the restore wait and the undo retries) stays inside the
-// `FOLD_SAFETY_MARGIN_S` (900 s) between the hour sealing for compaction and
-// sealing for the fold, so no fold folds a tampered record.
-const _: () = assert!(
-    120 + TAMPER_BY.as_secs() + 10 + 2 + RESTORE_AFTER_FAULTS.as_secs() + UNDO_FOR.as_secs()
-        < crate::clock::FOLD_SAFETY_MARGIN_S
-);
+/// How long a tampering race waits for a server's held record PUT after
+/// the nudge; the plain record race waits 120 s. Servers send one within a
+/// second of the nudge in practice.
+pub const TAMPER_HELD_WAIT: Duration = Duration::from_secs(45);
+
+/// One raw S3 request at its bound: curl's `--max-time` (`s3::MAX_TIME_S`).
+const S3_S: u64 = crate::s3::MAX_TIME_S;
+/// One proxy control command at its bound: the 2 s connect and 5 s read
+/// timeouts of `proxy::control`.
+const PROXY_CMD_S: u64 = 7;
+/// `clock::reach_wait_s`: one reread interval plus a second. Also the most
+/// two processes' faked clocks differ by.
+const REACH_WAIT_S: u64 = crate::clock::FAKETIME_CACHE_DURATION_S + 1;
+/// One round of `Shared::all_nodes_serve` at its bound, which the settle's
+/// wait can start just before its 120 s are up: two ravel nodes' readiness
+/// (2 s each) and SQL (`READ_TIMEOUT`, 30 s, each), two maintenance nodes'
+/// readiness (2 s each), and the 2 s pause between rounds.
+const SERVE_ROUND_S: u64 = 2 * (2 + crate::READ_TIMEOUT.as_secs()) + 2 * 2 + 2;
+
+/// From the nudge's write of the clock offset to the tamper, every term at
+/// its bound.
+pub const BEFORE_TAMPER_S: u64 =
+    // shift_clock: wait for the move to reach the driver, one reread plus 30 s.
+    (crate::clock::FAKETIME_CACHE_DURATION_S + 30)
+    // shift_clock: its reach wait.
+    + REACH_WAIT_S
+    // shift_clock: the GET of HEAD after the move (`head_read`).
+    + S3_S
+    // settle: its reach wait.
+    + REACH_WAIT_S
+    // settle: the 120 s `wait_serving`, and one serving round past it.
+    + 120 + SERVE_ROUND_S
+    // `hold-record`.
+    + PROXY_CMD_S
+    // The held wait, and one poll round past it: `held`, `release`, the
+    // 0.5 s pause, `hold-record`, the 0.25 s pause.
+    + TAMPER_HELD_WAIT.as_secs() + 3 * PROXY_CMD_S + 1
+    // The compaction's budget, measured from the held PUT's age.
+    + TAMPER_BY.as_secs()
+    // The GET of the CLI's record before the tamper.
+    + S3_S;
+
+/// From the tamper's start to the first undo attempt, every term at its
+/// bound.
+pub const TAMPER_TAIL_S: u64 =
+    // The tamper: the part's GET and DELETE (a forged record is one PUT).
+    2 * S3_S
+    // The GET that checks the tamper is in place.
+    + S3_S
+    // `release`.
+    + PROXY_CMD_S
+    // `held_result_of`: `HELD_RESULT_WAIT`, one command past it, the 0.1 s
+    // pause.
+    + crate::HELD_RESULT_WAIT.as_secs() + PROXY_CMD_S + 1
+    // The 2 s for the server's handling of the store's answer.
+    + 2
+    // The GET of the record after the release.
+    + S3_S
+    // The wait before the undo while faults may run.
+    + RESTORE_AFTER_FAULTS.as_secs();
+
+/// One undo attempt at its bound: the GET of the key and the PUT back.
+pub const UNDO_ATTEMPT_S: u64 = 2 * S3_S;
+
+/// Seconds from the nudge until the bucket's hour seals for the fold: the
+/// nudge lands the clocks `SEAL_SLACK_S` past the compaction seal, which is
+/// `FOLD_SAFETY_MARGIN_S` before the fold seal.
+pub const FOLD_SEAL_AFTER_NUDGE_S: u64 =
+    crate::clock::FOLD_SAFETY_MARGIN_S - crate::clock::SEAL_SLACK_S;
+
+/// The whole tampering race, every term at its bound.
+pub const TAMPER_RACE_S: u64 =
+    // From the nudge to the tamper.
+    BEFORE_TAMPER_S
+    // From the tamper to the first undo attempt.
+    + TAMPER_TAIL_S
+    // The undo's retries: attempts start for `UNDO_FOR`, and the last one
+    // started can take a whole attempt past it.
+    + UNDO_FOR.as_secs() + UNDO_ATTEMPT_S
+    // A server's faked clock can run this far ahead of the driver's.
+    + REACH_WAIT_S;
+const _: () = assert!(TAMPER_RACE_S <= FOLD_SEAL_AFTER_NUDGE_S);
+
+/// The unix second the bucket hour `hour` seals for the fold
+/// (`clock::seal_margin_s` after its end).
+pub fn fold_seal_s(hour: u64) -> u64 {
+    (hour + 1) * 3600 + crate::clock::seal_margin_s()
+}
+
+/// The last second of the driver's clock at which an undo attempt on a
+/// tamper in `hour` may start and still finish before any server's clock
+/// reaches the hour's fold seal.
+pub fn undo_by_s(hour: u64) -> u64 {
+    fold_seal_s(hour).saturating_sub(UNDO_ATTEMPT_S + REACH_WAIT_S)
+}
+
+/// Whether a race may tamper with a record of `hour` at `now_s`: the rest
+/// of the race at its bounds still ends before [`undo_by_s`]. The race runs
+/// no tamper otherwise, so a slow run up to the tamper never carries one
+/// past the fold seal.
+pub fn tamper_fits(now_s: u64, hour: u64) -> bool {
+    now_s + TAMPER_TAIL_S <= undo_by_s(hour)
+}
+
+/// The wait before the undo: [`restore_after`], cut short so the first
+/// undo attempt still starts by [`undo_by_s`].
+pub fn restore_wait(now_s: u64, hour: u64, faults_may_run: bool) -> Duration {
+    restore_after(faults_may_run).min(Duration::from_secs(undo_by_s(hour).saturating_sub(now_s)))
+}
+
+/// What the undo of a tamper in bucket hour `hour` does next, at `now_s`,
+/// after `attempts` refused attempts that started `tried` ago.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UndoStep {
+    /// Start an attempt. `overran` when it starts past [`undo_by_s`], so it
+    /// may finish after the fold seal: the cap fires, and the undo still
+    /// runs, since giving it up would leave the tamper in the store.
+    Attempt { overran: bool },
+    /// Stop retrying: at least one attempt ran, and [`UNDO_FOR`] is up.
+    GiveUp,
+}
+
+/// See [`UndoStep`]. The first attempt always starts.
+pub fn undo_step(now_s: u64, hour: u64, tried: Duration, attempts: u32) -> UndoStep {
+    if attempts > 0 && tried >= UNDO_FOR {
+        return UndoStep::GiveUp;
+    }
+    UndoStep::Attempt {
+        overran: now_s > undo_by_s(hour),
+    }
+}
+
+/// Seconds of the driver's clock from the nudge to `now_s`, against the
+/// [`FOLD_SEAL_AFTER_NUDGE_S`] budget: the nudge puts the clocks that long
+/// before the fold seal of `hour`.
+pub fn race_elapsed_s(now_s: u64, hour: u64) -> i64 {
+    now_s as i64 - (fold_seal_s(hour) - FOLD_SEAL_AFTER_NUDGE_S) as i64
+}
+
+/// Whether the record a loser met changed after the release: `after`, read
+/// 2 s after it, against what was in place at the release, the forged
+/// record in a divergent-record race and the CLI's record otherwise.
+/// `None` when either read failed or found nothing.
+pub fn record_changed(
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+    undo: Option<&Undo>,
+) -> Option<bool> {
+    let at_release = match undo {
+        Some(Undo::Record { forged, .. }) => Some(forged.as_slice()),
+        _ => before,
+    };
+    Some(after? != at_release?)
+}
 
 /// The wait before the undo: [`RESTORE_AFTER_FAULTS`] while faults may run,
 /// [`RESTORE_AFTER`] once they stopped.
@@ -805,6 +952,141 @@ mod tests {
         let mut other = hash.clone();
         other[7] ^= 1;
         assert!(diverge(&record_key_for(&other), &record).is_err());
+    }
+
+    #[test]
+    fn the_tampering_race_at_every_bound_ends_before_the_fold_seal() {
+        // The nudge lands 30 s past the compaction seal, 900 s before the
+        // fold seal.
+        assert_eq!(FOLD_SEAL_AFTER_NUDGE_S, 870);
+        // Every term, each from the constant it stands for, so dropping one
+        // from a sum fails here.
+        let reread = crate::clock::FAKETIME_CACHE_DURATION_S;
+        let reach = crate::clock::reach_wait_s(reread);
+        let s3 = crate::s3::MAX_TIME_S;
+        let serve_round = 2 * (2 + crate::READ_TIMEOUT.as_secs()) + 2 * 2 + 2;
+        let before_tamper = (reread + 30) // shift_clock: the move reaching the driver
+            + reach // shift_clock: its reach wait
+            + s3 // shift_clock: the GET of HEAD
+            + reach // settle: its reach wait
+            + 120 + serve_round // settle: wait_serving and one round past it
+            + PROXY_CMD_S // hold-record
+            + TAMPER_HELD_WAIT.as_secs() + 3 * PROXY_CMD_S + 1 // held wait, one poll round
+            + TAMPER_BY.as_secs() // the compaction
+            + s3; // the GET of the CLI's record
+        assert_eq!(BEFORE_TAMPER_S, before_tamper);
+        let tail = 2 * s3 // the tamper: two raw S3 requests
+            + s3 // the in-place GET
+            + PROXY_CMD_S // release
+            + crate::HELD_RESULT_WAIT.as_secs() + PROXY_CMD_S + 1 // the held result
+            + 2
+            + s3 // the GET after the release
+            + RESTORE_AFTER_FAULTS.as_secs();
+        assert_eq!(TAMPER_TAIL_S, tail);
+        assert_eq!(UNDO_ATTEMPT_S, 2 * s3);
+        assert_eq!(
+            TAMPER_RACE_S,
+            before_tamper + tail + UNDO_FOR.as_secs() + 2 * s3 + reach
+        );
+        // The figures: 372 + 347 + 60 + 60 + 3 = 842.
+        assert_eq!(BEFORE_TAMPER_S, 372);
+        assert_eq!(TAMPER_TAIL_S, 347);
+        assert_eq!(TAMPER_RACE_S, 842);
+    }
+
+    #[test]
+    fn a_tamper_happens_and_is_undone_only_before_the_fold_seal() {
+        let seal = (HOUR + 1) * 3600 + 4800;
+        assert_eq!(fold_seal_s(HOUR), seal);
+        // The last undo attempt starts one attempt and one clock skew
+        // before the seal.
+        assert_eq!(undo_by_s(HOUR), seal - 60 - 3);
+        // Right after the nudge every wait fits.
+        let nudged = (HOUR + 1) * 3600 + 3900 + 30;
+        assert!(tamper_fits(nudged + BEFORE_TAMPER_S, HOUR));
+        let last = undo_by_s(HOUR) - TAMPER_TAIL_S;
+        assert!(tamper_fits(last, HOUR));
+        assert!(!tamper_fits(last + 1, HOUR));
+        // An earlier hour, already past its seal, is never tampered.
+        assert!(!tamper_fits(nudged, HOUR - 1));
+        // The wait before the undo is cut so the first attempt starts by
+        // the deadline, and is zero past it.
+        assert_eq!(restore_wait(nudged, HOUR, true), RESTORE_AFTER_FAULTS);
+        assert_eq!(restore_wait(nudged, HOUR, false), RESTORE_AFTER);
+        assert_eq!(
+            restore_wait(undo_by_s(HOUR) - 50, HOUR, true),
+            Duration::from_secs(50)
+        );
+        assert_eq!(
+            restore_wait(undo_by_s(HOUR) + 5, HOUR, true),
+            Duration::ZERO
+        );
+        // The elapsed time printed for the race counts from the nudge.
+        assert_eq!(race_elapsed_s(nudged, HOUR), 0);
+        assert_eq!(race_elapsed_s(nudged + 842, HOUR), 842);
+    }
+
+    #[test]
+    fn a_late_undo_fires_the_cap_and_still_runs() {
+        let by = undo_by_s(HOUR);
+        // In time: an attempt, no cap.
+        assert_eq!(
+            undo_step(by, HOUR, Duration::ZERO, 0),
+            UndoStep::Attempt { overran: false }
+        );
+        // Past the deadline the cap fires, and the undo still runs: the
+        // first attempt, and every retry while UNDO_FOR lasts.
+        assert_eq!(
+            undo_step(by + 1, HOUR, Duration::ZERO, 0),
+            UndoStep::Attempt { overran: true }
+        );
+        assert_eq!(
+            undo_step(by + 300, HOUR, UNDO_FOR - Duration::from_millis(1), 3),
+            UndoStep::Attempt { overran: true }
+        );
+        // Even with UNDO_FOR spent before the first attempt, one runs.
+        assert_eq!(
+            undo_step(by + 300, HOUR, UNDO_FOR, 0),
+            UndoStep::Attempt { overran: true }
+        );
+        // After refused attempts for all of UNDO_FOR it gives up, and the
+        // undo is left pending.
+        assert_eq!(undo_step(by, HOUR, UNDO_FOR, 1), UndoStep::GiveUp);
+        assert_eq!(undo_step(by + 300, HOUR, UNDO_FOR, 4), UndoStep::GiveUp);
+    }
+
+    #[test]
+    fn a_record_change_after_the_release_is_judged_against_what_the_loser_met() {
+        let forged = Undo::Record {
+            key: "r".to_string(),
+            original: b"cli".to_vec(),
+            forged: b"forged".to_vec(),
+        };
+        // Divergent-record race: the forged record still there is no
+        // change, though it differs from the CLI's; a loser's own record is.
+        assert_eq!(
+            record_changed(Some(b"cli"), Some(b"forged"), Some(&forged)),
+            Some(false)
+        );
+        assert_eq!(
+            record_changed(Some(b"cli"), Some(b"loser"), Some(&forged)),
+            Some(true)
+        );
+        // Otherwise the CLI's record is what the loser met.
+        let part = Undo::Part {
+            key: "p".to_string(),
+            bytes: b"part".to_vec(),
+        };
+        assert_eq!(
+            record_changed(Some(b"cli"), Some(b"cli"), Some(&part)),
+            Some(false)
+        );
+        assert_eq!(
+            record_changed(Some(b"cli"), Some(b"loser"), None),
+            Some(true)
+        );
+        assert_eq!(record_changed(Some(b"cli"), None, None), None);
+        assert_eq!(record_changed(None, Some(b"cli"), None), None);
     }
 
     #[test]

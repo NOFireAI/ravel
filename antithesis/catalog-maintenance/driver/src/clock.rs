@@ -404,7 +404,7 @@ pub fn compaction_seal_margin_s() -> u64 {
 
 /// How far past a seal a nudge puts the clocks, so the settle and a process
 /// that reads its clock just before the reread still see the hour sealed.
-const SEAL_SLACK_S: u64 = 30;
+pub const SEAL_SLACK_S: u64 = 30;
 
 /// How far to move every clock forward so `hour` is sealed `margin_s` after
 /// its end, with [`SEAL_SLACK_S`] to spare; 0 when it already is.

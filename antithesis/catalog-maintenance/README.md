@@ -636,10 +636,12 @@ create-if-absent decides the winner.
 Two variants of the record race (rules `race_divergent_records` and
 `race_missing_parts`) change the store between the CLI's publish and the
 release, so the losing server meets a winner record it must fail closed on.
-Steps 1 to 6 are the record race's, except that the CLI gets until the held
-PUT is 10 s old, not 14 s (`forced::TAMPER_BY`), so the change and the
+Steps 1 to 6 are the record race's, except that step 5 waits 45 s for a
+held PUT, not 120 s (`forced::TAMPER_HELD_WAIT`), and the CLI gets until the
+held PUT is 10 s old, not 14 s (`forced::TAMPER_BY`), so the change and the
 release still land well inside the 18 s hold cap. Then, only if the CLI
-exited and its record is in the store:
+exited, its record is in the store, and the rest of the race at its bounds
+still ends before the hour seals for the fold (`forced::tamper_fits`):
 
 7. The tamper, through raw S3 (the driver reaches rustfs directly):
    - divergent record: PUT the CLI's record back with the last byte of its
@@ -678,15 +680,33 @@ exited and its record is in the store:
    tamper: PUT the CLI's record back if the forged one is still there (a
    record a mutant loser wrote stays; that loser had PUT its parts), or PUT
    the part back if it is still absent. An undo the store refuses is
-   retried for 120 s (`forced::UNDO_FOR`), then left pending: every later
+   retried for 60 s (`forced::UNDO_FOR`), then left pending: every later
    clock move and the `eventually` retry it before anything else, and no
    clock moves while it stays pending (the move reports itself not taken,
-   as one whose HEAD would not hold still does). The race, its waits
-   included, ends inside the 900 s between the hour sealing for compaction
-   and sealing for the fold, and only a clock move seals it, so no fold
-   folds the tampered record; no query, audit or write of the driver runs
-   while the race holds the gate. "Faults may run" ends only once the
-   `eventually`'s stop-faults command returned, not when it started.
+   as one whose HEAD would not hold still does). "Faults may run" ends only
+   once the `eventually`'s stop-faults command returned, not when it
+   started.
+
+   The faked clocks run in real time, so the hour seals for the fold 870 s
+   after the nudge whether or not the driver moves a clock. The race keeps
+   every tamper inside that: `forced::TAMPER_RACE_S`, the whole race with
+   every wait, raw S3 request (30 s each), proxy command (7 s each) and
+   serving round (70 s) at its bound, the undo retries and their last
+   attempt included, is 842 s, and a const assertion holds it at or below
+   870 s. At run time the driver also reads its own clock: it tampers only
+   when the rest of the race still fits (`forced::tamper_fits`), cuts the
+   wait before the undo so the first attempt starts in time
+   (`forced::restore_wait`). An undo attempt that starts later than one
+   attempt and one clock skew before the seal (`forced::undo_by_s`) fires
+   the unreachable-assertion `catalog: a record race's undo started past
+   its fold-seal deadline` and still runs (`forced::undo_step`): giving it
+   up would leave the tamper in the store. An undo still refused after its
+   retries fires `catalog: a record race's tamper was still in the store at
+   its undo deadline` and stays pending. Either way a tamper is never
+   carried silently past the seal. Each race prints `race_s`, its length on
+   the driver's clock from the nudge to the end of the undo, beside
+   `race_budget_s` (870). No query, audit or write of the driver runs while
+   the race holds the gate.
 10. `pass`. Asserted as `catalog: a server's compaction record PUT lost to a
     record whose input-set hash diverges from its own` or `catalog: a
     server's compaction record PUT lost to a record whose part is missing
@@ -1065,7 +1085,7 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     fallback.
 - The local loop's bound on the driver's run after setup is `seconds` plus
   4800 s for the `eventually`, which runs the forced races before its fold,
-  plus 330 s for each of up to six divergent-record and missing-part races,
+  plus 250 s for each of up to six divergent-record and missing-part races,
   900 s for its fresh compaction read, 60 s for each of up to 25 clock
   moves, and 150 s for the wait after the window jump.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
