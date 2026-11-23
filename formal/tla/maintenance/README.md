@@ -197,7 +197,7 @@ and its CreateIfAbsent/CasVersion operations are in
 through `ClaimGuard` (`crates/ravel-maintain/src/claim_guard.rs`), whose
 `checkpoint` renews it and cancels the run once it is lost or gone. The server
 maintenance tick installs it unless `--maintain-claims off` sets coordination
-off, and the CLI installs it unless `--no-claim` is given.
+off, and the CLI installs it unless `--no-claim` or `--dry-run` is given.
 The model checks the protocol that guard implements.
 
 ### What it establishes
