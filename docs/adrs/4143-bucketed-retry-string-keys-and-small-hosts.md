@@ -226,7 +226,8 @@ LargeUtf8, Utf8View, Binary, LargeBinary or BinaryView.
   any row is written and never exceeded: its fixed-width columns, its views
   or offsets (16 B per variable-width column per row), its validity and its
   copied string bytes all come out of `B`. A chunk seals when the next row
-  would take it past `B`, or at 8,192 rows. The rows a chunk holds and the
+  would take it past `B`, or at 8,192 rows (and earlier, when a buffer's
+  doubling would pass `B`: see the chunk growth amendment below). The rows a chunk holds and the
   bytes its strings take are what the data gives; `B` is the only parameter
   the derivation sets.
 - **Copies, not views.** Strings longer than the 12-byte inline limit are
@@ -254,7 +255,8 @@ LargeUtf8, Utf8View, Binary, LargeBinary or BinaryView.
   straight to the files in uncharged slices, because the pool has just
   refused a grow. For a variable-width route a slice is cut the way a chunk
   seals: it ends when the next row would take it past `B` bytes, or at
-  8,192 rows, and a single row larger than `B` is a slice of its own. The
+  8,192 rows (or earlier, as the chunk growth amendment below says), and a
+  single row larger than `B` is a slice of its own. The
   uncharged bound per stream is one slice of at most `B` bytes plus 12 B
   per row for its hashes and order (8 + 4 B, as in the router's scratch)
   plus the pieces' validity and per-bucket offsets, or one oversized row,
@@ -400,3 +402,34 @@ flowchart TD
   gate (#4154).
 - No frozen format changes: RSEG, `proto/`, series identity, commit tokens
   and the object key layout are untouched.
+
+## Amendment: chunk growth (issue #4650)
+
+<!-- amendment-applies: sections="3. String keys are routed in byte-budgeted chunks, in the retry only (#4132)" pointer="chunk growth amendment" -->
+
+Decision 3 states when a chunk seals by `B` and the row cap alone. As
+built, a chunk's buffers doubled while every doubled buffer still fit `B`,
+and after that a buffer that had to grow took exactly its new length
+rounded up to 64 bytes, allocating a replacement and copying itself for
+nearly every row. On ClickBench statements 34 and 35 that exact growth
+moved at least 1.49 TB through memmove to write 2.87 GB of spill.
+
+A chunk that still takes rows now grows a buffer only to at least twice its
+capacity (and at least its new length rounded up to 64 bytes). When that
+growth would take the buffers' capacities past `B` the chunk is full: it
+seals and the row starts the next chunk. A chunk therefore seals when the
+next row would take it past `B` by the budget's measure, when a doubling
+for it would take the capacities past `B`, or at 8,192 rows; a forced-route
+slice is cut the same way. A row larger than `B` still takes a chunk of
+its own, charged at its size. Everything else in decision 3 stands: `B` is
+charged in full before a row is written, and the capacities a chunk holds
+never sum past its charge.
+
+The bytes growth copies are less than twice the bytes a chunk's rows
+append, for any `B` and row shape: each growth copies at most the capacity
+it grows from and at least doubles it. The cost is fill. A chunk sealed by
+a doubling holds rows that, with the refused row, measure more than half of
+`B`, so the floor bullet's "about 118 rows" of a 16 KiB chunk is what the
+budget's measure admits, not what every chunk holds. The retry's INFO line
+reports the copies as `bucket_route_resize_bytes` and the chunks sealed as
+`bucket_route_chunks_sealed`.

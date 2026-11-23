@@ -49,8 +49,15 @@
 //! column's validity, fixed-width values, 16 bytes of view or offset per row
 //! and copied string bytes come. Strings are copied into the chunk's own
 //! data block, so a chunk keeps no input batch alive. A chunk seals when the
-//! next row would pass the budget or at `routed_chunk_rows` rows; a row
-//! larger than the budget takes a chunk of its own, charged at its size.
+//! next row would pass the budget, when one of its buffers would have to
+//! grow and doubling it would take the buffers' capacities past the budget,
+//! or at `routed_chunk_rows` rows; a row larger than the budget takes a
+//! chunk of its own, charged at its size. A filling chunk's buffers only
+//! ever double, never resize to an exact length, so the bytes growth copies
+//! are less than twice the bytes its rows append, for any budget and row
+//! shape (issue #4650), and a chunk seals only once it and the refused row
+//! measure more than half its budget. `bucket_route_resize_bytes` and
+//! `bucket_route_chunks_sealed` count the copies and the chunks sealed.
 //!
 //! The rule runs before `CompactSlices`, which wraps only `AggregateExec`, so
 //! a converted aggregate gets neither half of that rule: the slice compaction
@@ -224,6 +231,14 @@ pub const BUCKET_SPILL_ROWS_READ: &str = "bucket_spill_rows_read";
 /// The name of the exec's counter of the batches (IPC messages) appended to
 /// its scratch files.
 pub const BUCKET_SPILL_BATCHES_WRITTEN: &str = "bucket_spill_batches_written";
+
+/// The name of the exec's counter of the bytes a byte-budgeted chunk's
+/// buffers copied into a larger allocation while they filled.
+pub const BUCKET_ROUTE_RESIZE_BYTES: &str = "bucket_route_resize_bytes";
+
+/// The name of the exec's counter of the chunks its route sealed: every
+/// chunk a bucket filled, the forced route's uncharged pieces excluded.
+pub const BUCKET_ROUTE_CHUNKS_SEALED: &str = "bucket_route_chunks_sealed";
 
 /// Replaces every qualifying `FinalPartitioned` [`AggregateExec`] with a
 /// [`BucketedFinalAggregateExec`]. See the module docs.
@@ -491,6 +506,11 @@ pub(crate) struct BucketSpillFigures {
     pub(crate) bytes_read: u64,
     /// The state rows they read back from their scratch files.
     pub(crate) rows_read: u64,
+    /// The bytes their chunk buffers copied as they grew
+    /// ([`BUCKET_ROUTE_RESIZE_BYTES`]).
+    pub(crate) resize_bytes: u64,
+    /// The chunks their routes sealed ([`BUCKET_ROUTE_CHUNKS_SEALED`]).
+    pub(crate) chunks_sealed: u64,
     /// Whether any of them executed with a disk manager that allows temp
     /// files ([`BucketedFinalAggregateExec::spill_available`]).
     pub(crate) disk: bool,
@@ -531,11 +551,15 @@ fn collect_bucket_spill_figures(
             routed_chunk_rows: exec.config.routed_chunk_rows,
             bytes_read: 0,
             rows_read: 0,
+            resize_bytes: 0,
+            chunks_sealed: 0,
             disk: false,
             executed: false,
         });
         figures.bytes_read += counted(BUCKET_SPILL_BYTES_READ);
         figures.rows_read += counted(BUCKET_SPILL_ROWS_READ);
+        figures.resize_bytes += counted(BUCKET_ROUTE_RESIZE_BYTES);
+        figures.chunks_sealed += counted(BUCKET_ROUTE_CHUNKS_SEALED);
         figures.disk |= exec.spill_available();
         figures.executed |= metrics.iter().next().is_some();
     }
@@ -720,6 +744,18 @@ struct BucketMetrics {
     /// Rows the per-bucket top-k cut from routed buckets' output; zero
     /// without a TopK and for a partition that never engaged.
     topk_rows_dropped: Count,
+    /// The route's [`BUCKET_ROUTE_RESIZE_BYTES`] and
+    /// [`BUCKET_ROUTE_CHUNKS_SEALED`].
+    route: RouteCounters,
+}
+
+/// What a router counts as it fills chunks.
+#[derive(Clone, Default)]
+struct RouteCounters {
+    /// Bytes copied by [`resize_capacity`].
+    resize_bytes: Count,
+    /// Chunks sealed, the forced route's uncharged pieces excluded.
+    chunks_sealed: Count,
 }
 
 impl BucketMetrics {
@@ -730,6 +766,12 @@ impl BucketMetrics {
             routed_rows: MetricBuilder::new(metrics).counter("routed_rows", partition),
             engaged: MetricBuilder::new(metrics).counter("engaged", partition),
             topk_rows_dropped: MetricBuilder::new(metrics).counter("topk_rows_dropped", partition),
+            route: RouteCounters {
+                resize_bytes: MetricBuilder::new(metrics)
+                    .counter(BUCKET_ROUTE_RESIZE_BYTES, partition),
+                chunks_sealed: MetricBuilder::new(metrics)
+                    .counter(BUCKET_ROUTE_CHUNKS_SEALED, partition),
+            },
         }
     }
 }
@@ -1026,17 +1068,31 @@ impl<'a> ByteSource<'a> {
 /// to at most the chunk's charge: every buffer is sized for a row before any
 /// of the row is written ([`ByteChunk::reserve_row`]), and a write past a
 /// buffer's capacity is an error, never a reallocation ([`append`]). While
-/// one buffer grows (or is cut), its old copy is also held until the new one
-/// is filled ([`resize_capacity`]), so for that moment the allocation passes
-/// the charge by the old copy's capacity.
+/// one buffer grows, its old copy is also held until the new one is filled
+/// ([`resize_capacity`]), so for that moment the allocation passes the
+/// charge by the old copy's capacity.
+///
+/// A buffer grows only geometrically: to at least twice its capacity
+/// ([`grown_capacity`]). When that growth would take the capacities past
+/// the budget the chunk is full ([`ByteChunk::fits`]) and the row starts
+/// the next chunk, so no buffer of a filling chunk is ever resized to an
+/// exact length. Each growth copies the buffer's length, at most its
+/// capacity `C` before it, and takes the capacity to at least `2C`; the
+/// capacities a buffer grows from therefore sum to less than twice the last
+/// of them, which is less than the buffer's final length. The bytes growth
+/// copies are thus less than twice the bytes the chunk's rows append, for
+/// any budget and row shape. The price is fill: a chunk seals once its
+/// rows and the refused row measure more than half its budget, since every
+/// capacity is at most twice its rounded length.
 struct ByteChunk {
     types: Vec<(DataType, RoutedLayout)>,
     /// Per column: the validity bitmap, the values (fixed-width values,
     /// offsets or views) and the data block.
     buffers: Vec<[MutableBuffer; 3]>,
-    /// Per column, scratch for [`ByteChunk::reserve_row`]: each buffer's
-    /// length once the next row is written.
-    lengths: Vec<[usize; 3]>,
+    /// Per column, each buffer's capacity: the allocated one on a chunk
+    /// that writes rows, the one it would hold on the uncharged count
+    /// [`byte_slice_rows`] keeps.
+    capacities: Vec<[usize; 3]>,
     null_counts: Vec<usize>,
     copied: Vec<usize>,
     len: usize,
@@ -1044,26 +1100,45 @@ struct ByteChunk {
     row_cap: usize,
 }
 
-/// A chunk's data block slot.
-const DATA: usize = 2;
-
 fn chunk_error(what: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Internal(format!("BucketedFinalAggregateExec: {what}"))
 }
 
-/// `length` rounded up to the 64 bytes a buffer is allocated in.
-fn rounded_capacity(length: usize) -> DFResult<usize> {
-    length
-        .checked_next_multiple_of(64)
-        .ok_or_else(|| chunk_error(format!("a chunk buffer of {length} bytes passes usize")))
+/// The capacity a chunk buffer of `held` bytes takes to hold `length`
+/// bytes: `held` when it does, else at least twice `held` and at least
+/// `length` rounded up to the 64 bytes a buffer is allocated in. `None`
+/// past `usize`.
+fn grown_capacity(held: usize, length: usize) -> Option<usize> {
+    if length <= held {
+        return Some(held);
+    }
+    Some(
+        length
+            .checked_next_multiple_of(64)?
+            .max(held.checked_mul(2)?),
+    )
+}
+
+/// The lengths of a `layout` column's validity bitmap, values (fixed-width
+/// values, offsets or views) and data block at `rows` rows and `data`
+/// copied string bytes. `None` past `usize`.
+fn buffer_lengths(layout: RoutedLayout, rows: usize, data: usize) -> Option<[usize; 3]> {
+    let values = match layout {
+        RoutedLayout::Fixed(width) => rows.checked_mul(width)?,
+        RoutedLayout::Offsets(width) => rows.checked_add(1)?.checked_mul(width)?,
+        RoutedLayout::Views => rows.checked_mul(size_of::<u128>())?,
+    };
+    Some([rows.div_ceil(8), values, data])
 }
 
 /// Move `buffer`'s bytes into a new allocation of `capacity` bytes, at
 /// least its length; the old allocation is freed once they are copied.
-fn resize_capacity(buffer: &mut MutableBuffer, capacity: usize) {
+/// Returns the bytes copied.
+fn resize_capacity(buffer: &mut MutableBuffer, capacity: usize) -> usize {
     let mut resized = MutableBuffer::with_capacity(capacity);
     resized.extend_from_slice(buffer.as_slice());
     *buffer = resized;
+    buffer.len()
 }
 
 /// Append `bytes` to a chunk buffer inside the capacity it already holds.
@@ -1109,7 +1184,7 @@ impl ByteChunk {
                 .iter()
                 .map(|_| std::array::from_fn(|_| MutableBuffer::new(0)))
                 .collect(),
-            lengths: vec![[0; 3]; types.len()],
+            capacities: vec![[0; 3]; types.len()],
             null_counts: vec![0; types.len()],
             copied: vec![0; types.len()],
             len: 0,
@@ -1131,13 +1206,90 @@ impl ByteChunk {
         )
     }
 
+    /// The capacities every buffer holds once grown for `row` of `sources`
+    /// ([`grown_capacity`]), summed; `None` past `usize`.
+    fn grown_bytes(&self, sources: &[ByteSource<'_>], row: usize) -> Option<usize> {
+        let rows = self.len.checked_add(1)?;
+        let mut total = 0usize;
+        for ((((_, layout), capacities), copied), source) in self
+            .types
+            .iter()
+            .zip(&self.capacities)
+            .zip(&self.copied)
+            .zip(sources)
+        {
+            let lengths = buffer_lengths(*layout, rows, copied.checked_add(source.copied(row))?)?;
+            for (&held, length) in capacities.iter().zip(lengths) {
+                total = total.checked_add(grown_capacity(held, length)?)?;
+            }
+        }
+        Some(total)
+    }
+
     /// Whether `row` of `sources` fits: under the row cap and, with it, at
-    /// most the budget.
+    /// most the budget, both by the budget's measure and by the capacities
+    /// the buffers hold once grown for it. A row that fails only the second
+    /// would need a buffer resized short of doubling: the chunk is full
+    /// instead. An empty chunk's buffers grow to their rounded lengths,
+    /// which the measure covers, so a row that fits an empty chunk's budget
+    /// by the measure fits it.
     fn fits(&self, sources: &[ByteSource<'_>], row: usize) -> bool {
         self.len < self.row_cap
             && self
                 .bytes_with(sources, row)
                 .is_some_and(|bytes| bytes <= self.budget)
+            && self
+                .grown_bytes(sources, row)
+                .is_some_and(|bytes| bytes <= self.budget)
+    }
+
+    /// Take `row` of `sources` into [`capacities`](Self::capacities): every
+    /// buffer short of its new length grows to [`grown_capacity`]. Refused
+    /// before any capacity moves when they would sum past the budget.
+    fn grow_for(&mut self, sources: &[ByteSource<'_>], row: usize) -> DFResult<()> {
+        let Some(grown) = self.grown_bytes(sources, row) else {
+            return Err(chunk_error("a routed row passes usize"));
+        };
+        if grown > self.budget {
+            return Err(chunk_error(format!(
+                "a row needs {grown} bytes of grown chunk buffers, over the chunk's budget {}",
+                self.budget
+            )));
+        }
+        let rows = self.len + 1;
+        for ((((_, layout), capacities), copied), source) in self
+            .types
+            .iter()
+            .zip(&mut self.capacities)
+            .zip(&self.copied)
+            .zip(sources)
+        {
+            let lengths = copied
+                .checked_add(source.copied(row))
+                .and_then(|data| buffer_lengths(*layout, rows, data));
+            let Some(lengths) = lengths else {
+                return Err(chunk_error("a routed row passes usize"));
+            };
+            for (held, length) in capacities.iter_mut().zip(lengths) {
+                let Some(capacity) = grown_capacity(*held, length) else {
+                    return Err(chunk_error("a routed row passes usize"));
+                };
+                *held = capacity;
+            }
+        }
+        Ok(())
+    }
+
+    /// Count `row` of `sources` into the chunk without writing it: its
+    /// capacities, copied bytes and length move as
+    /// [`push_row`](Self::push_row) would move them.
+    fn count_row(&mut self, sources: &[ByteSource<'_>], row: usize) -> DFResult<()> {
+        self.grow_for(sources, row)?;
+        for (copied, source) in self.copied.iter_mut().zip(sources) {
+            *copied += source.copied(row);
+        }
+        self.len += 1;
+        Ok(())
     }
 
     /// The capacity every buffer of the chunk holds.
@@ -1152,83 +1304,22 @@ impl ByteChunk {
 
     /// Size every buffer for `row` of `sources` before any of the row is
     /// written, all of them together within the budget: every buffer short
-    /// of its new length doubles when all of them doubled still fit beside
-    /// the rest, else takes exactly its length rounded up to 64 bytes, after
-    /// every buffer is first cut to its own rounded length when even that
-    /// does not fit. Cuts run before growths, so the capacities held never
-    /// sum past the budget. The caller has checked the row
-    /// [`fits`](Self::fits), and the rounded lengths of a row that fits sum
-    /// to at most its [`routed_column_bytes`]; a set that would not is
-    /// refused before any buffer moves.
-    fn reserve_row(&mut self, sources: &[ByteSource<'_>], row: usize) -> DFResult<()> {
-        let rows = self.len + 1;
-        for (((lengths, (_, layout)), buffers), source) in self
-            .lengths
-            .iter_mut()
-            .zip(&self.types)
-            .zip(&self.buffers)
-            .zip(sources)
-        {
-            let values = match *layout {
-                RoutedLayout::Fixed(width) => rows.checked_mul(width),
-                RoutedLayout::Offsets(width) => {
-                    rows.checked_add(1).and_then(|rows| rows.checked_mul(width))
+    /// of its new length grows to [`grown_capacity`], at least doubling. The
+    /// caller has checked the row [`fits`](Self::fits); a growth that would
+    /// pass the budget is refused before any buffer moves
+    /// ([`grow_for`](Self::grow_for)). Returns the bytes the growth copied.
+    fn reserve_row(&mut self, sources: &[ByteSource<'_>], row: usize) -> DFResult<usize> {
+        self.grow_for(sources, row)?;
+        let mut copied = 0usize;
+        for (buffers, capacities) in self.buffers.iter_mut().zip(&mut self.capacities) {
+            for (buffer, capacity) in buffers.iter_mut().zip(capacities.iter_mut()) {
+                if *capacity > buffer.capacity() {
+                    copied += resize_capacity(buffer, *capacity);
                 }
-                RoutedLayout::Views => rows.checked_mul(size_of::<u128>()),
-            };
-            let data = buffers[DATA].len().checked_add(source.copied(row));
-            let (Some(values), Some(data)) = (values, data) else {
-                return Err(chunk_error("a routed row passes usize"));
-            };
-            *lengths = [rows.div_ceil(8), values, data];
-        }
-        let (mut doubled, mut exact, mut cut) = (0usize, 0usize, 0usize);
-        for (buffers, lengths) in self.buffers.iter().zip(&self.lengths) {
-            for (buffer, &length) in buffers.iter().zip(lengths) {
-                let held = buffer.capacity();
-                let rounded = rounded_capacity(length)?;
-                let (grown, grown_exact) = if length > held {
-                    (rounded.max(held.saturating_mul(2)), rounded)
-                } else {
-                    (held, held)
-                };
-                doubled = doubled.saturating_add(grown);
-                exact = exact.saturating_add(grown_exact);
-                cut = cut.saturating_add(rounded);
+                *capacity = buffer.capacity();
             }
         }
-        if cut > self.budget {
-            return Err(chunk_error(format!(
-                "a row needs {cut} bytes of chunk buffers, over the chunk's budget {}",
-                self.budget
-            )));
-        }
-        let double = doubled <= self.budget;
-        if !double && exact > self.budget {
-            for (buffers, lengths) in self.buffers.iter_mut().zip(&self.lengths) {
-                for (buffer, &length) in buffers.iter_mut().zip(lengths) {
-                    let rounded = rounded_capacity(length)?;
-                    if buffer.capacity() > rounded {
-                        resize_capacity(buffer, rounded);
-                    }
-                }
-            }
-        }
-        for (buffers, lengths) in self.buffers.iter_mut().zip(&self.lengths) {
-            for (buffer, &length) in buffers.iter_mut().zip(lengths) {
-                let held = buffer.capacity();
-                if length > held {
-                    let rounded = rounded_capacity(length)?;
-                    let capacity = if double {
-                        rounded.max(held.saturating_mul(2))
-                    } else {
-                        rounded
-                    };
-                    resize_capacity(buffer, capacity);
-                }
-            }
-        }
-        Ok(())
+        Ok(copied)
     }
 
     /// Size every buffer for exactly `rows` of `sources`, on an empty chunk
@@ -1246,6 +1337,8 @@ impl ByteChunk {
                 MutableBuffer::with_capacity(values),
                 MutableBuffer::with_capacity(copied),
             ];
+            self.capacities[column] =
+                std::array::from_fn(|slot| self.buffers[column][slot].capacity());
         }
     }
 
@@ -1253,8 +1346,8 @@ impl ByteChunk {
     /// [`reserve_row`](Self::reserve_row) before the first byte is written.
     /// The caller has checked it [`fits`](Self::fits), or sized the chunk
     /// for it.
-    fn push_row(&mut self, sources: &[ByteSource<'_>], row: usize) -> DFResult<()> {
-        self.reserve_row(sources, row)?;
+    fn push_row(&mut self, sources: &[ByteSource<'_>], row: usize) -> DFResult<usize> {
+        let copied = self.reserve_row(sources, row)?;
         let at = self.len;
         for (column, source) in sources.iter().enumerate() {
             let layout = self.types[column].1;
@@ -1304,7 +1397,7 @@ impl ByteChunk {
             self.copied[column] += source.copied(row);
         }
         self.len += 1;
-        Ok(())
+        Ok(copied)
     }
 
     /// The chunk's arrays, charged at the budget.
@@ -1351,9 +1444,12 @@ impl ByteChunk {
 }
 
 /// The rows from `start` one slice of `sources` takes when it is cut the
-/// way a byte-budgeted chunk seals: until the next row would take it past
-/// `budget` bytes, or at `row_cap` rows; a row larger than `budget` alone.
-/// At least one row while any remain.
+/// way a byte-budgeted chunk seals: until the next row does not
+/// [`fit`](ByteChunk::fits) a chunk of `budget` bytes filled with the rows
+/// before it (past the budget by its measure, or by the capacities its
+/// buffers would grow to), or at `row_cap` rows; a row larger than `budget`
+/// alone. At least one row while any remain. The chunk is only counted,
+/// never allocated.
 fn byte_slice_rows(
     types: &[(DataType, RoutedLayout)],
     sources: &[ByteSource<'_>],
@@ -1364,17 +1460,10 @@ fn byte_slice_rows(
 ) -> usize {
     let mut fill = ByteChunk::new(types, budget, row_cap.max(1));
     let mut row = start;
-    while row < rows && fill.len < fill.row_cap {
-        let fits = fill
-            .bytes_with(sources, row)
-            .is_some_and(|bytes| bytes <= budget);
-        if !fits {
+    while row < rows && fill.fits(sources, row) {
+        if fill.count_row(sources, row).is_err() {
             break;
         }
-        for (copied, source) in fill.copied.iter_mut().zip(sources) {
-            *copied += source.copied(row);
-        }
-        fill.len += 1;
         row += 1;
     }
     fill.len.max(1).min(rows.saturating_sub(start))
@@ -1490,6 +1579,7 @@ struct Router {
     /// it, so a router whose `hashes` and `order` were sized up front never
     /// grows them. `usize::MAX` after an engage, which sizes them per batch.
     scratch_rows: usize,
+    counters: RouteCounters,
 }
 
 /// The per-row bytes of a router's `hashes` and `order`.
@@ -1526,6 +1616,7 @@ impl Router {
             offsets: vec![0; bucket_count + 1],
             next: Vec::with_capacity(bucket_count + 1),
             scratch_rows: usize::MAX,
+            counters: RouteCounters::default(),
         }
     }
 
@@ -1623,6 +1714,7 @@ impl Router {
                 {
                     if let Some(full) = self.buckets[bucket].open.take() {
                         let sealed = full.seal()?;
+                        self.counters.chunks_sealed.add(1);
                         match spill.as_deref_mut() {
                             Some(spill) if spill.triggered => {
                                 spill.write(bucket, sealed.columns)?;
@@ -1675,9 +1767,10 @@ impl Router {
     /// [`route`](Self::route) on a route with a variable-width column
     /// (ADR-4143 decision 3): each bucket fills one [`ByteChunk`] of
     /// `budget` bytes at a time, charged in full before a row is written,
-    /// and sealed when the next row would take it past the budget or past
-    /// `chunk_rows` rows. A row larger than the budget takes a chunk of its
-    /// own, charged at its size.
+    /// and sealed when the next row does not [`fit`](ByteChunk::fits) it:
+    /// past the budget, past the budget once a buffer doubles for it, or
+    /// past `chunk_rows` rows. A row larger than the budget takes a chunk of
+    /// its own, charged at its size.
     fn route_bytes(
         &mut self,
         columns: &[ArrayRef],
@@ -1700,6 +1793,7 @@ impl Router {
                 {
                     if let Some(full) = self.buckets[bucket].filling.take() {
                         let sealed = full.seal()?;
+                        self.counters.chunks_sealed.add(1);
                         match spill.as_deref_mut() {
                             Some(spill) if spill.triggered => {
                                 spill.write(bucket, sealed.columns)?;
@@ -1741,7 +1835,8 @@ impl Router {
                         "BucketedFinalAggregateExec: a bucket has no open chunk".to_string(),
                     ));
                 };
-                filling.push_row(sources, row)?;
+                let copied = filling.push_row(sources, row)?;
+                self.counters.resize_bytes.add(copied);
                 target.rows += 1;
                 done += 1;
             }
@@ -1901,9 +1996,11 @@ impl Router {
             let mut chunks = std::mem::take(&mut target.sealed);
             if let Some(open) = target.open.take() {
                 chunks.push(open.seal()?);
+                self.counters.chunks_sealed.add(1);
             }
             if let Some(filling) = target.filling.take() {
                 chunks.push(filling.seal()?);
+                self.counters.chunks_sealed.add(1);
             }
             for chunk in chunks {
                 spill.write(bucket, chunk.columns)?;
@@ -1923,9 +2020,14 @@ impl Router {
             return Ok(Some(chunk));
         }
         if let Some(filling) = target.filling.take() {
+            self.counters.chunks_sealed.add(1);
             return filling.seal().map(Some);
         }
-        target.open.take().map(OpenChunk::seal).transpose()
+        let Some(open) = target.open.take() else {
+            return Ok(None);
+        };
+        self.counters.chunks_sealed.add(1);
+        open.seal().map(Some)
     }
 }
 
@@ -2271,6 +2373,7 @@ impl BucketedStream {
             self.config.routed_chunk_rows.max(1),
             self.config.routed_chunk_bytes.max(1),
         );
+        router.counters = self.metrics.route.clone();
         let mut state = self.group_values.emit(EmitTo::All)?;
         for accumulator in &mut self.accumulators {
             state.extend(accumulator.state(EmitTo::All)?);
@@ -2306,6 +2409,7 @@ impl BucketedStream {
             slice_rows,
             self.config.routed_chunk_bytes.max(1),
         );
+        router.counters = self.metrics.route.clone();
         let mut state = self.group_values.emit(EmitTo::All)?;
         for accumulator in &mut self.accumulators {
             state.extend(accumulator.state(EmitTo::All)?);
@@ -3096,6 +3200,196 @@ mod tests {
         }
     }
 
+    /// The byte budget near the one ClickBench statements 34 and 35 derive
+    /// on a 4 GB host, and a small one.
+    const GROWTH_BUDGETS: [usize; 2] = [480 * 1024, 4096];
+
+    /// `rows` rows of a string key of 60 to 200 bytes and an Int64 count,
+    /// the routed state of a GROUP BY over a long string column.
+    fn long_string_columns(string: &DataType, rows: usize) -> Vec<ArrayRef> {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::compute::cast;
+
+        let keys: StringArray = (0..rows)
+            .map(|i| {
+                let len = 60 + (i * 7919) % 141;
+                let mut key = format!("key-{i}-");
+                key.extend(std::iter::repeat_n('x', len.saturating_sub(key.len())));
+                Some(key)
+            })
+            .collect();
+        let keys: ArrayRef = Arc::new(keys);
+        let counts: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (0..rows as i64).map(|i| i % 97),
+        ));
+        vec![cast(&keys, string).expect("cast the key"), counts]
+    }
+
+    /// The bytes a sealed chunk's rows wrote into its buffers: every
+    /// buffer's length, and the validity bitmap's byte per 8 rows whether
+    /// or not the chunk kept it.
+    fn appended_bytes(chunk: &SealedChunk) -> usize {
+        chunk
+            .columns
+            .iter()
+            .map(|column| {
+                let data = column.to_data();
+                data.len().div_ceil(8)
+                    + data
+                        .buffers()
+                        .iter()
+                        .map(|buffer| buffer.len())
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Route `columns` through a two-bucket router at `budget` bytes in
+    /// batches of 8,192 rows and pop every chunk: the chunks, the bytes
+    /// the router's resizes copied and the chunks it counted sealed.
+    fn route_at_budget(columns: &[ArrayRef], budget: usize) -> (Vec<SealedChunk>, u64, u64) {
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut reservation = MemoryConsumer::new("growth").register(&pool);
+        let mut router = Router::new(routed_layouts(columns), 1, 1, 8192, budget);
+        let rows = columns[0].len();
+        let mut start = 0;
+        while start < rows {
+            let len = 8192.min(rows - start);
+            let batch: Vec<ArrayRef> = columns
+                .iter()
+                .map(|column| column.slice(start, len))
+                .collect();
+            router
+                .route(&batch, &mut reservation, None)
+                .expect("route a batch");
+            start += len;
+        }
+        let mut chunks = Vec::new();
+        for bucket in 0..router.buckets.len() {
+            while let Some(chunk) = router.pop_chunk(bucket).expect("seal a chunk") {
+                chunks.push(chunk);
+            }
+        }
+        let resized = router.counters.resize_bytes.value() as u64;
+        let sealed = router.counters.chunks_sealed.value() as u64;
+        (chunks, resized, sealed)
+    }
+
+    /// Issue #4650: the bytes a filling chunk's buffers copy as they grow
+    /// are at most twice the bytes its rows append, at a budget near the
+    /// derived one and at a small one, for offsets and views alike.
+    #[test]
+    fn chunk_growth_copies_at_most_twice_the_bytes_appended() {
+        for string in [DataType::Utf8, DataType::Utf8View] {
+            let columns = long_string_columns(&string, 40_000);
+            for budget in GROWTH_BUDGETS {
+                let (chunks, resized, sealed) = route_at_budget(&columns, budget);
+                let appended: usize = chunks.iter().map(appended_bytes).sum();
+                let rows: usize = chunks.iter().map(|chunk| chunk.columns[0].len()).sum();
+                assert_eq!(rows, 40_000, "{string} at {budget} B: every row routed");
+                assert_eq!(sealed, chunks.len() as u64, "{string} at {budget} B");
+                assert!(
+                    chunks.len() > 2 * 2,
+                    "{string} at {budget} B: {} chunks, several per bucket",
+                    chunks.len()
+                );
+                let ratio = resized as f64 / appended as f64;
+                eprintln!(
+                    "{string} at {budget} B: growth copied {resized} B for {appended} B \
+                     appended, ratio {ratio:.3}, {} chunks",
+                    chunks.len()
+                );
+                assert!(
+                    resized <= 2 * appended as u64,
+                    "{string} at {budget} B: growth copied {resized} B for {appended} B \
+                     appended, ratio {ratio:.3}"
+                );
+            }
+        }
+    }
+
+    /// The rows from `start` a chunk of `budget` bytes admits by the
+    /// budget's measure alone, as many as fit before the next would pass it.
+    fn rows_by_measure(
+        types: &[(DataType, RoutedLayout)],
+        sources: &[ByteSource<'_>],
+        start: usize,
+        rows: usize,
+        budget: usize,
+    ) -> usize {
+        let mut count = ByteChunk::new(types, budget, usize::MAX);
+        for row in start..rows {
+            if count
+                .bytes_with(sources, row)
+                .is_none_or(|bytes| bytes > budget)
+            {
+                break;
+            }
+            for (copied, source) in count.copied.iter_mut().zip(sources) {
+                *copied += source.copied(row);
+            }
+            count.len += 1;
+        }
+        count.len
+    }
+
+    /// Issue #4650: a chunk does not seal while a doubling still fits. Each
+    /// chunk sealed holds at least half the rows the budget's measure
+    /// admits from its first row, and it and the refused row measure more
+    /// than half the budget; its buffers never hold more than the budget,
+    /// checked after every row.
+    #[test]
+    fn chunks_seal_at_least_half_full() {
+        for string in [DataType::Utf8, DataType::Utf8View] {
+            let columns = long_string_columns(&string, 40_000);
+            let types = routed_layouts(&columns);
+            let data: Vec<ArrayData> = columns.iter().map(|c| c.to_data()).collect();
+            let sources = ByteSource::of(&columns, &data, &types).expect("sources");
+            let rows = columns[0].len();
+            for budget in GROWTH_BUDGETS {
+                let mut fills = Vec::new();
+                let mut start = 0;
+                let mut chunk = ByteChunk::new(&types, budget, usize::MAX);
+                for row in 0..rows {
+                    if !chunk.fits(&sources, row) {
+                        let admitted = rows_by_measure(&types, &sources, start, rows, budget);
+                        let with_refused = chunk.bytes_with(&sources, row).expect("a size");
+                        assert!(
+                            2 * chunk.len >= admitted,
+                            "{string} at {budget} B: a chunk from row {start} sealed at {} \
+                             rows of the {admitted} the budget admits",
+                            chunk.len
+                        );
+                        assert!(
+                            2 * with_refused > budget,
+                            "{string} at {budget} B: sealed at {with_refused} B with the \
+                             refused row"
+                        );
+                        fills.push(chunk.len as f64 / admitted as f64);
+                        chunk = ByteChunk::new(&types, budget, usize::MAX);
+                        start = row;
+                    }
+                    chunk.push_row(&sources, row).expect("push a row");
+                    assert!(chunk.capacity() <= budget, "{string} at {budget} B");
+                }
+                assert!(
+                    fills.len() > 4,
+                    "{string} at {budget} B: {} seals",
+                    fills.len()
+                );
+                let least = fills.iter().copied().fold(f64::INFINITY, f64::min);
+                let mean = fills.iter().sum::<f64>() / fills.len() as f64;
+                eprintln!(
+                    "{string} at {budget} B: {} chunks sealed, fill least {least:.3}, \
+                     mean {mean:.3}",
+                    fills.len()
+                );
+            }
+        }
+    }
+
     /// The column types `prop_byte_chunk_capacity_stays_within_its_budget`
     /// routes.
     const BUDGET_SHAPES: [[DataType; 2]; 5] = [
@@ -3144,10 +3438,12 @@ mod tests {
         /// ADR-4143 decision 3: a byte-budgeted chunk's buffers never hold
         /// more capacity together than its budget, checked after every row
         /// pushed, and the sealed chunks give back every input row exactly.
+        /// Issue #4650: the bytes growth copies are at most twice the bytes
+        /// the rows append, at every budget and row shape drawn.
         #[test]
         fn prop_byte_chunk_capacity_stays_within_its_budget(
             shape in 0..BUDGET_SHAPES.len(),
-            budget in prop::sample::select(vec![16 * 1024, 64 * 1024]),
+            budget in prop::sample::select(vec![4096, 16 * 1024, 64 * 1024]),
             rows in prop::collection::vec((budget_value(), budget_value()), 1..1500),
         ) {
             use datafusion::arrow::compute::concat;
@@ -3161,6 +3457,7 @@ mod tests {
             let sources = ByteSource::of(&columns, &data, &types).expect("sources");
 
             let mut sealed = Vec::new();
+            let mut resized = 0usize;
             let mut chunk = ByteChunk::new(&types, budget, 8192);
             for row in 0..rows.len() {
                 if !chunk.fits(&sources, row) {
@@ -3168,7 +3465,7 @@ mod tests {
                     sealed.push(full.seal().expect("seal a chunk"));
                     prop_assert!(chunk.fits(&sources, row), "a 400-byte row fits {budget} B");
                 }
-                chunk.push_row(&sources, row).expect("push a row");
+                resized += chunk.push_row(&sources, row).expect("push a row");
                 let held = chunk.capacity();
                 prop_assert!(
                     held <= budget,
@@ -3176,8 +3473,15 @@ mod tests {
                      budget {budget}",
                     chunk.len
                 );
+                let counted: usize = chunk.capacities.iter().flatten().sum();
+                prop_assert_eq!(counted, held, "fits reads the capacities held");
             }
             sealed.push(chunk.seal().expect("seal a chunk"));
+            let appended: usize = sealed.iter().map(appended_bytes).sum();
+            prop_assert!(
+                resized <= 2 * appended,
+                "{left}, {right}: growth copied {resized} B for {appended} B appended"
+            );
 
             for (index, column) in columns.iter().enumerate() {
                 let parts: Vec<&dyn Array> =
