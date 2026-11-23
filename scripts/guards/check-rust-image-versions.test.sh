@@ -153,6 +153,7 @@ EOF
 expect "docker.io/library/rust mismatch is a finding" 1 "${d}" \
   "docker.io/library/rust:1.97.1-trixie has version 1.97.1"
 
+# shellcheck disable=SC2016 # the ${RUST_VERSION} tag is meant literally
 for tag in "rust:latest" "rust:1" "rust:slim" "rust" "rust@sha256:00ff" 'rust:${RUST_VERSION}'; do
   d="$(new_repo "unpinned-${#tag}-${tag//[^a-z0-9]/}")"
   printf 'FROM %s AS build\n' "${tag}" | put "${d}" Dockerfile

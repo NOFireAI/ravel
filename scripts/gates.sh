@@ -946,6 +946,15 @@ bash "$(dirname "$0")/guards/check-release-profile.test.sh"
 echo "==> scripts/guards/check-release-profile.sh"
 "$(dirname "$0")/guards/check-release-profile.sh"
 
+# Every rust builder image tag in a Dockerfile names the version
+# rust-toolchain.toml pins (issue #4630): a Dockerfile that lands while a
+# toolchain bump is in flight keeps the old tag. Cases first, same reason as
+# the guards above. A text scan, no build.
+echo "==> scripts/guards/check-rust-image-versions.test.sh"
+bash "$(dirname "$0")/guards/check-rust-image-versions.test.sh"
+echo "==> scripts/guards/check-rust-image-versions.sh"
+"$(dirname "$0")/guards/check-rust-image-versions.sh"
+
 # The compat corpus is append-only (ADR-4233 decision 9, issue #4249): a
 # published fixture under crates/ravel-compat-tests/corpus/ is frozen evidence
 # of what a released build wrote, so it may be added, never edited or removed.

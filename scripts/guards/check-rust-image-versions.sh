@@ -118,8 +118,9 @@ image_of() {
   esac
 }
 
+# check_line <file:line> <image> <line above>
 check_line() {
-  local file="$1" n="$2" image="$3" prev="$4" spec tag version reason
+  local at="$1" image="$2" prev="$3" spec tag version reason
   spec="$(image_of "${image}")" || return 0
   checked=$((checked + 1))
   tag="${spec%%@*}"
@@ -134,14 +135,14 @@ check_line() {
       exempt=$((exempt + 1))
       return 0
     fi
-    printf '%s:%s: rust-image-allow marker above has no reason; it does not suppress\n' "${file}" "${n}"
+    printf '%s: rust-image-allow marker above has no reason; it does not suppress\n' "${at}"
   fi
   if [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    printf '%s:%s: %s has version %s, want %s (%s)\n' \
-      "${file}" "${n}" "${image}" "${version}" "${want}" "${toolchain}"
+    printf '%s: %s has version %s, want %s (%s)\n' \
+      "${at}" "${image}" "${version}" "${want}" "${toolchain}"
   else
-    printf '%s:%s: %s has no x.y.z version, want %s (%s)\n' \
-      "${file}" "${n}" "${image}" "${want}" "${toolchain}"
+    printf '%s: %s has no x.y.z version, want %s (%s)\n' \
+      "${at}" "${image}" "${want}" "${toolchain}"
   fi
   findings=$((findings + 1))
 }
@@ -162,7 +163,7 @@ for file in "${files[@]}"; do
           i=$((i + 1))
         done
         if [[ ${i} -lt ${#words[@]} ]]; then
-          check_line "${file}" "${n}" "${words[i]}" "${prev}"
+          check_line "${file}:${n}" "${words[i]}" "${prev}"
         fi
       elif [[ "${keyword}" == "arg" && "${words[1]}" == *=* ]]; then
         value="${words[1]#*=}"
@@ -170,7 +171,7 @@ for file in "${files[@]}"; do
         value="${value//\'/}"
         case "${value}" in
           rust:* | docker.io/library/rust:*)
-            check_line "${file}" "${n}" "${value}" "${prev}"
+            check_line "${file}:${n}" "${value}" "${prev}"
             ;;
         esac
       fi
