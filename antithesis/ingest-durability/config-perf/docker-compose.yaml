@@ -5,9 +5,12 @@
 # runs with WORKLOAD_PERF=1. In the eventually, after faults stop, it then
 # measures each node's time to its first strict acknowledgement and the
 # latency of strict writes after recovery, and reports both as log lines and
-# Sometimes assertions. It asserts no latency bound. Everything else matches
-# the base config, which this file must repeat in full: only this directory
-# ships as the run's config.
+# Sometimes assertions. Once the system recovers it also asserts three Always
+# bounds: every node's first strict ack within 60 s of faults stopping, every
+# post-recovery strict write answered within the client timeout, and every
+# recovered node's median strict-ack latency within 2 s. Everything else
+# matches the base config, which this file must repeat in full: only this
+# directory ships as the run's config.
 #
 # rustfs is the one durable component. init creates the bucket and qualifies
 # it, then exits. ravel1 and ravel2 are two `--mode all` processes over that

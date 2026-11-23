@@ -19,6 +19,15 @@
 #   CONFIG=config-perf  the perf variant (README.md, Perf variant), as test
 #       ravel-ingest-durability-perf with attrs.variant=perf. Not with a
 #       mutant.
+#   PERF_LEVER=slow-ack  with CONFIG=config-perf (not with a mutant): launch
+#       from a temporary copy of config-perf/ whose --max-flush-delay reads
+#       2400ms instead of 500ms, the value local/docker-compose.perf-slow-ack.yaml
+#       uses locally. The launched and local --max-flush-delay values are
+#       tied; the rest of the lever file's command list is not compared.
+#       The run is test ravel-ingest-durability-perf-mutant with
+#       attrs.variant=perf and attrs.mutant=perf-lever/slow-ack, on the plain
+#       images (no -mutants tag). PERF_LEVER=no-ack is refused: the no-ack
+#       lever is local only. WORKLOAD_PERF_SELF_CHECK is never passed to a run.
 set -euo pipefail
 HOURS="${1:?max compute hours}"
 DESC="${2:-ravel ingest durability}"
@@ -62,6 +71,26 @@ case "$VARIANT_CONFIG" in
         ;;
     *)
         echo "refused: CONFIG must be config, config-coverage, config-faults or config-perf, not '$VARIANT_CONFIG'" >&2
+        exit 1 ;;
+esac
+PERF_LEVER="${PERF_LEVER:-}"
+case "$PERF_LEVER" in
+    '') ;;
+    slow-ack)
+        if [ "$VARIANT_CONFIG" != config-perf ]; then
+            echo "refused: PERF_LEVER=slow-ack needs CONFIG=config-perf" >&2
+            exit 1
+        fi
+        if [ -n "$MUTANT" ]; then
+            echo "refused: PERF_LEVER=slow-ack does not combine with a mutant run" >&2
+            exit 1
+        fi
+        ;;
+    no-ack)
+        echo "refused: the no-ack lever is local only" >&2
+        exit 1 ;;
+    *)
+        echo "refused: PERF_LEVER must be slow-ack, not '$PERF_LEVER'" >&2
         exit 1 ;;
 esac
 CONFIG="$WL/$VARIANT_CONFIG"
@@ -132,6 +161,38 @@ if [ -n "$MUTANT" ]; then
     DESC="$DESC (mutant $MUTANT)"
 fi
 
+MUTANT_PARAM="${MUTANT:-none}"
+if [ "$PERF_LEVER" = slow-ack ]; then
+    # Launch from a temp copy of config-perf/ whose one --max-flush-delay value
+    # reads 2400ms instead of 500ms. Tie the launched --max-flush-delay value to
+    # the local lever file's (only that value; the rest of the lever file's
+    # command list is not compared): refuse unless the checked-in config has
+    # exactly one 500ms line, the copy exactly one 2400ms line and no 500ms
+    # line, and local/docker-compose.perf-slow-ack.yaml exactly one 2400ms line
+    # (its header comment's unquoted 2400ms must not count, so match whole
+    # quoted lines with grep -cxF).
+    base500=$(grep -cxF '    - "500ms"' "$CONFIG/docker-compose.yaml") || base500=0
+    if [ "$base500" -ne 1 ]; then
+        echo "refused: expected exactly one '    - \"500ms\"' line in $CONFIG/docker-compose.yaml, found $base500" >&2
+        exit 1
+    fi
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    cp -R "$CONFIG/." "$tmp/"
+    sed 's/^    - "500ms"$/    - "2400ms"/' "$CONFIG/docker-compose.yaml" > "$tmp/docker-compose.yaml"
+    copy2400=$(grep -cxF '    - "2400ms"' "$tmp/docker-compose.yaml") || copy2400=0
+    copy500=$(grep -cxF '    - "500ms"' "$tmp/docker-compose.yaml") || copy500=0
+    lever2400=$(grep -cxF '  - "2400ms"' "$WL/local/docker-compose.perf-slow-ack.yaml") || lever2400=0
+    if [ "$copy2400" -ne 1 ] || [ "$copy500" -ne 0 ] || [ "$lever2400" -ne 1 ]; then
+        echo "refused: slow-ack lever counts off (copy 2400ms=$copy2400 want 1, copy 500ms=$copy500 want 0, lever 2400ms=$lever2400 want 1)" >&2
+        exit 1
+    fi
+    CONFIG="$tmp"
+    TEST_NAME="$TEST_NAME-mutant"
+    DESC="$DESC (perf lever slow-ack)"
+    MUTANT_PARAM="perf-lever/slow-ack"
+fi
+
 # SKIP_VALIDATE=1 skips the local validation on a host that cannot run the
 # amd64 images (an Apple Silicon Mac without Rosetta emulation), once the same
 # config was validated on an amd64 host.
@@ -147,6 +208,6 @@ snouty launch --launcher basic_test --config "$CONFIG" \
     --setup-timeout 10m \
     --param attrs.workload=ingest-durability \
     --param attrs.ravel_ref="$REF" \
-    --param attrs.mutant="${MUTANT:-none}" \
+    --param attrs.mutant="$MUTANT_PARAM" \
     --param attrs.plugin_version=0.1.1 \
     ${VARIANT_PARAMS[@]+"${VARIANT_PARAMS[@]}"}

@@ -1,0 +1,13 @@
+# Perf variant self-check override (scripts/local-run.sh with
+# CONFIG=config-perf and WORKLOAD_PERF_SELF_CHECK=1; README.md, "Perf
+# variant"), layered over ../config-perf/docker-compose.yaml and
+# docker-compose.local.yaml. It sets WORKLOAD_PERF_SELF_CHECK=1 on the driver,
+# which sends ack probes 2, 5 and 8 of each node with a 1 ms client timeout, so
+# those three answer no-response. The run must show P2 ("every strict write
+# after recovery is answered within the client timeout") violated and P1 and
+# P3 held: the three abandoned probes leave seven of ten acked, so the median
+# stays finite.
+services:
+  driver:
+    environment:
+      WORKLOAD_PERF_SELF_CHECK: "1"
