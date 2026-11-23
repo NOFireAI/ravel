@@ -257,8 +257,10 @@ reads `MetadataOnlyExec: metadata_only=true, rows=<n>`. The shapes are:
   fails with the same overflow error the scan raises.
 
 All are additive to DataFusion's built-in `AggregateStatistics` rule (which
-handles the predicate-free `COUNT(*)` above and can never fire for any
-shape here, since it requires no `GROUP BY` and no residual filter). The
+handles the predicate-free `COUNT(*)` above and never fires for any shape
+here: it answers only `COUNT`, `MIN` and `MAX`, replaces all of a
+statement's aggregates or none, and needs no `GROUP BY` and no residual
+filter). The
 column index a filter or group key carries is in the scan's output space by
 the time the rule runs (projection pushdown has already run), so the rule
 resolves it through the scan's projection before reading statistics.
@@ -310,6 +312,12 @@ cannot be proven. The full set of decline conditions:
   not at all: no part of it is answered from statistics beside a scan of the
   rest. The executor skips the statistics load for a statement the rule would
   decline.
+- A pushed fetch on the scan or on any node between it and the aggregate,
+  for every shape above. A `LIMIT` in a subquery under the aggregate, as in
+  `SELECT SUM(a), COUNT(*) FROM (SELECT a FROM logs LIMIT 3)`, ends up as the
+  scan's own fetch when the scan has one partition, and the aggregate then
+  sees only the rows the fetch lets through, while the statistics count every
+  row.
 - A segment carrying an internally-inconsistent `ColumnStat` (its dictionary
   counts do not sum to `non_null_count`). Such a record is rejected at load by
   `decode_column_stats`, but `declared_not_equal_count`/`declared_group_counts`

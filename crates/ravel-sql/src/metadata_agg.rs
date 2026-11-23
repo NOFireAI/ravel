@@ -3,9 +3,10 @@
 //! 2 of epic #849; the first shape, predicate-free/ts-contained `COUNT(*)`
 //! and `MIN`/`MAX`, is [`crate::logs_scan::LogsScanExec::statistics_from_inputs`]
 //! feeding DataFusion's own built-in `AggregateStatistics` physical optimizer
-//! rule -- that rule requires zero `GROUP BY` and zero residual filter, so it
-//! can never fire for either shape here and this rule is additive, not
-//! competing):
+//! rule -- that rule answers only `COUNT`, `MIN` and `MAX`, replaces all of a
+//! statement's aggregates or none, and needs no `GROUP BY` and no residual
+//! filter, so it never fires for any shape here and this rule is additive,
+//! not competing):
 //!
 //! - **q02**: `COUNT(*) FROM logs WHERE <declared column> <> <literal>`, one
 //!   residual `FilterExec` over a [`LogsScanExec`], no `GROUP BY`. Answered by
@@ -61,6 +62,12 @@
 //! whose dictionary was omitted for exceeding the cardinality ceiling): this
 //! rule simply declines the rewrite and the unmodified plan runs, scanning
 //! exactly as it would have without ADR-0850.
+//!
+//! A pushed fetch on any node between the raw aggregate and the scan, the
+//! scan included, declines every shape: the aggregate then sees only the
+//! first rows the fetch lets through, while the statistics count every row.
+//! `LimitPushdown` leaves a subquery's `LIMIT` on the scan alone when the scan
+//! has one partition.
 //!
 //! [`MetadataOnlyExec`] is the observable marker (issue #850 deliverable 3):
 //! a purpose-named leaf `ExecutionPlan` whose `EXPLAIN` line always reads
@@ -691,7 +698,8 @@ fn declared_named<'a>(declared: &'a [DeclaredColumn], name: &str) -> Option<&'a 
 /// [`LogsScanExec::declared_group_counts`] or, for the ungrouped sum-backed
 /// shapes, [`LogsScanExec::declared_column_sum`] for every column read (plus
 /// [`LogsScanExec::declared_row_count`] beside a `COUNT(*)`) can prove the
-/// answer exact.
+/// answer exact. A node on the way down to the scan that carries a pushed
+/// fetch, the scan itself included, declines the rewrite.
 fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn ExecutionPlan>>> {
     let Some(agg) = node.downcast_ref::<physical_plan::aggregates::AggregateExec>() else {
         return Ok(Transformed::no(node));
@@ -725,10 +733,14 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
     };
 
     // Walk down from the raw stage's input to the scan, admitting at most one
-    // residual filter.
+    // residual filter. A pushed fetch on any node, the scan included, means
+    // the aggregate sees only some of the rows the statistics count.
     let mut current = raw_input;
     let mut filter: Option<Arc<FilterExec>> = None;
     let scan = loop {
+        if current.fetch().is_some() {
+            return Ok(Transformed::no(node));
+        }
         if let Some(scan) = current.downcast_ref::<LogsScanExec>() {
             break scan;
         }

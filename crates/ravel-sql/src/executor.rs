@@ -5523,22 +5523,10 @@ impl SqlExecutor {
     ///
     /// The load is kept only when some aggregate in the plan (subquery plans
     /// included) has a shape [`crate::MetadataOnlyAggregate`] answers
-    /// ([`crate::metadata_agg::logical_aggregate_answerable`], issue #3244):
-    /// q02 `COUNT(*) WHERE declared <> lit`, q08 `declared, COUNT(*) GROUP BY
-    /// declared`, or an ungrouped statement whose every aggregate is
-    /// `SUM(declared [+ int])`, `AVG(declared)` or `COUNT(*)` over `I64`
-    /// declared columns, in any mix, with at least one reading a column
-    /// (q03/q04/q30 and their mixes in the `metadata_agg` module doc), each
-    /// over a `logs` scan with no classified residual filter other than q02's
-    /// one `<>` conjunct (the next paragraph covers unclassified ones).
-    /// `MIN`/`MAX` are not among them: DataFusion's `AggregateStatistics`
-    /// answers them from the `SegmentRef` stamps, which the snapshot already
-    /// carries, so they load nothing.
+    /// ([`crate::metadata_agg::logical_aggregate_answerable`], issue #3244,
+    /// which lists the admitted shapes); a statement with no admitted
+    /// aggregate skips the load.
     ///
-    /// Anything else (a `SUM` or `AVG` beside any aggregate outside that mix,
-    /// such as `MIN`, a `DISTINCT` or `FILTER` call or a cast column, a
-    /// distinct count, a `GROUP BY` with a `<>` filter or with two keys, a raw
-    /// select) skips the load.
     /// A declared `Str` column's `<>` against a string literal
     /// counts as a residual `<>` conjunct here although the provider reports
     /// it `Exact` and no `FilterExec` holds it: the scan evaluates it as a row
