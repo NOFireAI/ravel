@@ -165,15 +165,19 @@ for file in "${files[@]}"; do
         if [[ ${i} -lt ${#words[@]} ]]; then
           check_line "${file}:${n}" "${words[i]}" "${prev}"
         fi
-      elif [[ "${keyword}" == "arg" && "${words[1]}" == *=* ]]; then
-        value="${words[1]#*=}"
-        value="${value//\"/}"
-        value="${value//\'/}"
-        case "${value}" in
-          rust:* | docker.io/library/rust:*)
-            check_line "${file}:${n}" "${value}" "${prev}"
-            ;;
-        esac
+      elif [[ "${keyword}" == "arg" ]]; then
+        # One ARG line can declare several variables.
+        for ((i = 1; i < ${#words[@]}; i++)); do
+          [[ "${words[i]}" == *=* ]] || continue
+          value="${words[i]#*=}"
+          value="${value//\"/}"
+          value="${value//\'/}"
+          case "${value}" in
+            rust:* | docker.io/library/rust:*)
+              check_line "${file}:${n}" "${value}" "${prev}"
+              ;;
+          esac
+        done
       fi
     fi
     prev="${line}"

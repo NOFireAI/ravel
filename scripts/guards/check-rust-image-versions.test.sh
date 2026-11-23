@@ -119,6 +119,14 @@ EOF
 expect "ARG default mismatch is a finding" 1 "${d}" \
   ".brig/Dockerfile:2: rust:1.97.1-bookworm@sha256:" "has version 1.97.1, want 1.100.0"
 
+d="$(new_repo arg-second-assignment)"
+put "${d}" Dockerfile <<'EOF'
+FROM rust:1.100.0-trixie
+ARG FOO=1 FETCH_IMAGE=rust:1.97.1-trixie
+EOF
+expect "a rust image in an ARG line's second assignment is a finding" 1 "${d}" \
+  "Dockerfile:2: rust:1.97.1-trixie" "has version 1.97.1, want 1.100.0"
+
 d="$(new_repo arg-quoted-mismatch)"
 put "${d}" Dockerfile <<'EOF'
 arg IMAGE="docker.io/library/rust:1.97.1"
