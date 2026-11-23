@@ -137,6 +137,19 @@ connection, a pushed-but-broken main).
   It refuses to rerun a run whose job ran within a minute of that job's own
   `timeout-minutes`, since rerunning a timeout only times out again and
   hides a budget problem; it prints the job and both numbers and exits 3.
+- `scripts/nextest-partition-sim.py hash|replay|simulate`: a copy of
+  nextest's `--partition hash:M/N` rule (`xxh64(test name, 0) % N`, the
+  name without its binary id), for sizing the `check-shard` and
+  `flight-sql-shard` matrices (ADR-4583 decision 4). It reads one downloaded
+  CI job log per leg, in leg order. `replay` exits 1 when any test ran on a
+  leg the rule does not give it, which is how a nextest release that changed
+  the rule shows up; run it on the logs before trusting `simulate`.
+  `simulate --legs 4,5` prints each leg's summed test seconds at each count
+  and the slowest leg's estimated wall time (summed seconds over
+  `--parallelism`, 3.8 by default for a four-vCPU runner), and `--band
+  N:LO:HI` exits 1 when the slowest leg at N legs falls outside the band.
+  Exit 2 is input with no nextest result lines. Cases in
+  `scripts/nextest-partition-sim.test.sh`, run by CI's `doc-scripts-rest`.
 - `scripts/fleet-result-inspect.sh <task-id>`: fetches a dispatched
   task's result branch and prints its commits and diff scope vs `main`,
   for review before merging. Never trust an executor's own "gates green"
