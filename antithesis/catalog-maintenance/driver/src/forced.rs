@@ -2,13 +2,14 @@
 //! races"): which bucket each one works on, when a held server PUT is fresh
 //! enough to race, and which of a compaction record's inputs the store holds.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use ravel_antithesis_catalog_driver::keys::{self, RecordKey};
 use ravel_antithesis_catalog_driver::proxy::{self, HOLD_CAP};
 
 use crate::audit::{DATA_SUFFIX, InputKeys};
+use crate::token::Token;
 
 /// The driver releases a held record PUT once it is this old, whether or not
 /// the `ravel-cli` compaction has published by then: before the proxy's own
@@ -42,6 +43,29 @@ pub fn compactable_bucket(
         }
     }
     None
+}
+
+/// The first of `writes` (a write id and its decoded tokens) with a token
+/// whose commit record its bucket's LIST in `listings` (keyed by
+/// [`keys::bucket_prefix`]) holds, in a bucket a compaction would publish a
+/// record for. That bucket has no compaction record yet, so the one a
+/// compaction of it publishes is created after every clock move before the
+/// LIST. Returns the write id and the bucket's `(hour, shard)`.
+pub fn uncompacted_input(
+    tenant_prefix: &str,
+    writes: &[(u64, Vec<Token>)],
+    listings: &BTreeMap<String, BTreeSet<String>>,
+) -> Option<(u64, u64, u32)> {
+    writes.iter().find_map(|(id, tokens)| {
+        tokens.iter().find_map(|t| {
+            let hour = u64::from(t.hour);
+            let prefix = keys::bucket_prefix(tenant_prefix, t.shard, hour);
+            let listed = listings.get(&prefix)?;
+            (listed.contains(&t.commit_key(tenant_prefix))
+                && keys::bucket(&prefix, listed).compactable())
+            .then_some((*id, hour, t.shard))
+        })
+    })
 }
 
 /// What the proxy's `held` reply means for the record race.
@@ -225,6 +249,92 @@ mod tests {
         assert_eq!(compactable_bucket(PREFIX, [HOUR], 4, &done), None);
         // Another tenant's keys do not count.
         assert_eq!(compactable_bucket("t/ffff/", [HOUR], 4, &listed), None);
+    }
+
+    #[test]
+    fn the_uncompacted_input_is_a_written_commit_record_in_a_bucket_without_a_record() {
+        const W1: &str = "00000000-0000-0000-0000-000000000001";
+        const W2: &str = "00000000-0000-0000-0000-000000000002";
+        let token = |shard: u32, writer: &str, seq: u64| Token {
+            shard,
+            writer: writer.to_string(),
+            epoch: 1,
+            seq,
+            hour: HOUR as u32,
+        };
+        let listings = |keys: &[String]| {
+            let mut by_bucket: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for shard in 0..4 {
+                by_bucket.insert(keys::bucket_prefix(PREFIX, shard, HOUR), BTreeSet::new());
+            }
+            for k in keys {
+                if let Some((bucket, _)) = k.rsplit_once('/') {
+                    by_bucket
+                        .entry(format!("{bucket}/"))
+                        .or_default()
+                        .insert(k.clone());
+                }
+            }
+            by_bucket
+        };
+        // Write 7 has inputs in shards 0 and 2, write 8 in shard 2 only.
+        let a = token(0, W1, 1);
+        let b = token(2, W1, 2);
+        let c = token(2, W2, 1);
+        let writes = vec![(7, vec![a.clone(), b.clone()]), (8, vec![c.clone()])];
+        // Shard 0 holds one commit record, too few to compact; shard 2 holds
+        // two, so write 7's second token is the first that qualifies.
+        let mut listed = vec![
+            a.commit_key(PREFIX),
+            b.commit_key(PREFIX),
+            c.commit_key(PREFIX),
+        ];
+        assert_eq!(
+            uncompacted_input(PREFIX, &writes, &listings(&listed)),
+            Some((7, HOUR, 2))
+        );
+        // Once shard 2 has a compaction record, its inputs may predate a
+        // clock move, so no write qualifies.
+        listed.push(key(2, HOUR, "l1.0011223344556677.cmt"));
+        assert_eq!(uncompacted_input(PREFIX, &writes, &listings(&listed)), None);
+        // A compactable bucket that does not hold the token's own commit
+        // record (another write's two records) gives that token nothing.
+        let others = vec![
+            a.commit_key(PREFIX),
+            key(0, HOUR, &format!("{W2}.1.00000000000000000009.cmt")),
+        ];
+        let only_a = vec![(9, vec![token(0, W1, 5)])];
+        assert_eq!(uncompacted_input(PREFIX, &only_a, &listings(&others)), None);
+        assert_eq!(
+            uncompacted_input(PREFIX, &[(9, vec![a.clone()])], &listings(&others)),
+            Some((9, HOUR, 0))
+        );
+        // A bucket with no LIST (it failed) gives nothing.
+        assert_eq!(uncompacted_input(PREFIX, &writes, &BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn the_fresh_compaction_nudge_stays_inside_the_protection_horizon() {
+        // The eventually's fresh compaction seals the bucket of a write it
+        // just acknowledged: the current hour, or the one before for a write
+        // that crossed the hour boundary. That bucket is not sealed before
+        // the nudge, so no record of it predates the move; and the move is
+        // far below the horizon, so even one that did would keep its inputs.
+        let now = HOUR * 3600 + 3599;
+        for hour in [HOUR - 1, HOUR] {
+            let nudge =
+                crate::clock::seal_nudge_s(now, hour, crate::clock::compaction_seal_margin_s());
+            assert!(nudge > 0);
+            assert!(nudge < crate::clock::protection_horizon_s());
+        }
+        let start = HOUR * 3600;
+        let largest =
+            crate::clock::seal_nudge_s(start, HOUR, crate::clock::compaction_seal_margin_s());
+        assert_eq!(
+            largest,
+            3600 + crate::clock::compaction_seal_margin_s() + 30
+        );
+        assert!(largest < crate::clock::protection_horizon_s());
     }
 
     #[test]

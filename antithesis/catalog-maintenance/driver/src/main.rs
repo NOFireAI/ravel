@@ -105,6 +105,9 @@ const FORCED_REASON: &str = "forced by WORKLOAD_EVENTUALLY_AFTER_SECS";
 const FORCED_BACKSTOP: Duration = Duration::from_secs(600);
 /// Writes the eventually reads with their tokens at each lifecycle point.
 const EVENTUALLY_TOKEN_READS: usize = 6;
+/// Token reads, each on the next node, the eventually's fresh compaction
+/// takes at most, until one gives a verdict on its compacted input.
+const FRESH_READS: usize = 3;
 /// How long a token read refused as unsatisfiable waits before its one
 /// retry; the refusal's own message asks for a retry.
 const UNSATISFIABLE_RETRY: Duration = Duration::from_secs(2);
@@ -2319,7 +2322,10 @@ impl Shared {
     /// decided before the read from the bucket's LIST, the decoded
     /// compaction records, a GET of the commit record and the last stable
     /// HEAD the audit saw, and after the read from the commit record's
-    /// presence. Returns whether every read that gave a verdict held.
+    /// presence. Returns whether the first read gave a verdict while a
+    /// compaction record named an input whose commit record was still there,
+    /// the state `catalog: a token read ran after its input was compacted`
+    /// asserts.
     fn lifecycle_read(&self, w: &Write, node: usize, twice: bool, reason: &str) -> bool {
         let Some(prefix) = self.tenant_prefix() else {
             println!("token read: no HEAD key known yet");
@@ -2397,7 +2403,6 @@ impl Shared {
             "restart": restart_json,
             "tally": tally,
         });
-        let mut all_hold = true;
         for (i, o) in outcomes.iter().enumerate() {
             let mut details = base.clone();
             details["read"] = json!(i);
@@ -2420,15 +2425,15 @@ impl Shared {
                     "catalog: a token read returns each acked record of its write exactly once",
                     &details
                 );
-                all_hold &= o.holds();
             }
         }
         let first_verdict = outcomes[0].conclusive();
+        let compacted_present = first_verdict
+            && states
+                .iter()
+                .any(token::InputState::compacted_record_present);
         assert_sometimes!(
-            first_verdict
-                && states
-                    .iter()
-                    .any(token::InputState::compacted_record_present),
+            compacted_present,
             "catalog: a token read ran after its input was compacted",
             &base
         );
@@ -2452,7 +2457,143 @@ impl Shared {
             "catalog: a token read ran on a node restarted since the write",
             &base
         );
-        all_hold
+        compacted_present
+    }
+
+    /// The eventually's read of a write compacted after its last clock move
+    /// (README.md, "Token reads across the lifecycle"). The races before it
+    /// may have moved the clocks past the protection horizon of every earlier
+    /// compaction record, so the sweep may have deleted every earlier input's
+    /// commit record. This writes until a single-attempt acked write has a
+    /// commit record in a bucket with no compaction record yet, nudges every
+    /// clock until that bucket seals for compaction, has `ravel-cli` compact
+    /// it, waits for the record, and reads the write back with its tokens.
+    /// The sweep deletes a superseded input only once the clocks pass the
+    /// record's `created_unix_ns` plus the horizon, and no move comes between
+    /// the record and the read, so its commit record is still there. The
+    /// caller holds the gate's write guard. Returns whether a read gave that
+    /// verdict.
+    fn fresh_compaction_read(&self, reason: &str) -> bool {
+        let Some(prefix) = self.known_prefix() else {
+            println!("{reason}: no HEAD key known");
+            return false;
+        };
+        let Some((w, hour, shard)) = self.uncompacted_write(&prefix, reason) else {
+            return false;
+        };
+        let nudge_s = |now_s| clock::seal_nudge_s(now_s, hour, clock::compaction_seal_margin_s());
+        if !self.nudge(reason, &nudge_s) {
+            println!("{reason}: the move sealing hour {hour} for compaction did not land");
+            return false;
+        }
+        let bucket = keys::bucket_prefix(&prefix, shard, hour);
+        let shard_arg = shard.to_string();
+        let hour_arg = hour.to_string();
+        let args = self.args(&[
+            "maintain",
+            "compact-bucket",
+            "--shard",
+            &shard_arg,
+            "--hour",
+            &hour_arg,
+            "--no-claim",
+        ]);
+        let cli = self.cli.run(&args, CLI_TIMEOUT_S);
+        // The maintenance servers compact the sealed bucket too; whichever
+        // record the store took is the one the read resolves through.
+        let deadline = Instant::now() + HELD_WAIT;
+        let record = loop {
+            match self.store.list(&bucket) {
+                Ok(listed) => {
+                    let listed: BTreeSet<String> = listed.into_iter().collect();
+                    if let Some(r) = keys::bucket(&bucket, &listed).records.into_iter().next() {
+                        break Some(r);
+                    }
+                }
+                Err(e) => println!("{reason}: listing {bucket}: {e}"),
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        };
+        let n = self.ravel.nodes.len().max(1);
+        let mut reads = 0;
+        let mut reached = false;
+        if record.is_some() {
+            while reads < FRESH_READS && !reached {
+                reached = self.lifecycle_read(&w, reads % n, true, reason);
+                reads += 1;
+            }
+        }
+        println!(
+            "{reason}: {}",
+            json!({
+                "write": w.id,
+                "bucket_hour": hour,
+                "bucket_shard": shard,
+                "cli": cli.summary(),
+                "record": record,
+                "reads": reads,
+                "reached": reached,
+            })
+        );
+        reached
+    }
+
+    /// A single-attempt acked write with a commit record in a bucket a
+    /// compaction would publish a record for ([`forced::uncompacted_input`]),
+    /// after up to [`FILL_WRITES`] live writes, and that bucket's
+    /// `(hour, shard)`. The caller holds the gate's write guard, so no other
+    /// write lands meanwhile.
+    fn uncompacted_write(&self, prefix: &str, what: &str) -> Option<(Write, u64, u32)> {
+        let first = lock(&self.model).next_id;
+        let n = self.ravel.nodes.len().max(1);
+        let mut next_node = 0usize;
+        for _ in 0..FILL_WRITES {
+            self.write(4, 4, &mut || {
+                next_node += 1;
+                next_node % n
+            });
+            let writes: Vec<Write> = {
+                let m = lock(&self.model);
+                m.writes
+                    .range(first..)
+                    .map(|(_, w)| w)
+                    .filter(|w| w.max_copies() == 1 && w.is_acked())
+                    .cloned()
+                    .collect()
+            };
+            let decoded: Vec<(u64, Vec<token::Token>)> = writes
+                .iter()
+                .filter_map(|w| {
+                    let tokens = token::decode_header(w.acked_header()?).ok()?;
+                    Some((w.id, tokens.into_iter().map(|(_, t)| t).collect()))
+                })
+                .collect();
+            let mut listings = BTreeMap::new();
+            for t in decoded.iter().flat_map(|(_, ts)| ts) {
+                let bucket = keys::bucket_prefix(prefix, t.shard, u64::from(t.hour));
+                if listings.contains_key(&bucket) {
+                    continue;
+                }
+                match self.store.list(&bucket) {
+                    Ok(listed) => {
+                        listings.insert(bucket, listed.into_iter().collect::<BTreeSet<String>>());
+                    }
+                    Err(e) => println!("{what}: listing {bucket}: {e}"),
+                }
+            }
+            if let Some((id, hour, shard)) = forced::uncompacted_input(prefix, &decoded, &listings)
+                && let Some(w) = writes.into_iter().find(|w| w.id == id)
+            {
+                return Some((w, hour, shard));
+            }
+        }
+        println!(
+            "{what}: no acked write's commit record is in a bucket without a compaction record"
+        );
+        None
     }
 
     /// The eventually's token reads: up to [`EVENTUALLY_TOKEN_READS`] writes
@@ -2745,9 +2886,9 @@ impl Workload {
 }
 
 /// Stop faults for good, wait for every node, jump the clocks if no rule
-/// did, fold, compact and audit, take the sweep jumps if no rule did, sweep
-/// every shard, fold and audit again, then check the whole multiset and end
-/// the timeline.
+/// did, fold, compact and audit, read a write compacted after the last clock
+/// move, take the sweep jumps if no rule did, sweep every shard, fold and
+/// audit again, then check the whole multiset and end the timeline.
 fn run_eventually(s: &Shared, reason: &str) -> ! {
     // A drawn and a forced eventually can race here: the loser halts, with
     // faults already stopping.
@@ -2826,6 +2967,10 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     }
     s.audit(&|_| 0);
     s.eventually_token_reads(1, "eventually: compacted", None);
+    // The races above may have taken every earlier compaction record past
+    // its protection horizon and swept its inputs, so one read goes to an
+    // input compacted after the last clock move.
+    s.fresh_compaction_read("eventually: fresh compaction");
     if s.compacted.load(Ordering::SeqCst) {
         s.sweep_jump("eventually");
     } else {

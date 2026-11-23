@@ -115,7 +115,7 @@ compaction record is seen the workload jumps the clock twice more.
 | `audit` | The store audit below. |
 | `check_bounds` | The upper-bound check below, on one node. |
 | `token_lifecycle_read` | While faults may run: reads one acked write back with its commit tokens on a drawn node, drawing the write from all of them, from those with a compacted input, or from those whose input commit record the sweep check confirmed deleted, and drawing whether to read it twice on that node ("Token reads across the lifecycle"). |
-| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs up to six fold races until a server fold lost its CAS, up to five record races until a server's record PUT lost, the unfolded-record sweep unless one already reached its situation, and the unreadable-HEAD sweep, then folds, compacts, audits, folds and audits again and token-reads up to six writes with a compacted input, takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, in the local loop has `local-run.sh` restart a node, token-reads up to six writes whose input commit record was swept, runs the full multiset check and ends the timeline. |
+| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs up to six fold races until a server fold lost its CAS, up to five record races until a server's record PUT lost, the unfolded-record sweep unless one already reached its situation, and the unreadable-HEAD sweep, then folds, compacts, audits, folds and audits again and token-reads up to six writes with a compacted input, then compacts a fresh bucket and token-reads one of its writes ("The fresh compaction read"), takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, in the local loop has `local-run.sh` restart a node, token-reads up to six writes whose input commit record was swept, runs the full multiset check and ends the timeline. |
 
 The forced eventually runs inside the state machine, like a drawn one: once
 `WORKLOAD_EVENTUALLY_AFTER_SECS` passes, the timer only sets a flag, and the
@@ -195,6 +195,42 @@ second read finds whatever the first one cached there (a present commit
 record, the bucket's compaction records). A swept commit record is not
 cached, so the second read of a swept input on a restarted node takes the
 fallback again.
+
+#### The fresh compaction read
+
+The eventually's reads of compacted writes come after its forced races,
+whose sweeps move the clocks past the protection horizon (91200 s a move),
+and a race a rule took earlier in the timeline may have moved them too. Once
+HEAD folded a compaction record and a sweep marked its inputs, the next move
+past the pinned-query window lets the sweep delete them. So by the time of
+those reads every compaction record published so far may have had its input
+commit records swept, and none of the six can show the state "compacted,
+commit record present" (#4617). The eventually therefore takes one more
+read, of an input compacted after its last clock move:
+
+1. Write (4 records over 4 streams, alternating nodes, up to 16 writes)
+   until a single-attempt acked write's token names a commit record that its
+   bucket's LIST holds, in a bucket a compaction would publish a record for:
+   two level-0 commit records at least and no compaction record
+   (`forced::uncompacted_input`).
+2. Move every clock forward until that bucket's hour is sealed for
+   compaction (hour end + 3900 s, plus 30 s), as the record race does. That
+   is at most 7530 s, and the bucket has no record before it.
+3. `ravel-cli maintain compact-bucket --no-claim` on the bucket, then LIST
+   it for up to 120 s until a compaction record is there (the maintenance
+   servers compact it too; either record will do).
+4. Token-read the write, twice on one node, up to three times on
+   alternating nodes, until a read gives a verdict while that record names
+   the input and its commit record is still there.
+
+The sweep deletes a superseded input only once the clocks pass the record's
+`created_unix_ns` plus the protection horizon, and the record was published
+after the last move, with no move between it and the read. So the commit
+record is still there whatever the earlier races did, and a read that gives
+a verdict holds `catalog: a token read ran after its input was compacted`.
+The line `eventually: fresh compaction: {...}` reports the write, the
+bucket, the record, the reads taken and whether one reached that state. The
+sweep jumps after it then sweep this input like the others.
 
 How this closes #4490: the ingest-durability driver reads at "now", so the
 listing path caches every commit record before the token loop and the
@@ -382,7 +418,7 @@ HEAD changed while a clock move landed`, so a cloud run attributes what
 follows to the harness. `local-run.sh` fails a run with a move whose
 `head_quiet_s` is below the span or whose `head_moved_while_landing` is not
 false, and checks that there is one such line per move. The wait
-adds about 56 s to each move, so up to 18 moves add about 1000 s to an
+adds about 56 s to each move, so up to 19 moves add about 1060 s to an
 eventually.
 
 The TTL comes from the server configuration. No flag in
