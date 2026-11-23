@@ -1129,7 +1129,9 @@ pub struct PhaseWallTiming {
     /// The rest of `resolve_ns`, so the four parts sum to it: the catalog's
     /// own remainder (snapshot parts and postings) plus the executor's work
     /// around the catalog calls, such as the Parquet manifest resolve and the
-    /// decoded-parts charge.
+    /// decoded-parts charge. A logs or spans lane whose parts charge is refused
+    /// resolves again without parts, and the refused resolve's whole time
+    /// lands here.
     pub resolve_other_ns: u64,
     /// Around logical planning against the pinned snapshot.
     pub plan_ns: u64,
