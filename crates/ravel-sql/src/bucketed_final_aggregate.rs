@@ -3430,10 +3430,12 @@ mod tests {
         /// ADR-4143 decision 3: a byte-budgeted chunk's buffers never hold
         /// more capacity together than its budget, checked after every row
         /// pushed, and the sealed chunks give back every input row exactly.
+        /// Issue #4650: the bytes growth copies are at most twice the bytes
+        /// the rows append, at every budget and row shape drawn.
         #[test]
         fn prop_byte_chunk_capacity_stays_within_its_budget(
             shape in 0..BUDGET_SHAPES.len(),
-            budget in prop::sample::select(vec![16 * 1024, 64 * 1024]),
+            budget in prop::sample::select(vec![4096, 16 * 1024, 64 * 1024]),
             rows in prop::collection::vec((budget_value(), budget_value()), 1..1500),
         ) {
             use datafusion::arrow::compute::concat;
@@ -3447,6 +3449,7 @@ mod tests {
             let sources = ByteSource::of(&columns, &data, &types).expect("sources");
 
             let mut sealed = Vec::new();
+            let mut resized = 0usize;
             let mut chunk = ByteChunk::new(&types, budget, 8192);
             for row in 0..rows.len() {
                 if !chunk.fits(&sources, row) {
@@ -3454,7 +3457,7 @@ mod tests {
                     sealed.push(full.seal().expect("seal a chunk"));
                     prop_assert!(chunk.fits(&sources, row), "a 400-byte row fits {budget} B");
                 }
-                chunk.push_row(&sources, row).expect("push a row");
+                resized += chunk.push_row(&sources, row).expect("push a row");
                 let held = chunk.capacity();
                 prop_assert!(
                     held <= budget,
@@ -3462,8 +3465,15 @@ mod tests {
                      budget {budget}",
                     chunk.len
                 );
+                let counted: usize = chunk.capacities.iter().flatten().sum();
+                prop_assert_eq!(counted, held, "fits reads the capacities held");
             }
             sealed.push(chunk.seal().expect("seal a chunk"));
+            let appended: usize = sealed.iter().map(appended_bytes).sum();
+            prop_assert!(
+                resized <= 2 * appended,
+                "{left}, {right}: growth copied {resized} B for {appended} B appended"
+            );
 
             for (index, column) in columns.iter().enumerate() {
                 let parts: Vec<&dyn Array> =
