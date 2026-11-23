@@ -1039,7 +1039,11 @@ async fn ninety_sums_answer_from_metadata_with_two_gets() {
     let sql = format!("SELECT {} FROM logs", terms.join(", "));
     let batches = assert_metadata_answer_with_two_gets(&sql).await;
     for k in 0..90 {
-        assert_eq!(scalar(&batches, k), Some(1408 + 5 * k as i64), "SUM(status + {k})");
+        assert_eq!(
+            scalar(&batches, k),
+            Some(1408 + 5 * k as i64),
+            "SUM(status + {k})"
+        );
     }
 }
 

@@ -164,7 +164,11 @@ fn stamped(seg: SegmentRef, stats: &[ColumnStat]) -> SegmentRef {
     };
     ravel_commit::declared_stats::stamp_commit_record(&mut record, &stamps);
     let validated = ravel_commit::declared_stats::read_commit_record(&record);
-    assert_eq!(validated.covered().len(), stats.len(), "fixture stamps valid");
+    assert_eq!(
+        validated.covered().len(),
+        stats.len(),
+        "fixture stamps valid"
+    );
     SegmentRef {
         declared_column_stats: ravel_catalog::DeclaredColumnStats::from_validated(&validated),
         ..seg
@@ -172,7 +176,12 @@ fn stamped(seg: SegmentRef, stats: &[ColumnStat]) -> SegmentRef {
 }
 
 /// Write `rows` as one real RLOG object and return its stamped ref.
-async fn write_segment(store: &Arc<CountingStore>, key: &str, seq: u64, rows: &[Row]) -> SegmentRef {
+async fn write_segment(
+    store: &Arc<CountingStore>,
+    key: &str,
+    seq: u64,
+    rows: &[Row],
+) -> SegmentRef {
     let mut w = RlogWriter::new(
         RlogConfig::default(),
         ObjectIdentity {
@@ -299,10 +308,8 @@ impl Corpus {
         .with_declared_columns(cols())
         .with_column_stats(stats);
         let config = SqlConfig::default();
-        let (pool, _breach) = config.query_pool(
-            TenantMemoryAccountant::new(1 << 30),
-            QueryAccounting::new(),
-        );
+        let (pool, _breach) =
+            config.query_pool(TenantMemoryAccountant::new(1 << 30), QueryAccounting::new());
         let ctx = build_session(
             &config,
             pool,
@@ -377,7 +384,8 @@ fn f64_at(column: &ArrayRef) -> Option<f64> {
 
 fn assert_answered(run: &Run, what: &str) {
     assert!(
-        run.plan.contains("MetadataOnlyExec: metadata_only=true, rows=1")
+        run.plan
+            .contains("MetadataOnlyExec: metadata_only=true, rows=1")
             && !run.plan.contains("LogsScanExec"),
         "{what}: answered from statistics; plan was:\n{}",
         run.plan
@@ -449,7 +457,12 @@ async fn line_3_is_answered_from_statistics() {
     let corpus = Corpus::two().await;
     for exact_typed in [false, true] {
         let run = corpus
-            .run(LINE_3, Some(Arc::clone(&corpus.stats)), Vec::new(), exact_typed)
+            .run(
+                LINE_3,
+                Some(Arc::clone(&corpus.stats)),
+                Vec::new(),
+                exact_typed,
+            )
             .await;
         assert_answered(&run, "line 3");
         let cols = columns(&run);
@@ -470,7 +483,12 @@ async fn line_30_is_answered_from_statistics() {
     let corpus = Corpus::two().await;
     for exact_typed in [false, true] {
         let run = corpus
-            .run(&sql, Some(Arc::clone(&corpus.stats)), Vec::new(), exact_typed)
+            .run(
+                &sql,
+                Some(Arc::clone(&corpus.stats)),
+                Vec::new(),
+                exact_typed,
+            )
             .await;
         assert_answered(&run, "line 30");
         let cols = columns(&run);
@@ -628,5 +646,26 @@ async fn an_unanswerable_aggregate_declines_the_statement() {
         let run = corpus.with_stats(sql).await;
         assert_scanned(&run, sql);
         assert_same_answer(&run, &corpus.scanned(sql).await, sql);
+    }
+}
+
+/// T3: a residual filter or a group key beside several answerable aggregates
+/// declines the statement.
+#[tokio::test]
+async fn a_filter_or_group_key_declines_several_aggregates() {
+    let corpus = Corpus::two().await;
+    for sql in [
+        "SELECT SUM(a), COUNT(*), AVG(w) FROM logs WHERE a <> 0",
+        "SELECT w, SUM(a), COUNT(*) FROM logs GROUP BY w ORDER BY w",
+    ] {
+        let run = corpus.with_stats(sql).await;
+        assert_scanned(&run, sql);
+        let scan = corpus.scanned(sql).await;
+        let (l, r) = (run.answer.expect("answer"), scan.answer.expect("answer"));
+        assert_eq!(
+            pretty_format_batches(&l).expect("format").to_string(),
+            pretty_format_batches(&r).expect("format").to_string(),
+            "{sql}"
+        );
     }
 }

@@ -223,7 +223,7 @@ and needs each one back as a residual.
 
 ## Logs aggregates from exact per-object column statistics
 
-Two further aggregate shapes are answered entirely from ADR-0850's exact
+Further aggregate shapes are answered entirely from ADR-0850's exact
 per-object column statistics, with zero data-block GETs and no `LogsScanExec`
 in the plan. The statistics are built at fold time (one exact decode pass per
 L0 object over each configured typed attribute column, stored in an RCST1
@@ -231,7 +231,7 @@ object bound to the covered part set) and loaded once per query by
 `Catalog::load_column_stats`; the query-side rewrite is `MetadataOnlyAggregate`
 (crates/ravel-sql/src/metadata_agg.rs), which replaces the aggregate subtree
 with a `MetadataOnlyExec` leaf whose line in a `ravel-cli sql explain` plan
-reads `MetadataOnlyExec: metadata_only=true, rows=<n>`. The two shapes are:
+reads `MetadataOnlyExec: metadata_only=true, rows=<n>`. The shapes are:
 
 - **q02**: `SELECT COUNT(*) FROM logs WHERE <typed attribute column> <>
   <literal>`, one residual filter over the scan and no `GROUP BY`. Answered as
@@ -242,9 +242,22 @@ reads `MetadataOnlyExec: metadata_only=true, rows=<n>`. The two shapes are:
   <typed attribute column>`, a plain group key directly over the scan and no
   filter. Answered by merging every touched segment's exact dictionary by
   value, plus the summed `null_count` as a synthetic NULL group when nonzero.
+- **Sums and averages** (q03, q04, q30): an ungrouped, filter-free statement
+  whose every aggregate is `SUM(<col>)`, `SUM(<col> + <integer>)`,
+  `AVG(<col>)` or `COUNT(*)`, in any mix and over any number of `I64` typed
+  attribute columns, with at least one aggregate naming a column. ClickBench
+  line 3 (`SUM(a), COUNT(*), AVG(w)`) and line 30 (ninety `SUM(w + k)`) are
+  both this shape. Each column's exact sum and non-null count are summed over
+  every touched segment's stored figures, and read once per statement however
+  many aggregates name the column. `SUM(<col> + k)` is `sum + k *
+  non_null_count`, `AVG(<col>)` is `sum / non_null_count` in `f64`, and both
+  are NULL when the column has no non-null row. `COUNT(*)` beside them is the
+  exact row count, the summed `sample_count` of every touched segment, never a
+  column's non-null count. A `SUM(<col> + k)` that passes the 64-bit range
+  fails with the same overflow error the scan raises.
 
-Both are additive to DataFusion's built-in `AggregateStatistics` rule (which
-handles the predicate-free `COUNT(*)` above and can never fire for either
+All are additive to DataFusion's built-in `AggregateStatistics` rule (which
+handles the predicate-free `COUNT(*)` above and can never fire for any
 shape here, since it requires no `GROUP BY` and no residual filter). The
 column index a filter or group key carries is in the scan's output space by
 the time the rule runs (projection pushdown has already run), so the rule
@@ -289,6 +302,14 @@ cannot be proven. The full set of decline conditions:
   cardinality ceiling (ADR-0850 decision 3) -- an omitted dictionary carries no
   exact per-value counts, so a derived count could be wrong outright, not
   merely unavailable.
+- For the sums and averages: a segment whose entry has no stored sum for any
+  one column the statement reads (a per-object sum that passed 64 bits at fold
+  time stores none), any one aggregate outside the list above (`DISTINCT`, a
+  per-aggregate `FILTER`, a cast column, `MIN`/`MAX`, a non-`I64` column), a
+  group key, or a residual filter. The statement is answered as a whole or
+  not at all: no part of it is answered from statistics beside a scan of the
+  rest. The executor skips the statistics load for a statement the rule would
+  decline.
 - A segment carrying an internally-inconsistent `ColumnStat` (its dictionary
   counts do not sum to `non_null_count`). Such a record is rejected at load by
   `decode_column_stats`, but `declared_not_equal_count`/`declared_group_counts`

@@ -1,4 +1,4 @@
-//! Answer two more ClickBench aggregate shapes straight from ADR-0850's
+//! Answer more ClickBench aggregate shapes straight from ADR-0850's
 //! per-object column statistics, with zero data-block GETs (issue #850, item
 //! 2 of epic #849; the first shape, predicate-free/ts-contained `COUNT(*)`
 //! and `MIN`/`MAX`, is [`crate::logs_scan::LogsScanExec::statistics_from_inputs`]
@@ -31,18 +31,30 @@
 //! - **q30**: `AVG(<declared integer column>) FROM logs`, likewise ungrouped
 //!   and filter-free. Answered as `sum / non_null_count` in `f64`, `NULL` when
 //!   there are no non-null rows.
+//! - **Several aggregates** (issue #4651, ClickBench lines 3 and 30): an
+//!   ungrouped, filter-free statement whose every aggregate is one of the
+//!   above or `COUNT(*)`, in any mix and over any number of declared integer
+//!   columns, is answered as one row. Each column's sum and non-null count are
+//!   read once per statement, however many aggregates name it. `COUNT(*)`
+//!   beside them is [`LogsScanExec::declared_row_count`], the summed
+//!   `sample_count` of every touched segment, never a column's non-null count.
+//!   One aggregate outside the list (`DISTINCT`, a per-aggregate `FILTER`, a
+//!   cast column, `MIN`/`MAX`) or one column without a stored sum on one
+//!   segment declines the whole statement; no part of it is answered from
+//!   statistics. A grouped statement with anything but a lone `COUNT(*)`
+//!   declines too.
 //!
 //! The sum-backed shapes decompose only for an integer column, and only when
-//! every touched segment carries an exact sum: a would-be float column, or a
+//! every touched segment carries an exact sum for every column read: a would-be float column, or a
 //! per-object sum that overflowed `i64` at fold time, has no stored sum and
 //! the statement scans (the ADR-0850 safety lemma).
 //!
-//! Both delegate the actual statistics read to `LogsScanExec` (the crate's
+//! Every shape delegates the actual statistics read to `LogsScanExec` (the crate's
 //! established split: `logs_scan.rs` owns every column-stats read,
 //! sibling optimizer-rule modules only match plan shape and splice in a
 //! replacement, the same way [`crate::late_materialization`] calls
 //! `scan.late_materialization_candidate()` rather than reaching into
-//! `LogsScanExec`'s fields). A `None` from either method means the ADR-0850
+//! `LogsScanExec`'s fields). A `None` from any of those methods means the ADR-0850
 //! safety lemma requires falling back to scanning (no loaded column-stats
 //! object, an unsupported declared type, a segment outside the loaded stats,
 //! a pending selective erasure, or -- specific to this path -- a segment
@@ -100,8 +112,9 @@ use crate::sum_plus::{EXACT_SUM_COUNT, sum_count_type};
 /// The rule's name, as it appears in DataFusion's optimizer diagnostics.
 pub const METADATA_ONLY_AGGREGATE_RULE: &str = "metadata_only_aggregate";
 
-/// Rewrites the q02 (`COUNT(*) WHERE <declared column> <> <literal>`) and q08
-/// (`GROUP BY <declared column>, COUNT(*)`) aggregate shapes into a
+/// Rewrites the q02 (`COUNT(*) WHERE <declared column> <> <literal>`), q08
+/// (`GROUP BY <declared column>, COUNT(*)`) and ungrouped `SUM`/`AVG` (alone
+/// or several, beside `COUNT(*)`) aggregate shapes into a
 /// [`MetadataOnlyExec`] over ADR-0850 statistics, when it can prove the
 /// answer exact. See the module docs for the shapes and every fallback
 /// condition.
@@ -673,10 +686,12 @@ fn declared_named<'a>(declared: &'a [DeclaredColumn], name: &str) -> Option<&'a 
 }
 
 /// Try to rewrite one node. Returns it unchanged unless it is a Final-output
-/// `COUNT(*)` aggregate, with or without a single declared-column group key,
-/// reachable down to a [`LogsScanExec`] in one of the two shapes the module
-/// docs describe, AND [`LogsScanExec::declared_not_equal_count`] /
-/// [`LogsScanExec::declared_group_counts`] can prove the answer exact.
+/// aggregate reachable down to a [`LogsScanExec`] in one of the shapes the
+/// module docs describe, AND [`LogsScanExec::declared_not_equal_count`],
+/// [`LogsScanExec::declared_group_counts`] or, for the ungrouped sum-backed
+/// shapes, [`LogsScanExec::declared_column_sum`] for every column read (plus
+/// [`LogsScanExec::declared_row_count`] beside a `COUNT(*)`) can prove the
+/// answer exact.
 fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn ExecutionPlan>>> {
     let Some(agg) = node.downcast_ref::<physical_plan::aggregates::AggregateExec>() else {
         return Ok(Transformed::no(node));
@@ -1213,7 +1228,11 @@ mod tests {
             },
             || panic!("no COUNT(*) in line 30"),
         );
-        assert_eq!(reads, vec![1], "one read for ninety aggregates on one column");
+        assert_eq!(
+            reads,
+            vec![1],
+            "one read for ninety aggregates on one column"
+        );
         assert_eq!(batch.map(|b| b.num_columns()), Some(90));
 
         let line_3 = [
