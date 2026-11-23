@@ -812,7 +812,14 @@ The same steps as ingest-durability, from this directory's `scripts/`:
 - `scripts/build.sh [server|driver|all]`. The driver's build context is
   `antithesis/` and it copies `ravel-cli` from the server image, so build the
   server first. The driver image also carries `s3-proxy`, which the
-  instrumentation check covers like `driver`.
+  instrumentation check covers like `driver`, and `ravel-cli-ant`, which it
+  covers too: ravel-cli built with its `antithesis` feature and the coverage
+  flags (`ravel/Dockerfile`, stage `cli-ant`), never with
+  `antithesis-mutants`. Only ravel-cli appends a resharding generation, so
+  only an instrumented one reaches those assertions. The stock `ravel-cli`
+  stays uninstrumented and runs every call above. The driver runs
+  `ravel-cli-ant` only through `AntCli` (`driver/src/cli.rs`), which points
+  its SDK output at `/tmp/sdk-cli.jsonl`; no rule calls it yet.
 - `scripts/local-run.sh <out-dir> [seconds]` starts the stack under the
   run's compose file, runs the workload for `seconds` (default 240) before
   the driver's forced `eventually`, and exits 0 only if all of these hold:
@@ -837,7 +844,11 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     driver's log reports as `clock: moved forward by <N> s outside the
     planned jumps`, and every clock probe read a number at least that total
     minus 60 s ahead of the host (`clock-probe.txt`);
-  - every container's SDK output was collected;
+  - every container's SDK output was collected. The driver container's
+    `/tmp/sdk-cli.jsonl`, from `ravel-cli-ant`, is collected as
+    `sdk-cli.jsonl` when it exists, and its absence is no failure. It is
+    judged with the others below, but never counts as the driver's own
+    assertions;
   - no always-type assertion was violated (`violated.tsv`), and none of this
     workload's that must be hit was never hit (`never-hit-owned.tsv`; see
     "The expected set" below);

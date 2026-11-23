@@ -54,6 +54,22 @@ RUN cargo build --release --locked -p ravel-cli \
  && mkdir -p /out \
  && cp target/release/ravel-cli /out/
 
+# ravel-cli-ant: ravel-cli built as the ingest-durability image builds it,
+# with its `antithesis` feature and the coverage flags, for the calls whose
+# assertions only ravel-cli reaches (provision reshard appends generations).
+# The driver image copies it from here; nothing else runs it, and it is never
+# built with antithesis-mutants.
+FROM rust:1.100.0-trixie AS cli-ant
+WORKDIR /src
+ENV CARGO_BUILD_JOBS=8
+COPY . .
+RUN cargo build --release --locked -p ravel-cli --features antithesis \
+      --config 'build.target = "x86_64-unknown-linux-gnu"' \
+      --config 'profile.release.lto = false' \
+      --config 'target.x86_64-unknown-linux-gnu.rustflags = ["-Ccodegen-units=1", "-Cpasses=sancov-module", "-Cllvm-args=-sanitizer-coverage-level=3", "-Cllvm-args=-sanitizer-coverage-trace-pc-guard", "-Cllvm-args=-sanitizer-coverage-pc-table", "-Clink-args=-Wl,--build-id"]' \
+ && mkdir -p /out \
+ && cp target/x86_64-unknown-linux-gnu/release/ravel-cli /out/ravel-cli-ant
+
 FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl jq procps \
@@ -61,6 +77,7 @@ RUN apt-get update \
 COPY --from=server /out/ravel-server /usr/local/bin/ravel-server
 COPY --from=server /symbols /symbols
 COPY --from=cli /out/ravel-cli /usr/local/bin/ravel-cli
+COPY --from=cli-ant /out/ravel-cli-ant /usr/local/bin/ravel-cli-ant
 COPY --from=faketime /out/libfaketimeMT.so.1 /usr/local/lib/faketime/libfaketimeMT.so.1
 COPY antithesis/catalog-maintenance/ravel/init.sh /usr/local/bin/ravel-antithesis-init
 COPY antithesis/catalog-maintenance/ravel/entrypoint.sh /usr/local/bin/ravel-antithesis-entrypoint
