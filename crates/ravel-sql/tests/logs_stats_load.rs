@@ -838,21 +838,16 @@ async fn gets_for_empty_snapshot(sql: &str, declared: &[DeclaredColumn]) -> u64 
     store.gets()
 }
 
-/// Issue #3244, exact ZERO. ClickBench q03's shape, `SUM` beside `COUNT(*)`
-/// and `AVG`, names the declared column, so the old "aggregate plus declared
-/// reference" gate loaded the statistics. Neither consumer can answer it:
-/// `MetadataOnlyAggregate` takes one aggregate, and DataFusion's
-/// `AggregateStatistics` replaces all or none and has no `SUM`/`AVG`.
+/// Issue #3244, exact ZERO. A statistics-answerable `SUM` beside a `MIN`:
+/// `MetadataOnlyAggregate` answers a statement as a whole or declines it, and
+/// DataFusion's `AggregateStatistics` replaces all or none and has no `SUM`,
+/// so no consumer answers it and the load must not fire (issue #4651).
 #[tokio::test]
-async fn q03_shape_sum_count_avg_issues_zero_gets() {
+async fn sum_beside_min_issues_zero_gets() {
     assert_eq!(
-        gets_for_empty_snapshot(
-            "SELECT SUM(status), COUNT(*), AVG(status) FROM logs",
-            &status_col()
-        )
-        .await,
+        gets_for_empty_snapshot("SELECT SUM(status), MIN(status) FROM logs", &status_col()).await,
         0,
-        "no statistics consumer answers SUM beside AVG, so the load must not fire"
+        "no statistics consumer answers SUM beside MIN, so the load must not fire"
     );
 }
 
@@ -879,21 +874,6 @@ async fn not_equal_filter_with_group_by_issues_zero_gets() {
         .await,
         0,
         "the group-by path takes no filter, so the load must not fire"
-    );
-}
-
-/// Issue #3244, exact ZERO. Three `SUM`s are three aggregates;
-/// `MetadataOnlyAggregate` answers one.
-#[tokio::test]
-async fn three_sums_issue_zero_gets() {
-    assert_eq!(
-        gets_for_empty_snapshot(
-            "SELECT SUM(status), SUM(status + 1), SUM(status + 2) FROM logs",
-            &status_col()
-        )
-        .await,
-        0,
-        "no statistics consumer answers several SUMs, so the load must not fire"
     );
 }
 
@@ -1025,6 +1005,46 @@ async fn avg_declared_answers_from_metadata_with_two_gets() {
         })
         .expect("one avg row");
     assert_eq!(avg.to_bits(), (1408.0_f64 / 5.0).to_bits(), "1408 / 5");
+}
+
+/// Issue #4651, exact TWO. ClickBench q03's shape, `SUM` beside `COUNT(*)`
+/// and `AVG`, loads the statistics once and answers every aggregate from them.
+#[tokio::test]
+async fn sum_count_avg_answer_from_metadata_with_two_gets() {
+    let batches =
+        assert_metadata_answer_with_two_gets("SELECT SUM(status), COUNT(*), AVG(status) FROM logs")
+            .await;
+    assert_eq!(scalar(&batches, 0), Some(1408), "200*3 + 404*2");
+    assert_eq!(scalar(&batches, 1), Some(5), "the row count");
+    let avg = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .map(|b| {
+            b.column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("float64 avg")
+                .value(0)
+        })
+        .expect("one avg row");
+    assert_eq!(avg.to_bits(), (1408.0_f64 / 5.0).to_bits(), "1408 / 5");
+}
+
+/// Issue #4651, exact TWO. ClickBench q30's shape, ninety `SUM(status + k)`,
+/// loads the statistics once (the HEAD GET and one `.cstat` GET, whatever the
+/// number of terms) and answers every term.
+#[tokio::test]
+async fn ninety_sums_answer_from_metadata_with_two_gets() {
+    let terms: Vec<String> = (0..90).map(|k| format!("SUM(status + {k})")).collect();
+    let sql = format!("SELECT {} FROM logs", terms.join(", "));
+    let batches = assert_metadata_answer_with_two_gets(&sql).await;
+    for k in 0..90 {
+        assert_eq!(
+            scalar(&batches, k),
+            Some(1408 + 5 * k as i64),
+            "SUM(status + {k})"
+        );
+    }
 }
 
 /// A `ts` bound written with `TIMESTAMP` literals, containing the fixture
