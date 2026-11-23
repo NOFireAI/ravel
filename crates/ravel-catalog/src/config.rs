@@ -87,7 +87,7 @@ pub const DEFAULT_CLOCK_SKEW_ALLOWANCE_NS: i64 = 5 * 60 * 1_000_000_000;
 ///   `CommitRecord.declared_column_stats` is a repeated field capped neither by
 ///   the format (proto/ravel/commit.proto) nor by validation nor by the
 ///   tenant-config declared-column path, so a record carrying 200 declared
-///   columns charges roughly 20 KB rather than 900 bytes, more than twenty
+///   columns charges roughly 29 KB rather than 900 bytes, more than thirty
 ///   times the planning figure
 ///   (`commit_records_with_large_declared_column_lists_evict_on_bytes` in
 ///   `crate::cache` pins that charge). It charges each entry an estimate of its
