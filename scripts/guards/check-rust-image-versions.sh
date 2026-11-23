@@ -172,11 +172,9 @@ for file in "${files[@]}"; do
           value="${words[i]#*=}"
           value="${value//\"/}"
           value="${value//\'/}"
-          case "${value}" in
-            rust:* | docker.io/library/rust:*)
-              check_line "${file}:${n}" "${value}" "${prev}"
-              ;;
-          esac
+          # check_line ignores a value that is not the official rust image,
+          # and reports an untagged one (rust, rust@<digest>) as a FROM does.
+          check_line "${file}:${n}" "${value}" "${prev}"
         done
       fi
     fi
