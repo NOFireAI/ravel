@@ -155,6 +155,7 @@ use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
 use crate::compact_slices::CompactSlices;
 use crate::config::{DEFAULT_SPILL_MERGE_FAN_IN, SqlConfig};
+use crate::dominant_key::DominantKeyCombiner;
 use crate::exchange_floor::FinalExchangeFloor;
 use crate::first_groups::FirstGroupsLimit;
 use crate::group_keys::DictionaryGroupKeysAsViews;
@@ -1073,6 +1074,18 @@ fn build_session_inner(
     // holds its own `k`-row heap.
     if let Some(max_limit) = config.partition_topk_max_limit {
         builder = builder.with_physical_optimizer_rule(Arc::new(LogsPartitionTopK::new(max_limit)));
+    }
+    // Issue #4676 (ADR-0102 decision 2's amendment of 2026-11-24): combine a
+    // dominant group key's rows between a `Partial` aggregate and its hash
+    // exchange. After every rule above: each of them matches the
+    // partial/exchange/final shape `EnforceDistribution` chose or walks an
+    // allowlist that refuses a node it does not know (`DictionaryGroupKeysAsViews`,
+    // `BoundedTopKAggregate`), and the bucketed rule must see the exchange's
+    // final partition count. Before `CompactSlices`, which treats the exec as
+    // the hash exchange it feeds: neither charges a batch by capacity. See
+    // `crate::dominant_key`.
+    if config.dominant_key_combiner {
+        builder = builder.with_physical_optimizer_rule(Arc::new(DominantKeyCombiner));
     }
     // Issue #2720: give an aggregate's output slices buffers of their own
     // before a `RepartitionExec` or a sort charges each slice the whole
@@ -2520,6 +2533,67 @@ mod tests {
                 ][..]
             ),
             "{names:?}"
+        );
+    }
+
+    /// Issue #4676: the dominant-key combiner runs directly before
+    /// `CompactSlices`, after every rule that matches the partial, exchange
+    /// and final shape, and the aggregate profile rule stays last. With the
+    /// field off it is not installed at all.
+    #[test]
+    fn the_dominant_key_combiner_runs_directly_before_compact_slices() {
+        let ctx = samples_and_logs();
+        let state = ctx.state();
+        let names: Vec<&str> = state
+            .physical_optimizers()
+            .iter()
+            .map(|rule| rule.name())
+            .collect();
+        let at = |name: &str| {
+            names
+                .iter()
+                .position(|rule| *rule == name)
+                .unwrap_or_else(|| panic!("{name} not installed: {names:?}"))
+        };
+        let combiner = at(crate::dominant_key::DOMINANT_KEY_COMBINER_RULE);
+        assert_eq!(
+            names.get(combiner + 1),
+            Some(&crate::compact_slices::COMPACT_SLICES_RULE),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.last(),
+            Some(&crate::memory::AGGREGATE_PROFILE_RULE),
+            "{names:?}"
+        );
+        for earlier in [
+            crate::exchange_floor::FINAL_EXCHANGE_FLOOR_RULE,
+            crate::group_keys::DICTIONARY_GROUP_KEYS_RULE,
+            crate::bounded_topk::BOUNDED_TOPK_AGGREGATE_RULE,
+        ] {
+            assert!(at(earlier) < combiner, "{earlier}: {names:?}");
+        }
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let off = build_session_with_tables(
+            &SqlConfig {
+                dominant_key_combiner: false,
+                ..SqlConfig::default()
+            },
+            test_pool(),
+            vec![logs_table(&store)],
+            false,
+            SpillDecision::Disabled,
+            &no_capabilities(),
+        )
+        .expect("session builds");
+        let state = off.state();
+        assert!(
+            state
+                .physical_optimizers()
+                .iter()
+                .all(|rule| rule.name() != crate::dominant_key::DOMINANT_KEY_COMBINER_RULE),
+            "the field off installs no rule"
         );
     }
 

@@ -587,6 +587,7 @@ fn registers_none(any: &dyn ExecutionPlan) -> bool {
         || any.is::<crate::spans_scan::SpansScanExec>()
         || any.is::<crate::dedup::RsegDedupExec>()
         || any.is::<crate::compact_slices::CompactSlicesExec>()
+        || any.is::<crate::dominant_key::DominantKeyCombinerExec>()
         || any.is::<crate::top_keys::TopKeysAggregateExec>()
         || any.is::<crate::first_groups::FirstGroupsExec>()
         || any.is::<crate::late_materialization::LogsRowFetchExec>()

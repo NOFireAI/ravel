@@ -372,7 +372,7 @@ fn is_bucketed_key(data_type: &DataType) -> bool {
 
 /// An accumulator state type the exec routes: fixed width and not float, so
 /// a chunk copies it by bytes and no float sum is reassociated.
-fn is_bucketed_state(data_type: &DataType) -> bool {
+pub(crate) fn is_bucketed_state(data_type: &DataType) -> bool {
     is_bucketed_key(data_type)
         || matches!(
             data_type,

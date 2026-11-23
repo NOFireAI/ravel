@@ -519,6 +519,25 @@ pub struct SqlConfig {
     /// is the "before" side of the regression test in
     /// `tests/skip_partial_aggregation.rs`.
     pub skip_partial_aggregation: bool,
+    /// Whether a partial aggregate's dominant group keys are combined before
+    /// the hash exchange (issue #4676, ADR-0102 decision 2's amendment of
+    /// 2026-11-24). Default `true`.
+    ///
+    /// A partition that skips partial aggregation forwards every row, so a
+    /// key holding most of a scan's rows sends most of them through the
+    /// exchange to the one final partition that owns it. When `true`,
+    /// [`crate::DominantKeyCombiner`] puts a
+    /// [`crate::DominantKeyCombinerExec`] between every admitted `Partial`
+    /// aggregate and its hash exchange: a table of `2P - 1` counters per input
+    /// partition, `P` the exchange's output partitions, that merges the rows
+    /// of a key holding a counter and forwards every other row unchanged. It
+    /// holds state for at most `2P - 1` groups per input partition. This
+    /// changes how many rows reach the final stage, never a result: the final
+    /// stage merges the same states either way.
+    ///
+    /// `false` installs no rule. It is the operator escape hatch and the
+    /// "before" side of `tests/dominant_key_combiner.rs`.
+    pub dominant_key_combiner: bool,
     /// Width threshold for TopK late materialization on the `logs` table
     /// (ADR-0774, issue #774). `Some(n)` installs
     /// [`crate::TopKLateMaterialization`] and lets it fire on a scan projecting
@@ -684,6 +703,7 @@ impl Default for SqlConfig {
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             parallel_final_aggregation: true,
             skip_partial_aggregation: true,
+            dominant_key_combiner: true,
             late_materialization_extra_columns: Some(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS),
             bounded_topk_max_limit: Some(DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
             bounded_groups_max_limit: DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
@@ -879,6 +899,12 @@ mod tests {
     #[test]
     fn skip_partial_aggregation_defaults_to_true() {
         assert!(SqlConfig::default().skip_partial_aggregation);
+    }
+
+    /// Issue #4676: the dominant-key combiner is on by default.
+    #[test]
+    fn dominant_key_combiner_defaults_to_true() {
+        assert!(SqlConfig::default().dominant_key_combiner);
     }
 
     /// ADR-0774: the rewrite is on by default, at eight surplus columns. A

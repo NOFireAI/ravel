@@ -67,6 +67,7 @@ mod cross_signal_tests;
 mod ddl;
 mod ddl_cost;
 mod declared;
+mod dominant_key;
 mod dedup;
 #[cfg(feature = "flight-sql")]
 pub mod distributed;
@@ -159,6 +160,10 @@ pub use bucketed_final_aggregate::{
     BucketedFinalAggregateRule,
 };
 pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
+pub use dominant_key::{
+    COUNTER_BYTES, DOMINANT_KEY_COMBINER_CONSUMER_PREFIX, DOMINANT_KEY_COMBINER_RULE,
+    DominantKeyCombiner, DominantKeyCombinerExec, KeyHasher, counters_for,
+};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{
     BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,

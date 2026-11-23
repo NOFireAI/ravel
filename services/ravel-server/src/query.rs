@@ -1857,6 +1857,7 @@ fn build_sql_state_inner(
         // `SqlConfig` field exists as an in-process escape hatch and for the
         // regression test's red side, not as a server-level knob.
         skip_partial_aggregation: SqlConfig::default().skip_partial_aggregation,
+        dominant_key_combiner: SqlConfig::default().dominant_key_combiner,
         // ADR-0774: the shipped default, with no flag, for the same reason as
         // the line above. The rewrite is invisible to results (the same rows,
         // in the same order, under the same schema), so the `SqlConfig` field
