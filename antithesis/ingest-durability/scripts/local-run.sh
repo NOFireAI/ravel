@@ -29,10 +29,10 @@
 #                                     a mutant. The run gates on the mode's
 #                                     line counts and latency bands, on every
 #                                     "required" assertion being hit with its
-#                                     condition true, and -- in place of the
-#                                     base "no always-type assertion violated"
-#                                     check -- on the exact set of violated
-#                                     always-type assertions: it must equal,
+#                                     condition true, and on the exact set of
+#                                     violated always-type assertions, which
+#                                     replaces the base "no always-type
+#                                     assertion violated" check: it must equal,
 #                                     whole line for whole line, the messages
 #                                     of class <mode>-violated in
 #                                     local/perf-required.tsv (none in the
@@ -309,8 +309,9 @@ if [ "$VARIANT" != perf ]; then
     fi
 fi
 if [ "$VARIANT" = perf ]; then
-    # The pre-registered local bands of #4559. Each figure is printed with its
-    # band; any miss fails the run.
+    # The pre-registered local bands of #4559, except the self-check bands,
+    # which are predicted and were not pre-registered there. Each figure is
+    # printed with its band; any miss fails the run.
     perf_missed=()
     # The mode's expected-violated and never-hit always-type classes.
     case "$PERF_MODE" in
@@ -480,6 +481,8 @@ if [ "$VARIANT" = perf ]; then
     # every lever/self-check mode, 2 no-ack-unhit lines.
     always_n=$(grep -c . "$OUT/perf-always.tsv") || always_n=0
     perf_count "always class" "$always_n" 3
+    always_u=$(sort -u "$OUT/perf-always.tsv" | grep -c .) || always_u=0
+    perf_count "always class distinct" "$always_u" 3
     if [ -n "$viol_class" ]; then
         viol_n=$(grep -c . "$OUT/perf-mode-violated.tsv") || viol_n=0
         perf_count "$viol_class class" "$viol_n" 1
@@ -492,8 +495,20 @@ if [ "$VARIANT" = perf ]; then
     # MODE-violated messages. Name every message violated and not expected (this
     # covers every non-perf always-type assertion too) and every message
     # expected and not violated.
-    grep -vxF -f "$OUT/perf-mode-violated.tsv" "$OUT/violated.tsv" > "$OUT/perf-unexpected-violated.tsv" || true
-    grep -vxF -f "$OUT/violated.tsv" "$OUT/perf-mode-violated.tsv" > "$OUT/perf-missing-violated.tsv" || true
+    # grep exits 1 when it selects no line, a normal outcome here; above 1 is an
+    # error and must not read as "no difference".
+    rc=0
+    grep -vxF -f "$OUT/perf-mode-violated.tsv" "$OUT/violated.tsv" > "$OUT/perf-unexpected-violated.tsv" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        echo "perf gate: exact-set check could not compare (grep exit $rc): perf-unexpected-violated.tsv: MISSED"
+        perf_missed+=("exact-set grep failed: perf-unexpected-violated.tsv")
+    fi
+    rc=0
+    grep -vxF -f "$OUT/violated.tsv" "$OUT/perf-mode-violated.tsv" > "$OUT/perf-missing-violated.tsv" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        echo "perf gate: exact-set check could not compare (grep exit $rc): perf-missing-violated.tsv: MISSED"
+        perf_missed+=("exact-set grep failed: perf-missing-violated.tsv")
+    fi
     if [ -s "$OUT/perf-unexpected-violated.tsv" ]; then
         echo "perf gate: always-type assertions violated but not expected in the $PERF_MODE mode: MISSED"
         cat "$OUT/perf-unexpected-violated.tsv"
@@ -512,7 +527,7 @@ if [ "$VARIANT" = perf ]; then
             continue
         fi
         passes=$(awk -F'\t' -v m="$msg" '$1 == "always" && $4 == m { print $3 }' "$OUT/perf.tsv")
-        if [ "${passes:-0}" -lt 1 ]; then
+        if ! [ "${passes:-0}" -ge 1 ] 2>/dev/null; then
             echo "perf gate: always assertion never hit with its condition true: $msg: MISSED"
             perf_missed+=("always unmet: $msg")
         fi
@@ -520,7 +535,7 @@ if [ "$VARIANT" = perf ]; then
     while IFS= read -r msg; do
         [ -n "$msg" ] || continue
         hits=$(awk -F'\t' -v c="$unhit_class" -v m="$msg" '$1 == c && $4 == m { print $2 }' "$OUT/perf.tsv")
-        if [ "${hits:-0}" -ne 0 ]; then
+        if ! [ "${hits:-0}" -eq 0 ] 2>/dev/null; then
             echo "perf gate: $unhit_class assertion was hit (hits ${hits:-0}): $msg: MISSED"
             perf_missed+=("unhit was hit: $msg")
         fi

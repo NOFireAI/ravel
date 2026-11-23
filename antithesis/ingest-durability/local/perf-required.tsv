@@ -3,7 +3,9 @@
 # and a tab:
 #   required            clean and self-check runs: hit with its condition true at least once
 #   reported            printed, not gated
-#   always              the perf variant's three always-type assertions
+#   always              the perf variant's three always-type assertions; one in neither
+#                       the mode's violated nor its unhit class: hit with its condition
+#                       true at least once and never false
 #   slow-ack-never      PERF_LEVER=slow-ack run: never hit with its condition true
 #   slow-ack-required   PERF_LEVER=slow-ack run: hit with its condition true at least once
 #   slow-ack-violated   PERF_LEVER=slow-ack run: hit with its condition false at least once

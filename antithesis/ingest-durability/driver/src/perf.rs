@@ -138,8 +138,10 @@ const P1_RECOVERY: Prop = Prop {
     message: "every node's first strict ack comes within 60 s of faults stopping",
 };
 /// P2: a deadline, not a measured band. The client abandons a probe write at
-/// the 15 s write timeout, so a post-recovery strict write not answered by
-/// then is a no-response and this fires.
+/// its client timeout, 15 s except for probes 2, 5 and 8 under the self-check,
+/// which use 1 ms (`ack_timeout`). A post-recovery strict write that gets no
+/// response, by that timeout or through a connection error
+/// (`Reply::NoResponse` in ravel.rs), makes this fire.
 const P2_ANSWERED: Prop = Prop {
     kind: Kind::Always,
     message: "every strict write after recovery is answered within the client timeout",
@@ -1499,10 +1501,24 @@ mod tests {
         assert_eq!(count(Kind::Reachable), 1);
         assert_eq!(count(Kind::Unreachable), 1);
         assert_eq!(count(Kind::Always), 3);
-        // The Always kind maps to the `assert_always!` arguments.
-        let (_, display, must_hit) = kind_args(Kind::Always);
-        assert_eq!(display, "Always");
-        assert!(must_hit);
+        // Each kind maps to its macro's arguments: assert type, display type
+        // and must-hit.
+        assert_eq!(
+            kind_args(Kind::Always),
+            (AssertType::Always, "Always", true)
+        );
+        assert_eq!(
+            kind_args(Kind::Sometimes),
+            (AssertType::Sometimes, "Sometimes", true)
+        );
+        assert_eq!(
+            kind_args(Kind::Reachable),
+            (AssertType::Reachability, "Reachable", true)
+        );
+        assert_eq!(
+            kind_args(Kind::Unreachable),
+            (AssertType::Reachability, "Unreachable", false)
+        );
     }
 
     fn answer_after(outcome: Outcome, took: Duration) -> Answer {

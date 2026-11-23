@@ -360,8 +360,8 @@ The Always bands, each with its own source:
 | P2, post-recovery write answered | client timeout | deadline, not a measurement: the 15 s client write timeout (`WRITE_TIMEOUT`, `driver/src/main.rs`) |
 
 t0 is not always free of faults (#4559 comment 7088652995): in about one
-history in four the platform stops, once kills, one container -- a ravel node
-in all but one case -- and restarts it 0.0012 to 8.54 s after the fault pause
+history in four the platform stops, once kills, one container (a ravel node
+in all but one case) and restarts it 0.0012 to 8.54 s after the fault pause
 and after t0 (the largest TTFA on such a history was 14570 ms). The 60 s band
 was derived over all histories, those included.
 
@@ -372,7 +372,11 @@ latency as a sum (flush delay + flush-permit wait + data PUT + commit PUT)
 with a p99 target that tracks `--max-flush-delay`, not a fixed constant, and
 the strict ack deadline there bounds when the server *answers*
 (`WriteError::AckTimeout`), not when it acknowledges; a strict ack follows the
-commit PUT. P2 is a deadline on that answer, not a latency band.
+commit PUT. P2 is not a latency band and not that server deadline: it is the
+driver's 15 s client deadline (`WRITE_TIMEOUT` in `driver/src/main.rs`). It is
+expected to hold because the server answers a strict write by its own ack
+deadline, `DEFAULT_ACK_DEADLINE` (10 s) in `services/ravel-server/src/lib.rs`,
+which is shorter.
 
 "Within N s" means `mono_ms <= N * 1000`. The log lines, one `println` each,
 fields in this order:
@@ -399,8 +403,9 @@ mutant. The local gate reads `local/perf-required.tsv`. In place of the base
 "no always-type assertion violated" check, a perf run gates on the exact set
 of violated always-type assertions: it must equal, whole line for whole line,
 the `<mode>-violated` messages for the mode (none in the clean mode). Its line
-counts and latency bands are the local expectations of the plan, predicted and
-not yet measured:
+counts and latency bands are the local expectations of the plan. The clean,
+slow-ack and no-ack loops ran inside these bands on the build box on the T1
+images (#4559 comment 7087421604); the self-check bands are predicted:
 
 - Clean run: exactly 1 `perf t0`, 1 `perf summary`, 2 `perf ttfa`,
   20 `perf ack` and 2 `perf median` lines and no `perf skipped` line; every
@@ -417,7 +422,8 @@ not yet measured:
   counts, every `perf ack` line acked with 2400 <= `mono_ms` <= 3400, no
   `slow-ack-never` line hit true and every `slow-ack-required` line hit true.
   It is meant to show that the figures move with the flush cadence. P3, and
-  only P3, must fail: the 2.4 s median is outside the 2 s band, while P1 and
+  only P3, must fail: on the build box the slow-ack medians were 2412 and
+  2413 ms (#4559 comment 7087421604), outside the 2 s band, while P1 and
   P2 hold. 2400 ms is near the server's limit: ravel-server refuses to start
   when `--max-flush-delay` plus a fixed 500 ms reserve is not under its 3 s
   strict visibility budget (`validate_strict_visibility_budget`), that is at
@@ -449,7 +455,9 @@ not yet measured:
 `scripts/launch.sh` also takes `PERF_LEVER=slow-ack` with `CONFIG=config-perf`
 (not with a mutant): it launches from a temporary copy of `config-perf/` whose
 `--max-flush-delay` reads 2400ms instead of 500ms, the same value the local
-lever file uses (the script ties the two counts so they cannot drift), as test
+lever file uses. The script ties the two values: it refuses unless the copy
+and the local lever file each carry exactly one 2400ms `--max-flush-delay`
+value. The rest of the lever file's command list is not compared. It runs as test
 `ravel-ingest-durability-perf-mutant` with `attrs.variant=perf` and
 `attrs.mutant=perf-lever/slow-ack`, on the plain images.
 `PERF_LEVER=no-ack` is local only; `scripts/launch.sh` refuses it.

@@ -22,7 +22,8 @@
 #   PERF_LEVER=slow-ack  with CONFIG=config-perf (not with a mutant): launch
 #       from a temporary copy of config-perf/ whose --max-flush-delay reads
 #       2400ms instead of 500ms, the value local/docker-compose.perf-slow-ack.yaml
-#       uses locally, so the launched lever and the local lever cannot drift.
+#       uses locally. The launched and local --max-flush-delay values are
+#       tied; the rest of the lever file's command list is not compared.
 #       The run is test ravel-ingest-durability-perf-mutant with
 #       attrs.variant=perf and attrs.mutant=perf-lever/slow-ack, on the plain
 #       images (no -mutants tag). PERF_LEVER=no-ack is refused: the no-ack
@@ -163,8 +164,9 @@ fi
 MUTANT_PARAM="${MUTANT:-none}"
 if [ "$PERF_LEVER" = slow-ack ]; then
     # Launch from a temp copy of config-perf/ whose one --max-flush-delay value
-    # reads 2400ms instead of 500ms. Tie the launched value to the local lever
-    # file so the two cannot drift: refuse unless the checked-in config has
+    # reads 2400ms instead of 500ms. Tie the launched --max-flush-delay value to
+    # the local lever file's (only that value; the rest of the lever file's
+    # command list is not compared): refuse unless the checked-in config has
     # exactly one 500ms line, the copy exactly one 2400ms line and no 500ms
     # line, and local/docker-compose.perf-slow-ack.yaml exactly one 2400ms line
     # (its header comment's unquoted 2400ms must not count, so match whole
