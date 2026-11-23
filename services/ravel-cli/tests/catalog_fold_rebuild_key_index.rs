@@ -247,6 +247,7 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
          uncovered_entries: 0\n\
          parts_over_cap: 0\n\
          series_index_parts_over_cap: 0\n\
+         series_index_over_cap_parts: 0\n\
          parts_erasure_gated: 0\n\
          erasure_list_requests: 0\n\
          erasure_get_requests: 0\n\

@@ -1782,9 +1782,10 @@ from `label_value`'s build:
   (`a_part_over_the_series_cap_gets_no_series_refs_and_one_at_it_does`,
   `a_posting_over_the_body_ceiling_leaves_the_part_without_series_refs`).
   The report's `metrics_series_index_over_cap_parts` lists each such part
-  with its leaf bytes and cap, each field's leaf bytes (null when a key
-  passed the body ceiling, which reports that body and ceiling instead),
-  each field's pairs, and its class and series counts, and the warn line
+  with its cap, its leaf bytes and each field's leaf bytes, each field's
+  pairs, and its class and series counts; when a key passed the body
+  ceiling, `leaf_bytes` and `field_bytes` are null and `body_bytes` and
+  `body_ceiling` carry that body and ceiling instead. The warn line
   carries the same figures
   (`a_part_over_the_series_cap_reports_each_field_and_its_classes`,
   `the_over_cap_class_count_counts_distinct_entry_sets`).

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use ravel_catalog::{
     COMPAT_KEY, CatalogConfig, FoldReport, KeyIndexRebuildError, KeyIndexRebuildOptions,
-    KeyIndexRebuildReport, PartLimits, RefoldRequest,
+    KeyIndexRebuildReport, PartLimits, RefoldRequest, SeriesIndexOverCapPart,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::catalog::v1::{SnapshotColumnStatsPartRef, SnapshotKeyIndexLeafRef};
@@ -744,6 +744,11 @@ fn render_fold_report(
         "metrics_series_index_parts_over_cap: {}\n",
         report.metrics_series_index_parts_over_cap
     ));
+    push_over_cap_parts(
+        &mut out,
+        "metrics_series_index_over_cap_parts",
+        &report.metrics_series_index_over_cap_parts,
+    );
     out.push_str(&format!(
         "metrics_label_index_parts_erasure_gated: {}\n",
         report.metrics_label_index_parts_erasure_gated
@@ -1135,6 +1140,11 @@ pub fn render_rebuild_report(
         "series_index_parts_over_cap: {}\n",
         report.series_index_parts_over_cap
     ));
+    push_over_cap_parts(
+        &mut out,
+        "series_index_over_cap_parts",
+        &report.series_index_over_cap_parts,
+    );
     out.push_str(&format!(
         "parts_erasure_gated: {}\n",
         report.parts_erasure_gated
@@ -1172,6 +1182,39 @@ pub fn render_rebuild_report(
         ));
     }
     Ok(out)
+}
+
+/// One `key: part=...` line per over-cap part, or `key: 0` when there is
+/// none. A byte-cap part gives `leaf_bytes` and `field_bytes`, a body-ceiling
+/// part `body_bytes` and `body_ceiling`; whichever pair is absent is omitted.
+fn push_over_cap_parts(out: &mut String, key: &str, parts: &[SeriesIndexOverCapPart]) {
+    if parts.is_empty() {
+        out.push_str(&format!("{key}: 0\n"));
+        return;
+    }
+    for part in parts {
+        let mut line = format!("{key}: part={}", part.part_blake3);
+        if let Some(leaf_bytes) = part.leaf_bytes {
+            line.push_str(&format!(" leaf_bytes={leaf_bytes}"));
+        }
+        line.push_str(&format!(" cap={}", part.cap));
+        if let Some(field_bytes) = &part.field_bytes {
+            line.push_str(&format!(" field_bytes={}", field_counts(field_bytes)));
+        }
+        if let Some(body_bytes) = part.body_bytes {
+            line.push_str(&format!(" body_bytes={body_bytes}"));
+        }
+        if let Some(body_ceiling) = part.body_ceiling {
+            line.push_str(&format!(" body_ceiling={body_ceiling}"));
+        }
+        line.push_str(&format!(
+            " field_pairs={} classes={} series={}\n",
+            field_counts(&part.field_pairs),
+            part.classes,
+            part.series
+        ));
+        out.push_str(&line);
+    }
 }
 
 /// `name=count` pairs joined by commas, in field name order; `none` for an
@@ -2150,6 +2193,137 @@ mod tests {
                 "{line}\n{text}"
             );
         }
+    }
+
+    /// One part over the series-index byte cap and one with a key over the
+    /// leaf body ceiling, as both reports list them.
+    fn over_cap_parts() -> Vec<SeriesIndexOverCapPart> {
+        let fields = |a, b, c| {
+            std::collections::BTreeMap::from([
+                ("class_objects".to_string(), a),
+                ("series_class".to_string(), b),
+                ("series_label".to_string(), c),
+            ])
+        };
+        vec![
+            SeriesIndexOverCapPart {
+                part_blake3: "aa".repeat(32),
+                leaf_bytes: Some(600),
+                cap: 500,
+                field_bytes: Some(fields(100, 200, 300)),
+                body_bytes: None,
+                body_ceiling: None,
+                field_pairs: fields(4, 5, 6),
+                classes: 2,
+                series: 3,
+            },
+            SeriesIndexOverCapPart {
+                part_blake3: "bb".repeat(32),
+                leaf_bytes: None,
+                cap: 700,
+                field_bytes: None,
+                body_bytes: Some(90),
+                body_ceiling: Some(80),
+                field_pairs: fields(7, 8, 9),
+                classes: 1,
+                series: 1,
+            },
+        ]
+    }
+
+    /// The text line each part of [`over_cap_parts`] renders to under `key`.
+    fn over_cap_lines(key: &str) -> [String; 2] {
+        [
+            format!(
+                "{key}: part={} leaf_bytes=600 cap=500 \
+                 field_bytes=class_objects=100,series_class=200,series_label=300 \
+                 field_pairs=class_objects=4,series_class=5,series_label=6 classes=2 series=3",
+                "aa".repeat(32)
+            ),
+            format!(
+                "{key}: part={} cap=700 body_bytes=90 body_ceiling=80 \
+                 field_pairs=class_objects=7,series_class=8,series_label=9 classes=1 series=1",
+                "bb".repeat(32)
+            ),
+        ]
+    }
+
+    /// The fold report's text form prints one line per over-cap series-index
+    /// part with every figure `--json` carries for it, and `: 0` for none.
+    #[tokio::test]
+    async fn fold_report_renders_each_over_cap_series_index_part() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog =
+            ravel_catalog::Catalog::new(store, CatalogConfig::default()).expect("catalog");
+        let mut report = catalog
+            .fold(
+                &TenantId::new("cli-fold-over-cap").hash(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                0,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        let render = |report: &FoldReport| {
+            render_fold_report(
+                report,
+                StoreSelection::explicit(crate::store::StoreKind::Memory),
+                SignalArg::Metrics,
+                0,
+                1,
+                false,
+            )
+            .expect("render")
+        };
+        let key = "metrics_series_index_over_cap_parts";
+        let empty = render(&report);
+        assert_eq!(
+            empty
+                .lines()
+                .filter(|l| l.starts_with(key))
+                .collect::<Vec<_>>(),
+            vec![format!("{key}: 0")],
+            "{empty}"
+        );
+
+        report.metrics_series_index_parts_over_cap = 2;
+        report.metrics_series_index_over_cap_parts = over_cap_parts();
+        let text = render(&report);
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with(key))
+                .collect::<Vec<_>>(),
+            over_cap_lines(key).to_vec(),
+            "{text}"
+        );
+    }
+
+    /// The rebuild report's text form lists over-cap series-index parts the
+    /// same way.
+    #[test]
+    fn rebuild_report_renders_each_over_cap_series_index_part() {
+        let report = KeyIndexRebuildReport {
+            series_index_parts_over_cap: 2,
+            series_index_over_cap_parts: over_cap_parts(),
+            ..KeyIndexRebuildReport::default()
+        };
+        let text = render_rebuild_report(
+            &report,
+            StoreSelection::explicit(crate::store::StoreKind::Memory),
+            SignalArg::Metrics,
+            false,
+        )
+        .expect("render");
+        let key = "series_index_over_cap_parts";
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with(key))
+                .collect::<Vec<_>>(),
+            over_cap_lines(key).to_vec(),
+            "{text}"
+        );
     }
 
     mod rebuild_budget {
