@@ -2,6 +2,9 @@
 //! whole-object min/max and null count of each stamp-eligible declared column
 //! (I64 and BOOL only, decision 2) as records land in a tenant's flush buffer,
 //! then stamps them onto that flush's `CommitRecord` beside `sample_count`.
+//! ADR-4628 adds the exact sum (I64 only, in `i128`) and the zero count (I64
+//! and BOOL) to the same running figures, over the same merged view, unless
+//! `IngestConfig::emit_declared_stat_aggregates` opts out.
 //!
 //! The extrema are captured in-stream, O(1) per record per attribute, never by
 //! a second pass over the buffered records at flush time: each buffered write
@@ -83,23 +86,108 @@ enum Winner {
     Other,
 }
 
-/// Running min/max and non-null row count for one `(column, kind)` over the
-/// non-null values seen so far. `min <= max` holds by construction (both start
-/// at the first value and only widen), so a stamp built from it never trips the
-/// reader's `min <= max` clause.
+/// A stamp-eligible value kind as the accumulator folds it: its zero, and the
+/// sum it carries (ADR-4628 decision 2). Only I64 carries a sum, so BOOL's
+/// `Sum` is `()` and its path does no sum arithmetic at all.
+trait Figure: Ord + Copy {
+    type Sum: Copy + Default + std::fmt::Debug;
+
+    fn is_zero(self) -> bool;
+
+    /// `sum + v * count`.
+    fn add_to_sum(sum: Self::Sum, v: Self, count: u64) -> Self::Sum;
+
+    fn sum_of(a: Self::Sum, b: Self::Sum) -> Self::Sum;
+
+    fn stat_value(self) -> DeclaredStatValue;
+
+    /// Attach `sum` to `stat`; a no-op for a kind that carries none.
+    fn attach_sum(
+        stat: DeclaredColumnStat,
+        sum: Self::Sum,
+    ) -> Result<DeclaredColumnStat, ravel_types::declared_stats::DeclaredStatError>;
+}
+
+impl Figure for i64 {
+    /// Exact: a buffer's non-null count is a `u64` and each value an `i64`,
+    /// and `(2^64 - 1) * 2^63` stays inside `i128` (ADR-4628 decision 2).
+    type Sum = i128;
+
+    fn is_zero(self) -> bool {
+        self == 0
+    }
+
+    fn add_to_sum(sum: i128, v: i64, count: u64) -> i128 {
+        sum + i128::from(v) * i128::from(count)
+    }
+
+    fn sum_of(a: i128, b: i128) -> i128 {
+        a + b
+    }
+
+    fn stat_value(self) -> DeclaredStatValue {
+        DeclaredStatValue::I64(self)
+    }
+
+    fn attach_sum(
+        stat: DeclaredColumnStat,
+        sum: i128,
+    ) -> Result<DeclaredColumnStat, ravel_types::declared_stats::DeclaredStatError> {
+        stat.with_sum(sum)
+    }
+}
+
+impl Figure for bool {
+    type Sum = ();
+
+    fn is_zero(self) -> bool {
+        !self
+    }
+
+    fn add_to_sum((): (), _: bool, _: u64) {}
+
+    fn sum_of((): (), (): ()) {}
+
+    fn stat_value(self) -> DeclaredStatValue {
+        DeclaredStatValue::Bool(self)
+    }
+
+    fn attach_sum(
+        stat: DeclaredColumnStat,
+        (): (),
+    ) -> Result<DeclaredColumnStat, ravel_types::declared_stats::DeclaredStatError> {
+        Ok(stat)
+    }
+}
+
+/// Running min/max, non-null row count, zero count and (I64 only) sum for one
+/// `(column, kind)` over the non-null values seen so far. `min <= max` holds by
+/// construction (both start at the first value and only widen), so a stamp
+/// built from it never trips the reader's `min <= max` clause.
 #[derive(Clone, Copy, Debug)]
-struct Running<T> {
+struct Running<T: Figure> {
     min: T,
     max: T,
     non_null: u64,
+    /// Non-null rows whose value is the kind's zero (0 or `false`).
+    zeros: u64,
+    sum: T::Sum,
 }
 
-impl<T: Ord + Copy> Running<T> {
+impl<T: Figure> Running<T> {
     fn start(v: T) -> Self {
+        Running::repeated(v, 1)
+    }
+
+    /// `count` rows all reading `v`, the shape a stream-level fallback folds
+    /// in as. `count > 0`.
+    fn repeated(v: T, count: u64) -> Self {
         Running {
             min: v,
             max: v,
-            non_null: 1,
+            non_null: count,
+            zeros: if v.is_zero() { count } else { 0 },
+            sum: T::add_to_sum(T::Sum::default(), v, count),
         }
     }
 
@@ -111,20 +199,33 @@ impl<T: Ord + Copy> Running<T> {
             self.max = v;
         }
         self.non_null += 1;
+        if v.is_zero() {
+            self.zeros += 1;
+        }
+        self.sum = T::add_to_sum(self.sum, v, 1);
     }
 
-    /// Merge a whole batch's `(min, max, count)` computed in one pass, for the
-    /// columnar path where a dynamic column's cells are folded once rather than
-    /// entry-by-entry. `count == 0` is never passed (an absent column produces
-    /// no dynamic column at all).
-    fn merge(&mut self, min: T, max: T, count: u64) {
-        if min < self.min {
-            self.min = min;
+    /// Merge another run over disjoint rows, for the columnar path where a
+    /// dynamic column's cells are folded once rather than entry-by-entry and
+    /// for the per-stream fallbacks.
+    fn merge(&mut self, other: Running<T>) {
+        if other.min < self.min {
+            self.min = other.min;
         }
-        if max > self.max {
-            self.max = max;
+        if other.max > self.max {
+            self.max = other.max;
         }
-        self.non_null += count;
+        self.non_null += other.non_null;
+        self.zeros += other.zeros;
+        self.sum = T::sum_of(self.sum, other.sum);
+    }
+}
+
+/// Fold `run` into `slot`, starting it when empty.
+fn merge_into<T: Figure>(slot: &mut Option<Running<T>>, run: Running<T>) {
+    match slot {
+        Some(existing) => existing.merge(run),
+        None => *slot = Some(run),
     }
 }
 
@@ -352,27 +453,14 @@ fn record_winner<'a>(attrs: &'a [(String, AttrValue)], name: &str) -> Option<&'a
 }
 
 impl DeclaredStatAccum {
-    fn merge_i64(&mut self, name: &str, min: i64, max: i64, count: u64) {
+    fn merge_i64(&mut self, name: &str, run: Running<i64>) {
         match self.cols.get_mut(name) {
-            Some(col) => match &mut col.i64 {
-                Some(run) => run.merge(min, max, count),
-                slot @ None => {
-                    *slot = Some(Running {
-                        min,
-                        max,
-                        non_null: count,
-                    })
-                }
-            },
+            Some(col) => merge_into(&mut col.i64, run),
             None => {
                 self.cols.insert(
                     name.to_string(),
                     ColumnAccum {
-                        i64: Some(Running {
-                            min,
-                            max,
-                            non_null: count,
-                        }),
+                        i64: Some(run),
                         boolean: None,
                     },
                 );
@@ -380,28 +468,15 @@ impl DeclaredStatAccum {
         }
     }
 
-    fn merge_bool(&mut self, name: &str, min: bool, max: bool, count: u64) {
+    fn merge_bool(&mut self, name: &str, run: Running<bool>) {
         match self.cols.get_mut(name) {
-            Some(col) => match &mut col.boolean {
-                Some(run) => run.merge(min, max, count),
-                slot @ None => {
-                    *slot = Some(Running {
-                        min,
-                        max,
-                        non_null: count,
-                    })
-                }
-            },
+            Some(col) => merge_into(&mut col.boolean, run),
             None => {
                 self.cols.insert(
                     name.to_string(),
                     ColumnAccum {
                         i64: None,
-                        boolean: Some(Running {
-                            min,
-                            max,
-                            non_null: count,
-                        }),
+                        boolean: Some(run),
                     },
                 );
             }
@@ -511,21 +586,41 @@ impl DeclaredStatAccum {
                 continue;
             }
             match &col.cells {
-                DynCells::I64(cells) => {
+                DynCells::I64(cells) if !cells.is_empty() => {
                     let mut min = i64::MAX;
                     let mut max = i64::MIN;
+                    let mut sum: i128 = 0;
+                    let mut zeros: u64 = 0;
                     for &v in cells {
                         min = min.min(v);
                         max = max.max(v);
+                        sum += i128::from(v);
+                        zeros += u64::from(v == 0);
                     }
-                    if !cells.is_empty() {
-                        self.merge_i64(&col.name, min, max, cells.len() as u64);
-                    }
+                    self.merge_i64(
+                        &col.name,
+                        Running {
+                            min,
+                            max,
+                            non_null: cells.len() as u64,
+                            zeros,
+                            sum,
+                        },
+                    );
                 }
                 DynCells::Bool(cells) if !cells.is_empty() => {
-                    let min = cells.iter().all(|&b| b);
-                    let max = cells.iter().any(|&b| b);
-                    self.merge_bool(&col.name, min, max, cells.len() as u64);
+                    let falses = cells.iter().filter(|&&b| !b).count() as u64;
+                    let non_null = cells.len() as u64;
+                    self.merge_bool(
+                        &col.name,
+                        Running {
+                            min: falses == 0,
+                            max: falses < non_null,
+                            non_null,
+                            zeros: falses,
+                            sum: (),
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -609,10 +704,10 @@ impl DeclaredStatAccum {
                 }
             }
             if let Some(run) = i64_run {
-                self.merge_i64(name, run.min, run.max, run.non_null);
+                self.merge_i64(name, run);
             }
             if let Some(run) = bool_run {
-                self.merge_bool(name, run.min, run.max, run.non_null);
+                self.merge_bool(name, run);
             }
         }
     }
@@ -694,7 +789,7 @@ impl DeclaredStatAccum {
         }
     }
 
-    /// Build the stamps for one flush from the accumulated extrema and the
+    /// Build the stamps for one flush from the accumulated figures and the
     /// flush's declared columns (`(name, TypedAttrColumnType tag)`), against the
     /// object's `sample_count`.
     ///
@@ -709,10 +804,17 @@ impl DeclaredStatAccum {
     /// `null_count = sample_count - non_null <= sample_count` with presence
     /// agreeing with the null count, so the flush's own reader drops none of
     /// them.
+    ///
+    /// With `emit_aggregates` (ADR-4628 decision 2), every stamp also carries
+    /// its zero count and, for I64, its sum; a column with no non-null row
+    /// carries sum 0 and zero count 0. Without it (the producer opt-out of
+    /// decision 8) every stamp carries neither, and min, max and null count are
+    /// unchanged.
     pub(crate) fn build_stamps(
         &self,
         declared: &[(String, u32)],
         sample_count: u64,
+        emit_aggregates: bool,
     ) -> Vec<DeclaredColumnStat> {
         if self.stream_attrs_undecodable {
             return Vec::new();
@@ -734,14 +836,9 @@ impl DeclaredStatAccum {
                     build_one(
                         name,
                         DeclaredStatType::I64,
-                        run.map(|r| {
-                            (
-                                DeclaredStatValue::I64(r.min),
-                                DeclaredStatValue::I64(r.max),
-                                r.non_null,
-                            )
-                        }),
+                        run,
                         sample_count,
+                        emit_aggregates,
                     )
                 }
                 DeclaredStatType::Bool => {
@@ -757,14 +854,9 @@ impl DeclaredStatAccum {
                     build_one(
                         name,
                         DeclaredStatType::Bool,
-                        run.map(|r| {
-                            (
-                                DeclaredStatValue::Bool(r.min),
-                                DeclaredStatValue::Bool(r.max),
-                                r.non_null,
-                            )
-                        }),
+                        run,
                         sample_count,
+                        emit_aggregates,
                     )
                 }
             };
@@ -776,14 +868,15 @@ impl DeclaredStatAccum {
     }
 
     /// Add the stream-level half of the merged view for one declared column to
-    /// the running extrema its records produced.
+    /// the running figures its records produced.
     ///
     /// Every row of a stream whose attributes supply a matching-typed value for
     /// `name`, other than the rows that set `name` themselves, reads that value.
     /// Those rows are non-null for the declaration and carry a single value, so
-    /// they fold in as one `(value, value, count)` merge per stream rather than
-    /// row by row.
-    fn fold_fallbacks<T: Ord + Copy>(
+    /// they fold in as one merge per stream rather than row by row: `count`
+    /// rows, `value * count` onto the sum, and `count` zeros when `value` is the
+    /// kind's zero.
+    fn fold_fallbacks<T: Figure>(
         &self,
         name: &str,
         mut run: Option<Running<T>>,
@@ -800,16 +893,7 @@ impl DeclaredStatAccum {
             if count == 0 {
                 continue;
             }
-            match &mut run {
-                Some(r) => r.merge(value, value, count),
-                slot @ None => {
-                    *slot = Some(Running {
-                        min: value,
-                        max: value,
-                        non_null: count,
-                    })
-                }
-            }
+            merge_into(&mut run, Running::repeated(value, count));
         }
         run
     }
@@ -819,21 +903,32 @@ impl DeclaredStatAccum {
 /// count exceeds `sample_count` (impossible under [`DeclaredStatAccum`]'s
 /// per-record dedup, but a `None` rather than a stamp its own reader would drop
 /// keeps decision 3's invariant true even if that ever changes) or the typed
-/// constructor refuses the triple.
-fn build_one(
+/// form refuses the triple, the sum or the zero count.
+fn build_one<T: Figure>(
     name: &str,
     ty: DeclaredStatType,
-    observed: Option<(DeclaredStatValue, DeclaredStatValue, u64)>,
+    observed: Option<Running<T>>,
     sample_count: u64,
+    emit_aggregates: bool,
 ) -> Option<DeclaredColumnStat> {
     let (min, max, null_count) = match observed {
-        Some((min, max, non_null)) => {
-            let null_count = sample_count.checked_sub(non_null)?;
-            (Some(min), Some(max), null_count)
+        Some(run) => {
+            let null_count = sample_count.checked_sub(run.non_null)?;
+            (
+                Some(run.min.stat_value()),
+                Some(run.max.stat_value()),
+                null_count,
+            )
         }
         None => (None, None, sample_count),
     };
-    DeclaredColumnStat::new(name, ty, min, max, null_count).ok()
+    let stat = DeclaredColumnStat::new(name, ty, min, max, null_count).ok()?;
+    if !emit_aggregates {
+        return Some(stat);
+    }
+    let (zeros, sum) = observed.map_or((0, T::Sum::default()), |run| (run.zeros, run.sum));
+    let stat = T::attach_sum(stat, sum).ok()?;
+    stat.with_zero_count(zeros).ok()
 }
 
 #[cfg(test)]
@@ -904,11 +999,14 @@ mod tests {
             rec(vec![("EventDate", AttrValue::I64(0))]),
         ];
         acc.observe_records(&records);
-        let stamps = acc.build_stamps(&[i64_col("EventDate")], 4);
+        let stamps = acc.build_stamps(&[i64_col("EventDate")], 4, true);
         let s = stat(&stamps, "EventDate").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(i64::MIN)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(i64::MAX)));
         assert_eq!(s.null_count(), 0);
+        // -5 + (2^63 - 1) - 2^63 + 0.
+        assert_eq!(s.sum(), Some(-6));
+        assert_eq!(s.zero_count(), Some(1));
     }
 
     #[test]
@@ -920,7 +1018,7 @@ mod tests {
             rec(vec![("IsRefresh", AttrValue::Bool(false))]),
         ];
         acc.observe_records(&all_false);
-        let stamps = acc.build_stamps(&[bool_col("IsRefresh")], 2);
+        let stamps = acc.build_stamps(&[bool_col("IsRefresh")], 2, true);
         let s = stat(&stamps, "IsRefresh").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::Bool(false)));
         assert_eq!(s.max(), Some(DeclaredStatValue::Bool(false)));
@@ -930,7 +1028,7 @@ mod tests {
         let mut acc = DeclaredStatAccum::default();
         acc.observe_records(&all_false);
         acc.observe_records(&[rec(vec![("IsRefresh", AttrValue::Bool(true))])]);
-        let stamps = acc.build_stamps(&[bool_col("IsRefresh")], 3);
+        let stamps = acc.build_stamps(&[bool_col("IsRefresh")], 3, true);
         let s = stat(&stamps, "IsRefresh").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::Bool(false)));
         assert_eq!(s.max(), Some(DeclaredStatValue::Bool(true)));
@@ -947,7 +1045,7 @@ mod tests {
             rec(vec![("EventDate", AttrValue::I64(15))]),
         ];
         acc.observe_records(&records);
-        let stamps = acc.build_stamps(&[i64_col("EventDate")], 5);
+        let stamps = acc.build_stamps(&[i64_col("EventDate")], 5, true);
         let s = stat(&stamps, "EventDate").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(10)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(20)));
@@ -965,7 +1063,7 @@ mod tests {
             rec(vec![("other", AttrValue::I64(2))]),
         ];
         acc.observe_records(&records);
-        let stamps = acc.build_stamps(&[i64_col("EventDate")], 3);
+        let stamps = acc.build_stamps(&[i64_col("EventDate")], 3, true);
         let s = stat(&stamps, "EventDate").expect("all-null column still stamps");
         assert_eq!(s.min(), None);
         assert_eq!(s.max(), None);
@@ -983,7 +1081,7 @@ mod tests {
             rec(vec![("flag", AttrValue::Bool(false))]),
         ];
         acc.observe_records(&records);
-        let stamps = acc.build_stamps(&[bool_col("flag")], 3);
+        let stamps = acc.build_stamps(&[bool_col("flag")], 3, true);
         let s = stat(&stamps, "flag").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::Bool(false)));
         assert_eq!(s.max(), Some(DeclaredStatValue::Bool(true)));
@@ -999,7 +1097,7 @@ mod tests {
         let mut acc = DeclaredStatAccum::default();
         acc.observe_records(&[rec(vec![("Ratio", AttrValue::F64(1.5))])]);
         let declared = vec![("Ratio".to_string(), TYPED_ATTR_COLUMN_TYPE_F64)];
-        let stamps = acc.build_stamps(&declared, 1);
+        let stamps = acc.build_stamps(&declared, 1, true);
         assert!(
             stat(&stamps, "Ratio").is_none(),
             "F64 declared column must carry no stamp"
@@ -1018,7 +1116,7 @@ mod tests {
             ("URL".to_string(), TYPED_ATTR_COLUMN_TYPE_STR),
             ("Blob".to_string(), TYPED_ATTR_COLUMN_TYPE_BYTES),
         ];
-        let stamps = acc.build_stamps(&declared, 1);
+        let stamps = acc.build_stamps(&declared, 1, true);
         assert!(stamps.is_empty(), "STR and BYTES never stamp");
     }
 
@@ -1038,7 +1136,7 @@ mod tests {
             ("EventDate", AttrValue::I64(7)),
             ("EventDate", AttrValue::I64(99)),
         ])]);
-        let stamps = acc.build_stamps(&[i64_col("EventDate")], 1);
+        let stamps = acc.build_stamps(&[i64_col("EventDate")], 1, true);
         let s = stat(&stamps, "EventDate").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(99)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(99)));
@@ -1051,7 +1149,7 @@ mod tests {
         // an I64 attribute nobody declared produces no stamp.
         let mut acc = DeclaredStatAccum::default();
         acc.observe_records(&[rec(vec![("user_id", AttrValue::I64(1))])]);
-        let stamps = acc.build_stamps(&[i64_col("EventDate")], 1);
+        let stamps = acc.build_stamps(&[i64_col("EventDate")], 1, true);
         assert!(stat(&stamps, "user_id").is_none());
         // EventDate was declared but never seen: it stamps all-null.
         let s = stat(&stamps, "EventDate").expect("declared, all-null");
@@ -1070,7 +1168,7 @@ mod tests {
             rec_in(1, &stream, vec![]),
             rec_in(1, &stream, vec![("other", AttrValue::I64(2))]),
         ]);
-        let stamps = acc.build_stamps(&[i64_col("k")], 3);
+        let stamps = acc.build_stamps(&[i64_col("k")], 3, true);
         let s = stat(&stamps, "k").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(7)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(7)));
@@ -1090,7 +1188,7 @@ mod tests {
             rec_in(1, &stream, vec![]),
             rec_in(1, &stream, vec![("other", AttrValue::Bool(true))]),
         ]);
-        let stamps = acc.build_stamps(&[i64_col("k")], 3);
+        let stamps = acc.build_stamps(&[i64_col("k")], 3, true);
         let s = stat(&stamps, "k").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(2)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(7)));
@@ -1108,7 +1206,7 @@ mod tests {
             rec_in(2, &stream, vec![("other", AttrValue::I64(1))]),
             rec_in(2, &stream, vec![]),
         ]);
-        let stamps = acc.build_stamps(&[bool_col("flag")], 3);
+        let stamps = acc.build_stamps(&[bool_col("flag")], 3, true);
         let s = stat(&stamps, "flag").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::Bool(true)));
         assert_eq!(s.max(), Some(DeclaredStatValue::Bool(true)));
@@ -1126,7 +1224,7 @@ mod tests {
             rec_in(1, &stream, vec![("k", AttrValue::Str("x".to_string()))]),
             rec_in(1, &stream, vec![]),
         ]);
-        let stamps = acc.build_stamps(&[i64_col("k")], 2);
+        let stamps = acc.build_stamps(&[i64_col("k")], 2, true);
         let s = stat(&stamps, "k").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(7)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(7)));
@@ -1140,7 +1238,7 @@ mod tests {
         let stream = blob(&[("k", AttrValue::Str("seven".to_string()))], &[]);
         let mut acc = DeclaredStatAccum::default();
         acc.observe_records(&[rec_in(1, &stream, vec![]), rec_in(1, &stream, vec![])]);
-        let stamps = acc.build_stamps(&[i64_col("k")], 2);
+        let stamps = acc.build_stamps(&[i64_col("k")], 2, true);
         let s = stat(&stamps, "k").expect("stamped");
         assert_eq!(s.min(), None);
         assert_eq!(s.max(), None);
@@ -1157,7 +1255,7 @@ mod tests {
             rec_in(2, &b, vec![]),
             rec_in(2, &b, vec![("k", AttrValue::I64(100))]),
         ]);
-        let stamps = acc.build_stamps(&[i64_col("k")], 3);
+        let stamps = acc.build_stamps(&[i64_col("k")], 3, true);
         let s = stat(&stamps, "k").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(-3)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(100)));
@@ -1170,7 +1268,7 @@ mod tests {
         // makes no statement at all rather than an affirmative wrong one.
         let mut acc = DeclaredStatAccum::default();
         acc.observe_records(&[rec_in(1, &[0xff, 0xff], vec![("k", AttrValue::I64(1))])]);
-        assert!(acc.build_stamps(&[i64_col("k")], 1).is_empty());
+        assert!(acc.build_stamps(&[i64_col("k")], 1, true).is_empty());
     }
 
     #[test]
@@ -1201,20 +1299,212 @@ mod tests {
 
         let mut columnar = DeclaredStatAccum::default();
         columnar.observe_batch(&batch);
-        let columnar = columnar.build_stamps(&[i64_col("k")], 3);
+        let columnar = columnar.build_stamps(&[i64_col("k")], 3, true);
         let s = stat(&columnar, "k").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(2)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(7)));
         assert_eq!(s.null_count(), 0);
+        // 2 from the record, 7 twice from the resource fallback.
+        assert_eq!(s.sum(), Some(16));
+        assert_eq!(s.zero_count(), Some(0));
 
         let mut row = DeclaredStatAccum::default();
         row.observe_records(&records);
-        let row = row.build_stamps(&[i64_col("k")], 3);
+        let row = row.build_stamps(&[i64_col("k")], 3, true);
         assert_eq!(row.len(), 1);
         assert_eq!(columnar.len(), 1);
-        assert_eq!(row[0].min(), s.min());
-        assert_eq!(row[0].max(), s.max());
-        assert_eq!(row[0].null_count(), s.null_count());
+        assert_eq!(row[0], *s);
+    }
+
+    /// The same records as a columnar batch, the loader's representation.
+    fn batch_of(records: &[NormalizedLogRecord]) -> ColumnarLogBatch {
+        let logrecords: Vec<ravel_logseg::LogRecord> = records
+            .iter()
+            .map(|r| ravel_logseg::LogRecord {
+                stream_id: r.stream_id,
+                stream_attrs: r.stream_attrs.to_vec(),
+                ts_ns: r.ts_ns,
+                observed_ts_ns: r.observed_ts_ns,
+                severity_num: r.severity_num,
+                severity_text: r.severity_text.clone(),
+                body: r.body.clone(),
+                trace_id: None,
+                span_id: None,
+                flags: r.flags,
+                attrs: r.attrs.clone(),
+            })
+            .collect();
+        ColumnarLogBatch::from_records(&logrecords)
+    }
+
+    /// Nine rows over two streams. Stream 1's resource set carries
+    /// `k = i64::MAX` and `b = false`; stream 2's carries nothing.
+    ///
+    /// | row | record attributes             | k (I64)  | b (BOOL) | c     | u   |
+    /// |-----|-------------------------------|----------|----------|-------|-----|
+    /// | 1   | c=false, u=0                  | MAX (fb) | false fb | false | 0   |
+    /// | 2   | c=true, u=-4                  | MAX (fb) | false fb | true  | -4  |
+    /// | 3   | other=1, c=false, u=10        | MAX (fb) | false fb | false | 10  |
+    /// | 4   | k=5                           | 5        | false fb | NULL  | NULL|
+    /// | 5   | k="x"                         | NULL     | false fb | NULL  | NULL|
+    /// | 6   | k=0, b=true                   | 0        | true     | NULL  | NULL|
+    /// | 7   | k=3, k=4 (one type, repeated) | 4        | false fb | NULL  | NULL|
+    /// | 8   | k=true, k=9                   | NULL     | false fb | NULL  | NULL|
+    /// | 9   | b=2 (stream 2)                | NULL     | NULL     | NULL  | NULL|
+    ///
+    /// Row 7's second occurrence overflows to `attrs_raw` and wins; row 8's
+    /// BOOL occurrence wins over its I64 one (see
+    /// `duplicate_key_stamp_follows_the_readers_rule`). Rows 5 and 8 set `k`, so
+    /// they override the fallback and read NULL; three rows fall back.
+    fn mixed_records() -> Vec<NormalizedLogRecord> {
+        let a = blob(
+            &[
+                ("k", AttrValue::I64(i64::MAX)),
+                ("b", AttrValue::Bool(false)),
+            ],
+            &[],
+        );
+        let bare = blob(&[], &[]);
+        vec![
+            rec_in(
+                1,
+                &a,
+                vec![("c", AttrValue::Bool(false)), ("u", AttrValue::I64(0))],
+            ),
+            rec_in(
+                1,
+                &a,
+                vec![("c", AttrValue::Bool(true)), ("u", AttrValue::I64(-4))],
+            ),
+            rec_in(
+                1,
+                &a,
+                vec![
+                    ("other", AttrValue::I64(1)),
+                    ("c", AttrValue::Bool(false)),
+                    ("u", AttrValue::I64(10)),
+                ],
+            ),
+            rec_in(1, &a, vec![("k", AttrValue::I64(5))]),
+            rec_in(1, &a, vec![("k", AttrValue::Str("x".to_string()))]),
+            rec_in(
+                1,
+                &a,
+                vec![("k", AttrValue::I64(0)), ("b", AttrValue::Bool(true))],
+            ),
+            rec_in(
+                1,
+                &a,
+                vec![("k", AttrValue::I64(3)), ("k", AttrValue::I64(4))],
+            ),
+            rec_in(
+                1,
+                &a,
+                vec![("k", AttrValue::Bool(true)), ("k", AttrValue::I64(9))],
+            ),
+            rec_in(2, &bare, vec![("b", AttrValue::I64(2))]),
+        ]
+    }
+
+    fn mixed_declared() -> Vec<(String, u32)> {
+        vec![i64_col("k"), bool_col("b"), bool_col("c"), i64_col("u")]
+    }
+
+    /// ADR-4628 test 8, producer half: both fold paths stamp the hand-computed
+    /// sum and zero count over the merged view of [`mixed_records`].
+    #[test]
+    fn row_and_columnar_paths_stamp_the_same_sum_and_zero_count() {
+        let records = mixed_records();
+        let mut row = DeclaredStatAccum::default();
+        row.observe_records(&records);
+        let mut columnar = DeclaredStatAccum::default();
+        columnar.observe_batch(&batch_of(&records));
+
+        for (acc, what) in [(&row, "row path"), (&columnar, "columnar path")] {
+            let stamps = acc.build_stamps(&mixed_declared(), 9, true);
+            assert_eq!(stamps.len(), 4, "{what}");
+
+            let k = stat(&stamps, "k").expect("k stamped");
+            assert_eq!(k.min(), Some(DeclaredStatValue::I64(0)), "{what}");
+            assert_eq!(k.max(), Some(DeclaredStatValue::I64(i64::MAX)), "{what}");
+            assert_eq!(k.null_count(), 3, "{what}: rows 5, 8 and 9");
+            // Three fallback rows of i64::MAX, then 5 + 0 + 4: past i64::MAX.
+            assert_eq!(k.sum(), Some(3 * i128::from(i64::MAX) + 9), "{what}: k sum");
+            assert_eq!(k.zero_count(), Some(1), "{what}: row 6 only");
+
+            let b = stat(&stamps, "b").expect("b stamped");
+            assert_eq!(b.min(), Some(DeclaredStatValue::Bool(false)), "{what}");
+            assert_eq!(b.max(), Some(DeclaredStatValue::Bool(true)), "{what}");
+            assert_eq!(b.null_count(), 1, "{what}: row 9's I64 reads NULL");
+            assert_eq!(b.sum(), None, "{what}: BOOL carries no sum");
+            assert_eq!(
+                b.zero_count(),
+                Some(7),
+                "{what}: seven fallback falses, row 6's true and row 9's NULL excluded"
+            );
+
+            let c = stat(&stamps, "c").expect("c stamped");
+            assert_eq!(c.null_count(), 6, "{what}");
+            assert_eq!(c.sum(), None, "{what}");
+            assert_eq!(c.zero_count(), Some(2), "{what}: c zero count");
+
+            let u = stat(&stamps, "u").expect("u stamped");
+            assert_eq!(u.min(), Some(DeclaredStatValue::I64(-4)), "{what}");
+            assert_eq!(u.max(), Some(DeclaredStatValue::I64(10)), "{what}");
+            assert_eq!(u.null_count(), 6, "{what}");
+            assert_eq!(u.sum(), Some(6), "{what}: u sum");
+            assert_eq!(u.zero_count(), Some(1), "{what}: u zero count");
+        }
+        assert_eq!(
+            row.build_stamps(&mixed_declared(), 9, true),
+            columnar.build_stamps(&mixed_declared(), 9, true)
+        );
+    }
+
+    /// ADR-4628 test 12, producer half: the opt-out withholds the sum and the
+    /// zero count on every stamp and leaves min, max and null count as the
+    /// emitting run states them.
+    #[test]
+    fn opt_out_withholds_sum_and_zero_count_only() {
+        let records = mixed_records();
+        let mut row = DeclaredStatAccum::default();
+        row.observe_records(&records);
+        let mut columnar = DeclaredStatAccum::default();
+        columnar.observe_batch(&batch_of(&records));
+
+        for (acc, what) in [(&row, "row path"), (&columnar, "columnar path")] {
+            let emitted = acc.build_stamps(&mixed_declared(), 9, true);
+            let withheld = acc.build_stamps(&mixed_declared(), 9, false);
+            assert_eq!(withheld.len(), emitted.len(), "{what}");
+            for (w, e) in withheld.iter().zip(&emitted) {
+                assert_eq!(w.name(), e.name(), "{what}");
+                assert_eq!(w.sum(), None, "{what}: {} sum", w.name());
+                assert_eq!(w.zero_count(), None, "{what}: {} zero count", w.name());
+                assert_eq!(w.min(), e.min(), "{what}: {}", w.name());
+                assert_eq!(w.max(), e.max(), "{what}: {}", w.name());
+                assert_eq!(w.null_count(), e.null_count(), "{what}: {}", w.name());
+            }
+        }
+    }
+
+    /// Decision 2: an I64 column with no non-null row states sum 0 and zero
+    /// count 0, not an absent sum, and a BOOL one states zero count 0.
+    #[test]
+    fn all_null_columns_stamp_a_zero_sum_and_zero_count() {
+        let mut acc = DeclaredStatAccum::default();
+        acc.observe_records(&[
+            rec(vec![("other", AttrValue::I64(1))]),
+            rec(vec![("EventDate", AttrValue::Str("x".to_string()))]),
+        ]);
+        let stamps = acc.build_stamps(&[i64_col("EventDate"), bool_col("flag")], 2, true);
+        let s = stat(&stamps, "EventDate").expect("all-null I64 stamped");
+        assert_eq!(s.min(), None);
+        assert_eq!(s.null_count(), 2);
+        assert_eq!(s.sum(), Some(0), "all-null I64 sum");
+        assert_eq!(s.zero_count(), Some(0), "all-null I64 zero count");
+        let f = stat(&stamps, "flag").expect("all-null BOOL stamped");
+        assert_eq!(f.sum(), None);
+        assert_eq!(f.zero_count(), Some(0), "all-null BOOL zero count");
     }
 
     /// Issue #1182, consumer 3: this fold must resolve a record that carries one
@@ -1325,7 +1615,7 @@ mod tests {
 
         let mut row = DeclaredStatAccum::default();
         row.observe_records(&records);
-        check(&row.build_stamps(&declared, 5), "row-major fold");
+        check(&row.build_stamps(&declared, 5, true), "row-major fold");
 
         let to_logrecord = |r: &NormalizedLogRecord| LogRecord {
             stream_id: r.stream_id,
@@ -1344,7 +1634,7 @@ mod tests {
             ColumnarLogBatch::from_records(&records.iter().map(to_logrecord).collect::<Vec<_>>());
         let mut columnar = DeclaredStatAccum::default();
         columnar.observe_batch(&batch);
-        check(&columnar.build_stamps(&declared, 5), "columnar fold");
+        check(&columnar.build_stamps(&declared, 5, true), "columnar fold");
     }
 
     /// The `attrs_raw` tier of the same rule: a record repeating one name at ONE
@@ -1370,7 +1660,7 @@ mod tests {
             ("k", AttrValue::I64(-1)),
             ("k", AttrValue::I64(2)),
         ])]);
-        let stamps = acc.build_stamps(&[i64_col("k")], 1);
+        let stamps = acc.build_stamps(&[i64_col("k")], 1, true);
         let s = stat(&stamps, "k").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(2)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(2)));
@@ -1419,7 +1709,7 @@ mod tests {
             ColumnarLogBatch::from_records(&records.iter().map(to_logrecord).collect::<Vec<_>>());
         let mut columnar = DeclaredStatAccum::default();
         columnar.observe_batch(&batch);
-        let stamps = columnar.build_stamps(&[i64_col("k")], 1);
+        let stamps = columnar.build_stamps(&[i64_col("k")], 1, true);
         let s = stat(&stamps, "k").expect("stamped");
         assert_eq!(
             s.min(),
@@ -1453,7 +1743,7 @@ mod tests {
             rec_in(1, &stream, vec![]),
             rec_in(1, &stream, vec![]),
         ]);
-        let stamps = acc.build_stamps(&[i64_col("k")], 3);
+        let stamps = acc.build_stamps(&[i64_col("k")], 3, true);
         let s = stat(&stamps, "k").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(2)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(7)));
@@ -1474,7 +1764,7 @@ mod tests {
             rec_in(1, &stream, vec![]),
             rec_in(1, &stream, vec![]),
         ]);
-        let stamps = acc.build_stamps(&[i64_col("k")], 3);
+        let stamps = acc.build_stamps(&[i64_col("k")], 3, true);
         let s = stat(&stamps, "k").expect("stamped");
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(7)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(7)));

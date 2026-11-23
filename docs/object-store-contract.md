@@ -1789,8 +1789,9 @@ adapter contract:
 
    Not every catalog object is alike here. The HEAD pointer, the snapshot
    entries inside a snapshot part, and the name postings carry identities,
-   hashes, counts, timestamps, and metric names only, never a label or
-   attribute value: that is what ADR-0064's Context establishes, and it
+   hashes, counts, timestamps, and metric names only, never a string label
+   or attribute value (a snapshot entry's numeric stamp is in the next
+   paragraph): that is what ADR-0064's Context establishes, and it
    enumerates exactly `SnapshotEntry`, `SnapshotPartHeader`, and name
    postings (ADR-0064 Context, plus its §7 requirement that subject
    identifiers never appear inside metric names). The per-part
@@ -1810,6 +1811,25 @@ adapter contract:
    `t/<hash>/catalog/<signal>/idx/*.cstat`
    (`crates/ravel-catalog/src/fold.rs`), inside the `idx/` prefix this
    sweep lists.
+
+   Numeric values are covered too. A retained stamp on a commit record, a
+   compaction record or a snapshot entry holds the min, max, sum and zero
+   count of each declared `I64` and `BOOL` column over the rows it covers
+   (the sum for `I64` only; ADR-4628, docs/catalog-and-mvcc.md). With the
+   min and max, a sum can recover an erased value: the pre-rewrite sum less
+   the sum over the rows the rewrite kept is the sum of the erased rows,
+   which for one erased row is its exact value. The erasure guarantee
+   covers numeric values (ADR-4628, question 6a; ADR-0064, declared-column
+   stamp amendment), so the catalog-keyspace `R` modifier applies to a
+   tenant with any declared `I64` or `BOOL` column, not only to one with a
+   `STR` or `BYTES` typed attribute column. A replaced `.csnap` part is
+   swept by the same rule as a `.cstat`: the sweep lists `snap/` beside
+   `idx/`, keeps what HEAD names, and deletes the rest past the
+   `protection_horizon` age gate (`sweep_unreferenced_catalog_objects` in
+   `crates/ravel-maintain/src/sweep.rs`), so the bound below holds for a
+   locked `.csnap` part's stamp, with `T_w` that part's `last_modified`. A
+   locked commit record's stamp goes with the record, inside its
+   `max(bound + E_v, R)` bound.
 
    So for any tenant with a `STR` or `BYTES` typed attribute column, an
    erased subject's own value can sit verbatim in a `.cstat`. Erasure does
