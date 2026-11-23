@@ -885,10 +885,8 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   The image carries that second driver too, `driver-reshard`: the same crate
   built with its `reshard` feature (`driver/src/reshard.rs`), which the
   reshard-ownership profile runs (`../reshard-ownership/README.md`). The
-  instrumentation check covers it like `driver`. It is a binary of its own
-  because the SDK registers every assertion a binary holds when it starts,
-  so the plain driver carries none of the reshard profile's literals and
-  this workload's expected set is unchanged.
+  instrumentation check covers it like `driver`; that README says why it is
+  a binary of its own.
 - `WORKLOAD_PROFILE=reshard-ownership` before `local-run.sh` or `launch.sh`
   runs the reshard-ownership profile instead (`scripts/profile.sh`): its
   config directory, test name, owned areas and required assertions.

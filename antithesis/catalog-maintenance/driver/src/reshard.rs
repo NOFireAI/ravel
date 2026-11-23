@@ -1,7 +1,7 @@
 //! The reshard-ownership profile (antithesis/reshard-ownership/README.md):
 //! the catalog-maintenance workload with the tenant resharded under it.
-//! Compiled only into `driver-reshard` (cargo feature `reshard`), so the
-//! plain driver's assertion catalog stays what it was.
+//! Compiled only into `driver-reshard` (cargo feature `reshard`; that README
+//! says why it is a binary of its own).
 //!
 //! Before the sealing jump the driver appends an increase from 4 to 6
 //! shards through `ravel-cli-ant` with the shortest lead, so the jump
@@ -389,11 +389,13 @@ fn fence(s: &Shared) -> bool {
     let mut grace = Vec::new();
     let mut fenced = Vec::new();
     let mut moved = false;
-    // A read already in flight when the rule was set may still have
-    // refreshed a view, so the horizon is counted from a little later.
-    let horizon_hour = (refused_ns + 30 * NS_PER_SECOND) / NS_PER_HOUR + audit::MIN_LEAD_HOURS;
+    let mut horizon_hour = refused_ns / NS_PER_HOUR + audit::MIN_LEAD_HOURS;
     if refused {
         std::thread::sleep(STALE_VIEW_WAIT);
+        // A read already in flight when the rule was set may still have
+        // refreshed a view during the wait; no read can after it, since the
+        // grace writes' own re-reads are refused.
+        horizon_hour = now_ns() / NS_PER_HOUR + audit::MIN_LEAD_HOURS;
         for node in 0..n {
             let (id, acked) = s.write_with_id(4, 4, &mut || node);
             grace.push(json!({ "node": node, "acked": acked, "last": last_attempt(s, id) }));
@@ -521,7 +523,8 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
     let details = json!({
         "cycle": cycle,
         "activation_hour": a,
-        "sent": delays.len(),
+        "planned": delays.len(),
+        "sent": ids.iter().filter(|(id, _)| id.is_some()).count(),
         "acked": burst.len(),
         "stragglers": stragglers.iter().map(|w| w.id).collect::<Vec<_>>(),
         "straggler_tokens": stragglers.iter().take(3).map(|w| w.acked_header()).collect::<Vec<_>>(),
@@ -540,8 +543,11 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
     // A write per node routed at 4 after the activation: a node restarted
     // later shows its new identity against this one at the same count
     // (`token::AckLedger::restarted_since`).
-    for node in 0..n {
-        write_to(s, 4, node);
+    let anchored: Vec<bool> = (0..n)
+        .map(|node| (0..3).any(|_| write_to(s, 4, node).is_some()))
+        .collect();
+    if !anchored.iter().all(|&a| a) {
+        println!("reshard: decrease cycle {cycle}: not every node acknowledged at 4: {anchored:?}");
     }
     for w in stragglers
         .iter()
