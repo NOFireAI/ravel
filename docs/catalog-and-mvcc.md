@@ -3338,7 +3338,10 @@ written only when it does not fit i64 and never beside field 6; and
 `zero_count` (field 8, `optional uint64`), the number of non-null rows whose
 value equals the type's zero (0 for I64, false for BOOL). A sum is written
 only for an I64 column. Each is absent when its producer did not compute it,
-which reads as unknown, and no producer writes them yet. A decoder drops and
+which reads as unknown. The logs flush writes them on every commit record it
+stamps, `ravel-cli load` included, unless the ingest process sets
+`IngestConfig::emit_declared_stat_aggregates` to false (docs/ingest.md); no
+other producer writes them yet. A decoder drops and
 counts an entry whose aggregates break ADR-4628 decision 2: both sum fields
 present, a `sum_wide` of any length other than 16 or holding a value that
 fits i64, a sum on a non-I64 column or outside `[non_null * min, non_null *

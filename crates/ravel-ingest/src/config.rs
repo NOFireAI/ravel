@@ -858,6 +858,14 @@ pub struct IngestConfig {
     /// `CatalogConfig` defaults; `ravel-server` sets it from the
     /// `CatalogConfig` its catalog is built from.
     pub fold_seal: FoldSealMargin,
+    /// Whether the declared-column stamps a log flush writes carry the sum
+    /// and zero count of ADR-4628 (fields 6 to 8). Default `true`. `false` is
+    /// the producer opt-out of ADR-4628 decision 8: every stamp then carries
+    /// neither, with min, max and null count unchanged, so the segments it
+    /// writes scan for the statements those fields answer. A process setting,
+    /// not a persisted record; neither ravel-server nor `ravel-cli load` sets
+    /// it from a flag yet.
+    pub emit_declared_stat_aggregates: bool,
 }
 
 /// The three `CatalogConfig` values ravel-catalog's `sealed_watermark_hour`
@@ -959,6 +967,7 @@ impl Default for IngestConfig {
             max_pending_strict_acks: 8_192,
             flush_object_backstop_multiple: OBJECT_BACKSTOP_TARGET_MULTIPLE,
             fold_seal: FoldSealMargin::default(),
+            emit_declared_stat_aggregates: true,
         }
     }
 }

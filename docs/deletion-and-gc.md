@@ -1261,9 +1261,14 @@ into them. An operator with erasure obligations must budget them deliberately.
   sweep deletes the snapshot and index objects the current HEAD no longer
   names, and for a tenant with a `STR` or `BYTES` typed attribute column a
   per-part `.cstat` index object among them holds that subject's own column
-  value. A lock over the keyspace does not delay that delete, which
+  value. For a tenant with any declared `I64` or `BOOL` column the same
+  holds of a replaced `.csnap` snapshot part, whose snapshot entries carry
+  the stamp described under "Three index object kinds hold no string
+  value" below, so the modifier applies to that tenant too. A lock over the
+  keyspace does not delay that delete, which
   succeeds as a delete marker as under `+D`, but the locked version holding
-  the value stays in storage. The sweep deletes the stale `.cstat` only
+  the value stays in storage. The sweep deletes the stale `.cstat` or
+  `.csnap` only
   once the fold has reconciled the hour (or HEAD is rebuilt) and the
   object's `last_modified` age exceeds `protection_horizon` (25 h 5 min
   with defaults), and the locked version then stays until its retain-until
@@ -1334,15 +1339,32 @@ into them. An operator with erasure obligations must budget them deliberately.
   completion pass walks `c/<shard>/<hour>/` commit records and verifies the
   segment data a snapshot resolves is subject-free. It does NOT separately
   walk index objects or analytics. For analytics that is sound (below); for
-  the catalog family it is sound for three of its four object kinds and not
-  for the fourth:
-  - **Three index object kinds hold no value, and `.cstat` is the
+  the catalog family it is sound for the string values of three of its four
+  object kinds, and not for the fourth or for the numeric stamps on
+  snapshot entries:
+  - **Three index object kinds hold no string value, and `.cstat` is the
     exception.** `SnapshotEntry`, `SnapshotPartHeader`, and name postings
-    hold identities, hashes, counts, and metric names, never label/attribute
-    *values*, and a snapshot entry's own typed-column stamp is restricted to
-    `I64` and `BOOL` extrema (proto/ravel/commit.proto,
-    `DeclaredColumnStatValue`), which cannot represent a `STR` or `BYTES`
-    value either. The per-part `.cstat` column-statistics objects are the
+    hold identities, hashes, counts, and metric names, never a string
+    label/attribute value. A snapshot entry's own typed-column stamp is
+    restricted to `I64` and `BOOL` columns (proto/ravel/commit.proto,
+    `DeclaredColumnStatValue`), so it cannot represent a `STR` or `BYTES`
+    value, but it does hold numeric values. A retained stamp on a commit
+    record, a compaction record or a snapshot entry holds the min, max, sum
+    and zero count of each declared `I64` and `BOOL` column over the rows it
+    covers (the sum for `I64` only; ADR-4628). With the min and max, a sum
+    can recover an erased value: the pre-rewrite sum less the sum over the
+    rows the rewrite kept is the sum of the erased rows, which for one
+    erased row is its exact value, and a zero count can tell whether that
+    value was zero. The erasure guarantee covers numeric values (ADR-4628,
+    question 6a; ADR-0064, declared-column stamp amendment), so for a
+    tenant with any declared `I64` or `BOOL` column the catalog-keyspace
+    `R` modifier above applies to replaced `.csnap` parts, with the same
+    bound it states for `.cstat`: the unreferenced-catalog sweep lists
+    `snap/` beside `idx/`, keeps what HEAD names, and deletes the rest past
+    the same `protection_horizon` age gate (`sweep_unreferenced_catalog_objects`
+    in ravel-maintain). A locked commit record's stamp goes with the record,
+    inside the `max(bound + E_v, R)` bound the commit-record `R` modifier
+    above states. The per-part `.cstat` column-statistics objects are the
     exception the catalog-keyspace `R` modifier above sets out: for a tenant with a `STR` or
     `BYTES` typed attribute column they hold that column's exact min, max,
     and distinct-value dictionary (the dictionary only up to a fixed entry
@@ -1351,8 +1373,8 @@ into them. An operator with erasure obligations must budget them deliberately.
     nothing an erasure subject can match, while the `catalog/` prefix does:
     the deny list's "disjoint by construction" claim no longer holds for the
     catalog family. ADR-0064's Decision still states the wider form;
-    amending it is tracked separately. The three value-free kinds are
-    value-free *only if* subject identifiers appear as label/attribute
+    amending it is tracked separately. The three kinds are free of string
+    values *only if* subject identifiers appear as label/attribute
     values and never inside metric names (a documented requirement; see
     docs/object-store-contract.md "Required bucket
     configuration" point 5). A snapshot entry whose object a rewrite
