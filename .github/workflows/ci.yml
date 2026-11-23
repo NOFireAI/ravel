@@ -1302,9 +1302,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.152
+          fallback: none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -1447,9 +1448,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.152
+          fallback: none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -1566,9 +1568,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.152
+          fallback: none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -1706,9 +1709,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.152
+          fallback: none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # The automatic key names the job, not the matrix entry, so without
@@ -2241,7 +2245,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install cargo-deny
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-deny
       # `cargo deny` goes through rustup's cargo proxy, which needs the
@@ -2387,9 +2391,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.152
+          fallback: none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -2457,9 +2462,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.152
+          fallback: none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -2729,9 +2735,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.152
+          fallback: none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -2838,9 +2845,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.152
+          fallback: none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main: a cache written on a PR ref
@@ -3325,9 +3333,10 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Install nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: nextest@0.9.143
+          tool: nextest@0.9.152
+          fallback: none
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Restore everywhere, save only on main, as in `features-otap`
@@ -3504,9 +3513,10 @@ jobs:
           # share one entry.
           key: ci-profile
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-llvm-cov,nextest@0.9.143
+          tool: cargo-llvm-cov,nextest@0.9.152
+          fallback: none
       # Run this leg's share of the workspace suite once and keep the raw
       # coverage data (`--no-report`), then render lcov from that data. The
       # suite runs under nextest, as `check-shard` runs it, which is what

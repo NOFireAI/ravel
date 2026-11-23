@@ -66,7 +66,7 @@ jobs then do not each recompile the overlapping crates from scratch.
   does not. One job compiles the objects, and the others reuse them. No repo
   secret or setting beyond those two environment variables is necessary.
 - Tests run under `cargo nextest run` (installed by `taiki-e/install-action`
-  with `tool: nextest@0.9.143`) instead of `cargo test`, for faster
+  with `tool: nextest@0.9.152`) instead of `cargo test`, for faster
   parallel execution and clearer output.
 - The jobs that reclaim runner disk before compiling share one composite
   action, `.github/actions/free-disk-space`, instead of copying the same
