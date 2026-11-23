@@ -1276,3 +1276,77 @@ async fn str_not_equal_shapes_load_no_column_statistics() {
         );
     }
 }
+
+/// Runs `sql` through the executor over one real five-row object whose
+/// `status` values (200, 200, 200, 404, 404) match its installed statistics,
+/// and returns the plan and the batches. One object makes one scan partition,
+/// so `LimitPushdown` leaves a subquery's `LIMIT 2` on the scan alone; the
+/// scan emits the first two rows, both 200.
+async fn run_over_a_real_status_object(sql: &str) -> (String, Vec<RecordBatch>) {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let statuses = [Some(200), Some(200), Some(200), Some(404), Some(404)];
+    let seg = write_one_record_blocks(&store, "logs/limit.rlog", &statuses).await;
+    install_head_and_stats(&*store, &[stats_segment(&seg, vec![status_stat()])]).await;
+    let executor = executor(&store);
+    run(&executor, snapshot_of(vec![seg]), sql, &status_col()).await
+}
+
+/// Asserts the plan holds one `MetadataOnlyExec` (the unlimited aggregate,
+/// which is what keeps the statistics load) and one `LogsScanExec` (the
+/// limited one, which must scan).
+fn assert_one_answered_one_scanned(sql: &str, plan: &str) {
+    assert_eq!(
+        (
+            plan.matches("MetadataOnlyExec").count(),
+            plan.matches("LogsScanExec").count()
+        ),
+        (1, 1),
+        "{sql}: the unlimited aggregate is answered from statistics and the \
+         limited one scans; plan was:\n{plan}"
+    );
+}
+
+/// Issue #4651 review, through the executor: a statement that loads the
+/// statistics for one aggregate and also sums a `LIMIT 2` subquery whose limit
+/// is the scan's pushed fetch. The limited sum is 400, the two rows the scan
+/// emits, not the statistics' 1408 for all five.
+#[tokio::test]
+async fn a_limited_sum_beside_an_answered_one_reads_the_limited_rows() {
+    let sql = "SELECT (SELECT SUM(status) FROM logs) AS total, \
+               (SELECT SUM(status) FROM (SELECT status FROM logs LIMIT 2)) AS limited";
+    let (plan, batches) = run_over_a_real_status_object(sql).await;
+    assert_eq!(
+        (scalar(&batches, 0), scalar(&batches, 1)),
+        (Some(1408), Some(400)),
+        "{sql}"
+    );
+    assert_one_answered_one_scanned(sql, &plan);
+
+    let sql = "SELECT SUM(status) FROM logs UNION ALL \
+               SELECT SUM(status) FROM (SELECT status FROM logs LIMIT 2)";
+    let (plan, batches) = run_over_a_real_status_object(sql).await;
+    let mut sums: Vec<Option<i64>> = batches
+        .iter()
+        .filter(|b| b.num_rows() > 0)
+        .map(|b| scalar(std::slice::from_ref(b), 0))
+        .collect();
+    sums.sort_unstable();
+    assert_eq!(sums, vec![Some(400), Some(1408)], "{sql}");
+    assert_one_answered_one_scanned(sql, &plan);
+}
+
+/// The q02 shape over a `LIMIT 2` subquery beside an answered q02 count: the
+/// limited `COUNT(*) WHERE status <> 404` is 2, both emitted rows being 200,
+/// not the statistics' 3 for all five rows.
+#[tokio::test]
+async fn a_limited_not_equal_count_beside_an_answered_one_reads_the_limited_rows() {
+    let sql = "SELECT (SELECT COUNT(*) FROM logs WHERE status <> 200) AS ne, \
+               (SELECT COUNT(*) FROM (SELECT status FROM logs LIMIT 2) WHERE status <> 404) AS limited";
+    let (plan, batches) = run_over_a_real_status_object(sql).await;
+    assert_eq!(
+        (scalar(&batches, 0), scalar(&batches, 1)),
+        (Some(2), Some(2)),
+        "{sql}"
+    );
+    assert_one_answered_one_scanned(sql, &plan);
+}

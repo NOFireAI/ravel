@@ -10,7 +10,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use datafusion::physical_plan::{collect, displayable};
+use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use ravel_catalog::{EntryIdentity, LoadedColumnStats, SegmentLevel, SegmentRef, Snapshot};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
@@ -263,6 +263,16 @@ struct Run {
     plan: String,
     answer: datafusion::error::Result<Vec<datafusion::arrow::record_batch::RecordBatch>>,
     gets: u64,
+    /// `fetch()` of every node in the physical plan, top-down, as
+    /// `(node name, fetch)`.
+    fetches: Vec<(String, Option<usize>)>,
+}
+
+fn fetches_of(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<(String, Option<usize>)>) {
+    out.push((plan.name().to_string(), plan.fetch()));
+    for child in plan.children() {
+        fetches_of(child, out);
+    }
 }
 
 impl Corpus {
@@ -327,12 +337,15 @@ impl Corpus {
             .await
             .expect("physical plan");
         let shown = displayable(plan.as_ref()).indent(true).to_string();
+        let mut fetches = Vec::new();
+        fetches_of(&plan, &mut fetches);
         let before = self.store.gets();
         let answer = collect(plan, ctx.task_ctx()).await;
         Run {
             plan: shown,
             answer,
             gets: self.store.gets() - before,
+            fetches,
         }
     }
 
@@ -667,5 +680,181 @@ async fn a_filter_or_group_key_declines_several_aggregates() {
             pretty_format_batches(&r).expect("format").to_string(),
             "{sql}"
         );
+    }
+}
+
+/// `SEG_A` then `SEG_B` as one object: one scan partition, so `LimitPushdown`
+/// leaves a subquery's `LIMIT 3` on the scan alone. The scan emits the first
+/// three rows, `a` = 0, 2, NULL.
+async fn one_object() -> Corpus {
+    let rows: Vec<Row> = SEG_A.iter().chain(SEG_B).copied().collect();
+    Corpus::build(&[rows.as_slice()]).await
+}
+
+/// Runs `sql` with statistics loaded and without, asserts both runs print
+/// `expected` with no `MetadataOnlyExec`, and that the plan without
+/// statistics carries its limit only as the scan's pushed fetch (no limit
+/// node, no fetch on any other node), the shape the rule saw before it
+/// declined.
+async fn assert_limit_on_the_scan_is_honoured(corpus: &Corpus, sql: &str, expected: &str) {
+    let run = corpus.with_stats(sql).await;
+    let scan = corpus.scanned(sql).await;
+    for (what, run) in [("with statistics", &run), ("scanned", &scan)] {
+        let got = pretty_format_batches(run.answer.as_ref().expect("an answer"))
+            .expect("format")
+            .to_string();
+        assert_eq!(got.trim(), expected.trim(), "{sql} {what}");
+        assert!(
+            !run.plan.contains("MetadataOnlyExec"),
+            "{sql} {what}: a scan with a pushed fetch is not answered from statistics; plan was:\n{}",
+            run.plan
+        );
+        if what == "scanned" {
+            let limited: Vec<_> = run.fetches.iter().filter(|(_, f)| f.is_some()).collect();
+            assert_eq!(
+                limited,
+                [&("LogsScanExec".to_string(), Some(3))],
+                "{sql}: the limit must sit on the scan alone; plan was:\n{}",
+                run.plan
+            );
+            assert!(
+                !run.plan.contains("LimitExec"),
+                "{sql}: no limit node; plan was:\n{}",
+                run.plan
+            );
+        }
+    }
+    assert!(run.gets > 0, "{sql}: the limited rows are read");
+}
+
+/// Issue #4651 review: `SUM(a), COUNT(*)` over a `LIMIT 3` subquery whose
+/// limit is the scan's pushed fetch is the sum and count of the three rows the
+/// scan emits (2 and 3), not the statistics of all nine rows (17 and 9).
+#[tokio::test]
+async fn sum_and_count_star_over_a_limit_on_the_scan_read_the_limited_rows() {
+    let corpus = one_object().await;
+    assert_limit_on_the_scan_is_honoured(
+        &corpus,
+        "SELECT SUM(a), COUNT(*) FROM (SELECT a FROM logs LIMIT 3)",
+        "
++-------------+----------+
+| sum(logs.a) | count(*) |
++-------------+----------+
+| 2           | 3        |
++-------------+----------+",
+    )
+    .await;
+}
+
+/// A single `SUM` over the same limited subquery: 2, not 17.
+#[tokio::test]
+async fn a_single_sum_over_a_limit_on_the_scan_reads_the_limited_rows() {
+    let corpus = one_object().await;
+    assert_limit_on_the_scan_is_honoured(
+        &corpus,
+        "SELECT SUM(a) FROM (SELECT a FROM logs LIMIT 3)",
+        "
++-------------+
+| sum(logs.a) |
++-------------+
+| 2           |
++-------------+",
+    )
+    .await;
+}
+
+/// A single `AVG` over the same limited subquery: 1.0, not 17/7.
+#[tokio::test]
+async fn a_single_avg_over_a_limit_on_the_scan_reads_the_limited_rows() {
+    let corpus = one_object().await;
+    assert_limit_on_the_scan_is_honoured(
+        &corpus,
+        "SELECT AVG(a) FROM (SELECT a FROM logs LIMIT 3)",
+        "
++-------------+
+| avg(logs.a) |
++-------------+
+| 1.0         |
++-------------+",
+    )
+    .await;
+}
+
+/// q02 over a limited subquery: `COUNT(*) WHERE a <> 0` counts the one
+/// qualifying row among the three the scan emits, not the four among all
+/// nine rows.
+#[tokio::test]
+async fn q02_over_a_limit_on_the_scan_reads_the_limited_rows() {
+    let corpus = one_object().await;
+    assert_limit_on_the_scan_is_honoured(
+        &corpus,
+        "SELECT COUNT(*) FROM (SELECT a FROM logs LIMIT 3) WHERE a <> 0",
+        "
++----------+
+| count(*) |
++----------+
+| 1        |
++----------+",
+    )
+    .await;
+}
+
+/// q08 over a limited subquery: three groups of one row, not the six groups
+/// of all nine rows.
+#[tokio::test]
+async fn q08_over_a_limit_on_the_scan_reads_the_limited_rows() {
+    let corpus = one_object().await;
+    assert_limit_on_the_scan_is_honoured(
+        &corpus,
+        "SELECT a, COUNT(*) FROM (SELECT a FROM logs LIMIT 3) GROUP BY a ORDER BY a",
+        "
++---+----------+
+| a | count(*) |
++---+----------+
+| 0 | 1        |
+| 2 | 1        |
+|   | 1        |
++---+----------+",
+    )
+    .await;
+}
+
+/// `MIN`/`MAX` over the limited subquery are not this rule's shape and scan:
+/// 0 and 2 over the three emitted rows.
+#[tokio::test]
+async fn min_max_over_a_limit_on_the_scan_read_the_limited_rows() {
+    let corpus = one_object().await;
+    assert_limit_on_the_scan_is_honoured(
+        &corpus,
+        "SELECT MIN(a), MAX(a) FROM (SELECT a FROM logs LIMIT 3)",
+        "
++-------------+-------------+
+| min(logs.a) | max(logs.a) |
++-------------+-------------+
+| 0           | 2           |
++-------------+-------------+",
+    )
+    .await;
+}
+
+/// A lone `COUNT(*)` over the limited subquery is DataFusion's
+/// `AggregateStatistics` answer, the constant 3 with no `MetadataOnlyExec` and
+/// no data-object GET: that rule runs while the limit is still a node above
+/// the scan, so this rule never sees the shape.
+#[tokio::test]
+async fn a_lone_count_star_over_a_limit_is_the_limited_row_count() {
+    let corpus = one_object().await;
+    let sql = "SELECT COUNT(*) FROM (SELECT a FROM logs LIMIT 3)";
+    for run in [corpus.with_stats(sql).await, corpus.scanned(sql).await] {
+        assert!(
+            run.plan.contains("ProjectionExec: expr=[3 as count(*)]")
+                && run.plan.contains("PlaceholderRowExec")
+                && !run.plan.contains("MetadataOnlyExec"),
+            "plan was:\n{}",
+            run.plan
+        );
+        let cols = columns(&run);
+        assert_eq!(i64_at(&cols[0]), Some(3));
+        assert_eq!(run.gets, 0);
     }
 }
