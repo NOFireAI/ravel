@@ -49,8 +49,9 @@ record (D3).
    t/<h>/l/prov` answers every GET and HEAD of the record 503. After 75 s,
    longer than the routers' 60 s refresh interval, a write to each node
    finds its view stale and its re-read refused, and routes on the
-   grace-extended view. Every clock then moves to the start of the refusal's
-   hour plus 2 plus 60 s, past every view's lead horizon
+   grace-extended view. Every clock then moves to 60 s past the start of hour
+   H + 2, where H is the hour when the stale-view wait ends, past every view's
+   lead horizon
    (`hour(refreshed) + min_lead_hours`), without waiting for the nodes to
    serve, since no SQL answers while the record cannot be read. A write to
    each node is then fenced (`503 provisioning view stale`). `thaw-read` and
