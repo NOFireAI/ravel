@@ -123,9 +123,9 @@ def read_leg(path):
 
 
 def read_legs(paths):
-    """Every leg's tests; a leg whose log holds no result line (missing,
-    truncated, or the wrong job) stops the run rather than passing as a leg
-    with nothing on it."""
+    """Every leg's tests; a leg whose log holds no result line (empty, the
+    wrong job, or cut off before its first result) stops the run rather than
+    passing as a leg with nothing on it."""
     legs = [read_leg(p) for p in paths]
     empty = [p for p, tests in zip(paths, legs) if not tests]
     if empty:
