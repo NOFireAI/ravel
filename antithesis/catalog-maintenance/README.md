@@ -702,6 +702,17 @@ A name `<area>/<stem>` selects its area by the part before `/`: the scripts
 accept it when that area's `.tsv` lists it, and `local-run.sh` reads its
 property from that same `.tsv`.
 
+The scripts accepting a name does not make its mutant falsifiable here. This
+profile never reshards (the driver seeds 4 shards and never changes the
+count), and a `resharding/` mutant changes behaviour only across a shard-count
+change, so it changes nothing a timeline here can see. The record race
+does make a server a compaction loser, but over the same inputs with the
+winner part present, so the situation a `maintenance/` mutant needs (a
+divergent input set, or a missing winner part) never arises. Either way the
+mutant's property is never falsified, and a local or Antithesis run of it
+exits 1 at the end. Do not launch one before the reshard profile and its
+forced races (#4340) land.
+
 The corrupt-HEAD mutant switches off the HEAD guard of both delete passes,
 and each pass asserts `CorruptHeadFailsClosedOnDeletePaths` under its own
 literal, so either literal going false counts. The `.tsv` names the first.
@@ -725,7 +736,8 @@ carry the `org.ravel.antithesis.ref` label, and the server image also
 `org.ravel.antithesis.features`. Besides the instrumentation check, the build
 checks that the server binary registers every mutant name of the three areas
 and refuses unless the per-area counts are exactly catalog 5, resharding 2 and
-maintenance 2, the mutants ADR-4326 decision 3 ships. The default build (no `MUTANTS`) is unchanged: features `sql,antithesis`, tag
+maintenance 2, the mutants ADR-4326 decision 3 ships. The default build (no
+`MUTANTS`) is unchanged: features `sql,antithesis`, tag
 `catalog-maintenance`.
 
 `RAVEL_ANTITHESIS_MUTANT=<area>/<stem>` selects a mutant for `local-run.sh`
