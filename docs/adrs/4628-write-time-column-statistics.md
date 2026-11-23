@@ -500,12 +500,35 @@ values recoverable. With one non-null row the sum is that value, and with
 two the min and max already state both. With three, the sum minus the min
 minus the max is the third value exactly, which no field of today's stamp
 states; with more rows a sum and a zero count still narrow what the values
-can be. Commit records and `.csnap` parts are immutable and outlive an
-erasure until the sweep removes them (decision 6, second row), so a stored
-sum adds recoverable value information to objects that survive an
-erasure. Whether that is acceptable, and whether #1848 has to widen to
-cover stamps first, is open question 6. See "Contradictions found", item
-3.
+can be. The exposure is wider than those small objects: a retained
+pre-rewrite sum, less the sum over the rows the rewrite kept, is the sum
+of the erased rows, and with one erased row that is its exact value at any
+object size. A rule that withholds the sum below some row count would
+therefore not help. This is derived, not run.
+
+How long a stamp is retained (code lines at `origin/main` `4cf6bbb3d`). A
+raw commit record is deleted before its data object
+(`crates/ravel-maintain/src/sweep.rs:1881-1893`, `:2710-2714`), a
+compaction record in the same sweep pass as its parts (`sweep.rs:3525-3526`),
+and a `.csnap` part a later fold replaced at the catalog sweep's age gate
+(`sweep.rs:4191`). So with no Object Lock, a stamp outlives no bound the
+erasure guarantee states: matching records gone from served segments at
+`.done`, superseded inputs swept by `.done` plus the protection horizon
+plus two full sweeps (`docs/consistency-model.md:902-903`). Under scoped
+per-object retention on the commit-record or catalog families
+(`docs/object-store-contract.md:1681`), data under `l0/` and `l1/` is not
+locked, and a locked record keeps its stamp until its retain-until, as it
+keeps the min and max today. Under a bucket-default lock the data is
+locked as well and the stamp adds nothing.
+
+Decided 2026-11-23 (open question 6): the sum and the zero count are
+emitted, and #1848 does not gate this ADR, on three conditions. A test
+pins the lifetimes above (test plan, item 11). `docs/deletion-and-gc.md`,
+`docs/consistency-model.md` and `docs/object-store-contract.md` state what
+a retained stamp reveals, in the same commit as the producers. And #1848's
+text is widened to name the stamps. Widening #1848's work first would
+shorten none of these lifetimes. Two points stay with the owner and are
+listed under open question 6. See "Contradictions found", items 3 and 6.
 
 **Measured 2026-11-23.** Q3 could not have been answered from the `int64`
 sum of `.cstat`: no folded object of the entry tenant carries a `UserID`
@@ -648,6 +671,13 @@ erasure (test 2). Q2 and Q29 meet it once #4651 has landed.
    the unfolded tenant, each metadata-only with zero data GETs.
 10. Mixed version: a stamp with the fields carried through a fold that
     strips them is reported by the coverage counter.
+11. Stamp lifetimes (open question 6): after an erasure rewrite and a
+    superseded sweep past the horizon, no raw commit record or compaction
+    record of a superseded input remains under `c/`; after the catalog
+    sweep's age gate, no replaced `.csnap` part remains.
+    `crates/ravel-maintain/tests/erasure_sweep.rs` already asserts the
+    compaction record and its parts are gone; the raw commit record case
+    is the new assertion.
 
 Then the A/B of decision 7.
 
@@ -727,12 +757,25 @@ Then the A/B of decision 7.
 5. **Should the fold stop tallying `.cstat` sums for segments whose stamp
    carries one?** Recommended: not in this epic. Decide after the A/B. An
    independent review proposes the same answer; the owner approves.
-6. **May sums sit on records that survive an erasure, and does #1848 have
-   to widen to cover stamps first?** A sum, with the min and max already
-   stamped, recovers a third value exactly (decision 6, "On #1848"), and
-   commit records and `.csnap` parts keep it until the sweep removes them.
-   No recommendation: this is the owner's call. See "Contradictions
-   found", item 3.
+6. Decided 2026-11-23, by the owner's delegation: sums may sit on these
+   records, and #1848 does not gate this ADR. A raw commit record is
+   deleted before its data object, a compaction record in the same sweep
+   pass as its parts, and a replaced `.csnap` part at the catalog sweep's
+   age gate, so with no Object Lock a sum outlives no bound the erasure
+   guarantee states; under scoped retention on commit records or the
+   catalog family the locked version keeps the sum and zero count until
+   its retain-until, as it keeps the min and max today. The conditions are
+   in decision 6, "On #1848". Two points were held for the owner and are
+   not decided:
+   - **6a. Does the erasure guarantee cover an erased record's numeric
+     values, or only its records and the matched identifier?** If it
+     covers the values, the answer above turns into "widen #1848 first",
+     and the min and max on locked records are already outside the
+     guarantee today. What would confirm the answer above: no deployment
+     with erasure obligations applies per-object retention to
+     `t/*/*/c/*`. Not established here.
+   - **6b. Emission is one-way under a lock.** A sum written to a locked
+     record cannot be removed before its retain-until.
 7. **The A/B box.** One c6a.4xlarge, one same-box run, needs approval.
 8. Withdrawn 2026-11-23: whether a pre-rewrite input can be resolved after
    an erasure completes is answered by `docs/deletion-and-gc.md:1366-1368`
@@ -764,11 +807,19 @@ Then the A/B of decision 7.
 4. **#4628 asks for a fallback "when a sum overflowed `i64`".** Under this
    ADR a per-object sum does not overflow; the fallback applies to the
    statement's total. The acceptance test is written against the total.
-5. **#4651 and the source disagree on why Q29 scans.** #4651 says the
-   `sum_plus` rewrite turns Q29 into more than one aggregate expression;
+5. **Why Q29 scans is not established.** #4651 first said the `sum_plus`
+   rewrite turns Q29 into more than one aggregate expression;
    `q30_shape_runs_one_aggregate` (`crates/ravel-sql/src/sum_plus.rs`)
-   pins one aggregate on a plain table. The measured scan is not in
+   pins one aggregate on a plain table, and the issue was corrected on
+   2026-11-23 to say the cause is open. The measured scan is not in
    question; its cause on the logs table is, and #4651 owns it (gap 3).
+6. **Three documents describe the stamp as holding less than it does.**
+   `docs/deletion-and-gc.md:1342-1343` says a snapshot entry's stamp is
+   restricted to I64 and BOOL extrema; `docs/object-store-contract.md:1792`
+   says snapshot entries hold no attribute value; and ADR-0064's
+   2026-10-15 amendment treats a verbatim I64 in `.kidx` as a subject
+   value while the stamp passage does not. An extremum is a value. These
+   are the sentences the condition on open question 6 has to correct.
 
 ## Task decomposition
 
