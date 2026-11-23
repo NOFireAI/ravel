@@ -127,6 +127,17 @@ EOF
 expect "a rust image in an ARG line's second assignment is a finding" 1 "${d}" \
   "Dockerfile:2: rust:1.97.1-trixie" "has version 1.97.1, want 1.100.0"
 
+d="$(new_repo arg-untagged)"
+put "${d}" Dockerfile <<'EOF'
+FROM rust:1.100.0-trixie
+ARG FETCH_IMAGE=rust
+ARG OTHER_IMAGE=rust@sha256:00ff
+ARG UNRELATED=debian:bookworm-slim
+EOF
+# Three lines checked: the FROM and the two rust ARGs, not the debian one.
+expect "an untagged rust image in an ARG default is a finding" 1 "${d}" \
+  "Dockerfile:2:" "Dockerfile:3:" "3 rust image line(s) checked" "2 finding(s)"
+
 d="$(new_repo arg-quoted-mismatch)"
 put "${d}" Dockerfile <<'EOF'
 arg IMAGE="docker.io/library/rust:1.97.1"
