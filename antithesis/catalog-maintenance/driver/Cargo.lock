@@ -1101,6 +1101,7 @@ dependencies = [
  "prost",
  "ravel-antithesis-driver",
  "reqwest",
+ "rustix",
  "serde_json",
 ]
 

@@ -36,7 +36,9 @@
 //! serves times out a read or write blocked for [`IO_TIMEOUT`] and drops
 //! the connection. A connection whose thread cannot be spawned is refused
 //! the same way. The control port has its own cap,
-//! [`MAX_CONTROL_CONNECTIONS`].
+//! [`MAX_CONTROL_CONNECTIONS`]. Both caps assume descriptors to spare: the
+//! binary refuses to start under a soft open-file limit below
+//! [`NOFILE_NEEDED`].
 
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -80,10 +82,49 @@ pub const MAX_CONNECTIONS: usize = 512;
 /// The most control connections served at once. The driver opens one per
 /// command and runs one command at a time per thread.
 pub const MAX_CONTROL_CONNECTIONS: usize = 8;
+/// The most descriptors one relayed connection holds at once, each
+/// `try_clone` being one of its own: the client and upstream sockets with a
+/// clone of each for the answers thread and for the request loop (six), and
+/// while a held request is forwarded, its dedicated upstream socket, two
+/// clones of that and one more client clone (four). Resolving the upstream
+/// name opens fewer than four, and only while the connection holds at most
+/// six.
+pub const FDS_PER_CONNECTION: usize = 10;
+/// The most descriptors one control connection holds: its socket and the
+/// clone it writes replies to.
+pub const FDS_PER_CONTROL_CONNECTION: usize = 2;
+/// The descriptors outside every connection: stdio, the two listeners and
+/// one socket per accept loop outside any slot (the handoff clone, or a
+/// connection being turned away), seven, with room for the files the runtime,
+/// the coverage instrumentation and name resolution open.
+const PROCESS_FDS: usize = 64;
 /// How long the accept loop may block writing a refusal.
 const REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// The largest request head the proxy reads.
 const MAX_HEAD: usize = 64 * 1024;
+
+/// The soft open-file limit under which `connections` relayed and `control`
+/// control connections at once cannot run out of descriptors.
+pub const fn nofile_needed(connections: usize, control: usize) -> u64 {
+    (connections * FDS_PER_CONNECTION + control * FDS_PER_CONTROL_CONNECTION + PROCESS_FDS) as u64
+}
+
+/// The open-file limit the proxy's caps need.
+pub const NOFILE_NEEDED: u64 = nofile_needed(MAX_CONNECTIONS, MAX_CONTROL_CONNECTIONS);
+
+/// Check the soft open-file limit (`None` is unlimited) against
+/// [`NOFILE_NEEDED`]. Below it, a connection under the cap can fail for lack
+/// of a descriptor, which the servers see as a store outage no rule drew.
+pub fn check_nofile(soft: Option<u64>) -> Result<(), String> {
+    match soft {
+        Some(limit) if limit < NOFILE_NEEDED => Err(format!(
+            "the soft open-file limit is {limit}, below the {NOFILE_NEEDED} that \
+             {MAX_CONNECTIONS} relayed and {MAX_CONTROL_CONNECTIONS} control connections \
+             need; raise nofile for the s3proxy container"
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// Counts the connections one listener serves at once, up to a cap.
 pub struct Slots {
@@ -816,6 +857,28 @@ mod tests {
 
     fn head(text: &str) -> io::Result<Option<Head>> {
         read_head(&mut io::Cursor::new(text.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn the_needed_open_file_limit_counts_every_descriptor_of_both_caps() {
+        assert_eq!(nofile_needed(0, 0), 64);
+        assert_eq!(nofile_needed(1, 0), 74);
+        assert_eq!(nofile_needed(0, 1), 66);
+        assert_eq!(nofile_needed(512, 8), 512 * 10 + 8 * 2 + 64);
+        assert_eq!(NOFILE_NEEDED, 5200);
+    }
+
+    #[test]
+    fn the_container_default_open_file_limit_is_refused() {
+        let err = check_nofile(Some(1024)).expect_err("1024 is below the caps' need");
+        assert!(
+            err.contains("the soft open-file limit is 1024, below the 5200"),
+            "{err}"
+        );
+        assert!(check_nofile(Some(NOFILE_NEEDED - 1)).is_err());
+        assert_eq!(check_nofile(Some(NOFILE_NEEDED)), Ok(()));
+        assert_eq!(check_nofile(Some(65536)), Ok(()));
+        assert_eq!(check_nofile(None), Ok(()));
     }
 
     #[test]
