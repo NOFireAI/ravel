@@ -537,10 +537,12 @@ Every step is something the system must survive anyway: every clock moves
 forward together, never back; a `ravel-cli` maintenance run happens
 concurrently with the servers', which the CLI documents as safe; a store
 answers some PUTs late or refuses them. Two races also change the store
-through raw S3, as the `corrupt_head` rule does: one rewrites a compaction
-record with a divergent input-set hash, the other deletes one of a
-record's parts, and each puts the original back before the race ends; the
-loser each one meets must fail closed. Each rule holds the driver's write
+through raw S3: one rewrites a compaction record with a divergent
+input-set hash, the other deletes one of a record's parts, and each puts
+the original back before the race ends; the loser each one meets must
+fail closed. Those two changes are outside the steps ADR-4326's
+forced-situation amendment lists, pending an owner decision ("The
+divergent-record and missing-part races"). Each rule holds the driver's write
 gate throughout, so no live write and no planned jump lands inside a race.
 Each clock move outside the planned jumps prints `clock: moved forward by
 <N> s outside the planned jumps (<reason>)`, and the local loop adds those
@@ -702,13 +704,17 @@ fails before evaluating it on the missing part, and the SUT has no
 reachability of its own on that arm, so the driver's assertion is the
 evidence that the missing-part race reached the loser.
 
-Why legitimate: as for the record race, plus one change to the store that
-the loser exists to fail closed on, the class of the garbage HEAD the
-driver's `corrupt_head` rule writes. A sealed bucket cannot hold two input
-sets under one record key without a 64-bit hash prefix collision, so a
-record whose full hash differs from the loser's while its key matches is
-store corruption, and `DivergentInputSetNeverMutates` requires the loser to
-leave it alone. A part a record names can vanish under a tenant tombstone
+Not yet covered by ADR-4326: the forced-situation amendment lists the
+steps a forced action may use, and neither tamper is on that list. The
+closest step is HEAD overwritten with garbage through raw S3, and these
+two change a compaction record or a part instead. Whether the amendment
+admits them is an owner decision (#4340). Until it does, these two races
+stand outside the ADR, and the case for them is this. Each makes one
+change to the store that the loser exists to fail closed on. A sealed
+bucket cannot hold two input sets under one record key without a 64-bit
+hash prefix collision, so a record whose full hash differs from the
+loser's while its key matches is store corruption, and
+`DivergentInputSetNeverMutates` requires the loser to leave it alone. A part a record names can vanish under a tenant tombstone
 or the unreferenced-part sweep (the case `AlreadyExistsPartVanished`
 names), and `MergeAttemptsConverge` requires a loser to report convergence
 only over parts it saw. A live write cannot add an input to the bucket
