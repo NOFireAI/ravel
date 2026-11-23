@@ -273,8 +273,11 @@ rate to 1 and the other to 0 with `LOCAL_COMPOSE_OVERRIDE`.
 
 `config-perf/` is the base config with `WORKLOAD_PERF=1` on the driver
 (`driver/src/perf.rs`). In the eventually, after faults stop, the driver
-measures two figures and reports them; no latency bound is asserted yet
-(#4559). `WORKLOAD_PERF=1` together with `WORKLOAD_COVERAGE=1` is refused:
+measures two figures and reports them, and once the system recovers it asserts
+three Always bounds on them (#4559): P1, every node's first strict ack within
+60 s of faults stopping; P2, every post-recovery strict write answered within
+the client timeout; P3, every recovered node's median strict-ack latency
+within 2 s. `WORKLOAD_PERF=1` together with `WORKLOAD_COVERAGE=1` is refused:
 the driver exits 1 before setup complete.
 
 - t0 is taken immediately after the eventually runs `ANTITHESIS_STOP_FAULTS`.
@@ -294,7 +297,9 @@ the driver exits 1 before setup complete.
   system recovered and both TTFA samples acked: after the 5 s settle sleep,
   one thread per node sends 10 probe writes to its own node, one after the
   other, alternating logs (even) and metrics (odd), each with the 15 s write
-  timeout. The interval is the HTTP call alone. Per node, the median is the
+  timeout (except under the self-check below, which shortens probes 2, 5 and 8
+  of each node to a 1 ms timeout). The interval is the HTTP call alone. Per
+  node, the median is the
   element at index 5 of the 10 latencies sorted ascending, with every
   probe that was not acknowledged counted as infinity, so it is finite only
   when at least 6 probes acked.
@@ -339,6 +344,35 @@ assertion goes through `assert_raw` and is catalogued only when
 | a perf interval saw the wall and monotonic clocks disagree by more than 1 s | sometimes | once per acked TTFA sample and per ack probe |
 | the driver could not stop faults before measuring | unreachable | hit when stop-faults failed |
 | the perf probes ran in an eventually | reachable | once per eventually, with the summary line |
+| every node's first strict ack comes within 60 s of faults stopping | always | once per node per eventually, only in a recovered timeline |
+| every strict write after recovery is answered within the client timeout | always | once per ack probe, only when the ack probes ran |
+| every recovered node's median strict-ack latency is within 2 s | always | once per node per eventually, only when the ack probes ran |
+
+That is 21 assertions catalogued at startup under `WORKLOAD_PERF=1`: 16
+Sometimes, 1 Reachable, 1 Unreachable and the 3 Always above.
+
+The Always bands, each with its own source:
+
+| Always | Band | Source |
+|---|---|---|
+| P1, first strict ack after recovery | 60 s | #4559 comment 7088441883, perf-measure-1: the next rung above the smallest rung with zero false over 952 TTFA samples (30 s) |
+| P3, median strict-ack latency | 2 s | #4559 comment 7088441883, perf-measure-1: the next rung above the smallest rung with zero false over 938 medians (1 s) |
+| P2, post-recovery write answered | client timeout | deadline, not a measurement: the 15 s client write timeout (`WRITE_TIMEOUT`, `driver/src/main.rs`) |
+
+t0 is not always free of faults (#4559 comment 7088652995): in about one
+history in four the platform stops, once kills, one container -- a ravel node
+in all but one case -- and restarts it 0.0012 to 8.54 s after the fault pause
+and after t0 (the largest TTFA on such a history was 14570 ms). The 60 s band
+was derived over all histories, those included.
+
+P1 and P3 are tripwires on a measured band, not checks of a documented
+guarantee: docs/consistency-model.md gives no recovery-time bound and no
+strict-ack latency bound. Its Visibility semantics section gives visibility
+latency as a sum (flush delay + flush-permit wait + data PUT + commit PUT)
+with a p99 target that tracks `--max-flush-delay`, not a fixed constant, and
+the strict ack deadline there bounds when the server *answers*
+(`WriteError::AckTimeout`), not when it acknowledges; a strict ack follows the
+commit PUT. P2 is a deadline on that answer, not a latency band.
 
 "Within N s" means `mono_ms <= N * 1000`. The log lines, one `println` each,
 fields in this order:
@@ -361,8 +395,12 @@ before the not-recovered exit.
 `CONFIG=config-perf` selects the variant in `scripts/local-run.sh` (it needs
 `WORKLOAD_EVENTUALLY_AFTER_SECS`) and `scripts/launch.sh` (test
 `ravel-ingest-durability-perf`, `attrs.variant=perf`); neither takes a
-mutant. The local gate reads `local/perf-required.tsv`. Its bands are the
-local expectations of the plan, predicted and not yet measured:
+mutant. The local gate reads `local/perf-required.tsv`. In place of the base
+"no always-type assertion violated" check, a perf run gates on the exact set
+of violated always-type assertions: it must equal, whole line for whole line,
+the `<mode>-violated` messages for the mode (none in the clean mode). Its line
+counts and latency bands are the local expectations of the plan, predicted and
+not yet measured:
 
 - Clean run: exactly 1 `perf t0`, 1 `perf summary`, 2 `perf ttfa`,
   20 `perf ack` and 2 `perf median` lines and no `perf skipped` line; every
@@ -372,15 +410,17 @@ local expectations of the plan, predicted and not yet measured:
   500 ms flush delay: a strict waiter's buffer flushes on the delay counted
   from its oldest row, and buffered rows the rules wrote before t0 can
   already be older than the delay, so the first probe can flush at the next
-  tick.
+  tick. No Always must fail: all three (P1, P2, P3) are hit with their
+  condition true.
 - `PERF_LEVER=slow-ack` layers `local/docker-compose.perf-slow-ack.yaml`
   (`--max-flush-delay 2400ms`, `--max-flush-delay-idle 5s`): the same
   counts, every `perf ack` line acked with 2400 <= `mono_ms` <= 3400, no
   `slow-ack-never` line hit true and every `slow-ack-required` line hit true.
-  It is meant to show that the figures move with the flush cadence. 2400 ms
-  is near the server's limit: ravel-server refuses to start when
-  `--max-flush-delay` plus a fixed 500 ms reserve is not under its 3 s strict
-  visibility budget (`validate_strict_visibility_budget`), that is at
+  It is meant to show that the figures move with the flush cadence. P3, and
+  only P3, must fail: the 2.4 s median is outside the 2 s band, while P1 and
+  P2 hold. 2400 ms is near the server's limit: ravel-server refuses to start
+  when `--max-flush-delay` plus a fixed 500 ms reserve is not under its 3 s
+  strict visibility budget (`validate_strict_visibility_budget`), that is at
   2500 ms or more.
 - `PERF_LEVER=no-ack` layers `local/docker-compose.perf-no-ack.yaml`, which
   sets `RAVEL_ANTITHESIS_FAULTS` to `ingest/data-put-refused=1` on ravel1 and
@@ -388,15 +428,44 @@ local expectations of the plan, predicted and not yet measured:
   acknowledged and the server answers it 503. No flush delay can do this,
   because of the 2500 ms limit above. Expected: 1 `perf t0`, 1 summary,
   2 `perf ttfa` lines, both `outcome=none`, no `perf ack` and no
-  `perf median` line, and the `no-ack-never` line never hit true. It is
-  meant to show that a node that never acks is reported, not dropped.
+  `perf median` line, and the `no-ack-never` line never hit true. P1, and only
+  P1, must fail: both TTFA samples are `none`. P2 and P3 are not evaluated at
+  all, because no ack probe runs.
+- `WORKLOAD_PERF_SELF_CHECK=1` (no `PERF_LEVER`) layers
+  `local/docker-compose.perf-self-check.yaml`, which sends ack probes 2, 5 and
+  8 of each node with a 1 ms client timeout, so those three answer
+  no-response. P2, and only P2, must fail: three no-response probes per node
+  make it false, while the other seven keep the median finite (P3 holds) and
+  the TTFA probes are untouched (P1 holds). Predicted bands: 1 `perf t0`,
+  1 summary, 2 `perf ttfa` lines acked as in the clean mode, 20 `perf ack`
+  lines of which exactly 6 are no-response (probes 2, 5 and 8, each
+  0 <= `mono_ms` <= 1000) and 14 acked with 0 <= `mono_ms` <= 1500, 2 `perf
+  median` lines, no `perf skipped` line, and every `required` line hit true.
+  The acked floor is 0 here, not the clean mode's 500: a probe abandoned after
+  1 ms can leave its row in the shard's buffer, so the next probe of that
+  signal flushes on the delay counted from that older row. That is a reason
+  for a loose floor, not a verified server behaviour.
 
-The base gate (no always-type assertion violated) applies to every perf run.
+`scripts/launch.sh` also takes `PERF_LEVER=slow-ack` with `CONFIG=config-perf`
+(not with a mutant): it launches from a temporary copy of `config-perf/` whose
+`--max-flush-delay` reads 2400ms instead of 500ms, the same value the local
+lever file uses (the script ties the two counts so they cannot drift), as test
+`ravel-ingest-durability-perf-mutant` with `attrs.variant=perf` and
+`attrs.mutant=perf-lever/slow-ack`, on the plain images.
+`PERF_LEVER=no-ack` is local only; `scripts/launch.sh` refuses it.
+`WORKLOAD_PERF_SELF_CHECK` is never passed to a launched run.
+
+`LOCAL_RUN_ANALYZE_ONLY=1` re-scores a kept run: it skips every docker command
+and wait and runs the collection and all gates over the files already in the
+out directory.
 
 ```sh
 CONFIG=config-perf WORKLOAD_EVENTUALLY_AFTER_SECS=180 antithesis/ingest-durability/scripts/local-run.sh out/perf1 900
 CONFIG=config-perf PERF_LEVER=slow-ack WORKLOAD_EVENTUALLY_AFTER_SECS=180 antithesis/ingest-durability/scripts/local-run.sh out/perf-slow 900
 CONFIG=config-perf PERF_LEVER=no-ack WORKLOAD_EVENTUALLY_AFTER_SECS=60 antithesis/ingest-durability/scripts/local-run.sh out/perf-noack 900
+CONFIG=config-perf WORKLOAD_PERF_SELF_CHECK=1 WORKLOAD_EVENTUALLY_AFTER_SECS=180 antithesis/ingest-durability/scripts/local-run.sh out/perf-self 900
+LOCAL_RUN_ANALYZE_ONLY=1 CONFIG=config-perf WORKLOAD_EVENTUALLY_AFTER_SECS=180 antithesis/ingest-durability/scripts/local-run.sh out/perf1
+CONFIG=config-perf PERF_LEVER=slow-ack antithesis/ingest-durability/scripts/launch.sh <max-compute-hours> "<description>"
 CONFIG=config-perf antithesis/ingest-durability/scripts/launch.sh <max-compute-hours> "<description>"
 ```
 
@@ -563,4 +632,9 @@ record more than is sent for each log write whose id is 3 modulo 50 (about one
 log write in 50; ids are shared with metrics writes, so about one write of any
 signal in 75 at the default rule weights), and the presence assertions must
 fail. `WORKLOAD_PERF=1` turns on the perf variant (see "Perf variant"; the
-`config-perf` compose file sets it).
+`config-perf` compose file sets it). `WORKLOAD_PERF_SELF_CHECK=1` (only with
+`WORKLOAD_PERF=1`, which the driver enforces by exiting 1 otherwise) is the
+perf self-check: ack probes 2, 5 and 8 of each node then use a 1 ms client
+timeout so P2 fails; `scripts/local-run.sh` sets it from
+`WORKLOAD_PERF_SELF_CHECK=1` through the self-check compose file, and
+`scripts/launch.sh` never passes it.

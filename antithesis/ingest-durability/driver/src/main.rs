@@ -1021,7 +1021,7 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         (recovered, last, ttfa)
     });
     if let Some(run) = perf_run.as_mut() {
-        run.record_ttfa(&ttfa);
+        run.record_ttfa(&ttfa, recovered);
     }
     assert_always!(
         recovered,
@@ -1198,6 +1198,13 @@ fn main(tc: TestCase) {
         std::env::var("WORKLOAD_COVERAGE").ok().as_deref(),
     ) {
         eprintln!("driver: WORKLOAD_PERF and WORKLOAD_COVERAGE cannot both be on");
+        std::process::exit(1);
+    }
+    if perf::self_check_needs_perf(
+        std::env::var("WORKLOAD_PERF").ok().as_deref(),
+        std::env::var("WORKLOAD_PERF_SELF_CHECK").ok().as_deref(),
+    ) {
+        eprintln!("driver: WORKLOAD_PERF_SELF_CHECK needs WORKLOAD_PERF=1");
         std::process::exit(1);
     }
     let cfg = Config::from_env();
