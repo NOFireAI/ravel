@@ -6289,6 +6289,8 @@ impl FirstRefusal {
             bucket_spill_bytes_written: bucket_bytes,
             bucket_spill_bytes_read: bucket.map_or(0, |bucket| bucket.bytes_read),
             bucket_spill_rows_written: bucket_rows,
+            bucket_route_resize_bytes: bucket.map_or(0, |bucket| bucket.resize_bytes),
+            bucket_route_chunks_sealed: bucket.map_or(0, |bucket| bucket.chunks_sealed),
             peak_unspillable_bytes: pool.peak_unspillable_bytes,
             share_bytes: share,
             retry_pool_limit_bytes: pool.query_limit,
@@ -6375,6 +6377,13 @@ pub struct SpillRetryReport {
     pub bucket_spill_bytes_read: u64,
     /// State rows the bucketed exec wrote.
     pub bucket_spill_rows_written: u64,
+    /// Bytes the bucketed exec's byte-budgeted chunk buffers copied into a
+    /// larger allocation while they filled
+    /// ([`crate::BUCKET_ROUTE_RESIZE_BYTES`]); 0 on a fixed-width route.
+    pub bucket_route_resize_bytes: u64,
+    /// Chunks the bucketed exec's route sealed
+    /// ([`crate::BUCKET_ROUTE_CHUNKS_SEALED`]).
+    pub bucket_route_chunks_sealed: u64,
     /// The retry pool's largest reservation by consumers that cannot spill.
     pub peak_unspillable_bytes: u64,
     /// The spill-budget share the retry reserved, or `None` when less than
@@ -6453,6 +6462,8 @@ impl SpillRetryReport {
             bucket_spill_bytes_written = self.bucket_spill_bytes_written,
             bucket_spill_bytes_read = self.bucket_spill_bytes_read,
             bucket_spill_rows_written = self.bucket_spill_rows_written,
+            bucket_route_resize_bytes = self.bucket_route_resize_bytes,
+            bucket_route_chunks_sealed = self.bucket_route_chunks_sealed,
             peak_unspillable_bytes = self.peak_unspillable_bytes,
             share_bytes = self.share_bytes.unwrap_or(0),
             effective_limit_bytes = or_none(self.effective_limit_bytes),
@@ -10289,6 +10300,8 @@ pub(crate) mod tests {
                 ("bucket_spill_bytes_written", "3072"),
                 ("bucket_spill_bytes_read", "3072"),
                 ("bucket_spill_rows_written", "6"),
+                ("bucket_route_resize_bytes", "5120"),
+                ("bucket_route_chunks_sealed", "3"),
                 ("peak_unspillable_bytes", "2200000"),
                 ("share_bytes", "17179869184"),
                 ("effective_limit_bytes", "134217728"),
@@ -10336,6 +10349,8 @@ pub(crate) mod tests {
                 ("bucket_spill_bytes_written", "0"),
                 ("bucket_spill_bytes_read", "0"),
                 ("bucket_spill_rows_written", "0"),
+                ("bucket_route_resize_bytes", "0"),
+                ("bucket_route_chunks_sealed", "0"),
                 ("bucket_spill_rows_read", "0"),
                 ("peak_unspillable_bytes", "0"),
                 ("retry_peak_asked_bytes", "7000000"),
@@ -10379,6 +10394,8 @@ pub(crate) mod tests {
                 ("bucket_spill_bytes_written", "0"),
                 ("bucket_spill_bytes_read", "0"),
                 ("bucket_spill_rows_written", "0"),
+                ("bucket_route_resize_bytes", "0"),
+                ("bucket_route_chunks_sealed", "0"),
                 ("bucket_spill_rows_read", "0"),
                 ("peak_unspillable_bytes", "0"),
                 ("effective_limit_bytes", "none"),
@@ -10445,6 +10462,8 @@ pub(crate) mod tests {
                 routed_chunk_rows: 2048,
                 bytes_read: 3072,
                 rows_read: 6,
+                resize_bytes: 5120,
+                chunks_sealed: 3,
                 disk: true,
                 executed: true,
             }),
@@ -10507,6 +10526,8 @@ pub(crate) mod tests {
             routed_chunk_rows: 8192,
             bytes_read: 9_000,
             rows_read: 400,
+            resize_bytes: 0,
+            chunks_sealed: 16,
             disk: true,
             executed: true,
         };
@@ -10538,6 +10559,13 @@ pub(crate) mod tests {
         assert_eq!(report.bucket_spill_bytes_written, 9_000);
         assert_eq!(report.bucket_spill_bytes_read, 9_000);
         assert_eq!(report.bucket_spill_rows_written, 400);
+        assert_eq!(
+            (
+                report.bucket_route_resize_bytes,
+                report.bucket_route_chunks_sealed
+            ),
+            (0, 16)
+        );
         assert_eq!(
             report.exchange_spill_bytes_written + report.bucket_spill_bytes_written,
             report.spill_bytes_written

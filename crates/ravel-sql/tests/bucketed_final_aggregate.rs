@@ -4376,6 +4376,20 @@ async fn bucket_spill_retry_admits_a_declared_str_key() {
         (bits.to_string(), rows.to_string(), budget.to_string()),
         "the INFO line is the report"
     );
+    // Issue #4650: the route's growth copies and sealed chunks reach the
+    // INFO line from the execs' metrics.
+    assert!(report.bucket_route_chunks_sealed > 0, "{report:?}");
+    assert_eq!(
+        (
+            retry_info_field(&log, "bucket_route_resize_bytes"),
+            retry_info_field(&log, "bucket_route_chunks_sealed"),
+        ),
+        (
+            report.bucket_route_resize_bytes.to_string(),
+            report.bucket_route_chunks_sealed.to_string(),
+        ),
+        "the INFO line is the report"
+    );
     let plan = run.plan.as_deref().expect("the retry's plan");
     assert!(
         plan.contains(&format!(
