@@ -497,8 +497,11 @@ than passing for "no pull request open".
   finding. A line is checked when its first word is `FROM`, in any case, and
   its image, after any `--platform=` style flags, is `rust`, `rust:<tag>` or
   `docker.io/library/rust:<tag>`, with an optional `@sha256:` digest and
-  `AS <name>`; or when its first word is `ARG` and the default it sets
-  starts with `rust:` or `docker.io/library/rust:`. Images that only start
+  `AS <name>`; or when its first word is `ARG` and a default it sets names
+  the official rust image the same way (`rust`, `rust:<tag>` or
+  `rust@<digest>`, with or without `docker.io/library/`). An `ARG` whose
+  value is the word `rust` for another purpose is a finding too, and needs
+  the marker. Images that only start
   with "rust" (`rustlang/rust:nightly`, `rust-musl-builder:1.0`) are not
   checked. The version is the tag up to the first `-` (`1.100.0` in
   `1.100.0-trixie`) and must equal the channel exactly; a tag with no x.y.z

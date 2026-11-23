@@ -18,9 +18,11 @@
 #     options such as `--platform=$BUILDPLATFORM`, is `rust`, `rust:<tag>` or
 #     `docker.io/library/rust:<tag>`, optionally followed by an `@sha256:`
 #     digest and `AS <name>`; or
-#   - its first word is ARG, in any case, and the default it sets starts with
-#     `rust:` or `docker.io/library/rust:` (an image a later FROM names by
-#     variable).
+#   - its first word is ARG, in any case, and a default it sets names the
+#     official rust image the way a FROM can: `rust`, `rust:<tag>` or
+#     `rust@<digest>`, with or without `docker.io/library/` (an image a later
+#     FROM names by variable). An ARG whose value is the word `rust` for
+#     another purpose is a finding too, and needs the marker below.
 # Images that only start with "rust" (rustlang/rust, rust-musl-builder) are
 # other images and are not checked.
 #
