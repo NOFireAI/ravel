@@ -457,6 +457,10 @@ driver action that forces its situation, and each such action:
 - runs again in the `eventually` until it was reached once (the
   unreadable-HEAD sweep runs there once).
 
+The step list in the first bullet gained two raw-S3 tampers on a compaction
+record the driver's own `ravel-cli` run just published; see the
+record-tamper amendment below.
+
 Two parts of the catalog-maintenance topology change with it. Decision 4's
 topology gains an `s3proxy` container between the ravel-server containers
 and the store. It forwards every byte unchanged until the driver sets a rule
@@ -546,3 +550,57 @@ switch that takes each of those paths on demand", but it defines two
 switches, as its own marker says: `ingest/encode-cancelled` and
 `ingest/data-put-refused`. The amendment adds two switches that between them
 take those three paths on demand. Nothing else in it changes.
+
+## Amendment (2026-11-24): record tampers for the maintenance loser mutants (#4340)
+
+<!-- amendment-applies: sections="Amendment (2026-11-18): forced situations for silent mutants (#4336)" pointer="record-tamper amendment" -->
+
+This is the record-tamper amendment. The forced-situation amendment's step
+list gains two steps. The catalog-maintenance workload's divergent-record
+and missing-part races use them (`antithesis/catalog-maintenance/README.md`,
+"The forced races"):
+
+- a compaction record that the driver's own concurrent `ravel-cli` run just
+  published, rewritten through raw S3 with the last byte of its
+  `input_set_hash` flipped (the key carries only the first 8 bytes, so the
+  record still verifies against its key);
+- one part that record names, deleted through raw S3.
+
+A step of this kind is legitimate only when all of these hold:
+
+- It changes only an object that the driver's own concurrent maintenance run
+  published inside the race, never a server's in-flight write. No fold,
+  query or audit reads the tampered state. The driver holds its write gate
+  for the whole race, a const assertion keeps the race with its waits and
+  undo retries inside the 900 s fold safety margin, and every clock move is
+  refused while an undo is pending.
+- The change is one that the system's contract requires a reader to detect
+  and fail closed on, and every assertion the tamper can falsify is named.
+  For the first step these are `maintenance: a loser observing a divergent
+  input-set hash fails closed and never overwrites the record`, plus
+  `catalog: a published compaction record is never replaced` under the
+  `mo-diverge-overwrites-record` mutant. For the second step it is
+  `maintenance: a loser reports Converged only when the winner part is
+  observed present in the store`.
+- The tamper is undone before the race ends. If the store refuses the undo,
+  it stays pending and every clock move is refused until the store accepts
+  it.
+- Reaching the tampered situation is a sometimes-assertion that the local
+  loop requires, as with the other forced rules.
+
+The deleted part models environment steps that the maintenance TLA model
+carries (`VanishPart` and `TombstonePart`: a tenant tombstone or the
+unreferenced-part sweep). The system answers it with the typed
+`ConvergedWinnerPartMissing`. The forged record models store corruption or a
+record-key prefix collision, the case `DivergentInputSetNeverMutates` exists
+for. The system answers it with `InputSetHashDivergence`. Neither situation
+has a tamper-free route in this workload: the plain record race meets the
+winner over the same inputs with every part present. That is the
+silent-mutant condition the forced-situation amendment exists for.
+
+Under faults, two windows remain in which a clean build could read the undo
+as an overwrite. A tamper PUT can be slower than the 8 s left before the
+hold cap, or a loser's requests can be retried near the store client's
+180 s bound. A false evaluation carries the race in the assertion's details
+(`tamper_in_place_at_release`, `released_at_age_ms`, `undo`), so triage can
+tell it from a mutant. Owner decision (delegated), 2026-11-24 (#4340).
