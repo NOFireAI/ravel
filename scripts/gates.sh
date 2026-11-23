@@ -60,12 +60,14 @@
 # own process; `cargo test` runs a binary's tests as threads of one process,
 # so a test that reads process-global state can fail there and pass in CI, and
 # a merge gate that does not run the tests as CI does is not the merge gate.
-# Install it with `cargo install cargo-nextest@0.9.143 --locked`. That version
-# moves together with the `tool: nextest@0.9.143` pins on
+# Install it with `cargo install cargo-nextest@0.9.152 --locked`. That version
+# moves together with the `tool: nextest@0.9.152` pins on
 # taiki-e/install-action in .github/workflows/ci.yml and interop-nightly.yml,
 # and with .brig/Dockerfile's NEXTEST_VERSION and its per-arch sha256 case
 # arms, which must be replaced too. It moves only to a version the pinned
-# install-action's manifest lists. The executor tier
+# install-action's manifest lists: those steps set `fallback: none`, so an
+# unlisted version fails the step instead of installing through
+# cargo-binstall. The executor tier
 # keeps the `cargo test` fallback, with a printed line, because fleet hosts do
 # not all carry nextest and CI runs the full suites anyway.
 # RAVEL_GATES_ALLOW_CARGO_TEST=1 runs the merge tier under `cargo test` with
@@ -311,7 +313,7 @@ else
 fi
 if [[ ${have_nextest} -eq 0 ]]; then
   if [[ "${tier}" == "merge" && ${dry_run} -eq 0 && "${RAVEL_GATES_ALLOW_CARGO_TEST:-0}" != "1" ]]; then
-    echo "gates.sh: cargo-nextest is not installed, and the merge tier runs tests as CI does, one process per test. Install it with: cargo install cargo-nextest@0.9.143 --locked. RAVEL_GATES_ALLOW_CARGO_TEST=1 runs this gate under cargo test instead, where a test that reads process-global state can fail without a defect." >&2
+    echo "gates.sh: cargo-nextest is not installed, and the merge tier runs tests as CI does, one process per test. Install it with: cargo install cargo-nextest@0.9.152 --locked. RAVEL_GATES_ALLOW_CARGO_TEST=1 runs this gate under cargo test instead, where a test that reads process-global state can fail without a defect." >&2
     exit 64
   fi
   echo "==> cargo-nextest not installed: tests run under cargo test, one process per test binary, not one per test as in CI"
