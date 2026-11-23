@@ -59,9 +59,11 @@ record (D3).
    sends one write every 50 ms through the last 2 s before it (40 writes,
    `burst_delays`). A write routed at 6 that flushes in the activation hour
    is a straggler: a token at shard 4 or 5 in an hour that routes at 4. Once
-   the activation hour began, each straggler (up to 4, single-attempt writes
-   only) is read back with its tokens on both nodes, which resolves it above
-   the active count. A cycle with no straggler is repeated once, after an
+   the activation hour began, each node acknowledges one write routed at 4
+   (the anchor a later restart's new identity is compared with, since
+   restart evidence needs two acknowledgements at one count), and each
+   straggler (up to 4, single-attempt writes only) is read back with its
+   tokens on both nodes, which resolves it above the active count. A cycle with no straggler is repeated once, after an
    increase back to 6.
 5. **Forged token read** (D4 part 1). An acknowledged write's first token
    moved to a shard at its hour's active count, with sequence number

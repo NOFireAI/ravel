@@ -537,6 +537,12 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
     while now_ns() < boundary_ns + NS_PER_SECOND {
         std::thread::sleep(Duration::from_millis(200));
     }
+    // A write per node routed at 4 after the activation: a node restarted
+    // later shows its new identity against this one at the same count
+    // (`token::AckLedger::restarted_since`).
+    for node in 0..n {
+        write_to(s, 4, node);
+    }
     for w in stragglers
         .iter()
         .filter(|w| w.max_copies() == 1)
