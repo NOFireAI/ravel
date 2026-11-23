@@ -471,12 +471,18 @@
 #                                       samples query failing after the L1
 #                                       listing answered stamps the
 #                                       listing's time and GETs from
-#                                       readback_partial, exit 70; ro10:
+#                                       readback_partial, exit 70; ro9b:
+#                                       the same with the samples query
+#                                       answering 422, error, exit 70; ro10:
 #                                       ravel-only-differences on
 #                                       postings_built (L0 true and L1
 #                                       false, both true, one report
 #                                       unreadable or unstamped) and
-#                                       ravel-only-postings on fold reports.
+#                                       ravel-only-postings on fold reports;
+#                                       ro11: the read-back ops on a series
+#                                       422 (refused), a samples 422
+#                                       (error, also at ingest) and null
+#                                       listing GET deltas (a miss).
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -1504,7 +1510,8 @@ printf 'metricsbench_ingest env token=%s\n' "${METRICSBENCH_RAVEL_TOKEN:+set}" >
 # without the elapsed time, naming only the deadline; 504other a 504
 # without the deadline message and 500deadline the deadline message on a
 # 500 (exit 1 each); partial a samples query failing after the series
-# listing answered, with the listing's figures in readback_partial (exit 1).
+# listing answered, with the listing's figures in readback_partial (exit 1),
+# partial422 the same with the samples query answering 422 (exit 1).
 if [ "${1:-}" = "--readback-only" ]; then
   mode="${STUB_READBACK_ONLY_EXIT:-0}"
   if [ -n "${STUB_READBACK_ONLY_SEQ:-}" ]; then
@@ -1523,7 +1530,8 @@ if [ "${1:-}" = "--readback-only" ]; then
     500deadline) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed after 120013 ms: GET /api/v1/series answered 500 Internal Server Error: query exceeded its deadline of 120s"}' ;;
     mismatch) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":999,"sample_count":120000,"matches_expected":false,"mismatches":["series_count 999, want 1000"],"query_ms":{"series":14,"samples.0":5},"query_cost":{"series":{"process_store_get_delta":40,"process_store_get_bytes_delta":2048}}}}' ;;
     partial) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"the read-back over ravel'"'"'s query API failed: query samples.0 failed after 9 ms: GET /api/v1/query answered 500 Internal Server Error: query refused","readback_partial":{"failed_query":"samples.0","attempt":1,"series_count":1000,"query_ms":{"series":37},"query_windows":{},"query_cost":{"series":{"process_store_get_delta":41,"process_store_get_bytes_delta":999}}}}' ;;
-    noms) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":1000,"sample_count":120000,"matches_expected":true,"mismatches":[],"query_ms":{"samples.0":5}}}' ;;
+    partial422) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"the read-back over ravel'"'"'s query API failed: query samples.0 failed after 9 ms: GET /api/v1/query answered 422 Unprocessable Entity: query memory budget exceeded","readback_partial":{"failed_query":"samples.0","attempt":1,"series_count":1000,"query_ms":{"series":37},"query_windows":{},"query_cost":{"series":{"process_store_get_delta":41,"process_store_get_bytes_delta":999}}}}' ;;
+    noms) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":1000,"sample_count":120000,"matches_expected":true,"mismatches":[],"query_ms":{"samples.0":5},"query_cost":{"series":{"process_store_get_delta":40,"process_store_get_bytes_delta":2048}}}}' ;;
   esac
   case "$mode" in
     0 | noms) exit 0 ;;
@@ -4150,6 +4158,17 @@ expect_rc ro9 70
 check "ro9: the l1 stamp carries the listing's figures from readback_partial, verdict error" 'j("stamps.json")["ravel_only"]["l1"]["readback"]["series_figures_from"] == "readback_partial" and j("stamps.json")["ravel_only"]["l1"]["readback"]["series_query_ms"] == 37 and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 37 and j("stamps.json")["ravel_only"]["l1"]["readback"]["series_store_get_calls"] == 41 and j("stamps.json")["ravel_only"]["l1"]["readback"]["series_store_get_bytes"] == 999 and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "error" and j("stamps.json")["ravel_only"]["l1"]["readback"]["error"].endswith("query samples.0 failed after 9 ms: GET /api/v1/query answered 500 Internal Server Error: query refused") and j("stamps.json")["ravel_only"]["l1"]["readback"]["missing"] == []'
 check "ro9: the partial read-back fails readback-l1, the l0 stamp from its read-back" 'j("stamps.json")["failed_step"] == "readback-l1" and j("stamps.json")["status"] == "failed" and j("stamps.json")["ravel_only"]["l0"]["readback"]["series_figures_from"] == "readback" and j("stamps.json")["ravel_only"]["l0"]["readback"]["series_store_get_calls"] == 40'
 expect_err "ro9: the failure names the step and the verdict" "step readback-l1 failed: metricsbench_ingest --readback-only exited 1, verdict error: "
+# ro9b: the same with the samples query answering 422. The listing answered,
+# so the 422 is not the listing's refusal: verdict error, the step fails.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="0 partial422" run_stage1 ro9b history --ravel-only
+expect_rc ro9b 70
+check "ro9b: a samples 422 after the listing answered is error, the listing's time from readback_partial" 'j("stamps.json")["ravel_only"]["l1"]["readback"]["verdict"] == "error" and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "error" and j("stamps.json")["ravel_only"]["l1"]["readback"]["series_figures_from"] == "readback_partial" and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 37 and j("stamps.json")["ravel_only"]["l1"]["readback"]["series_store_get_calls"] == 41 and j("stamps.json")["ravel_only"]["l1"]["readback"]["series_store_get_bytes"] == 999 and j("stamps.json")["failed_step"] == "readback-l1" and j("stamps.json")["status"] == "failed"'
+expect_err "ro9b: the failure names the step and verdict error" "step readback-l1 failed: metricsbench_ingest --readback-only exited 1, verdict error: "
+if grep -qF -- "series listing was refused" "${ERR}"; then
+  fail "ro9b: a listing refusal was said for a samples 422"
+else
+  pass "ro9b: no listing refusal is said"
+fi
 
 # ro10: ravel-only-differences on postings_built, run as an op on stamps
 # that differ in it alone, and ravel-only-postings on fold reports.
@@ -4192,6 +4211,46 @@ for pair in fold-true.json:true fold-bad.json:null fold-str.json:null fold-absen
     fail "ro10: ravel-only-postings ${pair%%:*} printed ${got}, want ${pair#*:}"
   fi
 done
+
+# ro11: ravel-only-readback and ravel-only-ingest run as ops on read-back
+# documents: a 422 grades refused (budget) only when the series listing
+# answered it, and a matched read-back without the listing's GET figures is
+# a miss.
+RD11="${TMP}/ro11"
+mkdir -p "${RD11}"
+cp "${RD}/mbpylib.py" "${RD11}/mbpylib.py"
+printf 'ravel_store_calls_total{mode="all",op="get"} 100\nravel_store_bytes_total{mode="all",op="get"} 5000\n' >"${RD11}/before.txt"
+printf 'ravel_store_calls_total{mode="all",op="get"} 150\nravel_store_bytes_total{mode="all",op="get"} 9000\n' >"${RD11}/after.txt"
+printf '%s\n' '{"system":"ravel","readback_error":"the read-back over ravel'"'"'s query API failed: query series failed after 4321 ms: GET /api/v1/series answered 422 Unprocessable Entity: series budget exceeded"}' >"${RD11}/series422.json"
+printf '%s\n' '{"system":"ravel","readback_error":"the read-back over ravel'"'"'s query API failed: query samples.0 failed after 9 ms: GET /api/v1/query answered 422 Unprocessable Entity: query memory budget exceeded"}' >"${RD11}/samples422.json"
+printf '%s\n' '{"system":"ravel","readback":{"series_count":1000,"sample_count":120000,"matches_expected":true,"mismatches":[],"query_ms":{"series":12},"query_cost":{"series":{"process_store_get_delta":null,"process_store_get_bytes_delta":null}}}}' >"${RD11}/nullcost.json"
+printf '%s\n' '{"systems":[{"system":"ravel","readback_error":"query samples.0 failed after 9 ms: GET /api/v1/query answered 422 Unprocessable Entity: query memory budget exceeded"}]}' >"${RD11}/ingest-samples422.json"
+ro11_op() {
+  local name="$1"
+  shift
+  rc=0
+  (cd "${RD11}" && python3 -I -c 'import sys; sys.path.insert(0, "."); import mbpylib' "$@" >"${name}.out" 2>&1) || rc=$?
+}
+ro11_check() {
+  local label="$1" name="$2" want_rc="$3" expr="$4"
+  if [ "${rc}" -eq "${want_rc}" ] && python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if eval(sys.argv[2]) else 1)' "${RD11}/${name}.out" "$expr" 2>/dev/null; then
+    pass "$label"
+  else
+    fail "$label (exit ${rc}, want ${want_rc}: $(cat "${RD11}/${name}.out"))"
+  fi
+}
+ro11_op series422 ravel-only-readback series422.json 1 before.txt after.txt
+ro11_check "ro11: the series listing answering 422 with no partial is refused (budget) with the error's ms" series422 0 'd["verdict"] == "refused (budget)" and d["series_query_ms"] == 4321 and d["series_figures_from"] == "readback_error" and d["missing"] == []'
+ro11_op samples422 ravel-only-readback samples422.json 1 before.txt after.txt
+ro11_check "ro11: a samples query answering 422 with no partial is error, not refused" samples422 3 'd["verdict"] == "error" and d["series_query_ms"] is None and d["series_figures_from"] is None and d["missing"] == ["series_query_ms"]'
+ro11_op nullcost ravel-only-readback nullcost.json 0 before.txt after.txt
+ro11_check "ro11: a matched read-back with null listing GET deltas misses both figures, exit 3" nullcost 3 'd["verdict"] == "matched" and d["series_query_ms"] == 12 and d["series_figures_from"] == "readback" and d["missing"] == ["series_store_get_calls", "series_store_get_bytes"]'
+ro11_op ingest-samples422 ravel-only-ingest ingest-samples422.json 1
+if [ "${rc}" -eq 3 ] && grep -qF "metricsbench_ingest exited 1: query samples.0 failed after 9 ms" "${RD11}/ingest-samples422.out"; then
+  pass "ro11: ravel-only-ingest fails an ingest read-back whose samples query answered 422"
+else
+  fail "ro11: ravel-only-ingest on a samples 422 (exit ${rc}, want 3: $(cat "${RD11}/ingest-samples422.out"))"
+fi
 
 # ro7: the Ravel-only shape on the real-S3 lane (issue #4481): Ravel's store
 # on PREFIX-ravel, createbuckets checking that bucket alone, no Mimir, the
