@@ -142,6 +142,9 @@ const P1_RECOVERY: Prop = Prop {
 /// which use 1 ms (`ack_timeout`). A post-recovery strict write that gets no
 /// response, by that timeout or through a transport error, including a failed
 /// body read (`Reply::NoResponse` in ravel.rs), makes this fire.
+/// The expectation that it holds rests on perf-measure-1 (0 false over 9506
+/// probes, #4559 comment 7088441883), whose post-pause restarts all landed
+/// before the ack probes (#4559 comment 7088652995).
 const P2_ANSWERED: Prop = Prop {
     kind: Kind::Always,
     message: "every strict write after recovery is answered within the client timeout",
@@ -149,6 +152,8 @@ const P2_ANSWERED: Prop = Prop {
 /// P3: the 2 s band is measured (#4559 comment 7088441883, perf-measure-1:
 /// over 938 medians the smallest rung with zero false was 1 s, and the band is
 /// the next rung up), not a guarantee documented in docs/consistency-model.md.
+/// The band was derived over all histories, including those whose post-pause
+/// restarts landed before the ack probes (#4559 comment 7088652995).
 const P3_MEDIAN: Prop = Prop {
     kind: Kind::Always,
     message: "every recovered node's median strict-ack latency is within 2 s",
