@@ -242,7 +242,7 @@ recorded is a negative control (a single flipped constant), classified here.
 - `claim-completion-without-cas`, `claim-delete-unconditional`,
   `claim-as-publication-authority`, `guarded-publish-ignores-claim` (safety):
   the ADR-1029 hazards the design forbids. Classification: **design
-  demonstration**; the proposed design uses CasVersion, never deletes, treats no
+  demonstration**; the design uses CasVersion, never deletes, treats no
   claim as publication authority, and abandons the guarded path on a lost claim.
 - `diverge-overwrites-record` / `mo-diverge-overwrites-record` and
   `missing-part-reports-converged` / `mo-missing-part-reports-converged`

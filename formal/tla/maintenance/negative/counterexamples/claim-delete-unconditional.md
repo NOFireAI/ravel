@@ -11,5 +11,5 @@ claim key is now absent while `claimBorn[1]` stays set, so
 Why it matters: ADR-1029 step 6 forbids an unconditional delete precisely
 because a stale worker's DELETE could destroy a newer owner's claim; the
 published compaction record is the only meaningful completion marker. The
-proposed design never deletes a claim -- it marks `state = done` with CasVersion
+design never deletes a claim -- it marks `state = done` with CasVersion
 or lets the claim age out.
