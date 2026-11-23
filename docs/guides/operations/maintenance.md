@@ -442,6 +442,34 @@ Which target a merge reads depends on the codec:
 | Spans (RSPAN) | Read. It is 256 MiB unless `--l1-part-memory-target-bytes` was set explicitly, and the `rspan_l1_part_memory_target_bytes` line names it. | Not read |
 | Metrics (RSEG) | Not read | Read |
 
+A metrics segment also closes on a second criterion that no flag sets: what
+the reader decodes from one segment. A segment's flagged provenance samples
+(the samples of its run-merged runs) and its run total are each kept at or
+under the most the reader's catalog decode accepts under its default limits,
+so the reader does not refuse a published segment on either of the two. The
+reader's page and section size limits are not checked this way. The check on the two bounds
+runs before a series is added, so a series that would take the segment over
+the bound closes the segment first. Segments split only between series, so a
+single series that is over the bound on its own cannot be placed. The
+bucket's compaction is then refused before its first page fetch with this
+error, where the quantity is `flagged provenance samples` or `runs`:
+
+```text
+RSEG compaction refused: series <series_id> alone carries <count> <quantity>, over the <bound> one part may hold under the reader's default limits; parts split only between series, so nothing is written or published and the L0 inputs stay live
+```
+
+Nothing is written or published for that bucket, its L0 inputs stay live, and
+the hour stays readable at L0. The bucket is held, not failed: the maintenance
+loop's shard scan counts it in the scan report's `held_reader_bound` field,
+marks its claim completed when it holds one, and goes on, so later hours of
+the shard still compact. The compaction cursor stays below the held hour. The
+loop's in-memory memo then skips the bucket until the process restarts, and
+the next evaluation refuses it again. Each refusal logs a warning, `compaction refused a bucket:
+one series alone is over the reader bound of one part`, with the fields
+`series_id`, `quantity`, `count` and `bound`. `ravel-cli maintain
+compact-tenant` prints the bucket as `outcome=Failed` with the error text
+above and still runs the tenant's other buckets.
+
 - Log segment bytes also depend on the compaction zstd level.
 - When the memory target is derived, the RLOG stored-size cap is set to the
   same value. The memory target then closes every segment and no probe runs.

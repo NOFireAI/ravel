@@ -562,6 +562,13 @@ jobs:
         run: bash scripts/guards/check-release-profile.test.sh
       - name: Release-profile guard (issue #2528)
         run: bash scripts/guards/check-release-profile.sh
+      # Every rust builder image tag in a Dockerfile names the version
+      # rust-toolchain.toml pins (issue #4630). Cases first, same reason as
+      # above.
+      - name: Rust image version guard cases (issue #4630)
+        run: bash scripts/guards/check-rust-image-versions.test.sh
+      - name: Rust image version guard (issue #4630)
+        run: bash scripts/guards/check-rust-image-versions.sh
       # A user guide must not keep a figure a later record superseded (issue
       # #1736): an operator picks a flag value from it. Cases first, same reason
       # as the guards above, and this one passes everything if its anchor page

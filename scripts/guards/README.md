@@ -488,6 +488,37 @@ than passing for "no pull request open".
   case where the scan would otherwise pass everything. Wired into `gates.sh`
   and CI's doc-scripts job, cases first; cases in
   `scripts/guards/check-release-profile.test.sh`.
+- `scripts/guards/check-rust-image-versions.sh [repo-root]`: exits non-zero
+  when a Rust builder image names a version other than the `channel` in
+  `rust-toolchain.toml` (issue #4630). It scans tracked files named
+  `Dockerfile`, `Dockerfile.<suffix>` (not `Dockerfile.dockerignore`) or
+  `<prefix>.Dockerfile`, at any depth; untracked files, Markdown and other
+  prose are out of scope, so a doc example naming an old image is not a
+  finding. A line is checked when its first word is `FROM`, in any case, and
+  its image, after any `--platform=` style flags, is `rust`, `rust:<tag>` or
+  `docker.io/library/rust:<tag>`, with an optional `@sha256:` digest and
+  `AS <name>`; or when its first word is `ARG` and a default it sets names
+  the official rust image the same way (`rust`, `rust:<tag>` or
+  `rust@<digest>`, with or without `docker.io/library/`). An `ARG` whose
+  value is the word `rust` for another purpose is a finding too, and needs
+  the marker. Images that only start
+  with "rust" (`rustlang/rust:nightly`, `rust-musl-builder:1.0`) are not
+  checked. The version is the tag up to the first `-` (`1.100.0` in
+  `1.100.0-trixie`) and must equal the channel exactly; a tag with no x.y.z
+  version (`rust:latest`, `rust:1`, `rust:slim`, a bare `rust`, a
+  `${VAR}`) is a finding, since it does not pin the toolchain. Its
+  suppression marker is a whole-line comment directly above the checked
+  line, `# rust-image-allow: <reason>`, with the reason required; a marker
+  with an empty reason, or two lines up, does not suppress. Only the line
+  above counts, because a Dockerfile comment takes a whole line. Findings
+  print as `file:line: <image> has version <found>, want <wanted>`, then a
+  summary with the number of lines checked. Exit 1 is a finding; 2 is could
+  not check: no `rust-toolchain.toml`, no `channel` line, a channel that is
+  not a plain x.y.z version, a repo-root git cannot list, or zero checked
+  lines, since this repository has such lines; 64 is bad usage. Wired into
+  `gates.sh` and CI's doc-scripts job, cases first; cases in
+  `scripts/guards/check-rust-image-versions.test.sh`, which reads
+  `RUST_IMAGE_GUARD` to pick the script under test.
 - `scripts/guards/check-quick-xml-entry-points.sh [Cargo.lock] [deny.toml]`:
   exits non-zero unless deny.toml's RUSTSEC-2026-0194/-0195 ignore comment
   names every direct Cargo.lock parent of an affected quick-xml version,

@@ -14,9 +14,10 @@
 
 use proptest::prelude::*;
 use ravel_segment::{
-    CompactionMetaV4, IngestBounds, ReaderLimits, RunInputV7, SampleProvenance, SegmentIdentity,
-    SegmentWriter, SeriesInputV4, SeriesInputV7, SeriesValues, V5_SPARSE_THRESHOLD,
-    decode_catalog_v5, encode_run_v4, open_from_full,
+    CompactionMetaV4, IngestBounds, PROVENANCE_LIVE_BYTES_PER_SAMPLE, ReaderLimits, RunInputV7,
+    SampleProvenance, SegmentError, SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesInputV7,
+    SeriesValues, V5_SPARSE_THRESHOLD, decode_catalog_v5, encode_run_v4, max_provenance_samples,
+    open_from_full,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
 
@@ -396,4 +397,97 @@ proptest! {
             }
         }
     }
+}
+
+/// An object of `series` series in which series `i < flagged.len()` carries one
+/// merged run of `flagged[i]` samples with a provenance column and every other
+/// series one plain single-sample run.
+fn object_with_flagged(series: usize, flagged: &[usize]) -> Vec<u8> {
+    let mut series_v7 = Vec::with_capacity(series);
+    for i in 0..series {
+        let mut raw = [0u8; 16];
+        raw[8..].copy_from_slice(&(i as u64).to_be_bytes());
+        let id = SeriesId(raw);
+        let n = flagged.get(i).copied().unwrap_or(0);
+        let run = if n == 0 {
+            run_with_prov(&id, 40, 1, 1, &[(100, 1.0)], None)
+        } else {
+            let vals: Vec<(i64, f64)> = (0..n).map(|k| (100 + k as i64, k as f64)).collect();
+            let prov = (0..n)
+                .map(|k| SampleProvenance {
+                    created_unix_ns: 40 + (k % 2) as i64,
+                    writer_epoch: 1,
+                    writer_seq: 1 + (k % 2) as u64,
+                    in_page_index: (k / 2) as u32,
+                })
+                .collect();
+            run_with_prov(&id, 40, 1, 1, &vals, Some(prov))
+        };
+        series_v7.push(SeriesInputV7 {
+            series_id: id,
+            labels: labels(&format!("m{i:05}")),
+            runs: vec![run],
+        });
+    }
+    SegmentWriter::write_v7_with_provenance(series_v7, identity(), bounds(), meta(), Vec::new())
+        .expect("write")
+        .bytes
+        .to_vec()
+}
+
+/// Reader limits whose provenance bound is exactly `bound`: the section cap
+/// sits one byte short of admitting `bound + 1` samples.
+fn limits_for_provenance_bound(bound: u64) -> ReaderLimits {
+    ReaderLimits {
+        max_section_uncompressed_bytes: (bound + 1) * PROVENANCE_LIVE_BYTES_PER_SAMPLE - 1,
+        ..ReaderLimits::default()
+    }
+}
+
+fn decode_with(bytes: &[u8], limits: ReaderLimits) -> Result<usize, SegmentError> {
+    let loc = open_from_full(bytes, limits)?;
+    Ok(decode_catalog_v5(&loc.footer, bytes, limits)?.len())
+}
+
+/// `max_provenance_samples` is the largest flagged-sample total a real object
+/// may carry: the whole-section reader decodes an object at the bound, summed
+/// across two series, and refuses one sample more.
+#[test]
+fn whole_section_reader_accepts_the_provenance_bound_and_refuses_one_more() {
+    const BOUND: u64 = 20;
+    let limits = limits_for_provenance_bound(BOUND);
+    assert_eq!(max_provenance_samples(limits), BOUND);
+
+    let at = object_with_flagged(2, &[12, 8]);
+    let loc = open_from_full(&at, ReaderLimits::default()).expect("open");
+    assert!(loc.footer.series_count < V5_SPARSE_THRESHOLD);
+    assert_eq!(decode_with(&at, limits).expect("bound decodes"), 2);
+
+    let over = object_with_flagged(2, &[12, 9]);
+    let err = decode_with(&over, limits).expect_err("bound + 1 refused");
+    assert!(
+        matches!(err, SegmentError::ProvenanceLiveBudgetExceeded { .. }),
+        "{err:?}"
+    );
+}
+
+/// The same bound on the chunked (sparse) catalog path, whose check runs per
+/// chunk frame: a frame holding the bound decodes, one sample more is refused.
+#[test]
+fn sparse_reader_accepts_the_provenance_bound_and_refuses_one_more() {
+    const BOUND: u64 = 4_000;
+    let limits = limits_for_provenance_bound(BOUND);
+    let n = V5_SPARSE_THRESHOLD as usize;
+
+    let at = object_with_flagged(n, &[BOUND as usize]);
+    let loc = open_from_full(&at, ReaderLimits::default()).expect("open");
+    assert!(loc.footer.series_count >= V5_SPARSE_THRESHOLD);
+    assert_eq!(decode_with(&at, limits).expect("bound decodes"), n);
+
+    let over = object_with_flagged(n, &[BOUND as usize + 1]);
+    let err = decode_with(&over, limits).expect_err("bound + 1 refused");
+    assert!(
+        matches!(err, SegmentError::ProvenanceLiveBudgetExceeded { .. }),
+        "{err:?}"
+    );
 }

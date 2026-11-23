@@ -555,6 +555,28 @@ pub enum MaintainError {
     InvalidRlogRunBlockTarget(#[from] crate::config::RlogRunBlockTargetError),
     #[error("RLOG compaction refused before writing any part: {0}")]
     InvalidRlogLevel2Setting(#[from] crate::config::RlogLevel2SettingError),
+    /// One series alone carries more of a reader-limited quantity than an
+    /// RSEG part may hold and still decode under the reader's default limits
+    /// (`ravel_segment::max_provenance_samples`,
+    /// `ravel_segment::max_run_total`). Parts split only between series, so
+    /// no split can fit it. Checked from the input catalogs before the first
+    /// page fetch, so nothing is written or published and the L0 inputs stay
+    /// live. A refusal, not a failure: the same build refuses the bucket
+    /// again, so a scan or maintain pass holds it and goes on
+    /// ([`MaintainError::is_reader_bound_refusal`]).
+    #[error(
+        "RSEG compaction refused: series {series_id} alone carries {count} {quantity}, over the {bound} one part may hold under the reader's default limits; parts split only between series, so nothing is written or published and the L0 inputs stay live"
+    )]
+    SeriesOverPartReaderBound {
+        /// Hex id of the series.
+        series_id: String,
+        /// What was counted: `flagged provenance samples` or `runs`.
+        quantity: &'static str,
+        /// That series' count.
+        count: u64,
+        /// The most one part may hold.
+        bound: u64,
+    },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     /// The ADR-1702 read gate returned no result for a maintenance decode or
@@ -772,6 +794,15 @@ impl MaintainError {
             self,
             MaintainError::PartRangeWindow { .. } | MaintainError::PartKeySpace { .. }
         )
+    }
+
+    /// Whether this error refuses an RSEG compaction because one series alone
+    /// is over a part's reader bound
+    /// ([`MaintainError::SeriesOverPartReaderBound`]). Raised before any part
+    /// is written, and the same build refuses the bucket again, so a pass
+    /// holds the bucket and goes on to its other buckets instead of failing.
+    pub fn is_reader_bound_refusal(&self) -> bool {
+        matches!(self, MaintainError::SeriesOverPartReaderBound { .. })
     }
 
     /// Whether the `sys/compat` write policy refused this run

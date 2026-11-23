@@ -2585,8 +2585,10 @@ enum MaintainCommand {
         /// Bound the encoded/on-object bytes a log or metrics merge writes
         /// before it closes an L1 segment (the stored-size target). A log
         /// segment closes on whichever of this and the log memory target is
-        /// reached first; a metrics segment closes on this alone and never
-        /// reads the memory target; span merges do not read this. Refused at 0.
+        /// reached first; a metrics segment closes on this, and also before
+        /// a series would take it over the flagged provenance samples or runs
+        /// the reader decodes in one part, and never reads the memory target;
+        /// span merges do not read this. Refused at 0.
         /// Setting it sets the log and metrics caps together. Unset, the
         /// metrics cap is 256 MiB and the log cap follows the derived log
         /// memory target; an explicit --l1-part-memory-target-bytes above
@@ -2690,8 +2692,10 @@ enum MaintainCommand {
         /// Bound the encoded/on-object bytes a log or metrics merge writes
         /// before it closes an L1 segment (the stored-size target). A log
         /// segment closes on whichever of this and the log memory target is
-        /// reached first; a metrics segment closes on this alone and never
-        /// reads the memory target; span merges do not read this. Refused at 0.
+        /// reached first; a metrics segment closes on this, and also before
+        /// a series would take it over the flagged provenance samples or runs
+        /// the reader decodes in one part, and never reads the memory target;
+        /// span merges do not read this. Refused at 0.
         /// Setting it sets the log and metrics caps together. Unset, the
         /// metrics cap is 256 MiB and the log cap follows the derived log
         /// memory target; an explicit --l1-part-memory-target-bytes above
