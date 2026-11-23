@@ -196,6 +196,21 @@ record, the bucket's compaction records). A swept commit record is not
 cached, so the second read of a swept input on a restarted node takes the
 fallback again.
 
+How this closes #4490: the ingest-durability driver reads at "now", so the
+listing path caches every commit record before the token loop and the
+fallback never runs; nothing there compacts or sweeps. Here the same
+caching holds: a ravel-server keeps every commit record it read, and both
+nodes read every live record while its hour was unsealed, so a read of a
+swept input on a node that has run since then is served from that cache and
+never GETs the record. The fallback, and with it `assert_token_never_stale`
+and the SUT's `commit: a commit token's stale-answer evidence read
+evaluated`, runs only for a read of a swept input on a node with a cold
+cache: a node restarted after the hour was folded (by a fault in
+Antithesis, by the eventually's requested restart in the local loop). Reads
+after HEAD named the compaction output run `include_token_l0` past its
+early return on any node. `local-run.sh` requires the SUT assertion in a
+plain run.
+
 #### The fresh compaction read
 
 The eventually's reads of compacted writes come after its forced races,
@@ -231,21 +246,6 @@ a verdict holds `catalog: a token read ran after its input was compacted`.
 The line `eventually: fresh compaction: {...}` reports the write, the
 bucket, the record, the reads taken and whether one reached that state. The
 sweep jumps after it then sweep this input like the others.
-
-How this closes #4490: the ingest-durability driver reads at "now", so the
-listing path caches every commit record before the token loop and the
-fallback never runs; nothing there compacts or sweeps. Here the same
-caching holds: a ravel-server keeps every commit record it read, and both
-nodes read every live record while its hour was unsealed, so a read of a
-swept input on a node that has run since then is served from that cache and
-never GETs the record. The fallback, and with it `assert_token_never_stale`
-and the SUT's `commit: a commit token's stale-answer evidence read
-evaluated`, runs only for a read of a swept input on a node with a cold
-cache: a node restarted after the hour was folded (by a fault in
-Antithesis, by the eventually's requested restart in the local loop). Reads
-after HEAD named the compaction output run `include_token_l0` past its
-early return on any node. `local-run.sh` requires the SUT assertion in a
-plain run.
 
 ### The store audit
 
@@ -935,7 +935,9 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     evaluated`, which holds only when a token read took the catalog's
     fallback.
 - The local loop's bound on the driver's run after setup is `seconds` plus
-  4800 s: the `eventually` runs the forced races before its fold.
+  4800 s for the `eventually`, which runs the forced races before its fold,
+  plus 900 s for its fresh compaction read, 60 s for each of up to 19 clock
+  moves, and 150 s for the wait after the window jump.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
   self-check. The model expects one seeded record moved to another write, so
   `catalog: compaction preserves the acked multiset` must appear in
