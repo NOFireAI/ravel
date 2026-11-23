@@ -1,7 +1,11 @@
 //! The perf variant (`WORKLOAD_PERF=1`; README.md, "Perf variant"): once
 //! faults stop, how long each node takes to its first strict
 //! acknowledgement, and how long strict writes take once the system has
-//! recovered. It measures and reports; it asserts no latency bound (#4559).
+//! recovered. It measures and reports, and once the system recovers asserts
+//! three always-bounds (#4559): P1, every node's first strict ack within 60 s
+//! of faults stopping; P2, every post-recovery strict write answered within
+//! the client timeout; P3, every recovered node's median strict-ack latency
+//! within 2 s.
 //!
 //! Every assertion here goes through `assert_raw` and is catalogued only when
 //! the variant is on, so the other variants' property lists do not change.
@@ -28,9 +32,16 @@ pub const TTFA_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TTFA_DEADLINE: Duration = Duration::from_secs(300);
 /// Ack probes per node after recovery.
 pub const ACK_PROBES: u32 = 10;
+/// P1's band, seconds: a recovered node's first strict ack must come within
+/// this of faults stopping. The 60 s rung of the TTFA ladder.
+pub const P1_RECOVERY_SECS: u64 = 60;
+/// P3's band, seconds: a recovered node's median strict-ack latency must be
+/// within this. The 2 s rung of the median ladder.
+pub const P3_MEDIAN_SECS: u64 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
+    Always,
     Sometimes,
     Reachable,
     Unreachable,
@@ -115,6 +126,34 @@ const PROBES_RAN: Prop = Prop {
     message: "the perf probes ran in an eventually",
 };
 
+/// P1: the 60 s band is #4559 comment 7088441883 (perf-measure-1): over 952
+/// TTFA samples the smallest rung with zero false was 30 s, and the band is
+/// the next rung up. t0 is not always fault-free: #4559 comment 7088652995
+/// found that in about one history in four the platform stops and restarts one
+/// container, in all but one case a ravel node, 0.0012 to 8.54 s after the
+/// fault pause and after t0 (largest TTFA on such a history 14570 ms); the
+/// 60 s band was derived over all histories, those included.
+const P1_RECOVERY: Prop = Prop {
+    kind: Kind::Always,
+    message: "every node's first strict ack comes within 60 s of faults stopping",
+};
+/// P2: a deadline, not a measured band. The client abandons a probe write at
+/// its client timeout, 15 s except for probes 2, 5 and 8 under the self-check,
+/// which use 1 ms (`ack_timeout`). A post-recovery strict write that gets no
+/// response, by that timeout or through a transport error, including a failed
+/// body read (`Reply::NoResponse` in ravel.rs), makes this fire.
+const P2_ANSWERED: Prop = Prop {
+    kind: Kind::Always,
+    message: "every strict write after recovery is answered within the client timeout",
+};
+/// P3: the 2 s band is measured (#4559 comment 7088441883, perf-measure-1:
+/// over 938 medians the smallest rung with zero false was 1 s, and the band is
+/// the next rung up), not a guarantee documented in docs/consistency-model.md.
+const P3_MEDIAN: Prop = Prop {
+    kind: Kind::Always,
+    message: "every recovered node's median strict-ack latency is within 2 s",
+};
+
 const TTFA_LADDER: [(u64, &Prop); 6] = [
     (5, &TTFA_5),
     (15, &TTFA_15),
@@ -131,7 +170,7 @@ const MEDIAN_LADDER: [(u64, &Prop); 4] = [
     (8, &MEDIAN_8),
 ];
 
-const PROPS: [&Prop; 18] = [
+const PROPS: [&Prop; 21] = [
     &TTFA_5,
     &TTFA_15,
     &TTFA_30,
@@ -150,16 +189,26 @@ const PROPS: [&Prop; 18] = [
     &CLOCKS_DISAGREE,
     &STOP_FAULTS_FAILED,
     &PROBES_RAN,
+    &P1_RECOVERY,
+    &P2_ANSWERED,
+    &P3_MEDIAN,
 ];
 
 /// The arguments the SDK's assertion macros pass to `assert_raw` for each
-/// kind: an unreachable is a reachability assertion with must-hit off.
-fn emit(p: &Prop, condition: bool, hit: bool, details: &Value) {
-    let (assert_type, display_type, must_hit) = match p.kind {
+/// kind: the assert type, the display type and must-hit. An always matches the
+/// `assert_always!` macro (`AssertType::Always`, "Always", must-hit on); an
+/// unreachable is a reachability assertion with must-hit off.
+fn kind_args(kind: Kind) -> (AssertType, &'static str, bool) {
+    match kind {
+        Kind::Always => (AssertType::Always, "Always", true),
         Kind::Sometimes => (AssertType::Sometimes, "Sometimes", true),
         Kind::Reachable => (AssertType::Reachability, "Reachable", true),
         Kind::Unreachable => (AssertType::Reachability, "Unreachable", false),
-    };
+    }
+}
+
+fn emit(p: &Prop, condition: bool, hit: bool, details: &Value) {
+    let (assert_type, display_type, must_hit) = kind_args(p.kind);
     assert_raw(
         condition,
         p.message.to_string(),
@@ -185,6 +234,29 @@ pub fn enabled(value: Option<&str>) -> bool {
 /// Whether the perf and coverage variants were both asked for.
 pub fn conflicts(perf: Option<&str>, coverage: Option<&str>) -> bool {
     enabled(perf) && coverage == Some("1")
+}
+
+/// Whether a `WORKLOAD_PERF_SELF_CHECK` value turns the self-check on.
+pub fn self_check_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Whether the self-check was asked for without the perf variant, which main
+/// refuses: the self-check only shortens the perf variant's ack probes.
+pub fn self_check_needs_perf(perf: Option<&str>, self_check: Option<&str>) -> bool {
+    self_check_enabled(self_check) && !enabled(perf)
+}
+
+/// The client timeout for ack probe `i`: 1 ms for probes 2, 5 and 8 of each
+/// node (i modulo 3 equal to 2) under the self-check, so those three answer
+/// no-response and make P2 false while the other seven keep the median finite;
+/// `normal` otherwise.
+pub fn ack_timeout(i: u32, self_check: bool, normal: Duration) -> Duration {
+    if self_check && i % 3 == 2 {
+        Duration::from_millis(1)
+    } else {
+        normal
+    }
 }
 
 /// What running `ANTITHESIS_STOP_FAULTS` came to.
@@ -416,8 +488,12 @@ pub struct Eval {
     pub details: Value,
 }
 
-/// The TTFA ladder for one node, plus the clock check when it acked.
-pub fn ttfa_evals(node: usize, s: &TtfaSample) -> Vec<Eval> {
+/// The TTFA ladder for one node, plus P1 when the timeline recovered and the
+/// clock check when it acked. P1 is evaluated once per node, only when
+/// `recovered`: a `none` sample is false, not skipped. When not recovered P1 is
+/// left out (the "the system recovers once faults stop" assertion already
+/// fails there); the ladder is evaluated either way.
+pub fn ttfa_evals(node: usize, s: &TtfaSample, recovered: bool) -> Vec<Eval> {
     let outcome = if s.mono_ms.is_some() { "acked" } else { "none" };
     let details = json!({
         "node": node,
@@ -434,6 +510,13 @@ pub fn ttfa_evals(node: usize, s: &TtfaSample) -> Vec<Eval> {
             details: details.clone(),
         })
         .collect();
+    if recovered {
+        out.push(Eval {
+            prop: &P1_RECOVERY,
+            condition: within(s.mono_ms, P1_RECOVERY_SECS),
+            details: details.clone(),
+        });
+    }
     if let (Some(mono), Some(wall)) = (s.mono_ms, s.wall_ms) {
         out.push(Eval {
             prop: &CLOCKS_DISAGREE,
@@ -469,6 +552,11 @@ pub fn ack_evals(node: usize, s: &AckSample) -> Vec<Eval> {
         details: details.clone(),
     });
     out.push(Eval {
+        prop: &P2_ANSWERED,
+        condition: s.outcome != Outcome::NoResponse,
+        details: details.clone(),
+    });
+    out.push(Eval {
         prop: &CLOCKS_DISAGREE,
         condition: clocks_disagree(s.mono_ms, s.wall_ms),
         details,
@@ -493,6 +581,32 @@ pub fn median_evals(node: usize, median: Option<u64>, acked: usize) -> Vec<Eval>
             details: details.clone(),
         })
         .collect()
+}
+
+/// One node's median strict-ack latency and its evaluations: the median ladder
+/// plus P3. The latency of a probe that was not acked is infinity (`median_ms`
+/// counts it so), so the median is finite only when at least six of the ten
+/// probes acked. P3 holds when the median is within the 2 s band.
+pub fn median_and_evals(node: usize, samples: &[AckSample]) -> (Option<u64>, Vec<Eval>) {
+    let lat: Vec<Option<u64>> = samples
+        .iter()
+        .map(|s| (s.outcome == Outcome::Acked).then_some(s.mono_ms))
+        .collect();
+    let median = median_ms(&lat);
+    let acked = lat.iter().filter(|l| l.is_some()).count();
+    let mut evals = median_evals(node, median, acked);
+    evals.push(Eval {
+        prop: &P3_MEDIAN,
+        condition: within(median, P3_MEDIAN_SECS),
+        details: json!({
+            "node": node,
+            "mono_ms": median,
+            "wall_ms": Value::Null,
+            "outcome": if median.is_some() { "finite" } else { "inf" },
+            "acked": acked,
+        }),
+    });
+    (median, evals)
 }
 
 fn apply(evals: Vec<Eval>) {
@@ -594,12 +708,15 @@ where
     }
 }
 
-/// Figure (b) for one node: `count` probe writes, serially, each with
-/// `timeout`, passing every line to `line` as it happens.
+/// Figure (b) for one node: `count` probe writes, serially, each with the
+/// timeout `ack_timeout` gives it (the self-check shortens probes 2, 5 and 8 to
+/// 1 ms, every other probe uses `timeout`), passing every line to `line` as it
+/// happens.
 pub fn run_ack_probes<F, L>(
     node: usize,
     count: u32,
     timeout: Duration,
+    self_check: bool,
     mut send: F,
     mut line: L,
 ) -> Vec<AckSample>
@@ -611,7 +728,7 @@ where
     for i in 0..count {
         let signal = ack_signal(i);
         line(ack_start_line(node, i));
-        let a = send(signal, timeout);
+        let a = send(signal, ack_timeout(i, self_check, timeout));
         let (mono_ms, wall_ms) = interval(a.sent, a.received);
         let s = AckSample {
             i,
@@ -626,12 +743,15 @@ where
     out
 }
 
-/// The variant's switch: catalogues its assertions when on.
-pub struct Perf;
+/// The variant's switch: catalogues its assertions when on and carries the
+/// self-check flag.
+pub struct Perf {
+    self_check: bool,
+}
 
 impl Perf {
     /// The variant, with every assertion catalogued, when `WORKLOAD_PERF=1`.
-    /// Call after `antithesis_init`.
+    /// Reads `WORKLOAD_PERF_SELF_CHECK` once here. Call after `antithesis_init`.
     pub fn from_env() -> Option<Perf> {
         if !enabled(std::env::var("WORKLOAD_PERF").ok().as_deref()) {
             return None;
@@ -640,7 +760,14 @@ impl Perf {
             emit(p, false, false, &Value::Null);
         }
         println!("driver: WORKLOAD_PERF=1, the perf variant is on");
-        Some(Perf)
+        let self_check =
+            self_check_enabled(std::env::var("WORKLOAD_PERF_SELF_CHECK").ok().as_deref());
+        if self_check {
+            println!(
+                "driver: WORKLOAD_PERF_SELF_CHECK=1, ack probes 2, 5 and 8 of each node use a 1 ms client timeout"
+            );
+        }
+        Some(Perf { self_check })
     }
 
     /// Prints the t0 line. On a failed stop-faults hits the unreachable and
@@ -662,6 +789,7 @@ impl Perf {
             ttfa_lines: 0,
             ack_lines: 0,
             all_acked: false,
+            self_check: self.self_check,
         })
     }
 }
@@ -672,6 +800,7 @@ pub struct Session {
     ttfa_lines: usize,
     ack_lines: usize,
     all_acked: bool,
+    self_check: bool,
 }
 
 impl Session {
@@ -683,12 +812,13 @@ impl Session {
         run_prober(send, self.t0, TTFA_CADENCE, TTFA_TIMEOUT, TTFA_DEADLINE)
     }
 
-    /// Prints one line per node, in node order, and evaluates the TTFA ladder.
-    pub fn record_ttfa(&mut self, samples: &[TtfaSample]) {
+    /// Prints one line per node, in node order, and evaluates the TTFA ladder,
+    /// with P1 when `recovered`.
+    pub fn record_ttfa(&mut self, samples: &[TtfaSample], recovered: bool) {
         for (node, s) in samples.iter().enumerate() {
             println!("{}", ttfa_line(node, s));
             self.ttfa_lines += 1;
-            apply(ttfa_evals(node, s));
+            apply(ttfa_evals(node, s, recovered));
         }
         self.all_acked = !samples.is_empty() && samples.iter().all(|s| s.mono_ms.is_some());
     }
@@ -703,25 +833,22 @@ impl Session {
     where
         F: FnMut(Signal, Duration) -> Answer,
     {
-        let samples = run_ack_probes(node, ACK_PROBES, timeout, send, |l| println!("{l}"));
+        let samples = run_ack_probes(node, ACK_PROBES, timeout, self.self_check, send, |l| {
+            println!("{l}")
+        });
         for s in &samples {
             apply(ack_evals(node, s));
         }
         samples
     }
 
-    /// Prints each node's median and evaluates the median ladder.
+    /// Prints each node's median and evaluates the median ladder and P3.
     pub fn record_acks(&mut self, per_node: &[Vec<AckSample>]) {
         for (node, samples) in per_node.iter().enumerate() {
             self.ack_lines += samples.len();
-            let lat: Vec<Option<u64>> = samples
-                .iter()
-                .map(|s| (s.outcome == Outcome::Acked).then_some(s.mono_ms))
-                .collect();
-            let median = median_ms(&lat);
+            let (median, evals) = median_and_evals(node, samples);
             println!("{}", median_line(node, median));
-            let acked = lat.iter().filter(|l| l.is_some()).count();
-            apply(median_evals(node, median, acked));
+            apply(evals);
         }
     }
 
@@ -780,12 +907,280 @@ mod tests {
         }
     }
 
+    fn perf(self_check: bool) -> Perf {
+        Perf { self_check }
+    }
+
+    fn ackn(i: u32, ms: u64, outcome: Outcome) -> AckSample {
+        AckSample {
+            i,
+            signal: ack_signal(i),
+            mono_ms: ms,
+            wall_ms: i64::try_from(ms).expect("small"),
+            outcome,
+        }
+    }
+
+    fn ten_acked(ms: u64) -> Vec<AckSample> {
+        (0..ACK_PROBES)
+            .map(|i| ackn(i, ms, Outcome::Acked))
+            .collect()
+    }
+
+    fn p3(samples: &[AckSample]) -> Option<bool> {
+        let (_, evals) = median_and_evals(0, samples);
+        cond(&evals, &P3_MEDIAN)
+    }
+
+    // Test a: P1 is evaluated once per node, only when the timeline recovered.
+    #[test]
+    fn p1_is_evaluated_only_when_recovered_and_counts_none_false() {
+        // Inclusive to the millisecond at the 60 s band.
+        assert_eq!(
+            cond(&ttfa_evals(0, &acked_ttfa(60_000), true), &P1_RECOVERY),
+            Some(true)
+        );
+        assert_eq!(
+            cond(&ttfa_evals(0, &acked_ttfa(60_001), true), &P1_RECOVERY),
+            Some(false)
+        );
+        // A none sample in a recovered timeline is false, not skipped.
+        assert_eq!(
+            cond(&ttfa_evals(0, &TtfaSample::none(300), true), &P1_RECOVERY),
+            Some(false)
+        );
+        // Not recovered: no P1 for either sample, but the six rungs remain.
+        for s in [acked_ttfa(500), TtfaSample::none(300)] {
+            let evals = ttfa_evals(0, &s, false);
+            assert_eq!(cond(&evals, &P1_RECOVERY), None);
+            for (_, prop) in TTFA_LADDER {
+                assert!(cond(&evals, prop).is_some(), "{}", prop.message);
+            }
+        }
+        // Recovered: the six rungs are still there beside P1.
+        for s in [acked_ttfa(500), TtfaSample::none(300)] {
+            let evals = ttfa_evals(0, &s, true);
+            for (_, prop) in TTFA_LADDER {
+                assert!(cond(&evals, prop).is_some(), "{}", prop.message);
+            }
+        }
+    }
+
+    // Test b: P2 is true unless the probe got no response.
+    #[test]
+    fn p2_is_true_unless_the_probe_got_no_response() {
+        assert_eq!(
+            cond(&ack_evals(0, &ack(10, Outcome::Acked)), &P2_ANSWERED),
+            Some(true)
+        );
+        assert_eq!(
+            cond(&ack_evals(0, &ack(10, Outcome::Refused(503))), &P2_ANSWERED),
+            Some(true)
+        );
+        assert_eq!(
+            cond(&ack_evals(0, &ack(10, Outcome::Partial)), &P2_ANSWERED),
+            Some(true)
+        );
+        assert_eq!(
+            cond(
+                &ack_evals(0, &ack(15_000, Outcome::NoResponse)),
+                &P2_ANSWERED
+            ),
+            Some(false)
+        );
+    }
+
+    // Test c: P3 tracks the median, non-acked counted infinite.
+    #[test]
+    fn p3_tracks_the_median_with_non_acked_counted_infinite() {
+        assert_eq!(p3(&ten_acked(2000)), Some(true));
+        assert_eq!(p3(&ten_acked(2001)), Some(false));
+        let none: Vec<AckSample> = (0..ACK_PROBES)
+            .map(|i| ackn(i, 10, Outcome::NoResponse))
+            .collect();
+        assert_eq!(p3(&none), Some(false)); // median is inf
+        // Five acked at 600 ms, five not acked: the median is inf.
+        let five_five: Vec<AckSample> = (0..ACK_PROBES)
+            .map(|i| {
+                if i < 5 {
+                    ackn(i, 600, Outcome::Acked)
+                } else {
+                    ackn(i, 600, Outcome::NoResponse)
+                }
+            })
+            .collect();
+        assert_eq!(p3(&five_five), Some(false));
+        // Nine acked at 600 ms, one at 9000 ms: the median is 600 ms.
+        let nine_one: Vec<AckSample> = (0..ACK_PROBES)
+            .map(|i| ackn(i, if i == 9 { 9000 } else { 600 }, Outcome::Acked))
+            .collect();
+        assert_eq!(p3(&nine_one), Some(true));
+    }
+
+    // Test d: each Always carries the same condition as its ladder rung.
+    #[test]
+    fn each_always_matches_its_ladder_rung() {
+        for ms in [0u64, 1_000, 60_000, 60_001, 120_000, 300_000] {
+            let evals = ttfa_evals(0, &acked_ttfa(ms), true);
+            assert_eq!(
+                cond(&evals, &P1_RECOVERY),
+                cond(&evals, &TTFA_60),
+                "ttfa {ms}"
+            );
+        }
+        let evals = ttfa_evals(0, &TtfaSample::none(5), true);
+        assert_eq!(
+            cond(&evals, &P1_RECOVERY),
+            cond(&evals, &TTFA_60),
+            "ttfa none"
+        );
+        for outcome in [
+            Outcome::Acked,
+            Outcome::Refused(503),
+            Outcome::Partial,
+            Outcome::NoResponse,
+        ] {
+            let evals = ack_evals(0, &ack(10, outcome.clone()));
+            assert_eq!(
+                cond(&evals, &P2_ANSWERED),
+                cond(&evals, &ANSWERED),
+                "{outcome:?}"
+            );
+        }
+        for ms in [0u64, 2_000, 2_001, 8_000] {
+            let (_, evals) = median_and_evals(0, &ten_acked(ms));
+            assert_eq!(
+                cond(&evals, &P3_MEDIAN),
+                cond(&evals, &MEDIAN_2),
+                "median {ms}"
+            );
+        }
+    }
+
+    // Test e covers the catalogue and the required tsv (above).
+
+    // Test f: the self-check parsing and the per-probe timeout choice.
+    #[test]
+    fn the_self_check_is_on_only_for_exactly_1() {
+        assert!(self_check_enabled(Some("1")));
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some(" 1"),
+            Some("1 "),
+            Some("01"),
+        ] {
+            assert!(!self_check_enabled(v), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn self_check_needs_perf_only_when_asked_without_it() {
+        assert!(self_check_needs_perf(None, Some("1")));
+        assert!(!self_check_needs_perf(Some("1"), Some("1")));
+        assert!(!self_check_needs_perf(Some("1"), None));
+        assert!(!self_check_needs_perf(None, None));
+    }
+
+    #[test]
+    fn the_self_check_shortens_only_probes_two_five_and_eight() {
+        let normal = Duration::from_secs(15);
+        for i in 0..ACK_PROBES {
+            assert_eq!(ack_timeout(i, false, normal), normal, "off i={i}");
+        }
+        let short = Duration::from_millis(1);
+        for i in 0..ACK_PROBES {
+            let want = if i == 2 || i == 5 || i == 8 {
+                short
+            } else {
+                normal
+            };
+            assert_eq!(ack_timeout(i, true, normal), want, "on i={i}");
+        }
+    }
+
+    // Mode shapes: all three Always together over hand-built samples.
+    #[test]
+    fn the_self_check_shape_fails_only_p2() {
+        // P1: one node, TTFA 600 ms, recovered.
+        assert_eq!(
+            cond(&ttfa_evals(0, &acked_ttfa(600), true), &P1_RECOVERY),
+            Some(true)
+        );
+        // The no-response set comes from run_ack_probes calling ack_timeout:
+        // the fake send answers no-response exactly for the 1 ms timeout.
+        let samples = run_ack_probes(
+            0,
+            ACK_PROBES,
+            Duration::from_secs(15),
+            true,
+            |_, t| {
+                let outcome = if t == Duration::from_millis(1) {
+                    Outcome::NoResponse
+                } else {
+                    Outcome::Acked
+                };
+                answer_in(outcome, 600)
+            },
+            |_| {},
+        );
+        let mut p2_true = 0;
+        let mut p2_false = 0;
+        for s in &samples {
+            match cond(&ack_evals(0, s), &P2_ANSWERED) {
+                Some(true) => p2_true += 1,
+                Some(false) => p2_false += 1,
+                None => panic!("P2 not evaluated"),
+            }
+        }
+        assert_eq!(p2_false, 3);
+        assert_eq!(p2_true, 7);
+        assert_eq!(p3(&samples), Some(true)); // seven acked at 600 ms
+    }
+
+    #[test]
+    fn the_slow_ack_shape_fails_only_p3() {
+        assert_eq!(
+            cond(&ttfa_evals(0, &acked_ttfa(2600), true), &P1_RECOVERY),
+            Some(true)
+        );
+        let samples: Vec<AckSample> = (0..ACK_PROBES)
+            .map(|i| ackn(i, 2412, Outcome::Acked))
+            .collect();
+        for s in &samples {
+            assert_eq!(cond(&ack_evals(0, s), &P2_ANSWERED), Some(true));
+        }
+        assert_eq!(p3(&samples), Some(false)); // median 2412 ms > 2 s
+    }
+
+    #[test]
+    fn the_no_ack_shape_fails_only_p1() {
+        for node in 0..2 {
+            assert_eq!(
+                cond(
+                    &ttfa_evals(node, &TtfaSample::none(300), true),
+                    &P1_RECOVERY
+                ),
+                Some(false)
+            );
+        }
+        // On a Session, two none samples leave the ack probes not due, so no
+        // P2 or P3 evaluation can exist.
+        let mut s = perf(false)
+            .start(StopFaults::Unset, Stamp::now())
+            .expect("measures");
+        s.record_ttfa(&[TtfaSample::none(300), TtfaSample::none(300)], true);
+        assert!(!s.ack_probes_due(true));
+    }
+
     #[test]
     fn ttfa_rungs_are_inclusive_to_the_millisecond() {
         for (secs, prop) in TTFA_LADDER {
-            let at = ttfa_evals(0, &acked_ttfa(secs * 1000));
+            let at = ttfa_evals(0, &acked_ttfa(secs * 1000), false);
             assert_eq!(cond(&at, prop), Some(true), "{}", prop.message);
-            let above = ttfa_evals(0, &acked_ttfa(secs * 1000 + 1));
+            let above = ttfa_evals(0, &acked_ttfa(secs * 1000 + 1), false);
             assert_eq!(cond(&above, prop), Some(false), "{}", prop.message);
         }
     }
@@ -812,7 +1207,7 @@ mod tests {
 
     #[test]
     fn a_none_ttfa_sample_evaluates_every_rung_false() {
-        let evals = ttfa_evals(1, &TtfaSample::none(300));
+        let evals = ttfa_evals(1, &TtfaSample::none(300), false);
         for (_, prop) in TTFA_LADDER {
             assert_eq!(cond(&evals, prop), Some(false), "{}", prop.message);
         }
@@ -832,7 +1227,7 @@ mod tests {
                     prop.message
                 );
             }
-            assert_eq!(evals.len(), 6);
+            assert_eq!(evals.len(), 7);
         }
     }
 
@@ -867,7 +1262,10 @@ mod tests {
         assert_eq!(cond(&ack_evals(0, &s), &CLOCKS_DISAGREE), Some(true));
         let mut t = acked_ttfa(500);
         t.wall_ms = Some(1600);
-        assert_eq!(cond(&ttfa_evals(0, &t), &CLOCKS_DISAGREE), Some(true));
+        assert_eq!(
+            cond(&ttfa_evals(0, &t, false), &CLOCKS_DISAGREE),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1006,12 +1404,16 @@ mod tests {
             start_line(StopFaults::Ok),
             ("perf t0 stop_faults=ok".to_string(), true)
         );
-        assert!(Perf.start(StopFaults::Failed, Stamp::now()).is_none());
-        let s = Perf
+        assert!(
+            perf(false)
+                .start(StopFaults::Failed, Stamp::now())
+                .is_none()
+        );
+        let s = perf(false)
             .start(StopFaults::Unset, Stamp::now())
             .expect("unset measures");
         assert_eq!((s.ttfa_lines, s.ack_lines), (0, 0));
-        assert!(Perf.start(StopFaults::Ok, Stamp::now()).is_some());
+        assert!(perf(false).start(StopFaults::Ok, Stamp::now()).is_some());
     }
 
     #[test]
@@ -1038,42 +1440,85 @@ mod tests {
     #[test]
     fn the_required_tsv_names_only_perf_messages() {
         let tsv = include_str!("../../local/perf-required.tsv");
+        let always: Vec<&str> = PROPS
+            .iter()
+            .filter(|p| p.kind == Kind::Always)
+            .map(|p| p.message)
+            .collect();
+        // T1 classes name no Always message; the T2 classes name only Always.
+        let t1 = [
+            "required",
+            "reported",
+            "slow-ack-never",
+            "slow-ack-required",
+            "no-ack-never",
+        ];
+        let t2 = [
+            "always",
+            "slow-ack-violated",
+            "no-ack-violated",
+            "no-ack-unhit",
+            "self-check-violated",
+        ];
         let mut lines = 0;
+        let mut new_lines = 0;
         for line in tsv.lines() {
             if line.starts_with('#') || line.is_empty() {
                 continue;
             }
             let (class, msg) = line.split_once('\t').expect("class<TAB>message");
-            assert!(
-                [
-                    "required",
-                    "reported",
-                    "slow-ack-never",
-                    "slow-ack-required",
-                    "no-ack-never"
-                ]
-                .contains(&class),
-                "{class}"
-            );
+            assert!(t1.contains(&class) || t2.contains(&class), "{class}");
             assert!(
                 PROPS.iter().any(|p| p.message == msg),
                 "not a perf message: {msg}"
             );
+            if t2.contains(&class) {
+                assert!(
+                    always.contains(&msg),
+                    "new line not an Always message: {msg}"
+                );
+                new_lines += 1;
+            } else {
+                assert!(
+                    !always.contains(&msg),
+                    "T1 line names an Always message: {msg}"
+                );
+            }
             lines += 1;
         }
-        assert_eq!(lines, 24);
+        assert_eq!(lines, 32);
+        assert_eq!(new_lines, 8);
     }
 
     #[test]
-    fn the_catalogue_holds_eighteen_distinct_messages() {
+    fn the_catalogue_holds_twenty_one_distinct_messages() {
         let mut m: Vec<&str> = PROPS.iter().map(|p| p.message).collect();
         m.sort_unstable();
         m.dedup();
-        assert_eq!(m.len(), 18);
+        assert_eq!(m.len(), 21);
         let count = |k: Kind| PROPS.iter().filter(|p| p.kind == k).count();
         assert_eq!(count(Kind::Sometimes), 16);
         assert_eq!(count(Kind::Reachable), 1);
         assert_eq!(count(Kind::Unreachable), 1);
+        assert_eq!(count(Kind::Always), 3);
+        // Each kind maps to its macro's arguments: assert type, display type
+        // and must-hit.
+        assert_eq!(
+            kind_args(Kind::Always),
+            (AssertType::Always, "Always", true)
+        );
+        assert_eq!(
+            kind_args(Kind::Sometimes),
+            (AssertType::Sometimes, "Sometimes", true)
+        );
+        assert_eq!(
+            kind_args(Kind::Reachable),
+            (AssertType::Reachability, "Reachable", true)
+        );
+        assert_eq!(
+            kind_args(Kind::Unreachable),
+            (AssertType::Reachability, "Unreachable", false)
+        );
     }
 
     fn answer_after(outcome: Outcome, took: Duration) -> Answer {
@@ -1202,6 +1647,7 @@ mod tests {
             1,
             ACK_PROBES,
             Duration::from_secs(15),
+            false,
             |_, _| {
                 n += 1;
                 // Time spent before the call is not part of the interval.

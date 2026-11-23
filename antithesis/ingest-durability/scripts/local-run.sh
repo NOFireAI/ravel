@@ -26,20 +26,40 @@
 #   CONFIG=config-perf                the perf variant (README.md, "Perf
 #                                     variant"). Needs
 #                                     WORKLOAD_EVENTUALLY_AFTER_SECS; not with
-#                                     a mutant. The run also fails unless the
-#                                     driver printed exactly one perf t0
-#                                     line, one perf summary line, two perf
-#                                     ttfa lines, 20 perf ack lines and two
-#                                     perf median lines (no ack and no median
-#                                     line with PERF_LEVER=no-ack), every perf
-#                                     line is inside its band, and every
-#                                     "required" assertion in
-#                                     local/perf-required.tsv was hit with its
-#                                     condition true.
+#                                     a mutant. The run gates on the mode's
+#                                     line counts and latency bands, on every
+#                                     "required" assertion being hit with its
+#                                     condition true, and on the exact set of
+#                                     violated always-type assertions, which
+#                                     replaces the base "no always-type
+#                                     assertion violated" check: it must equal,
+#                                     whole line for whole line, the messages
+#                                     of class <mode>-violated in
+#                                     local/perf-required.tsv (none in the
+#                                     clean mode). The four modes are clean,
+#                                     slow-ack, no-ack and self-check.
 #   PERF_LEVER=slow-ack|no-ack        with CONFIG=config-perf: layer
 #                                     local/docker-compose.perf-<lever>.yaml
 #                                     and gate on that lever's bands and its
 #                                     lines of local/perf-required.tsv instead.
+#   WORKLOAD_PERF_SELF_CHECK=1        with CONFIG=config-perf (and no
+#                                     PERF_LEVER, and WORKLOAD_EVENTUALLY_AFTER_SECS
+#                                     set): the perf self-check, which layers
+#                                     local/docker-compose.perf-self-check.yaml
+#                                     so ack probes 2, 5 and 8 of each node use
+#                                     a 1 ms client timeout. The run passes
+#                                     only if P2 ("every strict write after
+#                                     recovery is answered within the client
+#                                     timeout") is the single violated
+#                                     always-type assertion.
+#   LOCAL_RUN_ANALYZE_ONLY=1          skip every docker command and wait and
+#                                     re-score a kept run: collect
+#                                     assertions.tsv, would-fail.tsv and
+#                                     violated.tsv and run all gates over the
+#                                     files already in <out-dir>. Refused
+#                                     unless <out-dir>/compose.log and at least
+#                                     one <out-dir>/sdk-*.jsonl exist, and
+#                                     refused with RAVEL_ANTITHESIS_MUTANT.
 #   WORKLOAD_COVERAGE_SELF_CHECK=1    with CONFIG=config-coverage: the
 #                                     variant's self-check, which breaks each
 #                                     of its properties on purpose; the run
@@ -82,9 +102,48 @@ if [ "$VARIANT" = perf ] && [ -z "${WORKLOAD_EVENTUALLY_AFTER_SECS:-}" ]; then
     echo "refused: CONFIG=config-perf needs WORKLOAD_EVENTUALLY_AFTER_SECS: the perf probes run in the eventually"
     exit 1
 fi
+if [ -n "${WORKLOAD_INJECT_MISSING_RECORD:-}" ] && [ "$VARIANT" = perf ]; then
+    echo "refused: WORKLOAD_INJECT_MISSING_RECORD is the base self-check; it does not run with CONFIG=config-perf"
+    exit 1
+fi
+PERF_SELF_CHECK="${WORKLOAD_PERF_SELF_CHECK:-}"
+if [ -n "$PERF_SELF_CHECK" ]; then
+    if [ "$PERF_SELF_CHECK" != 1 ] || [ "$VARIANT" != perf ] || [ -n "$PERF_LEVER" ] \
+        || [ -z "${WORKLOAD_EVENTUALLY_AFTER_SECS:-}" ]; then
+        echo "refused: WORKLOAD_PERF_SELF_CHECK=1 needs CONFIG=config-perf, no PERF_LEVER and WORKLOAD_EVENTUALLY_AFTER_SECS"
+        exit 1
+    fi
+fi
+# The gate mode, set once after the refusals: clean, slow-ack, no-ack or
+# self-check. The perf gate switches on it instead of PERF_LEVER.
+PERF_MODE=clean
+if [ -n "$PERF_LEVER" ]; then
+    PERF_MODE="$PERF_LEVER"
+fi
+if [ -n "$PERF_SELF_CHECK" ]; then
+    PERF_MODE=self-check
+fi
+ANALYZE_ONLY="${LOCAL_RUN_ANALYZE_ONLY:-}"
+if [ -n "$ANALYZE_ONLY" ]; then
+    if [ "$ANALYZE_ONLY" != 1 ]; then
+        echo "refused: LOCAL_RUN_ANALYZE_ONLY must be 1, not '$ANALYZE_ONLY'"
+        exit 1
+    fi
+    if [ -n "$MUTANT" ]; then
+        echo "refused: LOCAL_RUN_ANALYZE_ONLY does not re-score a mutant run"
+        exit 1
+    fi
+    if [ ! -f "$OUT/compose.log" ] || ! ls "$OUT"/sdk-*.jsonl >/dev/null 2>&1; then
+        echo "refused: LOCAL_RUN_ANALYZE_ONLY=1 needs $OUT/compose.log and at least one $OUT/sdk-*.jsonl"
+        exit 1
+    fi
+fi
 export COMPOSE_FILE="$WL/$VARIANT_CONFIG/docker-compose.yaml:$WL/local/docker-compose.local.yaml"
 if [ -n "$PERF_LEVER" ]; then
     COMPOSE_FILE="$COMPOSE_FILE:$WL/local/docker-compose.perf-$PERF_LEVER.yaml"
+fi
+if [ -n "$PERF_SELF_CHECK" ]; then
+    COMPOSE_FILE="$COMPOSE_FILE:$WL/local/docker-compose.perf-self-check.yaml"
 fi
 export COMPOSE_PROJECT_NAME=ravel-antithesis
 if [ -n "$MUTANT" ]; then
@@ -128,6 +187,9 @@ if [ -n "${WORKLOAD_EVENTUALLY_AFTER_SECS:-}" ]; then
     export WORKLOAD_EVENTUALLY=on
 fi
 
+if [ -n "$ANALYZE_ONLY" ]; then
+    echo "analyze-only: re-scoring the kept run in $OUT (no docker)"
+else
 docker compose down -v > /dev/null 2>&1
 docker compose up -d || { echo "compose up failed"; exit 1; }
 docker compose exec -T driver /opt/antithesis/test/v1/main/first_start_workload \
@@ -169,6 +231,7 @@ done
 docker compose logs --no-color > "$OUT/compose.log" 2>&1
 docker compose ps -a > "$OUT/ps.txt" 2>&1
 docker compose stop > /dev/null 2>&1
+fi
 
 # Every assertion with its hit and pass counts, then the ones that would fail.
 jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
@@ -183,8 +246,11 @@ cat "$OUT/would-fail.tsv"
 
 # The gate. A fault-free local run cannot reach the assertions that need
 # faults, so an unreached or never-true assertion is reported above and not
-# gated. What is gated: no SDK output at all, and any always-type assertion
-# that was hit with its condition false.
+# gated. What is gated: no SDK output at all; for every variant but perf, any
+# always-type assertion hit with its condition false; and for a perf run, the
+# exact set of violated always-type assertions equalling the mode's
+# <mode>-violated messages (empty in the clean mode), plus the mode's line
+# counts, latency bands and required assertions.
 jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
     | select(.[0].assert_type != "sometimes" and any(.hit and (.condition | not)))
     | .[0].message' "$OUT"/sdk-*.jsonl | sort > "$OUT/violated.tsv"
@@ -231,15 +297,29 @@ if [ -n "$COVERAGE_SELF_CHECK" ]; then
     echo "coverage self-check OK: all $(wc -l < "$OUT/self-check-expected.tsv") properties violated"
     exit 0
 fi
-if [ -s "$OUT/violated.tsv" ]; then
-    echo "FAIL: always-type assertions violated:"
-    cat "$OUT/violated.tsv"
-    exit 1
+# The base gate for every variant but perf: no always-type assertion may be
+# hit with its condition false. A perf run replaces this with an exact-set
+# check below, because a lever run deliberately violates one always-type
+# assertion and must still reach the perf block.
+if [ "$VARIANT" != perf ]; then
+    if [ -s "$OUT/violated.tsv" ]; then
+        echo "FAIL: always-type assertions violated:"
+        cat "$OUT/violated.tsv"
+        exit 1
+    fi
 fi
 if [ "$VARIANT" = perf ]; then
-    # The pre-registered local bands of #4559. Each figure is printed with its
-    # band; any miss fails the run.
+    # The pre-registered local bands of #4559, except the self-check bands,
+    # which are predicted and were not pre-registered there. Each figure is
+    # printed with its band; any miss fails the run.
     perf_missed=()
+    # The mode's expected-violated and never-hit always-type classes.
+    case "$PERF_MODE" in
+        clean) viol_class=""; unhit_class="" ;;
+        slow-ack) viol_class=slow-ack-violated; unhit_class="" ;;
+        no-ack) viol_class=no-ack-violated; unhit_class=no-ack-unhit ;;
+        self-check) viol_class=self-check-violated; unhit_class="" ;;
+    esac
     perf_count() {
         local name="$1" got="$2" want="$3"
         if [ "$got" -eq "$want" ]; then
@@ -287,8 +367,8 @@ if [ "$VARIANT" = perf ]; then
     perf_count summary "$summary" 1
     perf_count ttfa "$ttfa" 2
     perf_count skipped "$skipped" 0
-    case "$PERF_LEVER" in
-        '')
+    case "$PERF_MODE" in
+        clean)
             perf_count ack "$acks" 20
             perf_count median "$medians" 2
             perf_out_of_band "perf ack " acked 500 1500 "" > "$OUT/perf-ack-out-of-band.txt"
@@ -308,6 +388,41 @@ if [ "$VARIANT" = perf ]; then
             perf_out_of_band "perf ttfa " none "" "" "" > "$OUT/perf-ttfa-out-of-band.txt"
             perf_band "perf ttfa" "outcome=none" "$OUT/perf-ttfa-out-of-band.txt"
             ;;
+        self-check)
+            # Predicted self-check bands: 20 ack lines, of which exactly 6 are
+            # no-response (probes 2, 5 and 8 of each node, abandoned after 1 ms)
+            # and 14 acked; 2 median lines; both ttfa lines as in the clean mode.
+            # The acked floor is 0, not the clean mode's 500: a probe abandoned
+            # after 1 ms can leave its row in the shard's buffer, so the next
+            # probe of that signal flushes on the delay counted from that older
+            # row. That is a reason for a loose floor, not a verified server
+            # behaviour.
+            perf_count ack "$acks" 20
+            perf_count median "$medians" 2
+            ack_noresp=$(awk 'index($0, "perf ack ") && index($0, "outcome=no-response") { c++ } END { print c + 0 }' "$OUT/compose.log")
+            ack_acked=$(awk 'index($0, "perf ack ") && index($0, "outcome=acked") { c++ } END { print c + 0 }' "$OUT/compose.log")
+            perf_count "ack no-response" "$ack_noresp" 6
+            perf_count "ack acked" "$ack_acked" 14
+            awk 'index($0, "perf ack ") {
+                    split("", f)
+                    for (i = 1; i <= NF; i++) {
+                        n = index($i, "=")
+                        if (n) f[substr($i, 1, n - 1)] = substr($i, n + 1)
+                    }
+                    oc = f["outcome"]
+                    if (oc == "no-response") {
+                        if (f["i"] != "2" && f["i"] != "5" && f["i"] != "8") { print; next }
+                        if (f["mono_ms"] !~ /^[0-9]+$/ || f["mono_ms"] + 0 < 0 || f["mono_ms"] + 0 > 1000) { print; next }
+                    } else if (oc == "acked") {
+                        if (f["mono_ms"] !~ /^[0-9]+$/ || f["mono_ms"] + 0 < 0 || f["mono_ms"] + 0 > 1500) { print; next }
+                    } else {
+                        print; next
+                    }
+                }' "$OUT/compose.log" > "$OUT/perf-ack-out-of-band.txt"
+            perf_band "perf ack" "self-check: no-response (i in 2,5,8, 0<=mono_ms<=1000) or acked (0<=mono_ms<=1500)" "$OUT/perf-ack-out-of-band.txt"
+            perf_out_of_band "perf ttfa " acked 0 1500 probes > "$OUT/perf-ttfa-out-of-band.txt"
+            perf_band "perf ttfa" "outcome=acked, 0 <= mono_ms <= 1500, probes 1 or 2" "$OUT/perf-ttfa-out-of-band.txt"
+            ;;
     esac
     # Each listed assertion with its hits and its passes (hits with the
     # condition true) from assertions.tsv; a message absent there is 0 0.
@@ -318,10 +433,11 @@ if [ "$VARIANT" = perf ]; then
     ' "$OUT/assertions.tsv" "$REQUIRED_TSV" > "$OUT/perf.tsv"
     echo "perf variant (class, hits, passes, message):"
     cat "$OUT/perf.tsv"
-    case "$PERF_LEVER" in
-        '') must=required; never="" ;;
+    case "$PERF_MODE" in
+        clean) must=required; never="" ;;
         slow-ack) must=slow-ack-required; never=slow-ack-never ;;
         no-ack) must=""; never=no-ack-never ;;
+        self-check) must=required; never="" ;;
     esac
     for class in $must $never; do
         listed=$(awk -F'\t' -v c="$class" '$1 == c' "$OUT/perf.tsv" | wc -l)
@@ -350,12 +466,88 @@ if [ "$VARIANT" = perf ]; then
             echo "perf gate: no $never assertion hit with its condition true: held"
         fi
     fi
+    # The always-type classes, read as whole lines (never a substring match:
+    # P2's message differs from a T1 Sometimes by two words).
+    awk -F'\t' '$1 == "always" { print $2 }' "$REQUIRED_TSV" | sort > "$OUT/perf-always.tsv"
+    : > "$OUT/perf-mode-violated.tsv"
+    if [ -n "$viol_class" ]; then
+        awk -F'\t' -v c="$viol_class" '$1 == c { print $2 }' "$REQUIRED_TSV" | sort > "$OUT/perf-mode-violated.tsv"
+    fi
+    : > "$OUT/perf-mode-unhit.tsv"
+    if [ -n "$unhit_class" ]; then
+        awk -F'\t' -v c="$unhit_class" '$1 == c { print $2 }' "$REQUIRED_TSV" | sort > "$OUT/perf-mode-unhit.tsv"
+    fi
+    # Guards against an empty read: 3 always lines, 1 MODE-violated line in
+    # every lever/self-check mode, 2 no-ack-unhit lines.
+    always_n=$(grep -c . "$OUT/perf-always.tsv") || always_n=0
+    perf_count "always class" "$always_n" 3
+    always_u=$(sort -u "$OUT/perf-always.tsv" | grep -c .) || always_u=0
+    perf_count "always class distinct" "$always_u" 3
+    if [ -n "$viol_class" ]; then
+        viol_n=$(grep -c . "$OUT/perf-mode-violated.tsv") || viol_n=0
+        perf_count "$viol_class class" "$viol_n" 1
+    fi
+    if [ "$unhit_class" = no-ack-unhit ]; then
+        unhit_n=$(grep -c . "$OUT/perf-mode-unhit.tsv") || unhit_n=0
+        perf_count "no-ack-unhit class" "$unhit_n" 2
+    fi
+    # Exact-set check: violated.tsv, whole line for whole line, must equal the
+    # MODE-violated messages. Name every message violated and not expected (this
+    # covers every non-perf always-type assertion too) and every message
+    # expected and not violated.
+    # grep exits 1 when it selects no line, a normal outcome here; above 1 is an
+    # error and must not read as "no difference".
+    rc=0
+    grep -vxF -f "$OUT/perf-mode-violated.tsv" "$OUT/violated.tsv" > "$OUT/perf-unexpected-violated.tsv" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        echo "perf gate: exact-set check could not compare (grep exit $rc): perf-unexpected-violated.tsv: MISSED"
+        perf_missed+=("exact-set grep failed: perf-unexpected-violated.tsv")
+    fi
+    rc=0
+    grep -vxF -f "$OUT/violated.tsv" "$OUT/perf-mode-violated.tsv" > "$OUT/perf-missing-violated.tsv" || rc=$?
+    if [ "$rc" -gt 1 ]; then
+        echo "perf gate: exact-set check could not compare (grep exit $rc): perf-missing-violated.tsv: MISSED"
+        perf_missed+=("exact-set grep failed: perf-missing-violated.tsv")
+    fi
+    if [ -s "$OUT/perf-unexpected-violated.tsv" ]; then
+        echo "perf gate: always-type assertions violated but not expected in the $PERF_MODE mode: MISSED"
+        cat "$OUT/perf-unexpected-violated.tsv"
+        perf_missed+=("unexpected violations: $(grep -c . "$OUT/perf-unexpected-violated.tsv")")
+    fi
+    if [ -s "$OUT/perf-missing-violated.tsv" ]; then
+        echo "perf gate: always-type assertions expected violated in the $PERF_MODE mode but not violated: MISSED"
+        cat "$OUT/perf-missing-violated.tsv"
+        perf_missed+=("missing violations: $(grep -c . "$OUT/perf-missing-violated.tsv")")
+    fi
+    # Every always line that is neither MODE-violated nor MODE-unhit must be hit
+    # with its condition true at least once; every MODE-unhit line's hits are 0.
+    while IFS= read -r msg; do
+        [ -n "$msg" ] || continue
+        if grep -qxF -- "$msg" "$OUT/perf-mode-violated.tsv" || grep -qxF -- "$msg" "$OUT/perf-mode-unhit.tsv"; then
+            continue
+        fi
+        passes=$(awk -F'\t' -v m="$msg" '$1 == "always" && $4 == m { print $3 }' "$OUT/perf.tsv")
+        if ! [ "${passes:-0}" -ge 1 ] 2>/dev/null; then
+            echo "perf gate: always assertion never hit with its condition true: $msg: MISSED"
+            perf_missed+=("always unmet: $msg")
+        fi
+    done < "$OUT/perf-always.tsv"
+    while IFS= read -r msg; do
+        [ -n "$msg" ] || continue
+        hits=$(awk -F'\t' -v c="$unhit_class" -v m="$msg" '$1 == c && $4 == m { print $2 }' "$OUT/perf.tsv")
+        if ! [ "${hits:-0}" -eq 0 ] 2>/dev/null; then
+            echo "perf gate: $unhit_class assertion was hit (hits ${hits:-0}): $msg: MISSED"
+            perf_missed+=("unhit was hit: $msg")
+        fi
+    done < "$OUT/perf-mode-unhit.tsv"
+    perf_suffix=""
+    [ "$PERF_MODE" != clean ] && perf_suffix=" ($PERF_MODE)"
     if [ "${#perf_missed[@]}" -gt 0 ]; then
-        echo "FAIL: perf gate${PERF_LEVER:+ ($PERF_LEVER)} missed:"
+        echo "FAIL: perf gate${perf_suffix} missed:"
         printf '  %s\n' "${perf_missed[@]}"
         exit 1
     fi
-    echo "OK: perf gate${PERF_LEVER:+ ($PERF_LEVER)} held"
+    echo "OK: perf gate${perf_suffix} held"
 fi
 if [ "$VARIANT" = coverage ]; then
     # Each listed assertion with its hits and its passes (hits with the
@@ -380,4 +572,8 @@ if [ "$VARIANT" = coverage ]; then
     fi
     echo "OK: all $required required coverage assertions met"
 fi
-echo "OK: no always-type assertion violated"
+if [ "$VARIANT" = perf ] && [ -n "${viol_class:-}" ]; then
+    echo "OK: only the expected always-type assertion was violated"
+else
+    echo "OK: no always-type assertion violated"
+fi
