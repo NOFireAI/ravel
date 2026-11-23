@@ -61,7 +61,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch, StructArray};
+use datafusion::arrow::array::{
+    ArrayRef, Decimal128Array, Float64Array, Int64Array, RecordBatch, StructArray,
+};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -234,6 +236,32 @@ enum StatsAggregate<C> {
     },
 }
 
+impl<C: Copy> StatsAggregate<C> {
+    /// The column this call reads statistics for; `None` for `COUNT(*)`.
+    fn col(&self) -> Option<C> {
+        match self {
+            StatsAggregate::CountStar => None,
+            StatsAggregate::Sum { col, .. }
+            | StatsAggregate::Avg { col }
+            | StatsAggregate::SumCount { col } => Some(*col),
+        }
+    }
+
+    /// This call with its column mapped through `f`, or `None` when `f`
+    /// refuses the column.
+    fn map_col<D>(&self, f: impl FnOnce(C) -> Option<D>) -> Option<StatsAggregate<D>> {
+        Some(match *self {
+            StatsAggregate::CountStar => StatsAggregate::CountStar,
+            StatsAggregate::Sum { col, addend } => StatsAggregate::Sum {
+                col: f(col)?,
+                addend,
+            },
+            StatsAggregate::Avg { col } => StatsAggregate::Avg { col: f(col)? },
+            StatsAggregate::SumCount { col } => StatsAggregate::SumCount { col: f(col)? },
+        })
+    }
+}
+
 /// The one aggregate-call classification both sides share: the physical
 /// rewrite ([`classify_aggregate`]) and the logical load gate
 /// ([`logical_aggregate_answerable`]) each reduce their own expression form to
@@ -260,31 +288,36 @@ fn stats_aggregate<C>(
     }
 }
 
-/// Classify `agg`'s single aggregate, or `None` when it is not exactly one
-/// aggregate this rule handles: more than one aggregate expression, and
-/// anything [`stats_aggregate`] refuses, are declined.
+/// Classify every aggregate of `agg`, in output order, or `None` when any one
+/// of them is not an aggregate [`stats_aggregate`] accepts: the statement is
+/// answered as a whole or not at all.
 ///
 /// The logical mirror of this rule's plan-shape conditions is
 /// [`logical_aggregate_answerable`]; a change to either belongs in both.
 fn classify_aggregate(
     agg: &physical_plan::aggregates::AggregateExec,
-) -> Option<StatsAggregate<usize>> {
+) -> Option<Vec<StatsAggregate<usize>>> {
     let aggr_exprs = agg.aggr_expr();
     let filter_exprs = agg.filter_expr();
-    if aggr_exprs.len() != 1 || filter_exprs.len() != 1 {
+    if aggr_exprs.is_empty() || aggr_exprs.len() != filter_exprs.len() {
         return None;
     }
-    let expr = &aggr_exprs[0];
-    let args = expr.expressions();
-    let [arg] = args.as_slice() else {
-        return None;
-    };
-    stats_aggregate(
-        expr.fun().name(),
-        expr.is_distinct(),
-        filter_exprs[0].is_some(),
-        physical_arg(arg)?,
-    )
+    aggr_exprs
+        .iter()
+        .zip(filter_exprs)
+        .map(|(expr, filter)| {
+            let args = expr.expressions();
+            let [arg] = args.as_slice() else {
+                return None;
+            };
+            stats_aggregate(
+                expr.fun().name(),
+                expr.is_distinct(),
+                filter.is_some(),
+                physical_arg(arg)?,
+            )
+        })
+        .collect()
 }
 
 /// `expr` as a [`StatsArg`] over scan-output column indices, or `None` for
@@ -370,8 +403,11 @@ fn not_equal_literal(predicate: &Arc<dyn PhysicalExpr>) -> Option<(usize, Scalar
 /// - **q02**: one `COUNT(*)`, no group key, and exactly one residual
 ///   conjunct, `<declared column> <> <non-null literal>` on a non-`Str`
 ///   column.
-/// - **q03/q04/q30**: one `SUM(col)`, `SUM(col + <int>)` or `AVG(col)` on an
-///   `I64` declared column, no group key, no residual conjunct.
+/// - **q03/q04/q30** and their mixes: no group key, no residual conjunct,
+///   and every aggregate one of `COUNT(*)`, `SUM(col)`, `SUM(col + <int>)` or
+///   `AVG(col)` on an `I64` declared column, in any mix and over any number
+///   of columns, with at least one aggregate reading a column. One
+///   aggregate outside that list refuses the statement.
 /// - **q08**: one `COUNT(*)`, a single group key that is a non-`Str` declared
 ///   column, no residual conjunct.
 ///
@@ -432,8 +468,15 @@ pub(crate) fn logical_aggregate_answerable(
     // conjunct.
     let unfiltered_request = match (aggregate.group_expr.as_slice(), calls.as_slice()) {
         ([], [StatsAggregate::CountStar]) => None,
-        ([], [StatsAggregate::Sum { col, .. } | StatsAggregate::Avg { col }])
-            if matches!(col.ty, DeclaredType::I64) =>
+        // Any mix of SUM/AVG calls and COUNT(*), as long as one reads a column
+        // and every column read is I64: the physical rule answers the
+        // statement as a whole or declines it as a whole.
+        ([], calls)
+            if calls.iter().any(|call| call.col().is_some())
+                && calls.iter().all(|call| {
+                    call.col()
+                        .is_none_or(|col| matches!(col.ty, DeclaredType::I64))
+                }) =>
         {
             Some(ColumnStatsRequest::summary_only())
         }
@@ -690,12 +733,12 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
     };
 
     let schema = node.schema();
-    let batch = match (group, agg_kind) {
+    let batch = match (group, agg_kind.as_slice()) {
         // q02: COUNT(*) WHERE <declared column> <> <literal>. A predicate-
         // free COUNT(*) here is already handled by DataFusion's own built-in
         // AggregateStatistics rule, so require the filter this rule exists
         // for rather than reproducing that case.
-        (None, StatsAggregate::CountStar) => {
+        (None, [StatsAggregate::CountStar]) => {
             let Some(filter) = filter else {
                 return Ok(Transformed::no(node));
             };
@@ -724,7 +767,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
         }
         // q08: <declared column>, COUNT(*) GROUP BY <declared column>. A
         // filter combined with a GROUP BY is out of scope for this rule.
-        (Some(col_index), StatsAggregate::CountStar) => {
+        (Some(col_index), [StatsAggregate::CountStar]) => {
             if filter.is_some() {
                 return Ok(Transformed::no(node));
             }
@@ -739,72 +782,33 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
                 None => return Ok(Transformed::no(node)),
             }
         }
-        // q03/q04: SUM(<declared integer column> + k), ungrouped, no filter.
-        (
-            None,
-            StatsAggregate::Sum {
-                col: col_index,
-                addend,
-            },
-        ) => {
+        // q03/q04/q30 and any mix of them with COUNT(*): ungrouped, no
+        // filter. Column indices are in the scan's output space; resolve each
+        // to its declared column before reading statistics.
+        (None, calls) => {
             if filter.is_some() {
                 return Ok(Transformed::no(node));
             }
-            let Some(k) = scan.declared_index_for_output(col_index) else {
+            let Some(calls) = calls
+                .iter()
+                .map(|call| call.map_col(|col| scan.declared_index_for_output(col)))
+                .collect::<Option<Vec<_>>>()
+            else {
                 return Ok(Transformed::no(node));
             };
-            let Some(cs) = scan.declared_column_sum(k) else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(scalar) = sum_scalar(&schema, &cs, addend) else {
-                return Ok(Transformed::no(node));
-            };
-            match single_scalar_batch(&schema, scalar) {
+            match ungrouped_batch(
+                &schema,
+                &calls,
+                |k| scan.declared_column_sum(k),
+                || scan.declared_row_count(),
+            ) {
                 Some(batch) => batch,
                 None => return Ok(Transformed::no(node)),
             }
         }
-        // q30: AVG(<declared integer column>), ungrouped, no filter.
-        (None, StatsAggregate::Avg { col: col_index }) => {
-            if filter.is_some() {
-                return Ok(Transformed::no(node));
-            }
-            let Some(k) = scan.declared_index_for_output(col_index) else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(cs) = scan.declared_column_sum(k) else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(scalar) = avg_scalar(&schema, &cs) else {
-                return Ok(Transformed::no(node));
-            };
-            match single_scalar_batch(&schema, scalar) {
-                Some(batch) => batch,
-                None => return Ok(Transformed::no(node)),
-            }
-        }
-        // q03/q04 after `crate::sum_plus`: the sum and non-null count of a
-        // declared integer column, ungrouped, no filter. The projection above
-        // computes `sum + k * count` and its overflow check.
-        (None, StatsAggregate::SumCount { col: col_index }) => {
-            if filter.is_some() {
-                return Ok(Transformed::no(node));
-            }
-            let Some(k) = scan.declared_index_for_output(col_index) else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(cs) = scan.declared_column_sum(k) else {
-                return Ok(Transformed::no(node));
-            };
-            match sum_count_batch(&schema, &cs) {
-                Some(batch) => batch,
-                None => return Ok(Transformed::no(node)),
-            }
-        }
-        // A grouped SUM/AVG is out of scope for this rule.
-        (Some(_), StatsAggregate::Sum { .. })
-        | (Some(_), StatsAggregate::Avg { .. })
-        | (Some(_), StatsAggregate::SumCount { .. }) => {
+        // Several aggregates beside a group key are out of scope for this
+        // rule, as is a grouped SUM/AVG.
+        (Some(_), _) => {
             return Ok(Transformed::no(node));
         }
     };
@@ -856,35 +860,99 @@ fn group_counts_batch(schema: &SchemaRef, counts: DeclaredGroupCounts) -> Option
     RecordBatch::try_new(Arc::clone(schema), vec![group_array, count_array]).ok()
 }
 
-/// The `SUM(col + addend)` answer as a scalar: `sum + addend * non_null_count`,
-/// or SQL `NULL` when no non-null row exists (`SUM` over zero rows is `NULL`,
-/// never 0). `None` -- a decline, never a partial answer -- when the outer
-/// schema is not the single `Int64` column `SUM(<Int64>)` produces, or the
-/// arithmetic overflows `i64` (the declared output type): the ADR-0850 lemma
-/// admits no silent truncation, so an overflow falls back to the scan.
-fn sum_scalar(schema: &SchemaRef, cs: &DeclaredColumnSum, addend: i128) -> Option<ScalarValue> {
-    if schema.fields().len() != 1 || *schema.field(0).data_type() != DataType::Int64 {
+/// The one-row answer of an ungrouped, filter-free statement whose every
+/// aggregate is `calls[i]`, under `schema` (one field per call, in order).
+/// Columns are declared-column indices. `read_sum` is called once per distinct
+/// column the calls name, however many calls name it, and `row_count` at most
+/// once, only when a `COUNT(*)` is among them.
+///
+/// `None` -- a decline of the whole statement, never a partial answer -- when
+/// no call reads a column (a bare `COUNT(*)` is DataFusion's
+/// `AggregateStatistics`'s), when either source declines, or when any one
+/// call's answer cannot be built ([`call_array`]).
+fn ungrouped_batch(
+    schema: &SchemaRef,
+    calls: &[StatsAggregate<usize>],
+    mut read_sum: impl FnMut(usize) -> Option<DeclaredColumnSum>,
+    row_count: impl FnOnce() -> Option<u64>,
+) -> Option<RecordBatch> {
+    if schema.fields().len() != calls.len() {
         return None;
     }
-    if cs.non_null_count == 0 {
-        return Some(ScalarValue::Int64(None));
+    let mut sums: Vec<(usize, DeclaredColumnSum)> = Vec::new();
+    for k in calls.iter().filter_map(StatsAggregate::col) {
+        if !sums.iter().any(|(seen, _)| *seen == k) {
+            sums.push((k, read_sum(k)?));
+        }
     }
-    let term = addend.checked_mul(i128::from(cs.non_null_count))?;
-    let total = cs.sum.checked_add(term)?;
-    Some(ScalarValue::Int64(Some(i64::try_from(total).ok()?)))
+    if sums.is_empty() {
+        return None;
+    }
+    let rows = if calls
+        .iter()
+        .any(|call| matches!(call, StatsAggregate::CountStar))
+    {
+        Some(row_count()?)
+    } else {
+        None
+    };
+    let columns = calls
+        .iter()
+        .zip(schema.fields())
+        .map(|(call, field)| {
+            let sum_of = |k: usize| sums.iter().find(|(seen, _)| *seen == k).map(|(_, cs)| cs);
+            match *call {
+                StatsAggregate::CountStar => count_array(field.data_type(), rows?),
+                StatsAggregate::Sum { col, addend } => {
+                    sum_array(field.data_type(), sum_of(col)?, addend)
+                }
+                StatsAggregate::Avg { col } => avg_array(field.data_type(), sum_of(col)?),
+                StatsAggregate::SumCount { col } => {
+                    sum_count_array(field.data_type(), sum_of(col)?)
+                }
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    RecordBatch::try_new(Arc::clone(schema), columns).ok()
 }
 
-/// The `exact_sum_count(col)` answer as a one-row batch: the exact sum and the
-/// non-null count. `None` -- a decline -- when the outer schema is not the
-/// single `exact_sum_count` column, the sum is outside `Decimal128(38, 0)`, or
-/// the count does not fit `i64`.
-fn sum_count_batch(schema: &SchemaRef, cs: &DeclaredColumnSum) -> Option<RecordBatch> {
+/// The `COUNT(*)` answer as a one-row array. `None` when the output field is
+/// not `COUNT(*)`'s `Int64` or the count does not fit it.
+fn count_array(ty: &DataType, count: u64) -> Option<ArrayRef> {
+    if *ty != DataType::Int64 {
+        return None;
+    }
+    Some(Arc::new(Int64Array::from(vec![count_to_i64(count)?])))
+}
+
+/// The `SUM(col + addend)` answer as a one-row array: `sum + addend *
+/// non_null_count`, or SQL `NULL` when no non-null row exists (`SUM` over zero
+/// rows is `NULL`, never 0). `None` -- a decline, never a partial answer --
+/// when the output field is not the `Int64` `SUM(<Int64>)` produces, or the
+/// arithmetic overflows `i64` (the declared output type): the ADR-0850 lemma
+/// admits no silent truncation, so an overflow falls back to the scan.
+fn sum_array(ty: &DataType, cs: &DeclaredColumnSum, addend: i128) -> Option<ArrayRef> {
+    if *ty != DataType::Int64 {
+        return None;
+    }
+    let total = if cs.non_null_count == 0 {
+        None
+    } else {
+        let term = addend.checked_mul(i128::from(cs.non_null_count))?;
+        Some(i64::try_from(cs.sum.checked_add(term)?).ok()?)
+    };
+    Some(Arc::new(Int64Array::from(vec![total])))
+}
+
+/// The `exact_sum_count(col)` answer as a one-row array: the exact sum and the
+/// non-null count. `None` -- a decline -- when the output field is not the
+/// `exact_sum_count` struct, the sum is outside `Decimal128(38, 0)`, or the
+/// count does not fit `i64`.
+fn sum_count_array(ty: &DataType, cs: &DeclaredColumnSum) -> Option<ArrayRef> {
     let DataType::Struct(fields) = sum_count_type() else {
         return None;
     };
-    if schema.fields().len() != 1
-        || *schema.field(0).data_type() != DataType::Struct(fields.clone())
-    {
+    if *ty != DataType::Struct(fields.clone()) {
         return None;
     }
     let sum = SumKind::Signed.state_value(cs.sum).ok()?;
@@ -898,35 +966,21 @@ fn sum_count_batch(schema: &SchemaRef, cs: &DeclaredColumnSum) -> Option<RecordB
         None,
     )
     .ok()?;
-    RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(array)]).ok()
+    Some(Arc::new(array))
 }
 
-/// The `AVG(col)` answer as a scalar: `sum / non_null_count` in `f64`, or SQL
-/// `NULL` when no non-null row exists (`AVG` over zero rows is `NULL`). `None`
-/// when the outer schema is not the single `Float64` column `AVG(<Int64>)`
-/// produces. The division mirrors DataFusion's integer `AVG` exactly: the exact
-/// `i128` sum and the count are each cast to `f64` and divided once, so the
-/// rewritten answer is bit-identical to the scanned one.
-fn avg_scalar(schema: &SchemaRef, cs: &DeclaredColumnSum) -> Option<ScalarValue> {
-    if schema.fields().len() != 1 || *schema.field(0).data_type() != DataType::Float64 {
+/// The `AVG(col)` answer as a one-row array: `sum / non_null_count` in `f64`,
+/// or SQL `NULL` when no non-null row exists (`AVG` over zero rows is `NULL`).
+/// `None` when the output field is not the `Float64` `AVG(<Int64>)` produces.
+/// The division mirrors DataFusion's integer `AVG` exactly: the exact `i128`
+/// sum and the count are each cast to `f64` and divided once, so the rewritten
+/// answer is bit-identical to the scanned one.
+fn avg_array(ty: &DataType, cs: &DeclaredColumnSum) -> Option<ArrayRef> {
+    if *ty != DataType::Float64 {
         return None;
     }
-    if cs.non_null_count == 0 {
-        return Some(ScalarValue::Float64(None));
-    }
-    let avg = (cs.sum as f64) / (cs.non_null_count as f64);
-    Some(ScalarValue::Float64(Some(avg)))
-}
-
-/// A single-row, single-column batch carrying `scalar` under `schema`. `None`
-/// on a schema-width mismatch (an internal-error decline; see
-/// [`count_star_batch`]).
-fn single_scalar_batch(schema: &SchemaRef, scalar: ScalarValue) -> Option<RecordBatch> {
-    if schema.fields().len() != 1 {
-        return None;
-    }
-    let array = scalar.to_array().ok()?;
-    RecordBatch::try_new(Arc::clone(schema), vec![array]).ok()
+    let avg = (cs.non_null_count != 0).then(|| (cs.sum as f64) / (cs.non_null_count as f64));
+    Some(Arc::new(Float64Array::from(vec![avg])))
 }
 
 /// `count` as `i64`, `COUNT(*)`'s declared output type. `None` on overflow,

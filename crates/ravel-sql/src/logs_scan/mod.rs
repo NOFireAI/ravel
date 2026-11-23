@@ -2889,6 +2889,20 @@ impl LogsScanExec {
         })
     }
 
+    /// Exact count of the rows this scan emits, for a `COUNT(*)` the metadata
+    /// rewrite answers beside a [`Self::declared_column_sum`] aggregate: the
+    /// sum of every touched segment's [`SegmentRef::sample_count`], the figure
+    /// [`Self::stats_are_exact`] grants DataFusion as `num_rows`. `None` means
+    /// fall back to scanning, under the same
+    /// [`Self::metadata_rewrite_stats_are_exact`] gate as the other
+    /// statistics answers, or when the sum overflows `u64`.
+    pub(crate) fn declared_row_count(&self) -> Option<u64> {
+        if !self.metadata_rewrite_stats_are_exact() {
+            return None;
+        }
+        self.sample_count_total()
+    }
+
     /// Whether this scan can take the predicate-free full-window whole-segment
     /// fast path (#693 part 3 deliverable 1, amended by #739), returning the
     /// count of relevant (ts-overlapping) segments when it can and the conjunct
