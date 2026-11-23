@@ -2655,6 +2655,12 @@ pub struct CompactorConfig {
     /// The versions fixed for the run in flight; set per run on a clone, like
     /// [`Self::claim_guard`]. Callers leave it `None`.
     pub compat_run: Option<crate::compat_policy::CompatRun>,
+    /// Whether the declared-column stamps this process writes on a logs
+    /// compaction, migrate or force 2 output part carry the sum and the zero
+    /// count (ADR-4628 decision 8, question 6b). Default `true`. When `false`
+    /// each stamp keeps its min, max and null count and omits both fields, so
+    /// a statement that needs them scans that part.
+    pub emit_declared_stat_aggregates: bool,
 }
 
 impl Default for CompactorConfig {
@@ -2711,6 +2717,7 @@ impl Default for CompactorConfig {
             reencode_writer_enabled: false,
             compat_policy: None,
             compat_run: None,
+            emit_declared_stat_aggregates: true,
         }
     }
 }

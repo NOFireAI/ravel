@@ -237,6 +237,9 @@ async fn present(store: &dyn ObjectStoreBackend, key: &str) -> bool {
 /// `BucketEntry::RewriteRecord` arm back to `continue`) leaves the L0 data
 /// objects in place, failing the `l0_data_count == 0` assertion after the
 /// horizon.
+///
+/// ADR-4628 test 11: the superseded inputs' raw commit records, which carry
+/// their declared-column stamps, are gone from `c/` after the horizon too.
 #[tokio::test]
 async fn rewrite_raw_l0_inputs_swept_only_after_horizon() {
     let store = MemoryStore::new();
@@ -255,6 +258,8 @@ async fn rewrite_raw_l0_inputs_swept_only_after_horizon() {
     );
     let rw_key = find_record_key(&store, true).await;
     let rw_parts = rewrite_part_keys(&store, &rw_key).await;
+    let (input_records, _) = bucket_record_keys(&store, &b).await;
+    assert_eq!(input_records.len(), 2, "two raw commit records seeded");
 
     // Before the horizon: the rewrite record superseded the inputs, but they
     // are not yet collectable.
@@ -275,6 +280,17 @@ async fn rewrite_raw_l0_inputs_swept_only_after_horizon() {
         l0_data_count(&store, &b).await,
         0,
         "L0 inputs physically gone after the horizon"
+    );
+    for k in &input_records {
+        assert!(
+            !present(&store, k).await,
+            "superseded raw commit record gone after the horizon: {k}"
+        );
+    }
+    let (remaining, _) = bucket_record_keys(&store, &b).await;
+    assert!(
+        remaining.is_empty(),
+        "no raw commit record remains under c/"
     );
     assert!(
         present(&store, &rw_key).await,
