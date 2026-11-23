@@ -369,9 +369,25 @@ impl ServiceError {
             | QueryError::TooManySliceFrames { .. }
             | QueryError::TooManySliceBytes { .. }
             | QueryError::RequestBudgetExceeded { .. } => ServiceErrorKind::BudgetExceeded,
+            // A memory refusal is a budget refusal of a well-formed query, the
+            // 422 HTTP answers (ADR-2633 decision 5), not a retryable outage.
+            QueryError::Fetch(ravel_query::FetchError::FetchMemoryExhausted { .. })
+            | QueryError::Catalog(ravel_catalog::CatalogError::MemoryExhausted(_))
+            | QueryError::AllocationRefused { .. } => ServiceErrorKind::BudgetExceeded,
             QueryError::DeadlineExceeded { .. } => ServiceErrorKind::Deadline,
             QueryError::SnapshotInvalidated => ServiceErrorKind::SnapshotInvalidated,
             QueryError::Eval(_) => ServiceErrorKind::Validation,
+            QueryError::Catalog(_)
+            | QueryError::Fetch(_)
+            | QueryError::CpuGate(_)
+            | QueryError::Distrib { .. }
+            | QueryError::Federation { .. }
+            | QueryError::NonMonotonicSamples { .. }
+            | QueryError::PrioritySampleCountMismatch { .. }
+            | QueryError::DuplicatePushdownSeries { .. } => ServiceErrorKind::Unavailable,
+            // `QueryError` is `#[non_exhaustive]`, so this crate cannot match
+            // it exhaustively; `from_query_classes_every_variant` lists the
+            // variants a new one has to be added beside.
             _ => ServiceErrorKind::Unavailable,
         };
         let api = ApiError::from_query(err);
@@ -536,5 +552,209 @@ impl From<ServiceError> for Response {
 impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
         ApiError::from(self).into_response()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use ravel_catalog::CatalogError;
+    use ravel_cpu_gate::CpuGateError;
+    use ravel_memory::{ExhaustionCause, MemoryExhausted};
+    use ravel_object_store::StoreError;
+    use ravel_query::{FetchError, FoldLag};
+
+    use super::*;
+
+    /// The memory refusals, one per variant that carries one: a fetch the
+    /// budget refused, a catalog decode it refused, and an allocation the
+    /// allocator refused after the budget admitted it.
+    pub(crate) fn memory_refusals() -> Vec<(&'static str, QueryError)> {
+        let exhausted = MemoryExhausted {
+            requested: 9,
+            reserved: 4,
+            limit: 8,
+            cause: ExhaustionCause::Accounted,
+        };
+        vec![
+            (
+                "FetchMemoryExhausted",
+                QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                    requested: exhausted.requested,
+                    reserved: exhausted.reserved,
+                    limit: exhausted.limit,
+                    cause: ExhaustionCause::HostMemory {
+                        available: 1,
+                        floor: 2,
+                    },
+                }),
+            ),
+            (
+                "Catalog(MemoryExhausted)",
+                QueryError::Catalog(CatalogError::MemoryExhausted(exhausted)),
+            ),
+            (
+                "AllocationRefused",
+                QueryError::AllocationRefused { requested: 9 },
+            ),
+        ]
+    }
+
+    /// Every memory refusal is the 422 HTTP answers and the `BudgetExceeded`
+    /// class, never the retryable `Unavailable` (ADR-2633 decision 5).
+    ///
+    /// FLIP: drop any one of the three patterns from the memory arm of
+    /// `from_query` and that case falls to `Unavailable`.
+    #[test]
+    fn from_query_classes_every_memory_refusal_as_budget_exceeded() {
+        for (name, err) in memory_refusals() {
+            let error = ServiceError::from_query(err);
+
+            assert_eq!(error.kind, ServiceErrorKind::BudgetExceeded, "{name}");
+            assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY, "{name}");
+        }
+    }
+
+    /// One case per `QueryError` variant, each pinned to its class. The
+    /// enum is `#[non_exhaustive]`, so `from_query` keeps a wildcard; a new
+    /// variant belongs both in an explicit arm there and in this list.
+    /// `Fetch` and `Catalog` are pinned through a transient store fault and
+    /// the memory refusals; a fault that redacts to a 500 is `Internal`.
+    #[test]
+    fn from_query_classes_every_variant() {
+        let store = || StoreError::Transient("down".to_string());
+        let mut cases = vec![
+            (
+                QueryError::Parse("x".to_string()),
+                ServiceErrorKind::InvalidArgument,
+            ),
+            (
+                QueryError::NonPositiveStep { step_ms: 0 },
+                ServiceErrorKind::InvalidArgument,
+            ),
+            (
+                QueryError::InvalidRange {
+                    start_ms: 2,
+                    end_ms: 1,
+                },
+                ServiceErrorKind::InvalidArgument,
+            ),
+            (QueryError::TimeOverflow, ServiceErrorKind::InvalidArgument),
+            (
+                QueryError::Unsupported {
+                    construct: "x".to_string(),
+                },
+                ServiceErrorKind::Unsupported,
+            ),
+            (
+                QueryError::Catalog(CatalogError::Store(store())),
+                ServiceErrorKind::Unavailable,
+            ),
+            (
+                QueryError::Fetch(FetchError::Store {
+                    key: "k".to_string(),
+                    source: store(),
+                }),
+                ServiceErrorKind::Unavailable,
+            ),
+            (
+                QueryError::Eval(ravel_promql::Error::TimeOverflow),
+                ServiceErrorKind::Validation,
+            ),
+            (
+                QueryError::CpuGate(CpuGateError::Cancelled),
+                ServiceErrorKind::Unavailable,
+            ),
+            (
+                QueryError::CpuGate(CpuGateError::Panicked),
+                ServiceErrorKind::Internal,
+            ),
+            (
+                QueryError::TooManySegments { count: 9, max: 8 },
+                ServiceErrorKind::BudgetExceeded,
+            ),
+            (
+                QueryError::TooManySeries { count: 9, max: 8 },
+                ServiceErrorKind::BudgetExceeded,
+            ),
+            (
+                QueryError::TooManySamples { count: 9, max: 8 },
+                ServiceErrorKind::BudgetExceeded,
+            ),
+            (
+                QueryError::TooManyBytesScanned { scanned: 9, max: 8 },
+                ServiceErrorKind::BudgetExceeded,
+            ),
+            (
+                QueryError::TooManySliceFrames { frames: 9, max: 8 },
+                ServiceErrorKind::BudgetExceeded,
+            ),
+            (
+                QueryError::TooManySliceBytes { bytes: 9, max: 8 },
+                ServiceErrorKind::BudgetExceeded,
+            ),
+            (
+                QueryError::RequestBudgetExceeded {
+                    requests: 9,
+                    max: 8,
+                    fold_lag: FoldLag::Healthy,
+                },
+                ServiceErrorKind::BudgetExceeded,
+            ),
+            (
+                QueryError::DeadlineExceeded {
+                    deadline: std::time::Duration::from_secs(1),
+                },
+                ServiceErrorKind::Deadline,
+            ),
+            (
+                QueryError::SnapshotInvalidated,
+                ServiceErrorKind::SnapshotInvalidated,
+            ),
+            (
+                QueryError::Distrib {
+                    reason: "x".to_string(),
+                },
+                ServiceErrorKind::Unavailable,
+            ),
+            (
+                QueryError::Federation {
+                    cluster: "c".to_string(),
+                    reason: "x".to_string(),
+                },
+                ServiceErrorKind::Unavailable,
+            ),
+            (
+                QueryError::NonMonotonicSamples { prev: 2, next: 1 },
+                ServiceErrorKind::Internal,
+            ),
+            (
+                QueryError::PrioritySampleCountMismatch {
+                    priorities: 1,
+                    samples: 2,
+                },
+                ServiceErrorKind::Unavailable,
+            ),
+            (
+                QueryError::DuplicatePushdownSeries {
+                    series_id: "s".to_string(),
+                },
+                ServiceErrorKind::Unavailable,
+            ),
+        ];
+        cases.extend(
+            memory_refusals()
+                .into_iter()
+                .map(|(_, err)| (err, ServiceErrorKind::BudgetExceeded)),
+        );
+
+        for (err, kind) in cases {
+            let label = format!("{err:?}");
+            let error = ServiceError::from_query(err);
+
+            assert_eq!(error.kind, kind, "{label}");
+            if error.status == StatusCode::INTERNAL_SERVER_ERROR {
+                assert_eq!(error.kind, ServiceErrorKind::Internal, "{label}");
+            }
+        }
     }
 }
