@@ -21,6 +21,7 @@ mod key_index_rebuild;
 mod metrics_meta;
 mod provisioning;
 mod read_gate;
+mod resolve_timings;
 mod seal_divergence;
 mod snapshot;
 mod snapshot_format;
@@ -115,6 +116,7 @@ pub use provisioning::{
     scan_shards_over_range, shard_ceiling, shard_count_drift_count, stable_generation_for_hour,
     validate_or_adopt, validate_or_adopt_fenced,
 };
+pub use resolve_timings::ResolveTimings;
 pub use seal_divergence::{
     EntryIdentity, SealDivergenceError, SealDivergenceReport, SnapshotCoverage, snapshot_coverage,
     verify_seal_divergence,
