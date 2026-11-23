@@ -129,7 +129,8 @@ use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{
-    Catalog, CatalogError, ColumnStatsRequest, SegmentOrigins, Snapshot, SnapshotParts,
+    Catalog, CatalogError, ColumnStatsRequest, ResolveTimings, SegmentOrigins, Snapshot,
+    SnapshotParts,
 };
 use ravel_logseg::decoded_cache::{DecodedCacheSnapshot, PressureSnapshot};
 use ravel_memory::MemoryBudget;
@@ -594,6 +595,8 @@ struct Resolved {
     /// How many signal tables the statement names, before a statement naming
     /// none is given the default `samples` lane.
     signal_tables_named: usize,
+    /// The catalog resolves' parts, summed over the lanes.
+    timings: ResolveTimings,
 }
 
 /// One signal's snapshot within a [`Resolved`] statement.
@@ -1117,6 +1120,17 @@ pub struct SqlStats {
 pub struct PhaseWallTiming {
     /// Around the attempt's snapshot resolve.
     pub resolve_ns: u64,
+    /// The parts of `resolve_ns`, summed over the statement's signal lanes
+    /// ([`ravel_catalog::ResolveTimings`]): the provisioning and generation
+    /// reads, the joined LIST wave, and the records pass up to the sorted set.
+    pub resolve_generations_ns: u64,
+    pub resolve_list_wave_ns: u64,
+    pub resolve_records_ns: u64,
+    /// The rest of `resolve_ns`, so the four parts sum to it: the catalog's
+    /// own remainder (snapshot parts and postings) plus the executor's work
+    /// around the catalog calls, such as the Parquet manifest resolve and the
+    /// decoded-parts charge.
+    pub resolve_other_ns: u64,
     /// Around logical planning against the pinned snapshot.
     pub plan_ns: u64,
     /// Physical plan creation plus starting the stream.
@@ -1127,6 +1141,33 @@ pub struct PhaseWallTiming {
     /// From the first batch (or the stream starting, when there was none) to
     /// the stream's end.
     pub drain_ns: u64,
+}
+
+impl PhaseWallTiming {
+    /// Sets `resolve_ns` and its parts. `parts` come from the catalog's clock
+    /// and `resolve_ns` from this executor's, so the remainder saturates at
+    /// zero rather than going negative when they disagree.
+    #[must_use]
+    fn with_resolve(self, resolve_ns: u64, parts: ResolveTimings) -> Self {
+        let generations = duration_ns(parts.generations);
+        let list_wave = duration_ns(parts.list_wave);
+        let records = duration_ns(parts.records);
+        Self {
+            resolve_ns,
+            resolve_generations_ns: generations,
+            resolve_list_wave_ns: list_wave,
+            resolve_records_ns: records,
+            resolve_other_ns: resolve_ns
+                .saturating_sub(generations)
+                .saturating_sub(list_wave)
+                .saturating_sub(records),
+            ..self
+        }
+    }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn elapsed_ns(since: Instant) -> u64 {
@@ -2882,6 +2923,7 @@ impl SqlExecutor {
                 )
                 .await?;
             let resolve_ns = elapsed_ns(resolve_started);
+            let resolve_parts = resolved.timings;
             stats.resolves += 1;
             stats.attempts += 1;
             stats.segments = resolved.segments_resolved();
@@ -3009,10 +3051,7 @@ impl SqlExecutor {
                     stats.rowpath_batches = blocks.rowpath_batches;
                     stats.columnar_batches = blocks.columnar_batches;
                     stats.scan_timing = blocks.timing;
-                    stats.wall = PhaseWallTiming {
-                        resolve_ns,
-                        ..caps.wall
-                    };
+                    stats.wall = caps.wall.with_resolve(resolve_ns, resolve_parts);
                     stats.histogram_series_skipped = blocks.histogram_series_skipped;
                     stats.cache = cache_mark
                         .as_ref()
@@ -4524,6 +4563,7 @@ impl SqlExecutor {
                     target: TargetSignal::Parquet,
                     parquet,
                     signal_tables_named: 0,
+                    timings: ResolveTimings::default(),
                 });
             }
         }
@@ -4566,6 +4606,7 @@ impl SqlExecutor {
         let mut resolved = Vec::with_capacity(lanes.len());
         let mut unfolded_segments_resolved = 0_u64;
         let mut sealed_total = 0_u64;
+        let mut timings = ResolveTimings::default();
         // Every lane resolves at the request's one resolve instant and window,
         // in `SIGNAL_LANE_ORDER`, before anything is planned.
         for lane in lanes {
@@ -4590,7 +4631,7 @@ impl SqlExecutor {
             let with_parts = if matches!(lane, TargetSignal::Spans | TargetSignal::Logs) {
                 match self
                     .catalog
-                    .resolve_pruned_with_parts(
+                    .resolve_pruned_with_parts_timed(
                         &tenant_hash,
                         signal,
                         req.window,
@@ -4608,23 +4649,25 @@ impl SqlExecutor {
             } else {
                 None
             };
-            let (snapshot, origins, parts) = if let Some((snapshot, origins, parts)) = with_parts {
-                (snapshot, origins, Some(parts))
-            } else {
-                let (snapshot, origins) = self
-                    .catalog
-                    .resolve_pruned_with_admission(
-                        &tenant_hash,
-                        signal,
-                        req.window,
-                        tokens.for_lane(lane),
-                        clocks.resolve_at_ns,
-                        lane_name_filter,
-                        phase_accounting.lane(lane).resolve(),
-                    )
-                    .await?;
-                (snapshot, origins, None)
-            };
+            let (snapshot, origins, parts, lane_timings) =
+                if let Some((snapshot, origins, parts, lane_timings)) = with_parts {
+                    (snapshot, origins, Some(parts), lane_timings)
+                } else {
+                    let (snapshot, origins, lane_timings) = self
+                        .catalog
+                        .resolve_pruned_with_admission_timed(
+                            &tenant_hash,
+                            signal,
+                            req.window,
+                            tokens.for_lane(lane),
+                            clocks.resolve_at_ns,
+                            lane_name_filter,
+                            phase_accounting.lane(lane).resolve(),
+                        )
+                        .await?;
+                    (snapshot, origins, None, lane_timings)
+                };
+            timings = timings.saturating_add(lane_timings);
             // Exact count of `SegmentOrigin::Recent` entries (issue #1214): the
             // one origin a folded catalog has not yet sealed, so it is never
             // served from the RSEG cache the way a folded, below-watermark
@@ -4683,6 +4726,7 @@ impl SqlExecutor {
             target,
             parquet,
             signal_tables_named: tables.signals.len(),
+            timings,
         })
     }
 

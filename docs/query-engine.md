@@ -4253,7 +4253,23 @@ buckets `stats.phases` names, and they live in their own object so the
 
 - `attempts`: plan-and-execute attempts, 2 when the snapshot retry fired.
 - `resolveMs`: the snapshot resolve (`SqlExecutor::resolve`: the catalog
-  listing and HEAD reads, plus any Parquet table resolution).
+  listing and HEAD reads, plus any Parquet table resolution). The next four
+  keys split it into disjoint parts that sum to it, each summed over the
+  statement's signal tables and measured on the catalog's monotonic clock
+  (`ravel_catalog::ResolveTimings`).
+- `resolveGenerationsMs`: the provisioning reads that open each catalog
+  resolve, the once-per-pair `shard_count` check and the generation history
+  read.
+- `resolveListWaveMs`: the joined LIST wave, from its start until the last
+  shard or `del/` LIST returns, plus each HEAD lookup that issued a store
+  request.
+- `resolveRecordsMs`: from the end of the LIST wave to the sorted segment
+  set: the commit record pass and bucket processing that outlast the wave,
+  the `min_tokens` probes and the sort.
+- `resolveOtherMs`: the rest of `resolveMs`, such as loading the snapshot
+  parts and postings, Parquet table resolution and the charge for decoded
+  parts; on a statement that names only Parquet tables it equals
+  `resolveMs` and the other three parts read 0.
 - `planMs`: logical planning against the pinned snapshot.
 - `startMs`: physical plan creation plus starting the stream.
 - `firstBatchMs`: from the stream starting to its first batch; 0 when the

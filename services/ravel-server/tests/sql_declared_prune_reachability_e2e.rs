@@ -373,9 +373,13 @@ fn pruning(value: &serde_json::Value, key: &str) -> u64 {
 
 /// The timing fields present for every statement, and the three that are
 /// present only when the plan holds exactly one logs scan.
-const TIMINGS_ALWAYS: [&str; 11] = [
+const TIMINGS_ALWAYS: [&str; 15] = [
     "attempts",
     "resolveMs",
+    "resolveGenerationsMs",
+    "resolveListWaveMs",
+    "resolveRecordsMs",
+    "resolveOtherMs",
     "planMs",
     "startMs",
     "firstBatchMs",

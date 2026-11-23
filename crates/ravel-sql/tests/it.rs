@@ -170,6 +170,8 @@ mod pipeline;
 mod pushdown_memory;
 #[path = "query_accounting.rs"]
 mod query_accounting;
+#[path = "resolve_timing_parts.rs"]
+mod resolve_timing_parts;
 #[path = "rowpath_stats.rs"]
 mod rowpath_stats;
 #[path = "scan_budgets.rs"]
