@@ -431,7 +431,7 @@
 #
 #   ingest      metricsbench_ingest with the Ravel row alone
 #               (--no-in-process-row) into <out>/ingest.json. A Ravel row
-#               whose read-back answered 422 is stamped refused (budget) as
+#               whose series listing answered 422 is stamped refused (budget) as
 #               ravel_only.ingest_readback, one whose series listing answered
 #               504 with the server's query-deadline message is stamped
 #               deadline there, each with series_query_ms as a read-back
@@ -466,7 +466,8 @@
 #               differ between the two read-backs, same or differs,
 #               postings_built among them: ravel_only.STATE.postings_built
 #               is stamped from <out>/stage1-STATE-fold.json, null when
-#               that report is missing or unreadable, and null differs
+#               that report is missing or unreadable or its postings_built
+#               is absent or not a boolean, and null differs
 #   objects-l1  as objects-l0, into <out>/ravel-objects-l1.json and
 #               <out>/ravel-only-l1.objects.jsonl (ravel_only.l1.objects,
 #               the L1 parts under its l1 kind, and .catalog_objects)
@@ -474,18 +475,26 @@
 #               name (ravel_only.l1.readback)
 #
 # Each ravel_only.STATE.readback carries verdict (matched, mismatch, error,
-# refused (budget) when the series listing answered 422, or deadline when it
-# answered 504 with the server's "query exceeded its deadline of D"),
-# series_query_ms (from the error's "query series failed after N ms" on a 422
-# or a deadline, else the deadline D it names), series_store_get_calls and
-# series_store_get_bytes (the series listing's own GETs from query_cost.series),
-# series_figures_from (readback, or readback_partial when a later query failed
-# after the listing answered, or readback_error), and Ravel's
-# ravel_store_calls_total and ravel_store_bytes_total for op="get" before and
-# after the whole read-back with their deltas; ravel_only.l0.series_query_ms,
-# .verdict and the same under l1 repeat the two headline figures. A mismatch
-# or error fails the read-back step, and so does any of those figures missing
-# (a miss); refused (budget) and deadline go on to the next step. The
+# refused (budget) when the error names the series query ("query series
+# failed") and it answered 422, or deadline when it answered 504 with the
+# server's "query exceeded its deadline of D"; a failure of any other query
+# is error, and so is every read-back that carries readback_partial),
+# series_query_ms (the read-back's or readback_partial's query_ms.series,
+# else from the error's "query series failed after N ms" on a 422 or a
+# deadline, else the deadline D it names), series_store_get_calls and
+# series_store_get_bytes (process_store_get_delta and
+# process_store_get_bytes_delta from query_cost.series: the change in Ravel's
+# process-wide GET counters between the scrapes taken right before and right
+# after the listing), series_figures_from (readback, or readback_partial
+# when a later query failed after the listing answered, or readback_error),
+# and Ravel's ravel_store_calls_total and ravel_store_bytes_total for
+# op="get" before and after the whole read-back with their deltas;
+# ravel_only.l0.series_query_ms, .verdict and the same under l1 repeat the
+# two headline figures. A mismatch or error fails the read-back step, and so
+# does a miss: series_query_ms null, a before or after of the whole
+# read-back's counters null, or, when series_figures_from is readback or
+# readback_partial, series_store_get_calls or series_store_get_bytes null.
+# refused (budget) and deadline go on to the next step. The
 # sampler, mimir-readiness, objects, query, capture, provenance, validate,
 # memory, object-spans and folded steps do not run, so
 # no report.json, memory.jsonl or memory-summary.json is written; the query,
@@ -756,14 +765,16 @@ def median(xs):
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
 def grade_readback_error(err):
-    # A read-back error's verdict and the series listing's elapsed ms:
-    # refused (budget) for a 422; deadline for a 504 whose body carries
-    # QueryError::DeadlineExceeded's message, the deadline in Duration's
-    # Debug form ("120s", "2.5s", "500ms"); else error. The ms is the
-    # error's "query series failed after N ms", else the deadline it names.
+    # A read-back error's verdict and the series listing's elapsed ms. Only
+    # an error that names the series query ("query series failed") grades as
+    # the listing's: refused (budget) for a 422; deadline for a 504 whose
+    # body carries QueryError::DeadlineExceeded's message, the deadline in
+    # Duration's Debug form ("120s", "2.5s", "500ms"). Any other error,
+    # including a 422 from a later query, is error. The ms is the error's
+    # "query series failed after N ms", else the deadline it names.
     deadline = re.search(r"\bquery series failed\b.*\banswered 504\b.*\bquery exceeded its deadline of "
                          r"(\d+(?:\.\d+)?)" "(ns|\N{MICRO SIGN}s|us|ms|s)" r"\b", err, re.S)
-    if re.search(r"\banswered 422\b", err):
+    if re.search(r"\bquery series failed\b.*\banswered 422\b", err, re.S):
         verdict = "refused (budget)"
     elif deadline:
         verdict = "deadline"
@@ -1329,6 +1340,8 @@ elif op == "ravel-only-readback":
         if stamp["series_query_ms"] is not None:
             stamp["series_figures_from"] = "readback_error"
         if isinstance(doc.get("readback_partial"), dict):
+            # The listing answered and a later query failed.
+            stamp["verdict"] = "error"
             listing = ("readback_partial", doc["readback_partial"])
     if listing is not None:
         source, part = listing
@@ -1346,6 +1359,8 @@ elif op == "ravel-only-readback":
         stamp["verdict"] = "error"
         stamp["error"] = f"{os.path.basename(out_path)} carries neither readback nor readback_error"
     missing = [k for k in ("series_query_ms",) if stamp[k] is None]
+    if stamp["series_figures_from"] in ("readback", "readback_partial"):
+        missing += [k for k in ("series_store_get_calls", "series_store_get_bytes") if stamp[k] is None]
     for key in ("store_get_calls", "store_get_bytes"):
         missing += [f"{key}.{w}" for w in ("before", "after") if stamp[key][w] is None]
     stamp["missing"] = missing

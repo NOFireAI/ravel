@@ -2108,15 +2108,16 @@ Steps, in order, stopping at the first failure (case ro1):
    `/api/v1/status/buildinfo` alone.
 4. `ingest`: `metricsbench_ingest` with the Ravel row alone, passing
    `--ravel-endpoint` and `--no-in-process-row` and no other row's
-   endpoint, into `ingest.json`. A Ravel read-back that answered 422 is
-   stamped `refused (budget)` in `ravel_only.ingest_readback` and the run
+   endpoint, into `ingest.json`. A Ravel read-back whose series listing
+   answered 422 is stamped `refused (budget)` in `ravel_only.ingest_readback` and the run
    goes on (case ro4). One whose series listing answered 504 with the
    server's query-deadline message is stamped `deadline` there and the run
    goes on too (case ro4b); on `history` this read-back reads the unfolded
    catalog under the same 120 s deadline. Either stamp carries `error` and
    `series_query_ms`, graded as for the read-back verdict below. Any other
    failed or extra row fails the step, a 504 without that message included
-   (case ro4c).
+   (case ro4c), and so does a 422 from any query other than the series
+   listing (case ro11).
 5. `stage1-l0-fold`: ravel-server stopped (the writers), then a wait
    through `METRICSBENCH_SLEEP` until the last ingest hour seals (its end
    plus the 5 minute clock-skew allowance and a minute, the same wait
@@ -2171,14 +2172,20 @@ For each catalog state (`l0` and `l1`), `stamps.json` holds these keys under
 - `catalog_objects`: the catalog's L0 and L1 data object counts.
 - `postings_built`: the `postings_built` of the fold report that built the
   snapshot (`stage1-STATE-fold.json`), or null when that report is missing
-  or unreadable.
+  or unreadable or its `postings_built` is absent or not a boolean.
 - `readback`: what the read-back produced:
   - `verdict`;
   - `series_query_ms`;
-  - `series_store_get_calls` and `series_store_get_bytes`: the GETs and GET
-    bytes the series listing alone caused, from the read-back's
+  - `series_store_get_calls` and `series_store_get_bytes`: the read-back's
     `query_cost.series` (`process_store_get_delta` and
-    `process_store_get_bytes_delta`), null when it carries none;
+    `process_store_get_bytes_delta`), the change in ravel-server's
+    process-wide `ravel_store_calls_total` and `ravel_store_bytes_total`
+    with `op="get"` between the scrapes taken right before and right after
+    the series listing. Process-wide, so a background GET in that window
+    counts too. The bytes are object bytes returned by successful GETs, a
+    ranged read counted as its range: not HTTP wire bytes, not decompressed
+    bytes. Null when the read-back carries none, which is a miss when
+    `series_figures_from` is `readback` or `readback_partial` (case ro11);
   - `series_figures_from`: where the listing's figures came from:
     `readback`, `readback_partial` (a later query failed after the listing
     answered, case ro9), `readback_error` (the time the error names) or
@@ -2196,9 +2203,12 @@ The verdict is one of these:
 - `matched`;
 - `mismatch`, which fails the step (case ro5);
 - `error`, which fails the step. When the series listing answered and a
-  later query failed, the listing's time and GETs are still stamped from
-  `readback_partial` (case ro9).
-- `refused (budget)`, when the series listing answered 422. The run goes on,
+  later query failed, the verdict is `error` whatever status that query
+  answered, a 422 included, and the listing's time and GETs are still
+  stamped from `readback_partial` (cases ro9 and ro9b).
+- `refused (budget)`, when the error names the series query
+  (`query series failed`) and it answered 422. A 422 from any other query
+  is `error` (case ro11). The run goes on,
   and `series_query_ms` is the elapsed time that the error names (case
   ro4).
 - `deadline`, when the series listing answered 504 with the server's
