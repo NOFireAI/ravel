@@ -2,6 +2,9 @@
 //! whole-object min/max and null count of each stamp-eligible declared column
 //! (I64 and BOOL only, decision 2) as records land in a tenant's flush buffer,
 //! then stamps them onto that flush's `CommitRecord` beside `sample_count`.
+//! ADR-4628 adds the exact sum (I64 only, in `i128`) and the zero count (I64
+//! and BOOL) to the same running figures, over the same merged view, unless
+//! `IngestConfig::emit_declared_stat_aggregates` opts out.
 //!
 //! The extrema are captured in-stream, O(1) per record per attribute, never by
 //! a second pass over the buffered records at flush time: each buffered write
@@ -1001,6 +1004,9 @@ mod tests {
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(i64::MIN)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(i64::MAX)));
         assert_eq!(s.null_count(), 0);
+        // -5 + (2^63 - 1) - 2^63 + 0.
+        assert_eq!(s.sum(), Some(-6));
+        assert_eq!(s.zero_count(), Some(1));
     }
 
     #[test]
@@ -1298,15 +1304,207 @@ mod tests {
         assert_eq!(s.min(), Some(DeclaredStatValue::I64(2)));
         assert_eq!(s.max(), Some(DeclaredStatValue::I64(7)));
         assert_eq!(s.null_count(), 0);
+        // 2 from the record, 7 twice from the resource fallback.
+        assert_eq!(s.sum(), Some(16));
+        assert_eq!(s.zero_count(), Some(0));
 
         let mut row = DeclaredStatAccum::default();
         row.observe_records(&records);
         let row = row.build_stamps(&[i64_col("k")], 3, true);
         assert_eq!(row.len(), 1);
         assert_eq!(columnar.len(), 1);
-        assert_eq!(row[0].min(), s.min());
-        assert_eq!(row[0].max(), s.max());
-        assert_eq!(row[0].null_count(), s.null_count());
+        assert_eq!(row[0], *s);
+    }
+
+    /// The same records as a columnar batch, the loader's representation.
+    fn batch_of(records: &[NormalizedLogRecord]) -> ColumnarLogBatch {
+        let logrecords: Vec<ravel_logseg::LogRecord> = records
+            .iter()
+            .map(|r| ravel_logseg::LogRecord {
+                stream_id: r.stream_id,
+                stream_attrs: r.stream_attrs.to_vec(),
+                ts_ns: r.ts_ns,
+                observed_ts_ns: r.observed_ts_ns,
+                severity_num: r.severity_num,
+                severity_text: r.severity_text.clone(),
+                body: r.body.clone(),
+                trace_id: None,
+                span_id: None,
+                flags: r.flags,
+                attrs: r.attrs.clone(),
+            })
+            .collect();
+        ColumnarLogBatch::from_records(&logrecords)
+    }
+
+    /// Nine rows over two streams. Stream 1's resource set carries
+    /// `k = i64::MAX` and `b = false`; stream 2's carries nothing.
+    ///
+    /// | row | record attributes             | k (I64)  | b (BOOL) | c     | u   |
+    /// |-----|-------------------------------|----------|----------|-------|-----|
+    /// | 1   | c=false, u=0                  | MAX (fb) | false fb | false | 0   |
+    /// | 2   | c=true, u=-4                  | MAX (fb) | false fb | true  | -4  |
+    /// | 3   | other=1, c=false, u=10        | MAX (fb) | false fb | false | 10  |
+    /// | 4   | k=5                           | 5        | false fb | NULL  | NULL|
+    /// | 5   | k="x"                         | NULL     | false fb | NULL  | NULL|
+    /// | 6   | k=0, b=true                   | 0        | true     | NULL  | NULL|
+    /// | 7   | k=3, k=4 (one type, repeated) | 4        | false fb | NULL  | NULL|
+    /// | 8   | k=true, k=9                   | NULL     | false fb | NULL  | NULL|
+    /// | 9   | b=2 (stream 2)                | NULL     | NULL     | NULL  | NULL|
+    ///
+    /// Row 7's second occurrence overflows to `attrs_raw` and wins; row 8's
+    /// BOOL occurrence wins over its I64 one (see
+    /// `duplicate_key_stamp_follows_the_readers_rule`). Rows 5 and 8 set `k`, so
+    /// they override the fallback and read NULL; three rows fall back.
+    fn mixed_records() -> Vec<NormalizedLogRecord> {
+        let a = blob(
+            &[
+                ("k", AttrValue::I64(i64::MAX)),
+                ("b", AttrValue::Bool(false)),
+            ],
+            &[],
+        );
+        let bare = blob(&[], &[]);
+        vec![
+            rec_in(
+                1,
+                &a,
+                vec![("c", AttrValue::Bool(false)), ("u", AttrValue::I64(0))],
+            ),
+            rec_in(
+                1,
+                &a,
+                vec![("c", AttrValue::Bool(true)), ("u", AttrValue::I64(-4))],
+            ),
+            rec_in(
+                1,
+                &a,
+                vec![
+                    ("other", AttrValue::I64(1)),
+                    ("c", AttrValue::Bool(false)),
+                    ("u", AttrValue::I64(10)),
+                ],
+            ),
+            rec_in(1, &a, vec![("k", AttrValue::I64(5))]),
+            rec_in(1, &a, vec![("k", AttrValue::Str("x".to_string()))]),
+            rec_in(
+                1,
+                &a,
+                vec![("k", AttrValue::I64(0)), ("b", AttrValue::Bool(true))],
+            ),
+            rec_in(
+                1,
+                &a,
+                vec![("k", AttrValue::I64(3)), ("k", AttrValue::I64(4))],
+            ),
+            rec_in(
+                1,
+                &a,
+                vec![("k", AttrValue::Bool(true)), ("k", AttrValue::I64(9))],
+            ),
+            rec_in(2, &bare, vec![("b", AttrValue::I64(2))]),
+        ]
+    }
+
+    fn mixed_declared() -> Vec<(String, u32)> {
+        vec![i64_col("k"), bool_col("b"), bool_col("c"), i64_col("u")]
+    }
+
+    /// ADR-4628 test 8, producer half: both fold paths stamp the hand-computed
+    /// sum and zero count over the merged view of [`mixed_records`].
+    #[test]
+    fn row_and_columnar_paths_stamp_the_same_sum_and_zero_count() {
+        let records = mixed_records();
+        let mut row = DeclaredStatAccum::default();
+        row.observe_records(&records);
+        let mut columnar = DeclaredStatAccum::default();
+        columnar.observe_batch(&batch_of(&records));
+
+        for (acc, what) in [(&row, "row path"), (&columnar, "columnar path")] {
+            let stamps = acc.build_stamps(&mixed_declared(), 9, true);
+            assert_eq!(stamps.len(), 4, "{what}");
+
+            let k = stat(&stamps, "k").expect("k stamped");
+            assert_eq!(k.min(), Some(DeclaredStatValue::I64(0)), "{what}");
+            assert_eq!(k.max(), Some(DeclaredStatValue::I64(i64::MAX)), "{what}");
+            assert_eq!(k.null_count(), 3, "{what}: rows 5, 8 and 9");
+            // Three fallback rows of i64::MAX, then 5 + 0 + 4: past i64::MAX.
+            assert_eq!(k.sum(), Some(3 * i128::from(i64::MAX) + 9), "{what}: k sum");
+            assert_eq!(k.zero_count(), Some(1), "{what}: row 6 only");
+
+            let b = stat(&stamps, "b").expect("b stamped");
+            assert_eq!(b.min(), Some(DeclaredStatValue::Bool(false)), "{what}");
+            assert_eq!(b.max(), Some(DeclaredStatValue::Bool(true)), "{what}");
+            assert_eq!(b.null_count(), 1, "{what}: row 9's I64 reads NULL");
+            assert_eq!(b.sum(), None, "{what}: BOOL carries no sum");
+            assert_eq!(
+                b.zero_count(),
+                Some(7),
+                "{what}: seven fallback falses, row 6's true and row 9's NULL excluded"
+            );
+
+            let c = stat(&stamps, "c").expect("c stamped");
+            assert_eq!(c.null_count(), 6, "{what}");
+            assert_eq!(c.sum(), None, "{what}");
+            assert_eq!(c.zero_count(), Some(2), "{what}: c zero count");
+
+            let u = stat(&stamps, "u").expect("u stamped");
+            assert_eq!(u.min(), Some(DeclaredStatValue::I64(-4)), "{what}");
+            assert_eq!(u.max(), Some(DeclaredStatValue::I64(10)), "{what}");
+            assert_eq!(u.null_count(), 6, "{what}");
+            assert_eq!(u.sum(), Some(6), "{what}: u sum");
+            assert_eq!(u.zero_count(), Some(1), "{what}: u zero count");
+        }
+        assert_eq!(
+            row.build_stamps(&mixed_declared(), 9, true),
+            columnar.build_stamps(&mixed_declared(), 9, true)
+        );
+    }
+
+    /// ADR-4628 test 12, producer half: the opt-out withholds the sum and the
+    /// zero count on every stamp and leaves min, max and null count as the
+    /// emitting run states them.
+    #[test]
+    fn opt_out_withholds_sum_and_zero_count_only() {
+        let records = mixed_records();
+        let mut row = DeclaredStatAccum::default();
+        row.observe_records(&records);
+        let mut columnar = DeclaredStatAccum::default();
+        columnar.observe_batch(&batch_of(&records));
+
+        for (acc, what) in [(&row, "row path"), (&columnar, "columnar path")] {
+            let emitted = acc.build_stamps(&mixed_declared(), 9, true);
+            let withheld = acc.build_stamps(&mixed_declared(), 9, false);
+            assert_eq!(withheld.len(), emitted.len(), "{what}");
+            for (w, e) in withheld.iter().zip(&emitted) {
+                assert_eq!(w.name(), e.name(), "{what}");
+                assert_eq!(w.sum(), None, "{what}: {} sum", w.name());
+                assert_eq!(w.zero_count(), None, "{what}: {} zero count", w.name());
+                assert_eq!(w.min(), e.min(), "{what}: {}", w.name());
+                assert_eq!(w.max(), e.max(), "{what}: {}", w.name());
+                assert_eq!(w.null_count(), e.null_count(), "{what}: {}", w.name());
+            }
+        }
+    }
+
+    /// Decision 2: an I64 column with no non-null row states sum 0 and zero
+    /// count 0, not an absent sum, and a BOOL one states zero count 0.
+    #[test]
+    fn all_null_columns_stamp_a_zero_sum_and_zero_count() {
+        let mut acc = DeclaredStatAccum::default();
+        acc.observe_records(&[
+            rec(vec![("other", AttrValue::I64(1))]),
+            rec(vec![("EventDate", AttrValue::Str("x".to_string()))]),
+        ]);
+        let stamps = acc.build_stamps(&[i64_col("EventDate"), bool_col("flag")], 2, true);
+        let s = stat(&stamps, "EventDate").expect("all-null I64 stamped");
+        assert_eq!(s.min(), None);
+        assert_eq!(s.null_count(), 2);
+        assert_eq!(s.sum(), Some(0), "all-null I64 sum");
+        assert_eq!(s.zero_count(), Some(0), "all-null I64 zero count");
+        let f = stat(&stamps, "flag").expect("all-null BOOL stamped");
+        assert_eq!(f.sum(), None);
+        assert_eq!(f.zero_count(), Some(0), "all-null BOOL zero count");
     }
 
     /// Issue #1182, consumer 3: this fold must resolve a record that carries one
