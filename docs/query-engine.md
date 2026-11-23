@@ -4254,9 +4254,10 @@ buckets `stats.phases` names, and they live in their own object so the
 - `attempts`: plan-and-execute attempts, 2 when the snapshot retry fired.
 - `resolveMs`: the snapshot resolve (`SqlExecutor::resolve`: the catalog
   listing and HEAD reads, plus any Parquet table resolution). The next four
-  keys split it into disjoint parts that sum to it, each summed over the
-  statement's signal tables and measured on the catalog's monotonic clock
-  (`ravel_catalog::ResolveTimings`).
+  keys split it into disjoint parts that sum to it. The first three are
+  summed over the statement's signal tables and measured on the catalog's
+  monotonic clock (`ravel_catalog::ResolveTimings`); `resolveOtherMs` is
+  `resolveMs`, timed by the executor, minus those three.
 - `resolveGenerationsMs`: the provisioning reads that open each catalog
   resolve, the once-per-pair `shard_count` check and the generation history
   read.
@@ -4269,7 +4270,10 @@ buckets `stats.phases` names, and they live in their own object so the
 - `resolveOtherMs`: the rest of `resolveMs`, such as loading the snapshot
   parts and postings, Parquet table resolution and the charge for decoded
   parts; on a statement that names only Parquet tables it equals
-  `resolveMs` and the other three parts read 0.
+  `resolveMs` and the other three parts read 0. When the charge for a logs
+  or spans lane's snapshot parts is refused and the lane resolves again
+  without them, the refused resolve's whole time lands here, and only the
+  second resolve's parts reach the other three keys.
 - `planMs`: logical planning against the pinned snapshot.
 - `startMs`: physical plan creation plus starting the stream.
 - `firstBatchMs`: from the stream starting to its first batch; 0 when the
