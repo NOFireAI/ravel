@@ -159,6 +159,7 @@ fail() {
 
 collect_logs() {
     docker compose logs --no-color > "$OUT/compose.log" 2>&1
+    docker compose logs --no-color s3proxy > "$OUT/s3proxy.log" 2>&1
     docker compose ps -a > "$OUT/ps.txt" 2>&1
 }
 
@@ -358,6 +359,12 @@ done
 collect_logs
 docker compose stop > /dev/null 2>&1
 [ -s "$OUT/missing-sdk.txt" ] && fail "SDK output missing: $(tr '\n' ' ' < "$OUT/missing-sdk.txt")"
+# The proxy never ran out of descriptors (issue #4633).
+if proxy_fds=$("$HERE/proxy-log-check.sh" "$OUT/s3proxy.log"); then
+    echo "$proxy_fds"
+else
+    fail "$proxy_fds"
+fi
 
 # Every assertion with its hit and pass counts, then the ones that would fail.
 if ! jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]

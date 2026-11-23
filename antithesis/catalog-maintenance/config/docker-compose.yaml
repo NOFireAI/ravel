@@ -150,6 +150,13 @@ services:
     image: ravel-antithesis-driver:catalog-maintenance
     platform: linux/amd64
     entrypoint: ["/usr/local/bin/s3-proxy"]
+    # Each relayed connection holds up to 10 descriptors, so the 512-connection
+    # cap needs 5200 (proxy::NOFILE_NEEDED), far above the usual default soft
+    # limit of 1024; the proxy refuses to start below it.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       S3_PROXY_LISTEN: 0.0.0.0:9000
       S3_PROXY_CONTROL: 0.0.0.0:9001

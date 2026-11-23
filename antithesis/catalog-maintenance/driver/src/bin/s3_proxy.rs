@@ -7,6 +7,10 @@
 //! `S3_PROXY_LISTEN` (default `0.0.0.0:9000`), `S3_PROXY_CONTROL` (default
 //! `0.0.0.0:9001`), `S3_PROXY_UPSTREAM` (default `rustfs:9000`) and
 //! `RAVEL_S3_BUCKET` (default `ravel`).
+//!
+//! It refuses to start under a soft open-file limit below what its
+//! connection caps need (`proxy::NOFILE_NEEDED`), and its startup line
+//! states the limit beside the cap.
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -27,6 +31,11 @@ fn bind(addr: &str) -> TcpListener {
 }
 
 fn main() {
+    let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    if let Err(e) = proxy::check_nofile(nofile) {
+        eprintln!("s3-proxy: refusing to start: {e}");
+        std::process::exit(1);
+    }
     let listen = var("S3_PROXY_LISTEN", "0.0.0.0:9000");
     let control = var("S3_PROXY_CONTROL", "0.0.0.0:9001");
     let upstream = var("S3_PROXY_UPSTREAM", "rustfs:9000");
@@ -45,8 +54,10 @@ fn main() {
     }
     println!(
         "s3-proxy: {listen} to {upstream} (bucket {bucket}), control on {control}, at most {} \
-         connections, {} s socket timeout",
+         connections, open-file limit {} ({} needed), {} s socket timeout",
         proxy::MAX_CONNECTIONS,
+        nofile.map_or_else(|| "unlimited".to_string(), |n| n.to_string()),
+        proxy::NOFILE_NEEDED,
         proxy::IO_TIMEOUT.as_secs()
     );
     proxy::serve(

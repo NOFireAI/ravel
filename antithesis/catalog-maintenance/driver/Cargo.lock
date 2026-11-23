@@ -1100,6 +1100,7 @@ dependencies = [
  "parquet",
  "ravel-antithesis-driver",
  "reqwest",
+ "rustix",
  "serde_json",
 ]
 
