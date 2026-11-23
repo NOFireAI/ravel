@@ -2864,6 +2864,11 @@ An entry also carries `declared_column_stats` (field 15, ADR-0873), the
 per-declared-column exact min, max, and null count the fold copies from the
 record it folds: `CommitRecord.declared_column_stats` (field 20) for a level-0
 entry, `CompactionPart.declared_column_stats` (field 12) for a level-1 part.
+ADR-4628 added three fields to each stamp (`sum` and `sum_wide` in fields 6 and
+7, `zero_count` in field 8), and the fold carries them the same way: when the
+source stamp had the sum and zero count, field 15 carries them, copied as the
+source predicate validated them and never recomputed, with a wide sum (past
+`i64`) in field 7 as 16 bytes and a narrow one in field 6, byte for byte.
 Only entries that passed the statistics validity predicate against the source
 record's own row count are copied, so a defective stamp never outlives the
 record that convicts it. The field is additive and permanently optional, and
@@ -2871,9 +2876,11 @@ neither the `.csnap` envelope version nor `SnapshotPartHeader.format_version`
 is bumped for it: absence costs a reader the statistics shortcut and never
 yields a wrong answer, which is the same reasoning ADR-0063 applied to
 `SnapshotPartHeader.min_hour`. Entries grow by roughly `name_len + 25` bytes
-per stamped column, so a part's `entries_uncompressed_len` and the resolve
-path's per-record cache sizing note below grow by that order for a tenant with
-typed attribute columns. `verify_seal_divergence`
+per stamped column for the min, max and null count, and ADR-4628 adds up to 29
+more for an I64 column (field 6 or the 18-byte field 7 for the sum, plus up to
+11 for field 8's zero count) and up to 11 for a BOOL column (field 8 alone), so
+a part's `entries_uncompressed_len` and the resolve path's per-record cache
+sizing note below grow by that order for a tenant with typed attribute columns. `verify_seal_divergence`
 (`crates/ravel-catalog/src/seal_divergence.rs`) therefore compares only the
 level-0 entries against the L0 commit history, and mirrors the fold's
 supersession exclusion on the ground-truth side: an L0 commit record named in a
@@ -3453,8 +3460,8 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    what actually holds the memory figure, because a `CommitRecord` has no
    bounded size: its `declared_column_stats` list is capped neither by the
    format nor by validation, so a record declaring 200 columns charges about
-   20 KB when admitted and about 38 KB once a resolve has kept its derivation
-   (the kept stamp list adds about 18 KB), where an ordinary one charges 896
+   29 KB when admitted and about 58 KB once a resolve has kept its derivation
+   (the kept stamp list adds about 29 KB), where an ordinary one charges 896
    bytes: 864 for the record and 32 for the inline slot that keeps its
    derivation. Each entry is charged an
    estimate of the live heap it holds and eviction runs until the tenant's
@@ -3948,12 +3955,16 @@ pinning are unchanged:
 `SegmentRef.declared_column_stats` is filled on every catalog route
 (ADR-0873 decision 4): from the commit record for a listed or token-resolved
 segment, from the compaction part for a listed L1 segment, and from
-`SnapshotEntry.declared_column_stats` (field 15) for a sealed entry. Two
-routes are deliberately always empty: a rewrite output's parts (the rewrite
-dropped rows, so a pre-drop stamp is stale; ADR-0873 decision 3), and a
-`SegmentRef` rebuilt from a Flight `SegmentPin` (its wire layout does not
-carry the field yet), so a segment covered in the catalog reads as uncovered
-after a pin round trip -- costing the shortcut there, never an answer. The
+`SnapshotEntry.declared_column_stats` (field 15) for a sealed entry. Every
+route that fills the min and max fills the ADR-4628 sum and zero count too
+(fields 6 to 8), from the same stamp and by the same copy, so a segment covered
+for its extrema is covered for its sum and zero count wherever the source stamp
+carried them. The two routes that carry no stamp at all carry none of the new
+fields either: a rewrite output's parts (the rewrite dropped rows, so a
+pre-drop stamp is stale; ADR-0873 decision 3), and a `SegmentRef` rebuilt from
+a Flight `SegmentPin` (its wire layout does not carry the field yet), so a
+segment covered in the catalog reads as uncovered after a pin round trip --
+costing the shortcut there, never an answer. The
 listing routes are what cover the always-unsealed recent tail and
 token-resolved segments, which no fold-built sibling object reaches. The
 entries are re-validated against the carrier's own row count wherever they are

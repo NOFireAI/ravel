@@ -125,14 +125,17 @@ const COMMIT_ENTRY_FIXED_BYTES: u64 = 416;
 /// `an_entry_count_above_any_declared_column_list_is_read_in_full` decodes
 /// 4,096 entries in one record), so an entry-count bound does not bound this
 /// cache's memory. Each statistic is charged on the same basis a compaction
-/// part's is ([`DECLARED_COLUMN_STAT_FIXED_BYTES`] plus its column name), since
-/// it is the same `DeclaredColumnMinMax` struct. An estimate, not a
-/// measurement of the allocator.
+/// part's is ([`DECLARED_COLUMN_STAT_FIXED_BYTES`] plus its column name, plus
+/// the `sum_wide` heap when a wide sum is present), since it is the same
+/// `DeclaredColumnMinMax` struct. An estimate, not a measurement of the
+/// allocator.
 fn commit_entry_resident_bytes(key: &str, record: &CommitRecord) -> u64 {
     let stats: u64 = record
         .declared_column_stats
         .iter()
-        .map(|stat| DECLARED_COLUMN_STAT_FIXED_BYTES + stat.name.len() as u64)
+        .map(|stat| {
+            DECLARED_COLUMN_STAT_FIXED_BYTES + stat.name.len() as u64 + stat.sum_wide.len() as u64
+        })
         .sum();
     COMMIT_ENTRY_FIXED_BYTES
         + 2 * key.len() as u64
@@ -453,12 +456,19 @@ const COMPACTION_INPUT_FIXED_BYTES: u64 = 40;
 /// statistics are charged on top.
 const COMPACTION_PART_FIXED_BYTES: u64 = 160;
 /// Charged cost of one decoded `DeclaredColumnMinMax` struct: a `String`
-/// header, a `u32`, two optional message-typed extrema and a `u64`. The
-/// column name's heap allocation is charged on top. Both record types carry
-/// this same struct, so both charge it the same way: on a `CompactionPart` via
+/// header, a `u32` type tag, two optional message-typed extrema, a `u64` null
+/// count, and the ADR-4628 statistics (an `Option<i64>` narrow `sum`, a
+/// `Vec<u8>` `sum_wide` header, and an `Option<u64>` `zero_count`). Taken as
+/// the struct's own `size_of`, so growing the proto re-derives the charge
+/// rather than leaving a hand number stale, the way [`L0_DERIVED_SLOT_BYTES`]
+/// does. The column name's heap allocation is charged on top, as is the
+/// `sum_wide` heap (16 bytes when a wide sum is present), since both are held
+/// off the struct. Both record types carry this same struct, so both charge it
+/// the same way: on a `CompactionPart` via
 /// [`compaction_entry_resident_bytes`], on a `CommitRecord` via
 /// [`commit_entry_resident_bytes`].
-const DECLARED_COLUMN_STAT_FIXED_BYTES: u64 = 80;
+const DECLARED_COLUMN_STAT_FIXED_BYTES: u64 =
+    std::mem::size_of::<ravel_proto::commit::v1::DeclaredColumnMinMax>() as u64;
 
 /// Estimated live heap one cached compaction entry holds, the figure
 /// [`CompactionTenantCache`] evicts against.
@@ -485,7 +495,11 @@ fn compaction_entry_resident_bytes(key: &str, record: &CompactionRecord) -> u64 
             let stats: u64 = part
                 .declared_column_stats
                 .iter()
-                .map(|stat| DECLARED_COLUMN_STAT_FIXED_BYTES + stat.name.len() as u64)
+                .map(|stat| {
+                    DECLARED_COLUMN_STAT_FIXED_BYTES
+                        + stat.name.len() as u64
+                        + stat.sum_wide.len() as u64
+                })
                 .sum();
             COMPACTION_PART_FIXED_BYTES
                 + part.first_series_id.len() as u64
@@ -1970,7 +1984,15 @@ mod tests {
             "a stats-free record is the fixed cost, the key twice, and its own heap"
         );
 
-        // Every generated name is `attr.column_NNNN`, 16 characters.
+        // The eight-field proto struct (ADR-4628 added the sum and zero count).
+        // Grounded so a silent struct-layout change trips here, not only in the
+        // derived KB figures the docs quote.
+        assert_eq!(
+            DECLARED_COLUMN_STAT_FIXED_BYTES, 128,
+            "DeclaredColumnMinMax is 128 bytes with fields 6 to 8"
+        );
+        // Every generated name is `attr.column_NNNN`, 16 characters, and these
+        // columns carry no wide sum, so `sum_wide` adds no heap.
         let per_stat = DECLARED_COLUMN_STAT_FIXED_BYTES + 16;
         for columns in [1usize, 100, 200] {
             let with = record_with_declared_columns([26; 16], 0, columns);
@@ -1982,9 +2004,52 @@ mod tests {
         }
         assert_eq!(
             200 * per_stat,
-            19_200,
-            "a record with 200 declared columns carries about 19 KB of statistics alone, not \
+            28_800,
+            "a record with 200 declared columns carries about 29 KB of statistics alone, not \
              the 900 bytes the planning rate assumes"
+        );
+    }
+
+    /// A wide sum (field 7) holds 16 bytes off the struct; a narrow sum (field
+    /// 6) is inline. The two records differ only in which sum field the one
+    /// column carries, so the charge difference is exactly the `sum_wide`
+    /// length. Pins exact charges, not an ordering: a charge that ignored the
+    /// `sum_wide` heap would make the two equal.
+    #[test]
+    fn a_wide_sum_is_charged_its_sixteen_heap_bytes() {
+        let key = "t/ab/m/c/0000/0/w.1.0.cmt";
+        let column = |sum: Option<i64>, sum_wide: Vec<u8>| {
+            ravel_proto::commit::v1::DeclaredColumnMinMax {
+                name: "attr.column_0000".to_string(), // 16 bytes
+                declared_type: 2,
+                min: None,
+                max: None,
+                null_count: 0,
+                sum,
+                sum_wide,
+                zero_count: None,
+            }
+        };
+        let base = commit_entry_resident_bytes(key, &record_with_declared_columns([28; 16], 0, 0));
+        let narrow = CommitRecord {
+            declared_column_stats: vec![column(Some(5), Vec::new())],
+            ..record([28; 16], 0)
+        };
+        let wide = CommitRecord {
+            declared_column_stats: vec![column(None, vec![0u8; 16])],
+            ..record([28; 16], 0)
+        };
+        let narrow_charge = commit_entry_resident_bytes(key, &narrow);
+        let wide_charge = commit_entry_resident_bytes(key, &wide);
+        assert_eq!(narrow_charge, base + DECLARED_COLUMN_STAT_FIXED_BYTES + 16);
+        assert_eq!(
+            wide_charge,
+            base + DECLARED_COLUMN_STAT_FIXED_BYTES + 16 + 16
+        );
+        assert_eq!(
+            wide_charge - narrow_charge,
+            16,
+            "a wide sum's 16 heap bytes, and nothing else, separate the two"
         );
     }
 
@@ -2016,14 +2081,14 @@ mod tests {
         let record = Arc::new(record_with_declared_columns([27; 16], 0, 200));
         let charge = commit_entry_admitted_bytes("k00", &record);
         assert!(
-            charge > 19_000,
-            "sanity: one such record is charged {charge} bytes, more than twenty times the 900 \
+            charge > 28_000,
+            "sanity: one such record is charged {charge} bytes, more than thirty times the 900 \
              an entry cap assumes"
         );
         let expected_resident = (budget / charge) as usize;
         assert_eq!(
-            expected_resident, 45,
-            "sanity: the budget holds exactly forty-five of these"
+            expected_resident, 30,
+            "sanity: the budget holds exactly thirty of these"
         );
 
         for i in 0..60 {
@@ -2053,9 +2118,9 @@ mod tests {
             "the entry cap is never reached here: only the byte bound can have evicted"
         );
 
-        // Least-recently-used first: the fifteen earliest keys are gone.
+        // Least-recently-used first: the thirty earliest keys are gone.
         let accounting = QueryAccounting::new();
-        for i in 0..15 {
+        for i in 0..30 {
             assert!(
                 cache
                     .get(&tenant, &format!("k{i:02}"), &accounting)
@@ -2063,7 +2128,7 @@ mod tests {
                 "k{i:02} must have been evicted"
             );
         }
-        for i in 15..60 {
+        for i in 30..60 {
             assert!(
                 cache
                     .get(&tenant, &format!("k{i:02}"), &accounting)
