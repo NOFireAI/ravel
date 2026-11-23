@@ -8,12 +8,13 @@
 //! hours and later past the sweep's protection horizon, overwrite HEAD with
 //! garbage through raw S3, audit the store against what HEAD names and for
 //! swept compaction inputs, and check that no scan exceeds the stored
-//! multiset of seeded and live records. Four forced situations, run as drawn
+//! multiset of seeded and live records. Six forced situations, run as drawn
 //! rules and again in the eventually, put the servers where a fault schedule
 //! alone rarely reaches: a fold losing its HEAD CAS, a compaction record PUT
-//! losing to a concurrent compaction, a sweep past a compaction record that
-//! HEAD has not folded, and a sweep past the protection horizon while HEAD
-//! is unreadable. Token reads read an acked write back with its commit
+//! losing to a concurrent compaction, the same with the winner record's
+//! input-set hash diverging or one of its parts gone, a sweep past a
+//! compaction record that HEAD has not folded, and a sweep past the
+//! protection horizon while HEAD is unreadable. Token reads read an acked write back with its commit
 //! tokens before and after its input is compacted, folded and swept, and
 //! judge every answer exactly against the model. The eventually stops
 //! faults, sweeps every shard and checks the whole multiset. See
@@ -52,7 +53,7 @@ use ravel_antithesis_catalog_driver::{keys, proxy};
 
 use audit::{InputKeys, JsonPart};
 use cli::Cli;
-use forced::Held;
+use forced::{Held, Tamper, Undo};
 use s3::Store;
 use seed::Plan;
 use stop::Stop;
@@ -85,6 +86,9 @@ const FOLD_RACES_EVENTUALLY: u32 = 6;
 /// for a race the store refused for another reason and for races in which
 /// no server sent a record PUT in time.
 const RECORD_RACES_EVENTUALLY: u32 = 5;
+/// Divergent-record races, and then missing-part races, the eventually runs
+/// until one of each kind reached its situation.
+const TAMPER_RACES_EVENTUALLY: u32 = 3;
 /// How long a record race waits, after the release, for the proxy to report
 /// the store's answer to the held PUT.
 const HELD_RESULT_WAIT: Duration = Duration::from_secs(10);
@@ -322,6 +326,10 @@ struct Shared {
     record_races: AtomicU64,
     /// Whether a server's record PUT lost to the `ravel-cli` compaction.
     record_lost: AtomicBool,
+    /// Whether a divergent-record race reached its situation.
+    divergent_lost: AtomicBool,
+    /// Whether a missing-part race reached its situation.
+    part_missing_lost: AtomicBool,
     /// Set once the unfolded-record sweep took its first sweep jump; the rule
     /// runs it once per timeline.
     unfolded_started: AtomicBool,
@@ -1525,36 +1533,130 @@ impl Shared {
     /// sends. While the PUT is held run a `ravel-cli` compaction of the held
     /// record's bucket, which publishes the same record key first. The
     /// released create-only PUT then finds the record in place, and the store
-    /// answers it 412. The caller holds the gate's write guard. Returns
-    /// whether the server's PUT lost.
-    fn record_race(&self, reason: &str) -> bool {
+    /// answers it 412. With a `tamper`, the driver first rewrites the CLI's
+    /// record with a divergent input-set hash, or deletes one of its parts,
+    /// through raw S3, so the losing server meets that record, and undoes
+    /// it once the loser resolved. The caller holds the gate's write guard.
+    /// Returns whether the race reached its situation.
+    fn record_race(&self, reason: &str, tamper: Tamper) -> bool {
+        let what = tamper.race();
         let Some(prefix) = self.known_prefix() else {
-            println!("record race: no HEAD key known yet");
+            println!("{what}: no HEAD key known yet");
             return false;
         };
-        let Some((hour, shard)) = self.compactable_bucket(&prefix, "record race") else {
+        let Some((hour, shard)) = self.compactable_bucket(&prefix, what) else {
             return false;
         };
         if self.proxy_cmd("pass").is_err() {
             return false;
         }
         let n = self.record_races.fetch_add(1, Ordering::SeqCst);
-        let lost = self.record_race_held(n, &prefix, (hour, shard), reason);
+        let lost = self.record_race_held(n, &prefix, (hour, shard), reason, tamper);
         let _ = self.proxy_cmd("pass");
         if lost {
-            self.record_lost.store(true, Ordering::SeqCst);
+            match tamper {
+                Tamper::None => &self.record_lost,
+                Tamper::Diverge => &self.divergent_lost,
+                Tamper::DeletePart => &self.part_missing_lost,
+            }
+            .store(true, Ordering::SeqCst);
         }
         lost
     }
 
+    /// The rules `race_divergent_records` and `race_missing_parts`: rarely,
+    /// once HEAD is known, one record race with `tamper`.
+    fn race_tampered(&self, tc: &TestCase, tamper: Tamper) {
+        if lock(&self.head_key).is_none() {
+            return;
+        }
+        if !tc.draw(gs::weighted_booleans(0.03)) {
+            return;
+        }
+        let quiet = self.gate.write().unwrap_or_else(|e| e.into_inner());
+        if self.stop.stopping() {
+            release_and_halt(quiet);
+        }
+        self.record_race("drawn", tamper);
+    }
+
+    /// The tamper of a record race on the record `key`, whose bytes the
+    /// `ravel-cli` compaction published as `record`: what it changes, and the
+    /// error of its raw S3 request, if any. `Err` when it changed nothing.
+    fn tamper(
+        &self,
+        tamper: Tamper,
+        key: &str,
+        record: &[u8],
+    ) -> Result<(Undo, Option<String>), String> {
+        match tamper {
+            Tamper::None => Err("no tamper".to_string()),
+            Tamper::Diverge => {
+                let forged = forced::diverge(key, record)?;
+                let put = self.store.put(key, &forged).err();
+                let undo = Undo::Record {
+                    key: key.to_string(),
+                    original: record.to_vec(),
+                    forged,
+                };
+                Ok((undo, put))
+            }
+            Tamper::DeletePart => {
+                let part = forced::part_to_delete(key, record)?;
+                let bytes = self
+                    .store
+                    .get(&part)?
+                    .ok_or_else(|| format!("{part} was absent before the delete"))?;
+                let delete = self.store.delete(&part).err();
+                Ok((Undo::Part { key: part, bytes }, delete))
+            }
+        }
+    }
+
+    /// Put back what a tamper changed, if it is still in place, and say
+    /// what happened.
+    fn undo_tamper(&self, undo: &Undo) -> String {
+        let key = undo.key();
+        let mut last = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            let current = match self.store.get(key) {
+                Ok(current) => current,
+                Err(e) => {
+                    last = format!("reading {key}: {e}");
+                    continue;
+                }
+            };
+            let Some(bytes) = undo.restore(current.as_deref()) else {
+                return format!("{key}: no longer as the tamper left it, left alone");
+            };
+            match self.store.put(key, bytes) {
+                Ok(()) => return format!("{key}: put back"),
+                Err(e) => last = format!("putting back {key}: {e}"),
+            }
+        }
+        println!("record race: could not undo the tamper: {last}");
+        format!("failed: {last}")
+    }
+
     /// [`Shared::record_race`] once the proxy runs with no rules.
-    fn record_race_held(&self, n: u64, prefix: &str, bucket: (u64, u32), reason: &str) -> bool {
+    fn record_race_held(
+        &self,
+        n: u64,
+        prefix: &str,
+        bucket: (u64, u32),
+        reason: &str,
+        tamper: Tamper,
+    ) -> bool {
+        let what = tamper.race();
         let nudge_s =
             |now_s| clock::seal_nudge_s(now_s, bucket.0, clock::compaction_seal_margin_s());
         // The nudge's settle waits `clock::reach_wait_s` after the move
         // reached the driver, so every record PUT held below was signed on
         // the moved clock, which rustfs shares: none is refused for skew.
-        if !self.nudge("record race", &nudge_s) || self.proxy_cmd("hold-record").is_err() {
+        if !self.nudge(what, &nudge_s) || self.proxy_cmd("hold-record").is_err() {
             return false;
         }
         let deadline = Instant::now() + HELD_WAIT;
@@ -1565,7 +1667,7 @@ impl Shared {
             match forced::judge_held(&reply, prefix) {
                 Held::Race { key, record, age } => break (key, record, age),
                 Held::Skip(key) => {
-                    println!("record race: released {key}, not a PUT to race");
+                    println!("{what}: released {key}, not a PUT to race");
                     if self.proxy_cmd("release").is_err() {
                         return false;
                     }
@@ -1578,7 +1680,7 @@ impl Shared {
             }
             if Instant::now() >= deadline {
                 println!(
-                    "record race: no server sent a compaction record PUT within {} s of the nudge",
+                    "{what}: no server sent a compaction record PUT within {} s of the nudge",
                     HELD_WAIT.as_secs()
                 );
                 return false;
@@ -1596,9 +1698,9 @@ impl Shared {
             &hour_arg,
             "--no-claim",
         ]);
-        let budget = forced::cli_budget(age);
+        let budget = forced::cli_budget(age, tamper);
         let started = Instant::now();
-        let ((cli_out, cli_took), before, released_at_age, held_result, after) =
+        let ((cli_out, cli_took), before, tampered, released_at_age, held_result, after) =
             std::thread::scope(|scope| {
                 let cli = scope.spawn(|| {
                     let out = self.cli.run(&args, CLI_TIMEOUT_S);
@@ -1608,6 +1710,23 @@ impl Shared {
                     std::thread::sleep(Duration::from_millis(100));
                 }
                 let before = self.store.get(&key);
+                // Only once the compaction exited, so nothing of it still
+                // writes or checks its parts, and only over the record it
+                // published.
+                let tampered = match &before {
+                    Ok(Some(record)) if tamper != Tamper::None && cli.is_finished() => {
+                        Some(self.tamper(tamper, &key, record))
+                    }
+                    _ => None,
+                };
+                let in_place = match &tampered {
+                    Some(Ok((undo, _))) => self
+                        .store
+                        .get(undo.key())
+                        .ok()
+                        .map(|current| undo.in_place(current.as_deref())),
+                    _ => None,
+                };
                 let released_at_age = age + started.elapsed();
                 let released = self.proxy_cmd("release").ok().map(|_| released_at_age);
                 let cli = cli.join().unwrap_or_else(|_| {
@@ -1624,11 +1743,44 @@ impl Shared {
                 // it; then time for the server's handling of that answer.
                 let held_result = self.held_result_of(&key);
                 std::thread::sleep(Duration::from_secs(2));
-                (cli, before, released, held_result, self.store.get(&key))
+                let after = self.store.get(&key);
+                (
+                    cli,
+                    before,
+                    (tampered, in_place),
+                    released,
+                    held_result,
+                    after,
+                )
             });
+        let (tampered, in_place) = tampered;
         let held_status = forced::held_status(&key, held_result.as_ref());
         let published_before_release = matches!(before, Ok(Some(_)));
-        let lost = forced::record_lost(published_before_release, released_at_age, held_status);
+        let lost = match tamper {
+            Tamper::None => {
+                forced::record_lost(published_before_release, released_at_age, held_status)
+            }
+            Tamper::Diverge | Tamper::DeletePart => forced::tampered_lost(
+                published_before_release,
+                released_at_age,
+                held_status,
+                in_place == Some(true),
+            ),
+        };
+        // Undone whether or not the race reached its situation, once the
+        // loser has had its GET, HEAD and GET of the record answered.
+        let undone = match &tampered {
+            Some(Ok((undo, _))) => {
+                std::thread::sleep(forced::RESTORE_AFTER);
+                Some(self.undo_tamper(undo))
+            }
+            _ => None,
+        };
+        let (tamper_key, tamper_error) = match &tampered {
+            None => (None, None),
+            Some(Ok((undo, error))) => (Some(undo.key().to_string()), error.clone()),
+            Some(Err(e)) => (None, Some(e.clone())),
+        };
         let changed = match (&before, &after) {
             (Ok(Some(b)), Ok(Some(a))) => Some(a != b),
             _ => None,
@@ -1649,13 +1801,30 @@ impl Shared {
             "held_status": held_status,
             "held_result": held_result.as_ref().map(|(k, s)| format!("{k} {s}")),
             "record_bytes_changed_after_release": changed,
+            "tamper": format!("{tamper:?}"),
+            "tamper_key": tamper_key,
+            "tamper_error": tamper_error,
+            "tamper_in_place_at_release": in_place,
+            "undo": undone,
         });
-        println!("record race: {details}");
-        assert_sometimes!(
-            lost,
-            "catalog: a server's compaction record PUT lost to a concurrent compaction",
-            &details
-        );
+        println!("{what}: {details}");
+        match tamper {
+            Tamper::None => assert_sometimes!(
+                lost,
+                "catalog: a server's compaction record PUT lost to a concurrent compaction",
+                &details
+            ),
+            Tamper::Diverge => assert_sometimes!(
+                lost,
+                "catalog: a server's compaction record PUT lost to a record whose input-set hash diverges from its own",
+                &details
+            ),
+            Tamper::DeletePart => assert_sometimes!(
+                lost,
+                "catalog: a server's compaction record PUT lost to a record whose part is missing from the store",
+                &details
+            ),
+        }
         lost
     }
 
@@ -2756,7 +2925,19 @@ impl Workload {
         if s.stop.stopping() {
             release_and_halt(quiet);
         }
-        s.record_race("drawn");
+        s.record_race("drawn", Tamper::None);
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
+    fn race_divergent_records(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
+        self.0.race_tampered(&tc, Tamper::Diverge);
+    }
+
+    #[rule(groups = ["main"], weight = 1)]
+    fn race_missing_parts(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
+        self.0.race_tampered(&tc, Tamper::DeletePart);
     }
 
     #[rule(groups = ["main"], weight = 1)]
@@ -2936,7 +3117,18 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         if s.record_lost.load(Ordering::SeqCst) {
             break;
         }
-        s.record_race("eventually");
+        s.record_race("eventually", Tamper::None);
+    }
+    for (tamper, reached) in [
+        (Tamper::Diverge, &s.divergent_lost),
+        (Tamper::DeletePart, &s.part_missing_lost),
+    ] {
+        for _ in 0..TAMPER_RACES_EVENTUALLY {
+            if reached.load(Ordering::SeqCst) {
+                break;
+            }
+            s.record_race("eventually", tamper);
+        }
     }
     if !s.unfolded_reached.load(Ordering::SeqCst) {
         s.unfolded_sweep("eventually");
@@ -3345,6 +3537,8 @@ fn main(tc: TestCase) {
         proxy,
         record_races: AtomicU64::new(0),
         record_lost: AtomicBool::new(false),
+        divergent_lost: AtomicBool::new(false),
+        part_missing_lost: AtomicBool::new(false),
         unfolded_started: AtomicBool::new(false),
         unfolded_reached: AtomicBool::new(false),
         unreadable_started: AtomicBool::new(false),

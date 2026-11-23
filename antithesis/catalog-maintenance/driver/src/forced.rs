@@ -1,6 +1,8 @@
-//! The record race and the unfolded-record sweep (README.md, "The forced
+//! The record races and the unfolded-record sweep (README.md, "The forced
 //! races"): which bucket each one works on, when a held server PUT is fresh
-//! enough to race, and which of a compaction record's inputs the store holds.
+//! enough to race, what a record race changes in the store before the
+//! release and how it undoes that, and which of a compaction record's inputs
+//! the store holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -16,6 +18,220 @@ use crate::token::Token;
 /// cap, so the release, not the cap, decides when the PUT is sent.
 pub const RELEASE_BY: Duration = Duration::from_secs(14);
 const _: () = assert!(RELEASE_BY.as_secs() + 2 < HOLD_CAP.as_secs());
+
+/// In a record race that tampers, the `ravel-cli` compaction must have
+/// finished by the time the held PUT is this old, or the race tampers with
+/// nothing. The tamper's raw S3 requests and the release then have the rest
+/// of the hold cap, so the release, not the cap, still sends the PUT.
+pub const TAMPER_BY: Duration = Duration::from_secs(10);
+const _: () = assert!(TAMPER_BY.as_secs() + 8 <= HOLD_CAP.as_secs());
+
+/// How long after the store answered the released PUT the driver undoes its
+/// tamper: three of the servers' 20 s store request timeouts, so the
+/// loser's GET, HEAD and second GET of the record have all been answered
+/// before the record's version changes again. The bucket's hour seals for
+/// the fold `FOLD_SAFETY_MARGIN_S` (900 s) after it sealed for compaction,
+/// well past the whole race, so no fold folds the tampered record.
+pub const RESTORE_AFTER: Duration = Duration::from_secs(3 * crate::clock::STORE_REQUEST_TIMEOUT_S);
+const _: () = assert!(RESTORE_AFTER.as_secs() * 4 < crate::clock::FOLD_SAFETY_MARGIN_S);
+
+/// What a record race does to the store after the `ravel-cli` compaction
+/// published and before the driver releases the held server PUT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tamper {
+    /// Nothing: the plain record race.
+    None,
+    /// Rewrite the record with its input-set hash changed after the 8
+    /// bytes its key carries ([`diverge`]).
+    Diverge,
+    /// Delete one part the record names ([`part_to_delete`]).
+    DeletePart,
+}
+
+impl Tamper {
+    /// The race's name in log lines.
+    pub fn race(self) -> &'static str {
+        match self {
+            Tamper::None => "record race",
+            Tamper::Diverge => "divergent-record race",
+            Tamper::DeletePart => "missing-part race",
+        }
+    }
+}
+
+/// The fields of `CompactionRecord` (proto/ravel/commit.proto) a tamper
+/// reads; prost skips the rest.
+#[derive(Clone, PartialEq, prost::Message)]
+struct CompactionRecord {
+    #[prost(bytes = "vec", tag = "8")]
+    input_set_hash: Vec<u8>,
+    #[prost(message, repeated, tag = "9")]
+    parts: Vec<CompactionPart>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct CompactionPart {
+    #[prost(uint32, tag = "1")]
+    part_index: u32,
+    #[prost(bytes = "vec", tag = "4")]
+    content_hash: Vec<u8>,
+}
+
+/// `input_set_hash` (field 8, wire type 2) framed as protobuf writes a
+/// 32-byte value: its key byte and its length.
+const HASH_FRAME: [u8; 2] = [(8 << 3) | 2, 32];
+
+/// The record at `record_key` decoded, with the 16 hex digits its key names
+/// checked against the first 8 bytes of its 32-byte input-set hash.
+fn decode_record(record_key: &str, record: &[u8]) -> Result<CompactionRecord, String> {
+    use prost::Message;
+    keys::parse_record_key(record_key)
+        .ok_or_else(|| format!("{record_key} is not a compaction record key"))?;
+    let hash16 = record_key
+        .rsplit_once("/l1.")
+        .and_then(|(_, name)| name.strip_suffix(".cmt"))
+        .ok_or_else(|| format!("{record_key} names no input-set hash"))?;
+    let decoded = CompactionRecord::decode(record)
+        .map_err(|e| format!("{record_key} does not decode: {e}"))?;
+    if decoded.input_set_hash.len() != 32 {
+        return Err(format!(
+            "{record_key}: the input-set hash is {} bytes, not 32",
+            decoded.input_set_hash.len()
+        ));
+    }
+    if !hex(&decoded.input_set_hash[..8]).eq_ignore_ascii_case(hash16) {
+        return Err(format!(
+            "{record_key}: the input-set hash does not start with the key's {hash16}"
+        ));
+    }
+    Ok(decoded)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The keys of the parts the compaction record `record` at `record_key`
+/// names, by part index: `<tenant>/<signal>/l1/<shard:04>/<hour>/
+/// <input_set_hash16>.<part:04>.<content_hash16>.rseg`, as `l1_part_key`
+/// in crates/ravel-commit/src/keys.rs builds them. `Err` when the key is not
+/// a compaction record key, the bytes do not decode, the hash does not match
+/// the key, or a part's content hash is not 32 bytes.
+pub fn winner_parts(record_key: &str, record: &[u8]) -> Result<Vec<String>, String> {
+    let decoded = decode_record(record_key, record)?;
+    let rk = keys::parse_record_key(record_key)
+        .ok_or_else(|| format!("{record_key} is not a compaction record key"))?;
+    let dir = format!(
+        "{}{}/l1/{:04}/{}/",
+        rk.tenant_prefix,
+        rk.signal,
+        rk.shard,
+        keys::hour_string(rk.hour)
+    );
+    let input16 = hex(&decoded.input_set_hash[..8]);
+    let mut parts = decoded.parts;
+    parts.sort_by_key(|p| p.part_index);
+    parts
+        .iter()
+        .map(|p| {
+            if p.content_hash.len() != 32 || p.part_index > 9999 {
+                return Err(format!(
+                    "{record_key}: part {} has a {}-byte content hash",
+                    p.part_index,
+                    p.content_hash.len()
+                ));
+            }
+            Ok(format!(
+                "{dir}{input16}.{:04}.{}.rseg",
+                p.part_index,
+                hex(&p.content_hash[..8])
+            ))
+        })
+        .collect()
+}
+
+/// The part a missing-part race deletes: the record's first part.
+pub fn part_to_delete(record_key: &str, record: &[u8]) -> Result<String, String> {
+    winner_parts(record_key, record)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("{record_key} names no part"))
+}
+
+/// The record's bytes with the last byte of its input-set hash flipped, and
+/// nothing else changed, so no field it does not know is lost to a
+/// re-encode. The first 8 bytes of the hash, which the key carries, stay, so
+/// the record still verifies against its key, and a compaction of the same
+/// inputs now finds a winner whose hash differs from its own. `Err` unless
+/// the record decodes, its hash matches the key, and the framed hash occurs
+/// exactly once in the bytes.
+pub fn diverge(record_key: &str, record: &[u8]) -> Result<Vec<u8>, String> {
+    let decoded = decode_record(record_key, record)?;
+    let mut framed = HASH_FRAME.to_vec();
+    framed.extend_from_slice(&decoded.input_set_hash);
+    let at: Vec<usize> = record
+        .windows(framed.len())
+        .enumerate()
+        .filter(|(_, w)| *w == framed.as_slice())
+        .map(|(i, _)| i)
+        .collect();
+    let [start] = at.as_slice() else {
+        return Err(format!(
+            "{record_key}: the framed input-set hash occurs {} times, not once",
+            at.len()
+        ));
+    };
+    let mut forged = record.to_vec();
+    forged[start + framed.len() - 1] ^= 0xff;
+    Ok(forged)
+}
+
+/// What a tamper changed, so the driver can tell whether it was in place at
+/// the release and undo it once the loser resolved.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Undo {
+    /// The record at `key` was overwritten with `forged`; `original` is the
+    /// `ravel-cli` compaction's.
+    Record {
+        key: String,
+        original: Vec<u8>,
+        forged: Vec<u8>,
+    },
+    /// The part at `key` was deleted; `bytes` are its content.
+    Part { key: String, bytes: Vec<u8> },
+}
+
+impl Undo {
+    /// The key the tamper changed.
+    pub fn key(&self) -> &str {
+        match self {
+            Undo::Record { key, .. } | Undo::Part { key, .. } => key,
+        }
+    }
+
+    /// Whether the key holds what the tamper left (`current`, `None` when
+    /// the key is absent): the forged record, or no part.
+    pub fn in_place(&self, current: Option<&[u8]>) -> bool {
+        match self {
+            Undo::Record { forged, .. } => current == Some(forged.as_slice()),
+            Undo::Part { .. } => current.is_none(),
+        }
+    }
+
+    /// The bytes to put back at [`Undo::key`] when it holds `current`; `None`
+    /// when the tamper is no longer in place. A record a loser overwrote
+    /// stays: the `mo-diverge-overwrites-record` mutant PUT its own record,
+    /// whose parts that loser had PUT before it.
+    pub fn restore(&self, current: Option<&[u8]>) -> Option<&[u8]> {
+        if !self.in_place(current) {
+            return None;
+        }
+        Some(match self {
+            Undo::Record { original, .. } => original,
+            Undo::Part { bytes, .. } => bytes,
+        })
+    }
+}
 
 /// A held PUT older than this when the driver first sees it leaves too
 /// little of [`RELEASE_BY`] for the compaction; the driver releases it and
@@ -125,10 +341,28 @@ pub fn record_lost(
         && matches!(held_status, Some(412) | Some(409))
 }
 
+/// Whether a record race that tampers reached its situation: the server's
+/// PUT lost as [`record_lost`] judges it, and a read just before the release
+/// found the tamper in place ([`Undo::in_place`]), so the loser that the
+/// store's refusal sends to the winner record finds the forged record, or
+/// the record without one of its parts.
+pub fn tampered_lost(
+    published_before_release: bool,
+    released_at_age: Option<Duration>,
+    held_status: Option<u16>,
+    tamper_in_place: bool,
+) -> bool {
+    tamper_in_place && record_lost(published_before_release, released_at_age, held_status)
+}
+
 /// How long the `ravel-cli` compaction may run before a PUT held for `age`
-/// is released.
-pub fn cli_budget(age: Duration) -> Duration {
-    RELEASE_BY.saturating_sub(age)
+/// is released, or, in a race that tampers, before the tamper.
+pub fn cli_budget(age: Duration, tamper: Tamper) -> Duration {
+    match tamper {
+        Tamper::None => RELEASE_BY,
+        Tamper::Diverge | Tamper::DeletePart => TAMPER_BY,
+    }
+    .saturating_sub(age)
 }
 
 /// The keys of `inputs` that `listed` holds: each input's commit record and
@@ -371,15 +605,213 @@ mod tests {
 
     #[test]
     fn the_compaction_gets_what_is_left_before_the_release() {
-        assert_eq!(cli_budget(Duration::ZERO), RELEASE_BY);
-        assert_eq!(cli_budget(MAX_HELD_AGE), RELEASE_BY - MAX_HELD_AGE);
+        let none = Tamper::None;
+        assert_eq!(cli_budget(Duration::ZERO, none), RELEASE_BY);
+        assert_eq!(cli_budget(MAX_HELD_AGE, none), RELEASE_BY - MAX_HELD_AGE);
         assert_eq!(
-            cli_budget(RELEASE_BY + Duration::from_secs(1)),
+            cli_budget(RELEASE_BY + Duration::from_secs(1), none),
             Duration::ZERO
         );
         // The freshest PUT the race takes still leaves the compaction most
         // of the window.
-        assert!(cli_budget(MAX_HELD_AGE) >= Duration::from_secs(8));
+        assert!(cli_budget(MAX_HELD_AGE, none) >= Duration::from_secs(8));
+        // A race that tampers stops waiting for the compaction earlier, so
+        // the tamper and the release land well inside the hold cap; the
+        // compaction, which takes about 0.1 s, still gets seconds.
+        for tamper in [Tamper::Diverge, Tamper::DeletePart] {
+            assert_eq!(cli_budget(Duration::ZERO, tamper), TAMPER_BY);
+            assert!(cli_budget(MAX_HELD_AGE, tamper) >= Duration::from_secs(4));
+            assert!(TAMPER_BY + Duration::from_secs(8) <= HOLD_CAP);
+        }
+    }
+
+    /// The `CompactionRecord` fields a test record carries, one of them
+    /// (`created_unix_ns`) unknown to the driver's own decode.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FullRecord {
+        #[prost(uint32, tag = "1")]
+        format_version: u32,
+        #[prost(bytes = "vec", tag = "2")]
+        tenant_hash: Vec<u8>,
+        #[prost(uint32, tag = "4")]
+        shard: u32,
+        #[prost(bytes = "vec", tag = "8")]
+        input_set_hash: Vec<u8>,
+        #[prost(message, repeated, tag = "9")]
+        parts: Vec<FullPart>,
+        #[prost(sfixed64, tag = "10")]
+        created_unix_ns: i64,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FullPart {
+        #[prost(uint32, tag = "1")]
+        part_index: u32,
+        #[prost(bytes = "vec", tag = "4")]
+        content_hash: Vec<u8>,
+        #[prost(uint64, tag = "5")]
+        object_size: u64,
+    }
+
+    fn input_hash() -> Vec<u8> {
+        (0u8..32)
+            .map(|i| i.wrapping_mul(7).wrapping_add(1))
+            .collect()
+    }
+
+    fn record_bytes(hash: &[u8], parts: &[(u32, u8)]) -> Vec<u8> {
+        use prost::Message;
+        FullRecord {
+            format_version: 1,
+            tenant_hash: vec![0x0a; 16],
+            shard: 3,
+            input_set_hash: hash.to_vec(),
+            parts: parts
+                .iter()
+                .map(|&(part_index, fill)| FullPart {
+                    part_index,
+                    content_hash: vec![fill; 32],
+                    object_size: 4096,
+                })
+                .collect(),
+            created_unix_ns: 1_794_931_200_123_456_789,
+        }
+        .encode_to_vec()
+    }
+
+    fn record_key_for(hash: &[u8]) -> String {
+        key(3, HOUR, &format!("l1.{}.cmt", hex(&hash[..8])))
+    }
+
+    #[test]
+    fn the_part_to_delete_is_the_records_first_part_at_its_l1_key() {
+        let hash = input_hash();
+        let record_key = record_key_for(&hash);
+        // Parts in the record out of index order.
+        let record = record_bytes(&hash, &[(1, 0xbb), (0, 0xaa)]);
+        let dir = format!("{PREFIX}l/l1/0003/{}/", keys::hour_string(HOUR));
+        let h16 = hex(&hash[..8]);
+        assert_eq!(
+            winner_parts(&record_key, &record),
+            Ok(vec![
+                format!("{dir}{h16}.0000.aaaaaaaaaaaaaaaa.rseg"),
+                format!("{dir}{h16}.0001.bbbbbbbbbbbbbbbb.rseg"),
+            ])
+        );
+        assert_eq!(
+            part_to_delete(&record_key, &record),
+            Ok(format!("{dir}{h16}.0000.aaaaaaaaaaaaaaaa.rseg"))
+        );
+        // A record with no part has none to delete.
+        assert!(part_to_delete(&record_key, &record_bytes(&hash, &[])).is_err());
+        // The key must name the record's own hash.
+        let mut other = hash.clone();
+        other[0] ^= 1;
+        assert!(winner_parts(&record_key_for(&other), &record).is_err());
+        // Not a compaction record key, or not a record.
+        assert!(winner_parts(&key(3, HOUR, "w1.1.00000000000000000001.cmt"), &record).is_err());
+        assert!(winner_parts(&record_key, b"\xff\xff\xff").is_err());
+        // A part whose content hash is not 32 bytes names no key.
+        let mut short = {
+            use prost::Message;
+            FullRecord::decode(record.as_slice()).expect("decode")
+        };
+        short.parts[0].content_hash.truncate(8);
+        let short = {
+            use prost::Message;
+            short.encode_to_vec()
+        };
+        assert!(winner_parts(&record_key, &short).is_err());
+    }
+
+    #[test]
+    fn diverge_flips_only_the_hash_byte_past_the_keys_eight() {
+        use prost::Message;
+        let hash = input_hash();
+        let record_key = record_key_for(&hash);
+        let record = record_bytes(&hash, &[(0, 0xaa), (1, 0xbb)]);
+        let forged = diverge(&record_key, &record).expect("diverges");
+        assert_eq!(forged.len(), record.len());
+        let changed: Vec<usize> = (0..record.len())
+            .filter(|&i| record[i] != forged[i])
+            .collect();
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        let was = FullRecord::decode(record.as_slice()).expect("decode");
+        let now = FullRecord::decode(forged.as_slice()).expect("decode forged");
+        // The hash differs in its last byte only, so the key still names it
+        // and every other field, the unknown one included, is the same.
+        assert_eq!(now.input_set_hash[..31], was.input_set_hash[..31]);
+        assert_ne!(now.input_set_hash[31], was.input_set_hash[31]);
+        assert_eq!(
+            FullRecord {
+                input_set_hash: was.input_set_hash.clone(),
+                ..now.clone()
+            },
+            was
+        );
+        assert!(winner_parts(&record_key, &forged).is_ok());
+        // A hash framed twice in the bytes (a repeated field, the last of
+        // which protobuf keeps) is refused rather than half patched.
+        let mut twice = record.clone();
+        twice.extend_from_slice(&HASH_FRAME);
+        twice.extend_from_slice(&hash);
+        assert_eq!(
+            FullRecord::decode(twice.as_slice())
+                .expect("decode")
+                .input_set_hash,
+            hash
+        );
+        assert!(diverge(&record_key, &twice).is_err());
+        // A key that does not name the record's hash.
+        let mut other = hash.clone();
+        other[7] ^= 1;
+        assert!(diverge(&record_key_for(&other), &record).is_err());
+    }
+
+    #[test]
+    fn a_tamper_is_undone_only_while_it_is_in_place() {
+        let record = Undo::Record {
+            key: "r".to_string(),
+            original: b"cli".to_vec(),
+            forged: b"forged".to_vec(),
+        };
+        assert!(record.in_place(Some(b"forged")));
+        assert_eq!(record.restore(Some(b"forged")), Some(&b"cli"[..]));
+        // A loser overwrote the forged record (the mutant): its record stays.
+        assert!(!record.in_place(Some(b"loser")));
+        assert_eq!(record.restore(Some(b"loser")), None);
+        // The forged PUT never landed, or a sweep removed the record.
+        assert_eq!(record.restore(Some(b"cli")), None);
+        assert_eq!(record.restore(None), None);
+        let part = Undo::Part {
+            key: "p".to_string(),
+            bytes: b"part".to_vec(),
+        };
+        assert_eq!(part.key(), "p");
+        assert!(part.in_place(None));
+        assert_eq!(part.restore(None), Some(&b"part"[..]));
+        // The DELETE never landed, or the part is back already.
+        assert!(!part.in_place(Some(b"part")));
+        assert_eq!(part.restore(Some(b"part")), None);
+    }
+
+    #[test]
+    fn a_tampered_race_counts_only_with_the_tamper_in_place_at_the_release() {
+        let fresh = Some(Duration::from_secs(10));
+        assert!(tampered_lost(true, fresh, Some(412), true));
+        // The store refused the held PUT, but a read just before the release
+        // did not find the tamper: the loser met the plain winner.
+        assert!(!tampered_lost(true, fresh, Some(412), false));
+        // The tamper was in place, but the race was not lost as
+        // record_lost judges it.
+        assert!(!tampered_lost(true, fresh, Some(200), true));
+        assert!(!tampered_lost(false, fresh, Some(412), true));
+        assert!(!tampered_lost(
+            true,
+            Some(HOLD_CAP + Duration::from_millis(1)),
+            Some(412),
+            true
+        ));
     }
 
     #[test]

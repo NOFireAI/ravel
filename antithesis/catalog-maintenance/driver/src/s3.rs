@@ -1,5 +1,6 @@
 //! Raw S3 calls the driver makes around ravel: listing the bucket for the
-//! audit, the seed marker, and HEAD corruption. Each call is one `curl
+//! audit, the seed marker, HEAD corruption, and the record races' tampers.
+//! Each call is one `curl
 //! --aws-sigv4` subprocess, the same client the compose entrypoints use, so
 //! the driver needs no S3 SDK.
 
@@ -156,6 +157,24 @@ impl Store {
             200 => Ok(()),
             s => Err(format!(
                 "PUT {key} answered {s}: {}",
+                String::from_utf8_lossy(&r.body)
+            )),
+        }
+    }
+
+    /// A DELETE. S3 answers one of an absent key 204 too.
+    pub fn delete(&self, key: &str) -> Result<(), String> {
+        let r = self.request("DELETE", &format!("/{key}"), None);
+        if !r.complete {
+            return Err(format!(
+                "DELETE {key}: curl did not finish (status {})",
+                r.status
+            ));
+        }
+        match r.status {
+            200 | 204 => Ok(()),
+            s => Err(format!(
+                "DELETE {key} answered {s}: {}",
                 String::from_utf8_lossy(&r.body)
             )),
         }
