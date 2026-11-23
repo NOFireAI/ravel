@@ -2569,6 +2569,10 @@ fn stats_object<'a>(raw: &[u8], value: &'a Value, name: &str, expected: &[&str])
 const TIMINGS_KEYS: &[&str] = &[
     "attempts",
     "resolveMs",
+    "resolveGenerationsMs",
+    "resolveListWaveMs",
+    "resolveRecordsMs",
+    "resolveOtherMs",
     "planMs",
     "startMs",
     "firstBatchMs",
@@ -2578,6 +2582,14 @@ const TIMINGS_KEYS: &[&str] = &[
     "planningWaitMaxMs",
     "openMaxMs",
     "decodeBuildMaxMs",
+];
+
+/// The parts `resolveMs` is split into (issue #4634).
+const RESOLVE_PART_KEYS: [&str; 4] = [
+    "resolveGenerationsMs",
+    "resolveListWaveMs",
+    "resolveRecordsMs",
+    "resolveOtherMs",
 ];
 
 const PRUNING_KEYS: &[&str] = &[
@@ -2628,6 +2640,14 @@ async fn sql_response_carries_timings_and_pruning_stats() {
     }
     let resolve_ms = timings["resolveMs"].as_f64().expect("resolveMs");
     assert!(resolve_ms > 0.0, "resolve took measurable time: {value}");
+    let parts_ms: f64 = RESOLVE_PART_KEYS
+        .iter()
+        .map(|key| timings[*key].as_f64().unwrap_or(f64::NAN))
+        .sum();
+    assert!(
+        (parts_ms - resolve_ms).abs() <= 5.0,
+        "the resolve parts sum to resolveMs: {value}"
+    );
     for key in TIMINGS_KEYS {
         assert!(
             timings[*key].as_f64().is_some_and(|ms| ms >= 0.0),
