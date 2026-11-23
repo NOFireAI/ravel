@@ -140,8 +140,8 @@ const P1_RECOVERY: Prop = Prop {
 /// P2: a deadline, not a measured band. The client abandons a probe write at
 /// its client timeout, 15 s except for probes 2, 5 and 8 under the self-check,
 /// which use 1 ms (`ack_timeout`). A post-recovery strict write that gets no
-/// response, by that timeout or through a connection error
-/// (`Reply::NoResponse` in ravel.rs), makes this fire.
+/// response, by that timeout or through a transport error, including a failed
+/// body read (`Reply::NoResponse` in ravel.rs), makes this fire.
 const P2_ANSWERED: Prop = Prop {
     kind: Kind::Always,
     message: "every strict write after recovery is answered within the client timeout",
