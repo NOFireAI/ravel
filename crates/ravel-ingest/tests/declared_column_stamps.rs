@@ -9,7 +9,9 @@
 //! that every stamp a flush emits round-trips the wave-2 reader with an empty
 //! `dropped()` set (a flush never emits a stamp its own reader would drop), and
 //! that two flushes of one shard each stamp from their own buffer, not a
-//! cumulative one.
+//! cumulative one. ADR-4628's sum and zero count are pinned the same way, on
+//! the row write and on `write_columnar`, with and without the producer
+//! opt-out.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -504,6 +506,8 @@ async fn two_flushes_stamp_from_their_own_buffers() {
     );
     assert_eq!(c1.sample_count, 2);
     assert_eq!(ev1.null_count(), 0);
+    assert_eq!(ev1.sum(), Some(40), "10 + 30, the first buffer only");
+    assert_eq!(ev1.zero_count(), Some(0));
 
     let c2 = commit_record_for(store.as_ref(), &second.tokens[0]).await;
     let s2 = read_commit_record(&c2);
@@ -515,6 +519,12 @@ async fn two_flushes_stamp_from_their_own_buffers() {
     );
     assert_eq!(ev2.max(), Some(DeclaredStatValue::I64(200)));
     assert_eq!(c2.sample_count, 2);
+    assert_eq!(
+        ev2.sum(),
+        Some(300),
+        "100 + 200, the second buffer only, not 340"
+    );
+    assert_eq!(ev2.zero_count(), Some(0));
 
     // Two distinct data objects, one per flush.
     assert_ne!(
@@ -767,4 +777,237 @@ async fn list_resource_attribute_falls_back_to_scope_value_end_to_end() {
         "the scan is elided:\n{plan_text}"
     );
     assert_eq!(gets, 0, "a statement answered from stamps reads no data");
+}
+
+/// The ADR-4628 producer cases, run end to end. Declared: `EventDate` (I64),
+/// `IsRefresh` (BOOL) and `Total` (I64). The stream's resource set carries
+/// `Total = i64::MAX` and `IsRefresh = false`.
+///
+/// | row | record attributes           | EventDate | IsRefresh  | Total         |
+/// |-----|-----------------------------|-----------|------------|---------------|
+/// | 1   | (none)                      | NULL      | false (fb) | i64::MAX (fb) |
+/// | 2   | (none)                      | NULL      | false (fb) | i64::MAX (fb) |
+/// | 3   | EventDate=0                 | 0         | false (fb) | i64::MAX (fb) |
+/// | 4   | Total=-2, IsRefresh=true    | NULL      | true       | -2            |
+/// | 5   | Total="x", EventDate=7      | 7         | false (fb) | NULL          |
+const TOTAL_COL: &str = "Total";
+
+fn aggregate_records() -> Vec<NormalizedLogRecord> {
+    let res = [
+        (TOTAL_COL, AttrValue::I64(i64::MAX)),
+        (BOOL_COL, AttrValue::Bool(false)),
+    ];
+    vec![
+        record_on(&res, BASE_NS, vec![]),
+        record_on(&res, BASE_NS + 1, vec![]),
+        record_on(&res, BASE_NS + 2, vec![(COL, AttrValue::I64(0))]),
+        record_on(
+            &res,
+            BASE_NS + 3,
+            vec![
+                (TOTAL_COL, AttrValue::I64(-2)),
+                (BOOL_COL, AttrValue::Bool(true)),
+            ],
+        ),
+        record_on(
+            &res,
+            BASE_NS + 4,
+            vec![
+                (TOTAL_COL, AttrValue::Str("x".to_string())),
+                (COL, AttrValue::I64(7)),
+            ],
+        ),
+    ]
+}
+
+fn aggregate_decl() -> Vec<DeclaredTypedColumn> {
+    vec![
+        DeclaredTypedColumn {
+            key: COL.to_string(),
+            ty: DeclaredColumnType::I64,
+        },
+        DeclaredTypedColumn {
+            key: BOOL_COL.to_string(),
+            ty: DeclaredColumnType::Bool,
+        },
+        DeclaredTypedColumn {
+            key: TOTAL_COL.to_string(),
+            ty: DeclaredColumnType::I64,
+        },
+    ]
+}
+
+/// Which `LogIngestRouter` entry a flush is driven through: the row write the
+/// OTLP path uses, or `write_columnar`, the bulk loader's entry.
+#[derive(Clone, Copy, Debug)]
+enum WritePath {
+    Rows,
+    Columnar,
+}
+
+/// Flush [`aggregate_records`] once through `path` under `config` and return
+/// the commit record the flush published.
+async fn flush_aggregate_records(config: IngestConfig, path: WritePath) -> CommitRecord {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(BASE_NS);
+    declare_columns(store.as_ref(), aggregate_decl()).await;
+    let router = LogIngestRouter::new(
+        config,
+        Arc::clone(&store),
+        clock.clone(),
+        Arc::new(PendingAckBudget::new(0)),
+    );
+    let records = aggregate_records();
+    let receipt = match path {
+        WritePath::Rows => {
+            router
+                .write(
+                    tenant(),
+                    records,
+                    WriteMode::Strict,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+        }
+        WritePath::Columnar => {
+            let rows: Vec<ravel_logseg::LogRecord> = records
+                .iter()
+                .map(|r| ravel_logseg::LogRecord {
+                    stream_id: r.stream_id,
+                    stream_attrs: r.stream_attrs.to_vec(),
+                    ts_ns: r.ts_ns,
+                    observed_ts_ns: r.observed_ts_ns,
+                    severity_num: r.severity_num,
+                    severity_text: r.severity_text.clone(),
+                    body: r.body.clone(),
+                    trace_id: r.trace_id,
+                    span_id: r.span_id,
+                    flags: r.flags,
+                    attrs: r.attrs.clone(),
+                })
+                .collect();
+            router
+                .write_columnar(
+                    tenant(),
+                    ravel_logseg::ColumnarLogBatch::from_records(&rows),
+                    WriteMode::Strict,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+        }
+    }
+    .expect("strict write flushes");
+    router.shutdown().await;
+    assert_eq!(receipt.tokens.len(), 1, "{path:?}: one flush");
+    let commit = commit_record_for(store.as_ref(), &receipt.tokens[0]).await;
+    assert_eq!(commit.sample_count, 5, "{path:?}");
+    commit
+}
+
+fn raw_entry<'a>(
+    commit: &'a CommitRecord,
+    name: &str,
+) -> &'a ravel_proto::commit::v1::DeclaredColumnMinMax {
+    let mut matching = commit
+        .declared_column_stats
+        .iter()
+        .filter(|e| e.name == name);
+    let entry = matching.next().expect("raw entry present");
+    assert!(matching.next().is_none(), "{name}: exactly one raw entry");
+    entry
+}
+
+/// ADR-4628 test 8, producer half, through the real flush on both write
+/// paths: the raw commit-record entries carry field 6 or 7 and field 8 with
+/// the figures [`aggregate_records`] states, the reader keeps every entry,
+/// and the drop metric does not move.
+#[tokio::test]
+async fn flush_stamps_sum_and_zero_count_on_both_write_paths() {
+    use ravel_commit::declared_stats::{StatCarrier, declared_stat_drops_observed};
+    let drops_before = declared_stat_drops_observed(StatCarrier::CommitRecord);
+    // Three fallback rows of i64::MAX and the record's -2: past i64::MAX.
+    let total_sum: i128 = 3 * i128::from(i64::MAX) - 2;
+
+    for path in [WritePath::Rows, WritePath::Columnar] {
+        let commit = flush_aggregate_records(flush_on_first(), path).await;
+
+        let ev = raw_entry(&commit, COL);
+        assert_eq!(ev.sum, Some(7), "{path:?}: 0 + 7 fits i64, field 6");
+        assert!(ev.sum_wide.is_empty(), "{path:?}: no field 7 beside 6");
+        assert_eq!(ev.zero_count, Some(1), "{path:?}: row 3");
+        assert_eq!(ev.null_count, 3, "{path:?}");
+
+        let total = raw_entry(&commit, TOTAL_COL);
+        assert_eq!(total.sum, None, "{path:?}: past i64, no field 6");
+        assert_eq!(
+            total.sum_wide,
+            total_sum.to_le_bytes().to_vec(),
+            "{path:?}: field 7 holds 3 * i64::MAX - 2"
+        );
+        assert_eq!(total.zero_count, Some(0), "{path:?}");
+        assert_eq!(total.null_count, 1, "{path:?}: row 5's Str");
+
+        let refresh = raw_entry(&commit, BOOL_COL);
+        assert_eq!(refresh.sum, None, "{path:?}: BOOL carries no sum");
+        assert!(refresh.sum_wide.is_empty(), "{path:?}");
+        assert_eq!(
+            refresh.zero_count,
+            Some(4),
+            "{path:?}: four false rows, row 4's true excluded"
+        );
+        assert_eq!(refresh.null_count, 0, "{path:?}");
+
+        let read = read_commit_record(&commit);
+        assert!(read.dropped().is_empty(), "{path:?}: reader drops nothing");
+        assert_eq!(read.column(COL).expect("EventDate").sum(), Some(7));
+        assert_eq!(
+            read.column(TOTAL_COL).expect("Total").sum(),
+            Some(total_sum)
+        );
+        assert_eq!(
+            read.column(BOOL_COL).expect("IsRefresh").zero_count(),
+            Some(4)
+        );
+    }
+    assert_eq!(
+        declared_stat_drops_observed(StatCarrier::CommitRecord),
+        drops_before,
+        "no stamp a flush wrote was dropped"
+    );
+}
+
+/// ADR-4628 test 12, producer half: with `emit_declared_stat_aggregates`
+/// false, the same rows through the same paths give entries with no sum and
+/// no zero count, and min, max and null count equal to the emitting run's.
+#[tokio::test]
+async fn opt_out_flush_writes_no_sum_or_zero_count() {
+    use ravel_commit::declared_stats::{StatCarrier, declared_stat_drops_observed};
+    let drops_before = declared_stat_drops_observed(StatCarrier::CommitRecord);
+    for path in [WritePath::Rows, WritePath::Columnar] {
+        let emitted = flush_aggregate_records(flush_on_first(), path).await;
+        let withheld = flush_aggregate_records(
+            IngestConfig {
+                emit_declared_stat_aggregates: false,
+                ..flush_on_first()
+            },
+            path,
+        )
+        .await;
+        assert_eq!(withheld.declared_column_stats.len(), 3, "{path:?}");
+        for entry in &withheld.declared_column_stats {
+            let name = &entry.name;
+            assert_eq!(entry.sum, None, "{path:?}: {name} sum");
+            assert!(entry.sum_wide.is_empty(), "{path:?}: {name} sum_wide");
+            assert_eq!(entry.zero_count, None, "{path:?}: {name} zero_count");
+            let on = raw_entry(&emitted, name);
+            assert_eq!(entry.min, on.min, "{path:?}: {name} min");
+            assert_eq!(entry.max, on.max, "{path:?}: {name} max");
+            assert_eq!(entry.null_count, on.null_count, "{path:?}: {name} nulls");
+        }
+        assert!(read_commit_record(&withheld).dropped().is_empty());
+    }
+    assert_eq!(
+        declared_stat_drops_observed(StatCarrier::CommitRecord),
+        drops_before
+    );
 }

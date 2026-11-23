@@ -111,7 +111,8 @@ concrete failure rows:
   attribute values, never inside metric names. That proviso becomes a
   documented requirement (§7). (No longer true of every catalog object:
   `.cstat` and `.kidx` hold attribute values; see the kidx subject-values
-  amendment below.)
+  amendment below. A snapshot entry's declared-column stamp holds numeric
+  values; see the declared-column stamp amendment below.)
 
 ## Decision
 
@@ -506,7 +507,9 @@ Index objects (`SnapshotEntry`, `SnapshotPartHeader`, name postings) carry
 identities, hashes, counts, and metric names -- never label/attribute values
 (§7 point 5's requirement; narrowed by the kidx subject-values amendment
 below, since `.kidx` leaves and `.cstat` objects do hold attribute values
-and are cleared by the fold and the catalog sweep instead). ADR-0028
+and are cleared by the fold and the catalog sweep instead; narrowed again
+by the declared-column stamp amendment below, since a `SnapshotEntry`'s
+stamp holds numeric values). ADR-0028
 analytics is a pure query-time stage
 (`ravel-analytics` has no clock/IO/object-store/catalog) that runs *after*
 the query-time exclusion filter and persists nothing durable, so a derived
@@ -621,7 +624,9 @@ Stated explicitly, per ADR-0055's own consequence:
   amendment, which is what lets an unreferenced `.cstat` holding an erased
   value be deleted at all), and `u/**` hold no subject attribute values
   (Context; §7 requirement; `catalog/*/idx/` `.cstat` and `.kidx` objects
-  are the exception, see the kidx subject-values amendment below), so the
+  are the exception, see the kidx subject-values amendment below, and so
+  are `.csnap` snapshot parts through their numeric stamps, see the
+  declared-column stamp amendment below), so the
   WORM boundary and subject erasure are
   disjoint by construction — except the audit keyspace, which ADR-0062
   fixes (Consequences).
@@ -992,3 +997,41 @@ with this rule. A bucket an earlier build already rewrote for the request is
 skipped as already applied and keeps the records that build did not match;
 a new request with a new id for the same subject rewrites it under this
 rule.
+
+## Amendment (2026-11-23, #4670): declared-column stamps carry subject values
+
+<!-- amendment-applies: sections="Constraints already landed that this ADR must compose with|Amendment: completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies|6. Interaction with ADR-0055 (WORM / credential scoping / legal hold) — the landed-second obligation" pointer="declared-column stamp amendment" -->
+
+ADR-0873 stamps the min, max and null count of each declared `I64` and
+`BOOL` column on logs commit records, compaction records and snapshot
+entries, and ADR-4628 adds the exact sum (`I64` only) and the zero count
+(`I64` and `BOOL`). The logs flush, `ravel-cli load` included, writes the
+sum and zero count from issue #4670 on, unless the ingest process opts out
+(`IngestConfig::emit_declared_stat_aggregates`). These are numeric values
+of the stamped rows. With the min and max, a sum can recover an erased
+value: the pre-rewrite sum less the sum over the rows the rewrite kept is
+the sum of the erased rows, which for one erased row is its exact value.
+
+The stamp's numeric values count as subject values, as an `I64` `key8` in
+a `.kidx` leaf does (the kidx subject-values amendment). ADR-4628 question
+6a reads the guarantee as covering every label and attribute value of an
+erased record, numeric included, and any figure one can be recovered from;
+the matcher rule that a non-string value never matches (the attribute
+scope amendment) says which records a request selects, not which of their
+values the guarantee covers. The Context's catalog-contents bullet, the F3
+determination and §6's disjointness statement each say a snapshot entry
+holds no attribute value; that stops being true of its stamp.
+
+What follows for erasure:
+
+- An erasure rewrite's outputs carry no stamp, so a fold that applies the
+  rewrite record writes a snapshot entry without one, and the replaced
+  `.csnap` part is then named by no HEAD and swept past the protection
+  horizon, the same rule as for `.cstat`. A commit record or compaction
+  record the rewrite superseded is swept with its chain.
+- Under per-object compliance retention, a locked version keeps its stamp
+  until its retain-until. For a commit record that is inside the
+  `max(bound + E_v, R)` bound docs/deletion-and-gc.md states; for a
+  `.csnap` part it is the catalog-keyspace bound
+  docs/object-store-contract.md states for `.cstat`, and that modifier
+  applies to a tenant with any declared `I64` or `BOOL` column.
