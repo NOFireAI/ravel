@@ -374,9 +374,9 @@ the strict ack deadline there bounds when the server *answers*
 (`WriteError::AckTimeout`), not when it acknowledges; a strict ack follows the
 commit PUT. P2 is not a latency band and not that server deadline: it is the
 driver's 15 s client deadline (`WRITE_TIMEOUT` in `driver/src/main.rs`). It is
-expected to hold because the server answers a strict write by its own ack
-deadline, `DEFAULT_ACK_DEADLINE` (10 s) in `services/ravel-server/src/lib.rs`,
-which is shorter.
+expected to hold because the server's ack deadline, `DEFAULT_ACK_DEADLINE`
+(10 s) in `services/ravel-server/src/lib.rs`, bounds the wait for a strict ack
+once the write reaches the router, and is shorter.
 
 "Within N s" means `mono_ms <= N * 1000`. The log lines, one `println` each,
 fields in this order:
@@ -405,7 +405,9 @@ of violated always-type assertions: it must equal, whole line for whole line,
 the `<mode>-violated` messages for the mode (none in the clean mode). Its line
 counts and latency bands are the local expectations of the plan. The clean,
 slow-ack and no-ack loops ran inside these bands on the build box on the T1
-images (#4559 comment 7087421604); the self-check bands are predicted:
+images (#4559 comment 7087421604); the self-check bands are predicted, and no
+loop had run the P1 to P3 expectations of the bullets below when this was
+written:
 
 - Clean run: exactly 1 `perf t0`, 1 `perf summary`, 2 `perf ttfa`,
   20 `perf ack` and 2 `perf median` lines and no `perf skipped` line; every
@@ -456,11 +458,11 @@ images (#4559 comment 7087421604); the self-check bands are predicted:
 (not with a mutant): it launches from a temporary copy of `config-perf/` whose
 `--max-flush-delay` reads 2400ms instead of 500ms, the same value the local
 lever file uses. The script ties the two values: it refuses unless the copy
-and the local lever file each carry exactly one 2400ms `--max-flush-delay`
-value. The rest of the lever file's command list is not compared. It runs as test
-`ravel-ingest-durability-perf-mutant` with `attrs.variant=perf` and
-`attrs.mutant=perf-lever/slow-ack`, on the plain images.
-`PERF_LEVER=no-ack` is local only; `scripts/launch.sh` refuses it.
+and the local lever file each carry exactly one quoted 2400ms line (the
+`--max-flush-delay` value). The rest of the lever file's command list is not
+compared. It runs as test `ravel-ingest-durability-perf-mutant` with
+`attrs.variant=perf` and `attrs.mutant=perf-lever/slow-ack`, on the plain
+images. `PERF_LEVER=no-ack` is local only; `scripts/launch.sh` refuses it.
 `WORKLOAD_PERF_SELF_CHECK` is never passed to a launched run.
 
 `LOCAL_RUN_ANALYZE_ONLY=1` re-scores a kept run: it skips every docker command
