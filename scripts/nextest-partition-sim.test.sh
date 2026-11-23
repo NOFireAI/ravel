@@ -66,6 +66,16 @@ check "replay with two legs swapped" 1 "ran on leg 1, the rule gives leg 2" \
   replay "$TMP/leg2.log" "$TMP/leg1.log" "$TMP/leg3.log" "$TMP/leg4.log"
 check "replay of a log with no results" 2 "no nextest result lines" \
   replay "$TMP/empty.log"
+check "replay with one leg's log empty" 2 "no nextest result lines in $TMP/empty.log" \
+  replay "$TMP/leg1.log" "$TMP/empty.log" "$TMP/leg3.log" "$TMP/leg4.log"
+
+# A test that timed out still counts on its leg: the 60 s TIMEOUT line below
+# adds to leg 3's sum, so the four legs hold 13 tests and 213 summed seconds.
+cp "$TMP/leg3.log" "$TMP/leg3-timeout.log"
+printf '2026-11-22T08:42:00.0000000Z     TIMEOUT [  60.000s] (  2/4102) ravel-affinity tests::determinism_same_inputs_same_output_again\n' \
+  >> "$TMP/leg3-timeout.log"
+check "a TIMEOUT line counts" 0 "13 tests, 213 summed seconds" \
+  simulate --legs 4 "$TMP/leg1.log" "$TMP/leg2.log" "$TMP/leg3-timeout.log" "$TMP/leg4.log"
 
 # At 4 legs the sums are the files' own: leg 1 holds the 100 s test.
 check "simulate at the recorded count" 0 "legs=4 slowest=100s" \
@@ -80,6 +90,8 @@ check "a band for a count not simulated" 64 "names a leg count --legs does not" 
   simulate --legs 4 --band 5:10:50 "$TMP/leg1.log"
 check "a malformed leg list" 64 "--legs wants a list" \
   simulate --legs four "$TMP/leg1.log"
+check "a zero parallelism" 64 "--parallelism wants a positive number" \
+  simulate --legs 4 --parallelism 0 "$TMP/leg1.log"
 
 if [ "$fails" -ne 0 ]; then
   echo "nextest-partition-sim.test.sh: $fails case(s) failed"
