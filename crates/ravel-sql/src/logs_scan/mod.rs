@@ -2083,6 +2083,28 @@ impl LogsScanExec {
         })
     }
 
+    /// A sibling of this scan whose row filter conjuncts have `rewrite`
+    /// applied, or `None` when it changes none (issue #4660). `rewrite` must
+    /// keep the columns each conjunct reads, so the build projection, the
+    /// decoded columns and the bound positions stay as they are; everything
+    /// else is shared as [`Self::sibling`] shares it.
+    pub(crate) fn with_row_filters_rewritten(
+        &self,
+        rewrite: row_filter::RewriteExpr,
+    ) -> DFResult<Option<Self>> {
+        let Some(row_filters) = self.row_filters.rewritten(&self.full_schema, rewrite)? else {
+            return Ok(None);
+        };
+        let bound_row_filters = match &self.bound_row_filters {
+            Some(bound) => Some(Arc::new(bound.rewritten(&self.build_schema, rewrite)?)),
+            None => None,
+        };
+        let mut scan = self.sibling(self.fetch, self.topk.clone());
+        scan.row_filters = row_filters;
+        scan.bound_row_filters = bound_row_filters;
+        Ok(Some(scan))
+    }
+
     /// Attach this plan's loaded column statistics (ADR-0850), resolved once
     /// per plan by [`crate::executor::SqlExecutor`] and threaded down through
     /// [`crate::logs_provider::LogsTableProvider::with_column_stats`]. A

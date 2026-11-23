@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3b5ab5251256a6e01363ece5aa771ac9a559e182d52c9889c35024f65477d91f # shrinks to case = Case { rows: [None, Some("bc"), Some(""), Some(""), Some(""), None, Some("a"), Some(""), Some("bc"), Some(""), Some("a"), Some("a"), Some(""), None, Some("bc"), Some(""), Some(""), Some("bc"), Some(""), None, Some("bc"), Some("bc"), Some("bc")], layout: 1, null_entry: [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false], offset: 0, len: 21, negated: true }
+cc 78fe760f4379563f079f58dbc7b8f129d12bd0d987154132621207874804aa40 # shrinks to case = Case { rows: [Some("longer than twelve bytes"), Some(""), Some("longer than twelve bytes"), Some("longer than twelve bytes"), Some(""), Some("bc"), Some("bc"), None, None, Some("longer than twelve bytes"), Some("bc"), Some(""), Some("a"), None, None, None, Some("bc"), Some(""), Some(""), None, Some(""), Some(""), Some("a"), Some("a"), Some("longer than twelve bytes")], layout: 8, null_entry: [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false], offset: 0, len: 18, negated: false }

@@ -94,6 +94,8 @@ mod logs_declared_minmax_from_stamps;
 mod logs_decoded_cache;
 #[path = "logs_differential.rs"]
 mod logs_differential;
+#[path = "logs_empty_string_compare.rs"]
+mod logs_empty_string_compare;
 #[path = "logs_fast_path_projection_routing.rs"]
 mod logs_fast_path_projection_routing;
 #[path = "logs_i64_equality_row_filter.rs"]

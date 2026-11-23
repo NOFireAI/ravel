@@ -147,7 +147,7 @@ async fn a_row_filtered_scan_under_a_global_topk_gets_a_partition_topk() {
         "    SortExec: TopK(fetch=3), expr=[SearchPhrase@0 ASC NULLS LAST], \
          preserve_partitioning=[true]",
         "      LogsScanExec: partitions=4, content=0, prune=0, projection=[SearchPhrase], \
-         row_filters=[SearchPhrase != ]",
+         row_filters=[empty_ne(SearchPhrase)]",
     ];
     for (objects, values) in fixtures {
         let (store, segments) = fixture(objects).await;
@@ -217,7 +217,7 @@ async fn other_topk_shapes_plan_as_before() {
                 "    CoalescePartitionsExec",
                 "      ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, ts@0 as ts]",
                 "        LogsScanExec: partitions=4, content=0, prune=0, \
-                 projection=[ts, SearchPhrase], row_filters=[SearchPhrase != ], \
+                 projection=[ts, SearchPhrase], row_filters=[empty_ne(SearchPhrase)], \
                  topk_threshold=ts",
             ],
         ),
@@ -231,7 +231,7 @@ async fn other_topk_shapes_plan_as_before() {
                 "    CoalescePartitionsExec",
                 "      ProjectionExec: expr=[SearchPhrase@1 as SearchPhrase, ts@0 as ts]",
                 "        LogsScanExec: partitions=4, content=0, prune=0, \
-                 projection=[ts, SearchPhrase], row_filters=[SearchPhrase != ], \
+                 projection=[ts, SearchPhrase], row_filters=[empty_ne(SearchPhrase)], \
                  topk_threshold=ts",
             ],
         ),
@@ -263,7 +263,7 @@ async fn other_topk_shapes_plan_as_before() {
                  gby=[CAST(null_entries_as_null_keys(SearchPhrase@0) AS Utf8View) \
                  as SearchPhrase], aggr=[count(Int64(1))]",
                 "              LogsScanExec: partitions=4, content=0, prune=0, \
-                 projection=[SearchPhrase], row_filters=[SearchPhrase != ]",
+                 projection=[SearchPhrase], row_filters=[empty_ne(SearchPhrase)]",
             ],
         ),
         (
@@ -275,7 +275,7 @@ async fn other_topk_shapes_plan_as_before() {
                 "  CoalescePartitionsExec",
                 "    FilterExec: like(URL@1, %google%), projection=[SearchPhrase@0]",
                 "      LogsScanExec: partitions=4, content=1, prune=0, \
-                 projection=[SearchPhrase, URL], row_filters=[SearchPhrase != ]",
+                 projection=[SearchPhrase, URL], row_filters=[empty_ne(SearchPhrase)]",
             ],
         ),
     ];
