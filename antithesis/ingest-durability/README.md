@@ -378,6 +378,20 @@ expected to hold because the server's ack deadline, `DEFAULT_ACK_DEADLINE`
 (10 s) in `services/ravel-server/src/lib.rs`, bounds the wait for a strict ack
 once the write reaches the router, and is shorter.
 
+The ack deadline covers only a write that reaches the router; a probe that
+never reaches the server, for example because the platform stopped its node,
+is not bounded by it. P2 and P3 are therefore also measured over the same
+histories as P1. In perf-measure-1, "answered within the client timeout" had 0
+false over 9506 ack probes (#4559 comment 7088441883), and all four per-node
+median rungs (1, 2, 5 and 8 s) had 0 false over 938 medians (#4559 comment
+7088441883). Every fault after the pause in that run (111 stops, 1 kill)
+landed 0.0012 to 8.54 s after the pause and before that history's TTFA lines
+(#4559 comment 7088652995). The ack probes start only after both TTFA samples
+and a further 5 s settle (`driver/src/main.rs`), so each of those restarts had
+finished before the first ack probe. A platform stop that landed inside the
+ack probes would make P2, and possibly P3, fire on a platform fault rather than
+a Ravel one; none did in perf-measure-1.
+
 "Within N s" means `mono_ms <= N * 1000`. The log lines, one `println` each,
 fields in this order:
 
