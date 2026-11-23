@@ -4649,29 +4649,24 @@ impl SqlExecutor {
             } else {
                 None
             };
-            let (snapshot, origins, parts, lane_timings) = if let Some((
-                snapshot,
-                origins,
-                parts,
-                lane_timings,
-            )) = with_parts
-            {
-                (snapshot, origins, Some(parts), lane_timings)
-            } else {
-                let (snapshot, origins, lane_timings) = self
-                    .catalog
-                    .resolve_pruned_with_admission_timed(
-                        &tenant_hash,
-                        signal,
-                        req.window,
-                        tokens.for_lane(lane),
-                        clocks.resolve_at_ns,
-                        lane_name_filter,
-                        phase_accounting.lane(lane).resolve(),
-                    )
-                    .await?;
-                (snapshot, origins, None, lane_timings)
-            };
+            let (snapshot, origins, parts, lane_timings) =
+                if let Some((snapshot, origins, parts, lane_timings)) = with_parts {
+                    (snapshot, origins, Some(parts), lane_timings)
+                } else {
+                    let (snapshot, origins, lane_timings) = self
+                        .catalog
+                        .resolve_pruned_with_admission_timed(
+                            &tenant_hash,
+                            signal,
+                            req.window,
+                            tokens.for_lane(lane),
+                            clocks.resolve_at_ns,
+                            lane_name_filter,
+                            phase_accounting.lane(lane).resolve(),
+                        )
+                        .await?;
+                    (snapshot, origins, None, lane_timings)
+                };
             timings = timings.saturating_add(lane_timings);
             // Exact count of `SegmentOrigin::Recent` entries (issue #1214): the
             // one origin a folded catalog has not yet sealed, so it is never

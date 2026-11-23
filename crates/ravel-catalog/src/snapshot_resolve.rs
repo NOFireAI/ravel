@@ -698,7 +698,14 @@ impl Catalog {
         let requests_before = accounting.snapshot().total_s3_requests();
         let started = self.monotonic_clock().now_nanos();
         let head = self
-            .read_head(tenant, signal, head_key, bypass_cache, generations, accounting)
+            .read_head(
+                tenant,
+                signal,
+                head_key,
+                bypass_cache,
+                generations,
+                accounting,
+            )
             .await;
         if accounting.snapshot().total_s3_requests() > requests_before {
             *head_wait += between(started, self.monotonic_clock().now_nanos());
