@@ -7,11 +7,11 @@
      "basis": "87,608 data objects measured on history, 2026-11-06, #3694 comment 6704570952, same stream and anchor rule; the band is about plus or minus 10 %"},
     {"name": "ravel_only_l0_series_query_ms", "file": "stamps.json", "path": "ravel_only.l0.series_query_ms", "min": 100000, "max": 130000,
      "basis": "predicted: the L0 listing reaching the 120 s deadline, 87,608 GETs at about 60 ms over fetch concurrency 32, about 164 s"},
-    {"name": "ravel_only_l1_parts", "file": "stamps.json", "path": "ravel_only.l1.objects.l1.count", "min": 20, "max": 260,
-     "basis": "predicted: 84 parts (11,960,008,444 B) measured before #4645 on the #3941 rerun, comment 7096343044; #4645 also closes a part at 16,777,216 flagged provenance samples or 4,473,924 runs, and the two parts the reader refused held about 24.5M flagged samples in 173 MB (about 7 B each), so at that density a part closes near 118 MB: about 6 parts in each of the 20 (shard, hour) buckets of about 600 MB, about 120; the run bound was not measured, so the band doubles 130 at the top and keeps 20 at the bottom, since a split only adds parts"},
+    {"name": "ravel_only_l1_parts", "file": "stamps.json", "path": "ravel_only.l1.objects.l1.count", "min": 76, "max": 260,
+     "basis": "predicted: 84 parts (11,960,008,444 B) measured before #4645 on the #3941 rerun, comment 7096343044; #4645 also closes a part at 16,777,216 flagged provenance samples or 4,473,924 runs, and the two parts the reader refused held about 24.5M flagged samples in 173 MB (about 7 B each), so at that density a part closes near 118 MB: about 6 parts in each of the 20 (shard, hour) buckets of about 600 MB, about 120; the run bound was not measured, so the band doubles 130 at the top; a split only adds parts, so the bottom is the measured 84 less 10 % for a different clock-derived anchor's stream"},
     {"name": "ravel_only_l1_series_query_ms", "file": "stamps.json", "path": "ravel_only.l1.series_query_ms", "min": 0, "max": 30000,
      "basis": "predicted: 2 GETs per L1 part plus the catalog section bytes; the provenance decode is skipped since #4461; a quarter of the 120 s deadline"},
-    {"name": "ravel_only_l1_series_store_get_calls", "file": "stamps.json", "path": "ravel_only.l1.readback.series_store_get_calls", "min": 20, "max": 800,
-     "basis": "predicted: 2 to 3 GETs per part over the ravel_only_l1_parts band of 20 to 260 parts; counts the series listing alone (query_cost.series), not the whole read-back"}
+    {"name": "ravel_only_l1_series_store_get_calls", "file": "stamps.json", "path": "ravel_only.l1.readback.series_store_get_calls", "min": 150, "max": 800,
+     "basis": "predicted: 2 to 3 GETs per part over the ravel_only_l1_parts band of 76 to 260 parts, 152 to 780, rounded out; counts the series listing alone (query_cost.series), not the whole read-back"}
   ]
 }

@@ -4836,14 +4836,14 @@ expect_check_err "check series si8: the switch off leaves the series figures mis
 RO_BANDS="${HERE}/../stage1-bands.ravel-only.history.json"
 RO_FIGURES="$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["figures"]))' "${RO_BANDS}")"
 rm -rf "${TMP}/check-ro" && cp -R "${TMP}/ro8/out" "${TMP}/check-ro"
-python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); ro=d["ravel_only"]; ro["l0"]["objects"]["data"]["count"]=87608; ro["l1"]["objects"]["l1"]["count"]=24; json.dump(d,open(p,"w"))' "${TMP}/check-ro/stamps.json"
+python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); ro=d["ravel_only"]; ro["l0"]["objects"]["data"]["count"]=87608; ro["l1"]["objects"]["l1"]["count"]=120; ro["l1"]["readback"]["series_store_get_calls"]=300; json.dump(d,open(p,"w"))' "${TMP}/check-ro/stamps.json"
 run_check ro-clean "${RO_BANDS}" "${TMP}/check-ro"
 if [ "${rc}" -eq 0 ] && [ "${RO_FIGURES}" -eq 5 ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq "${RO_FIGURES}" ] &&
   grep -qxF 'ok ravel_only_l0_data_objects = 87608 in [79000, 96000] (stamps.json ravel_only.l0.objects.data.count)' "${CHECK_OUT}" &&
   grep -qxF 'ok ravel_only_l0_series_query_ms = 120013 in [100000, 130000] (stamps.json ravel_only.l0.series_query_ms)' "${CHECK_OUT}" &&
-  grep -qxF 'ok ravel_only_l1_parts = 24 in [20, 260] (stamps.json ravel_only.l1.objects.l1.count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok ravel_only_l1_parts = 120 in [76, 260] (stamps.json ravel_only.l1.objects.l1.count)' "${CHECK_OUT}" &&
   grep -qxF 'ok ravel_only_l1_series_query_ms = 12 in [0, 30000] (stamps.json ravel_only.l1.series_query_ms)' "${CHECK_OUT}" &&
-  grep -qxF 'ok ravel_only_l1_series_store_get_calls = 40 in [20, 800] (stamps.json ravel_only.l1.readback.series_store_get_calls)' "${CHECK_OUT}"; then
+  grep -qxF 'ok ravel_only_l1_series_store_get_calls = 300 in [150, 800] (stamps.json ravel_only.l1.readback.series_store_get_calls)' "${CHECK_OUT}"; then
   pass "check ravel-only: every one of the ${RO_FIGURES} figures in band on a history-shaped Ravel-only run"
 else
   fail "check ravel-only: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
