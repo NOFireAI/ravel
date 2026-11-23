@@ -7345,6 +7345,70 @@ mod tests {
         );
     }
 
+    /// ADR-4628 test 11: a `.csnap` part a later fold replaced, with the
+    /// declared-column stamps its entries carry, is spared until it clears
+    /// the age gate and is gone after it; its replacement is spared.
+    #[tokio::test]
+    async fn catalog_sweep_deletes_replaced_part_after_age_gate() {
+        let tenant = tenant();
+        let signal = Signal::Logs;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let horizon = config.protection_horizon_ns;
+        let written_ns = horizon;
+        store.set_clock_ms((written_ns / 1_000_000) as u64);
+
+        let replaced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let replacement = format!(
+            "{}20260101T01.bbbb.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &replaced).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&replaced, [1u8; 32])],
+            None,
+        )
+        .await;
+        put_catalog_object(&store, &replacement).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&replacement, [2u8; 32])],
+            None,
+        )
+        .await;
+
+        let young = FixedClock::new(written_ns + horizon / 2);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &young, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+        assert_eq!(outcome.deleted, 0, "the replaced part is still young");
+        assert!(present(&store, &replaced).await);
+
+        let past = FixedClock::new(written_ns + horizon.saturating_mul(2));
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &past, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+        assert_eq!(outcome.deleted, 1);
+        assert!(
+            !present(&store, &replaced).await,
+            "the replaced part must be swept past the age gate"
+        );
+        assert!(
+            present(&store, &replacement).await,
+            "the HEAD-named replacement must be spared"
+        );
+    }
+
     /// A postings object named by `HEAD.postings.key` is spared like a part ref;
     /// an unreferenced old postings object under `idx/` is swept.
     #[tokio::test]

@@ -3369,10 +3369,17 @@ or a `zero_count` below the non-null count when min and max are both zero.
 The fields are additive and `format_version` stays 1: an older reader
 ignores them and keeps the min, max, and null count it read before.
 `CompactionPart.declared_column_stats` (field 12) is the same statement over
-the same merged view, per compaction or erasure-rewrite output part. The
-producer is the compaction recompute (`crates/ravel-maintain/src/rlog.rs`),
-again not the segment writer: it recomputes over the rows that part holds and
-never copies an input's stamp.
+the same merged view, per logs compaction output part. The producer is the
+compaction recompute (`crates/ravel-maintain/src/rlog.rs`), again not the
+segment writer: it recomputes over the rows that part holds and never copies
+an input's stamp. That recompute also writes the sum (I64 only) and the zero
+count on every entry of a compaction, migrate or force 2 output part, over
+that part's rows only; an I64 column with no non-null row carries sum 0 and
+zero count 0. An erasure-rewrite output part carries no stamp, because the
+rewrite drops rows. `CompactorConfig::emit_declared_stat_aggregates`
+(default `true`) withholds both fields when `false` and leaves the min, max
+and null count unchanged; no task wires a flag to it yet. No reader uses the
+part's sum or zero count until ADR-4628 T5.
 
 `object_key` is informational. Readers MUST reconstruct the data key from
 (tenant_hash, signal, shard, writer_id, epoch, seq, content_hash) and treat

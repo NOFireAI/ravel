@@ -20,6 +20,10 @@
 //! 6. an erasure rewrite's parts stay unstamped even when the surviving records
 //!    carry eligible declared columns (the wave-3 staleness rule).
 //!
+//! ADR-4628 (issue #4671) adds the exact I64 sum and the I64/BOOL zero count to
+//! the same recompute: tests 1, 1b and 2 pin both per part, computed by hand
+//! from the rows each part holds, over inputs stamped without them.
+//!
 //! (Test 5, the conservation gate under stamping, is a unit test beside the
 //! gate it exercises, in `publish.rs`.)
 
@@ -28,7 +32,9 @@
 use std::sync::Arc;
 
 use prost::Message;
-use ravel_commit::declared_stats::{read_compaction_part, stamp_commit_record};
+use ravel_commit::declared_stats::{
+    StatCarrier, declared_stat_drops_observed, read_compaction_part, stamp_commit_record,
+};
 use ravel_commit::keys;
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, writer::ObjectIdentity};
@@ -247,6 +253,27 @@ fn l0_stamps(records: &[LogRecord]) -> Vec<DeclaredColumnStat> {
     ]
 }
 
+/// [`l0_stamps`] plus the ADR-4628 sum and zero count over `records`' own
+/// rows, as a flush that emits them would write.
+fn l0_stamps_with_aggregates(records: &[LogRecord]) -> Vec<DeclaredColumnStat> {
+    let iv: Vec<i64> = records.iter().filter_map(|r| attr_i64(r, STATUS)).collect();
+    let bv: Vec<bool> = records.iter().filter_map(|r| attr_bool(r, CACHE)).collect();
+    let mut stamps = l0_stamps(records).into_iter();
+    let status = stamps
+        .next()
+        .unwrap()
+        .with_sum(iv.iter().map(|v| i128::from(*v)).sum())
+        .unwrap()
+        .with_zero_count(iv.iter().filter(|v| **v == 0).count() as u64)
+        .unwrap();
+    let cache = stamps
+        .next()
+        .unwrap()
+        .with_zero_count(bv.iter().filter(|b| !**b).count() as u64)
+        .unwrap();
+    vec![status, cache]
+}
+
 /// Seed one L0 `.rlog` input (data object + commit record), as the ingest log
 /// shard would. When `stamp` is set the commit record carries the wave-5a
 /// declared-column stamps for `records`; otherwise it carries none (the
@@ -257,6 +284,22 @@ async fn seed(
     seq: u64,
     records: &[LogRecord],
     stamp: bool,
+) {
+    let stamps = if stamp {
+        l0_stamps(records)
+    } else {
+        Vec::new()
+    };
+    seed_with_stamps(store, writer_id, seq, records, &stamps).await;
+}
+
+/// [`seed`] with the commit record carrying exactly `stamps`.
+async fn seed_with_stamps(
+    store: &dyn ObjectStoreBackend,
+    writer_id: Uuid,
+    seq: u64,
+    records: &[LogRecord],
+    stamps: &[DeclaredColumnStat],
 ) {
     let th = tenant_hash();
     let identity = ObjectIdentity {
@@ -316,8 +359,8 @@ async fn seed(
         ingest_hour_bucket: HOUR,
     })
     .expect("build commit record");
-    if stamp {
-        stamp_commit_record(&mut crec, &l0_stamps(records));
+    if !stamps.is_empty() {
+        stamp_commit_record(&mut crec, stamps);
     }
     let commit_key = keys::commit_key_for_record(&crec).expect("commit key");
     store
@@ -399,6 +442,23 @@ fn part_bool(p: &CompactionPart, name: &str) -> (Option<bool>, Option<bool>, u64
     (mn, mx, stat.null_count())
 }
 
+/// The validated stamp's `(sum, zero_count)` a part carries for `name`.
+fn part_aggs(p: &CompactionPart, name: &str) -> (Option<i128>, Option<u64>) {
+    let validated = read_compaction_part(p);
+    let stat = validated
+        .covered()
+        .iter()
+        .find(|s| s.name() == name)
+        .unwrap_or_else(|| panic!("part {} uncovered for {name}", p.part_index));
+    (stat.sum(), stat.zero_count())
+}
+
+/// The drop metric's `compaction-part` tally. A stamp the compactor writes is
+/// valid by construction, so reading it back must never move this.
+fn part_drops() -> u64 {
+    declared_stat_drops_observed(StatCarrier::CompactionPart)
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: each output part's stamps are exactly its own records' extrema.
 // ---------------------------------------------------------------------------
@@ -416,8 +476,20 @@ fn part_bool(p: &CompactionPart, name: &str) -> (Option<bool>, Option<bool>, u64
 /// Prove-the-test: delete the `self.declared_accum.observe_record(&r)`
 /// call in `PartBuilder::push` (crates/ravel-maintain/src/rlog.rs) and every
 /// part stamps all-NULL, so each `Some(..)` min/max assertion fails.
+///
+/// The sum and zero count (ADR-4628) are pinned per part over inputs stamped
+/// without them and, separately, over inputs stamped with their own sums. Each
+/// input splits across both parts, so a part that copied or added its inputs'
+/// sums reports no sum in the first run and 159 in the second, never 60 and 99.
 #[tokio::test]
 async fn each_output_part_stamps_exactly_its_own_records() {
+    for inputs_carry_aggregates in [false, true] {
+        each_output_part_stamps_exactly_its_own_records_with(inputs_carry_aggregates).await;
+    }
+}
+
+async fn each_output_part_stamps_exactly_its_own_records_with(inputs_carry_aggregates: bool) {
+    let drops_before = part_drops();
     let store = MemoryStore::new();
     // Merged (ts-ascending) order across the two inputs is A, B, C, D. The
     // memory split target closes a part every two records, so part 0 = {A, B}
@@ -434,8 +506,29 @@ async fn each_output_part_stamps_exactly_its_own_records() {
         rec(0, 2000, Some(10), Some(true), &[]),
         rec(0, 4000, Some(99), None, &[]),
     ];
-    seed(&store, Uuid::from_u128(1), 1, &input_1, true).await;
-    seed(&store, Uuid::from_u128(2), 2, &input_2, true).await;
+    let stamps_of = |records: &[LogRecord]| {
+        if inputs_carry_aggregates {
+            l0_stamps_with_aggregates(records)
+        } else {
+            l0_stamps(records)
+        }
+    };
+    seed_with_stamps(
+        &store,
+        Uuid::from_u128(1),
+        1,
+        &input_1,
+        &stamps_of(&input_1),
+    )
+    .await;
+    seed_with_stamps(
+        &store,
+        Uuid::from_u128(2),
+        2,
+        &input_2,
+        &stamps_of(&input_2),
+    )
+    .await;
 
     let record = compact_and_record(&store, &split_config()).await;
     assert_eq!(record.parts.len(), 2, "two records per part -> two parts");
@@ -475,6 +568,32 @@ async fn each_output_part_stamps_exactly_its_own_records() {
         part_bool(p1, CACHE),
         (Some(true), Some(true), 1),
         "part1 cache true, one NULL (D)"
+    );
+
+    assert_eq!(
+        part_aggs(p0, STATUS),
+        (Some(60), Some(0)),
+        "part0 status sum 50 + 10, no zero"
+    );
+    assert_eq!(
+        part_aggs(p0, CACHE),
+        (None, Some(1)),
+        "part0 cache: no sum on BOOL, one false (A)"
+    );
+    assert_eq!(
+        part_aggs(p1, STATUS),
+        (Some(99), Some(0)),
+        "part1 status sum 99; C's NULL is not a zero"
+    );
+    assert_eq!(
+        part_aggs(p1, CACHE),
+        (None, Some(0)),
+        "part1 cache: C is true and D's NULL is not a false"
+    );
+    assert_eq!(
+        part_drops(),
+        drops_before,
+        "no compaction stamp is dropped on read"
     );
 }
 
@@ -517,6 +636,16 @@ async fn part_stamps_the_stream_level_value_of_a_declared_column() {
         (None, None, 3),
         "a column neither the records nor the stream carry is all-NULL"
     );
+    assert_eq!(
+        part_aggs(p, STATUS),
+        (Some(21), Some(0)),
+        "the stream's 7 is summed once per row that falls back to it"
+    );
+    assert_eq!(
+        part_aggs(p, CACHE),
+        (None, Some(0)),
+        "an all-NULL BOOL column counts no false"
+    );
 }
 
 /// A record that sets the declared key overrides its stream's value for that
@@ -546,6 +675,11 @@ async fn record_attribute_overrides_the_stream_level_value_for_its_row() {
         part_i64(p, STATUS),
         (Some(2), Some(7), 1),
         "2 from the record, 7 from the stream, one NULL for the Str row"
+    );
+    assert_eq!(
+        part_aggs(p, STATUS),
+        (Some(9), Some(0)),
+        "sum 2 + 7: the Str row overrides the stream's 7 and adds nothing"
     );
 }
 
@@ -610,6 +744,7 @@ async fn part_stamps_skip_list_resource_for_a_matching_scope_fallback() {
 /// accumulator prevents, demonstrated by moving the boundary.
 #[tokio::test]
 async fn boundary_record_folds_into_the_part_it_opens() {
+    let drops_before = part_drops();
     let store = MemoryStore::new();
     // input_1 = {R1, R3}, input_2 = {R2}; merged ts-ascending: R1, R2, R3.
     let input_1 = vec![
@@ -644,6 +779,92 @@ async fn boundary_record_folds_into_the_part_it_opens() {
         part_i64(p1, STATUS),
         (Some(5), Some(5), 0),
         "R3's 5 lands in the part it opens"
+    );
+    assert_eq!(
+        part_aggs(p0, STATUS),
+        (Some(200), Some(0)),
+        "part0 sums R1 and R2 only, not input_1's R3"
+    );
+    assert_eq!(
+        part_aggs(p1, STATUS),
+        (Some(5), Some(0)),
+        "part1 sums R3 only, not input_1's R1"
+    );
+    assert_eq!(
+        part_drops(),
+        drops_before,
+        "no compaction stamp is dropped on read"
+    );
+}
+
+/// ADR-4628 decision 2 over the merged view in one part: a stream-level zero
+/// counts once per row that falls back to it, a record that names the key at
+/// another kind reads NULL (no fallback, no zero), and a part sum past
+/// `i64::MAX` is exact and written as the 16-byte `sum_wide`.
+///
+/// Rows (stream supplies STATUS = 0 and CACHE = false):
+///   R1 no attrs                   status 0 (stream)   cache false (stream)
+///   R2 STATUS = i64::MAX, true    status MAX          cache true
+///   R3 STATUS = i64::MAX          status MAX          cache false (stream)
+///   R4 STATUS = "x" (Str)         status NULL         cache false (stream)
+/// so status sum 2 * MAX, zero count 1, null 1; cache zero count 3, null 0.
+#[tokio::test]
+async fn part_sum_past_i64_and_zero_counts_follow_the_merged_view() {
+    let drops_before = part_drops();
+    let store = MemoryStore::new();
+    let stream = stream_ident_with(
+        8,
+        &[(STATUS, AttrValue::I64(0)), (CACHE, AttrValue::Bool(false))],
+    );
+    let input_1 = vec![
+        rec_on(&stream, 1000, vec![]),
+        rec_on(&stream, 3000, vec![(STATUS, AttrValue::I64(i64::MAX))]),
+    ];
+    let input_2 = vec![
+        rec_on(
+            &stream,
+            2000,
+            vec![
+                (STATUS, AttrValue::I64(i64::MAX)),
+                (CACHE, AttrValue::Bool(true)),
+            ],
+        ),
+        rec_on(
+            &stream,
+            4000,
+            vec![(STATUS, AttrValue::Str("x".to_string()))],
+        ),
+    ];
+    seed(&store, Uuid::from_u128(50), 1, &input_1, true).await;
+    seed(&store, Uuid::from_u128(51), 2, &input_2, true).await;
+
+    let record = compact_and_record(&store, &CompactorConfig::default()).await;
+    assert_eq!(record.parts.len(), 1, "four small records -> one part");
+    let p = &record.parts[0];
+    assert_eq!(p.sample_count, 4);
+    assert_eq!(part_i64(p, STATUS), (Some(0), Some(i64::MAX), 1));
+    assert_eq!(
+        part_aggs(p, STATUS),
+        (Some(2 * i128::from(i64::MAX)), Some(1)),
+        "exact sum past i64::MAX; R1's stream zero counts, R4's NULL does not"
+    );
+    assert_eq!(part_bool(p, CACHE), (Some(false), Some(true), 0));
+    assert_eq!(
+        part_aggs(p, CACHE),
+        (None, Some(3)),
+        "R1, R3 and R4 read the stream's false"
+    );
+    let raw = p
+        .declared_column_stats
+        .iter()
+        .find(|e| e.name == STATUS)
+        .expect("raw STATUS entry");
+    assert_eq!(raw.sum, None, "a sum past i64 is not written to field 6");
+    assert_eq!(raw.sum_wide.len(), 16, "it is written to field 7");
+    assert_eq!(
+        part_drops(),
+        drops_before,
+        "no compaction stamp is dropped on read"
     );
 }
 
@@ -877,6 +1098,9 @@ async fn resolve_answers_min_max_count_from_stamps_without_data_gets() {
 /// argument to `merge_catalogs` with a non-empty set (e.g. `vec![(STATUS,
 /// DeclaredStatType::I64)]`) and the survivors' parts gain stamps, failing the
 /// `is_empty` assertion here.
+///
+/// Since ADR-4628 the empty stamp also means no sum and no zero count, while a
+/// compaction of the same two survivors carries both (sum 57, two falses).
 #[tokio::test]
 async fn erasure_rewrite_parts_stay_unstamped() {
     let store = MemoryStore::new();
@@ -967,4 +1191,15 @@ async fn erasure_rewrite_parts_stay_unstamped() {
             "and the reader sees no coverage on a rewrite part"
         );
     }
+
+    // The same survivors through compaction carry the fields.
+    let survivors_store = MemoryStore::new();
+    seed(&survivors_store, Uuid::from_u128(1), 1, &input_1[..1], true).await;
+    seed(&survivors_store, Uuid::from_u128(2), 2, &input_2[1..], true).await;
+    let compacted = compact_and_record(&survivors_store, &CompactorConfig::default()).await;
+    assert_eq!(compacted.parts.len(), 1);
+    let p = &compacted.parts[0];
+    assert_eq!(p.sample_count, survivor_rows);
+    assert_eq!(part_aggs(p, STATUS), (Some(57), Some(0)), "50 + 7");
+    assert_eq!(part_aggs(p, CACHE), (None, Some(2)), "both survivors false");
 }
