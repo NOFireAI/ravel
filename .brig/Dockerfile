@@ -27,7 +27,7 @@ ARG GUEST_IMAGE=ghcr.io/brig-sh/claude-code-stock:root@sha256:f6bfd5213245c86ebb
 # The same builder image the root Dockerfile pins.
 ARG FETCH_IMAGE=rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 
-ARG NEXTEST_VERSION=0.9.143
+ARG NEXTEST_VERSION=0.9.152
 ARG CARGO_DENY_VERSION=0.20.2
 
 # ========== Release binaries ==========
@@ -45,8 +45,8 @@ RUN set -eu; \
       *) echo "tools: unsupported TARGETARCH $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     case "$NEXTEST_VERSION-$TARGETARCH" in \
-      0.9.143-amd64) nextest_sha=66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e ;; \
-      0.9.143-arm64) nextest_sha=2a64b3566a92508550a7ab29c3e8db25472ca37730ecb4d22100b6aa440c2a68 ;; \
+      0.9.152-amd64) nextest_sha=d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a ;; \
+      0.9.152-arm64) nextest_sha=ca1f81a5b86533eb45ab97e0064aa88e925e53aab9a698ca6331a7cad1f85f07 ;; \
       *) echo "tools: no sha256 for cargo-nextest $NEXTEST_VERSION on $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     case "$CARGO_DENY_VERSION-$TARGETARCH" in \
