@@ -64,6 +64,12 @@ pub struct ScanReport {
     /// cursor stops before the first refused hour, so a build that can merge
     /// it revisits it.
     pub geometry_unsupported: usize,
+    /// Buckets compaction refused because one series alone is over a part's
+    /// reader bound ([`MaintainError::is_reader_bound_refusal`]). Nothing was
+    /// written; later hours still compact, and the cursor stops before the
+    /// first refused hour. The warning logged for each names the series, the
+    /// quantity, its count and the bound.
+    pub held_reader_bound: usize,
     /// The hour the cursor was advanced to, if it moved.
     pub cursor_advanced_to: Option<u32>,
 }
@@ -106,6 +112,7 @@ pub async fn scan_and_compact(
         held_out_of_window: 0,
         held_unknown_section: 0,
         geometry_unsupported: 0,
+        held_reader_bound: 0,
         cursor_advanced_to: None,
     };
     let mut highest_done: Option<u32> = None;
@@ -123,6 +130,13 @@ pub async fn scan_and_compact(
             // it again, so it is counted and held like a geometry refusal.
             Err(err) if err.is_part_index_refusal() => {
                 report.geometry_unsupported += 1;
+                first_held.get_or_insert(hour);
+                continue;
+            }
+            // One series over a part's reader bound: nothing written, and this
+            // build refuses it again, so it is held under its own count.
+            Err(err) if err.is_reader_bound_refusal() => {
+                report.held_reader_bound += 1;
                 first_held.get_or_insert(hour);
                 continue;
             }
@@ -217,6 +231,14 @@ pub struct MaintainReport {
     /// windows ([`MaintainError::is_part_index_refusal`]). Not counted for a
     /// bucket the [`MaintainMemo`] already holds as refused.
     pub geometry_unsupported: usize,
+    /// Buckets whose compaction this pass refused because one series alone is
+    /// over a part's reader bound
+    /// ([`MaintainError::is_reader_bound_refusal`]): nothing written, the L0
+    /// inputs stay live, and the pass goes on to later hours. The warning
+    /// logged for each names the series, the quantity, its count and the
+    /// bound. Not counted for a bucket the [`MaintainMemo`] already holds as
+    /// refused.
+    pub held_reader_bound: usize,
     /// Expired buckets whose physical sweep was blocked because the live
     /// catalog HEAD snapshot still names an object inside the bucket
     /// (ADR-0020 delete-blocker, [`RetentionOutcome::BlockedBySnapshot`] with
@@ -831,8 +853,9 @@ pub enum TerminalState {
     /// its two-level merge ([`CompactionOutcome::TwoLevelUnsupported`],
     /// [`CompactionOutcome::ScratchHeadroom`],
     /// [`CompactionOutcome::ScratchLocked`]), or refused it for its part-index
-    /// windows ([`MaintainError::is_part_index_refusal`]). Terminal
-    /// for this process's binary only, so it is held in memory and never
+    /// windows ([`MaintainError::is_part_index_refusal`]) or for one series
+    /// over a part's reader bound ([`MaintainError::is_reader_bound_refusal`]).
+    /// Terminal for this process's binary only, so it is held in memory and never
     /// written to the durable snapshot: a restart, or a sibling seeded from a
     /// snapshot, evaluates the bucket again.
     GeometryUnsupported,
@@ -2153,7 +2176,7 @@ pub async fn scan_and_maintain_with_memo(
             RewriteBound::Read(&mut bound_read)
         };
         let mut swept_objects = 0usize;
-        let (retention_outcome, observed_expiry, compaction, acquisition, part_index_refused) =
+        let (retention_outcome, observed_expiry, compaction, acquisition, refused) =
             if claim_deferred || geometry_refused {
                 let (outcome, expiry) = retention_sweep_bucket_observed(
                     &mut reach,
@@ -2282,9 +2305,17 @@ pub async fn scan_and_maintain_with_memo(
                 // Retention left a held bucket live, so compaction would have
                 // run here; the hold skipped it without a claim request.
                 None if claim_deferred => report.claim_skipped += 1,
+                // Refused for one series over a part's reader bound: held
+                // below like any refusal, under its own count.
+                None if refused
+                    .as_ref()
+                    .is_some_and(MaintainError::is_reader_bound_refusal) =>
+                {
+                    report.held_reader_bound += 1
+                }
                 // Refused for its part-index windows (ADR-3853): counted as
                 // a refusal and held below like one.
-                None if part_index_refused.is_some() => report.geometry_unsupported += 1,
+                None if refused.is_some() => report.geometry_unsupported += 1,
                 None => {}
             },
         }
@@ -2310,8 +2341,9 @@ pub async fn scan_and_maintain_with_memo(
             None if geometry_refused && ran.is_none() && retention_left_live => {
                 Some(TerminalState::GeometryUnsupported)
             }
-            // A part-index refusal, which this build would repeat.
-            None if part_index_refused.is_some() && retention_left_live => {
+            // A part-index or reader-bound refusal, which this build would
+            // repeat.
+            None if refused.is_some() && retention_left_live => {
                 Some(TerminalState::GeometryUnsupported)
             }
             other => other,
