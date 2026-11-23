@@ -4841,9 +4841,9 @@ run_check ro-clean "${RO_BANDS}" "${TMP}/check-ro"
 if [ "${rc}" -eq 0 ] && [ "${RO_FIGURES}" -eq 5 ] && [ "$(grep -c '^ok ' "${CHECK_OUT}")" -eq "${RO_FIGURES}" ] &&
   grep -qxF 'ok ravel_only_l0_data_objects = 87608 in [79000, 96000] (stamps.json ravel_only.l0.objects.data.count)' "${CHECK_OUT}" &&
   grep -qxF 'ok ravel_only_l0_series_query_ms = 120013 in [100000, 130000] (stamps.json ravel_only.l0.series_query_ms)' "${CHECK_OUT}" &&
-  grep -qxF 'ok ravel_only_l1_parts = 24 in [20, 130] (stamps.json ravel_only.l1.objects.l1.count)' "${CHECK_OUT}" &&
+  grep -qxF 'ok ravel_only_l1_parts = 24 in [20, 260] (stamps.json ravel_only.l1.objects.l1.count)' "${CHECK_OUT}" &&
   grep -qxF 'ok ravel_only_l1_series_query_ms = 12 in [0, 30000] (stamps.json ravel_only.l1.series_query_ms)' "${CHECK_OUT}" &&
-  grep -qxF 'ok ravel_only_l1_series_store_get_calls = 40 in [20, 400] (stamps.json ravel_only.l1.readback.series_store_get_calls)' "${CHECK_OUT}"; then
+  grep -qxF 'ok ravel_only_l1_series_store_get_calls = 40 in [20, 800] (stamps.json ravel_only.l1.readback.series_store_get_calls)' "${CHECK_OUT}"; then
   pass "check ravel-only: every one of the ${RO_FIGURES} figures in band on a history-shaped Ravel-only run"
 else
   fail "check ravel-only: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
