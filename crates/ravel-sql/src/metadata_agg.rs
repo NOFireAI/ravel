@@ -1179,4 +1179,70 @@ mod tests {
             }
         }
     }
+
+    fn schema_of(types: &[DataType]) -> SchemaRef {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let fields: Vec<Field> = types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| Field::new(format!("c{i}"), ty.clone(), true))
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    /// T4: each column's statistics are read once per statement, however many
+    /// aggregates name it. Line 30's ninety `SUM(w + k)` over one column read
+    /// it once; line 3's `SUM(a), COUNT(*), AVG(w)` reads `a` and `w` once each
+    /// and the row count once.
+    #[test]
+    fn each_column_is_read_once_per_statement() {
+        let sum_of = |k: usize| DeclaredColumnSum {
+            sum: [17, 10405][k],
+            non_null_count: [7, 8][k],
+        };
+        let line_30: Vec<StatsAggregate<usize>> = (0..90)
+            .map(|k| StatsAggregate::Sum { col: 1, addend: k })
+            .collect();
+        let mut reads = Vec::new();
+        let batch = ungrouped_batch(
+            &schema_of(&vec![DataType::Int64; 90]),
+            &line_30,
+            |k| {
+                reads.push(k);
+                Some(sum_of(k))
+            },
+            || panic!("no COUNT(*) in line 30"),
+        );
+        assert_eq!(reads, vec![1], "one read for ninety aggregates on one column");
+        assert_eq!(batch.map(|b| b.num_columns()), Some(90));
+
+        let line_3 = [
+            StatsAggregate::Sum { col: 0, addend: 0 },
+            StatsAggregate::CountStar,
+            StatsAggregate::Avg { col: 1 },
+            StatsAggregate::SumCount { col: 1 },
+        ];
+        let mut reads = Vec::new();
+        let mut counts = 0;
+        let batch = ungrouped_batch(
+            &schema_of(&[
+                DataType::Int64,
+                DataType::Int64,
+                DataType::Float64,
+                sum_count_type(),
+            ]),
+            &line_3,
+            |k| {
+                reads.push(k);
+                Some(sum_of(k))
+            },
+            || {
+                counts += 1;
+                Some(9)
+            },
+        );
+        assert_eq!(reads, vec![0, 1], "one read per column");
+        assert_eq!(counts, 1, "one row-count read");
+        assert_eq!(batch.map(|b| b.num_columns()), Some(4));
+    }
 }
