@@ -1781,14 +1781,23 @@ from `label_value`'s build:
   written as with the switch off
   (`a_part_over_the_series_cap_gets_no_series_refs_and_one_at_it_does`,
   `a_posting_over_the_body_ceiling_leaves_the_part_without_series_refs`).
+  The report's `metrics_series_index_over_cap_parts` lists each such part
+  with its leaf bytes and cap, each field's leaf bytes (null when a key
+  passed the body ceiling, which reports that body and ceiling instead),
+  each field's pairs, and its class and series counts, and the warn line
+  carries the same figures
+  (`a_part_over_the_series_cap_reports_each_field_and_its_classes`,
+  `the_over_cap_class_count_counts_distinct_entry_sets`).
 - **Erasure.** While a metrics erasure request is pending no series leaf is
   built, as for `label_value`
   (`a_pending_erasure_request_builds_no_series_leaf`).
 - **Repair.** `--rebuild-key-index` with the switch on builds the three
   fields of a part that lacks any of them, by range, and attaches the
   missing ones; a failed ranged GET defers the part, and a part over the
-  cap is counted in the report's `series_index_parts_over_cap`
-  (`rebuild_key_index_attaches_the_three_series_fields`). A part carried by
+  cap is counted in the report's `series_index_parts_over_cap` and listed
+  with the same figures in `series_index_over_cap_parts`
+  (`rebuild_key_index_attaches_the_three_series_fields`,
+  `rebuild_key_index_defers_a_failed_read_and_counts_a_part_over_the_cap`). A part carried by
   reference keeps the refs it has, so a part without series refs counts in
   `key_index_parts_missing_declared_leaves` until the repair attaches
   them.

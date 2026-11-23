@@ -39,9 +39,9 @@ use crate::error::CatalogError;
 use crate::fold::{
     BuiltPartKeyIndex, HeadState, HeldLabelDicts, KeyIndexBuildCaller, KeyIndexBuildLimits,
     KeyIndexSectionHold, MAX_HEAD_CAS_ATTEMPTS, RequestCounters, SeriesIndexLimits,
-    SeriesIndexOutcome, build_part_key_index, build_part_series_index, declared_key_index_fields,
-    head_object_key, is_series_index_field, key_index_leaf_limits, merge_series_index,
-    metrics_label_index_leaf_bytes_cap, newer_leaf_refusal,
+    SeriesIndexOutcome, SeriesIndexOverCapPart, build_part_key_index, build_part_series_index,
+    declared_key_index_fields, head_object_key, is_series_index_field, key_index_leaf_limits,
+    merge_series_index, metrics_label_index_leaf_bytes_cap, newer_leaf_refusal,
 };
 use crate::snapshot_format::{
     self, key_index_leaf_format_version, key_index_leaf_prefix_range,
@@ -218,8 +218,14 @@ pub struct KeyIndexRebuildReport {
     /// because their leaves would pass
     /// [`CatalogConfig::metrics_series_index_max_ratio_ppm`](crate::CatalogConfig::metrics_series_index_max_ratio_ppm),
     /// or one key's posting or entries pass the leaf body ceiling; no series
-    /// leaf is PUT for them.
+    /// leaf is PUT for them. Equal to the length of
+    /// `series_index_over_cap_parts`.
     pub series_index_parts_over_cap: u64,
+    /// One element per part `series_index_parts_over_cap` counts, in the
+    /// order the run built them: its leaf bytes against its cap, the bytes
+    /// and pairs of each of the three fields, and its class and series
+    /// counts.
+    pub series_index_over_cap_parts: Vec<SeriesIndexOverCapPart>,
     /// Metrics parts left unindexed because a metrics erasure request was
     /// pending (or the pending listing failed): every part in
     /// `parts_unindexed`, with no part read.
@@ -822,6 +828,7 @@ impl Catalog {
                     field_passes: BTreeMap::new(),
                     stopped_on_failed_get: false,
                     series_outcome: None,
+                    series_over_cap: None,
                 })
             } else {
                 build_part_key_index(
@@ -939,6 +946,9 @@ impl Catalog {
             }
             if leaves.series_outcome == Some(SeriesIndexOutcome::OverCap) {
                 report.series_index_parts_over_cap += 1;
+            }
+            if let Some(detail) = &leaves.series_over_cap {
+                report.series_index_over_cap_parts.push(detail.clone());
             }
             for (field, pairs) in &leaves.field_pairs {
                 *report.field_pairs.entry(field.clone()).or_insert(0) += pairs;
@@ -1283,6 +1293,7 @@ mod tests {
                 uncovered_entries: 0,
                 parts_over_cap: 0,
                 series_index_parts_over_cap: 0,
+                series_index_over_cap_parts: Vec::new(),
                 parts_erasure_gated: 0,
                 erasure_list_requests: 0,
                 erasure_get_requests: 0,
@@ -1689,6 +1700,7 @@ mod tests {
                 uncovered_entries: 0,
                 parts_over_cap: 0,
                 series_index_parts_over_cap: 0,
+                series_index_over_cap_parts: Vec::new(),
                 parts_erasure_gated: 0,
                 erasure_list_requests: 0,
                 erasure_get_requests: 0,
@@ -1873,6 +1885,7 @@ mod tests {
                     uncovered_entries: 2,
                     parts_over_cap: 0,
                     series_index_parts_over_cap: 0,
+                    series_index_over_cap_parts: Vec::new(),
                     parts_erasure_gated: 0,
                     erasure_list_requests: 0,
                     erasure_get_requests: 0,
@@ -2968,6 +2981,7 @@ mod tests {
                 uncovered_entries: 0,
                 parts_over_cap: 0,
                 series_index_parts_over_cap: 0,
+                series_index_over_cap_parts: Vec::new(),
                 parts_erasure_gated: 0,
                 erasure_list_requests: 0,
                 erasure_get_requests: 0,

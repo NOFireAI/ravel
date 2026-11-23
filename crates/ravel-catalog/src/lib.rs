@@ -84,8 +84,9 @@ pub use declared_stats::{
 pub use error::CatalogError;
 pub use fold::{
     FOLD_CATALOG_FAMILIES, FoldCompatRefusal, FoldKeyIndexTotals, FoldReport,
-    METRICS_LABEL_VALUE_FIELD, PostingsBuildError, RefoldRequest, Transaction, fetch_segment_names,
-    fold_key_index_totals, fold_read_versions, fold_write_version,
+    METRICS_LABEL_VALUE_FIELD, PostingsBuildError, RefoldRequest, SeriesIndexOverCapPart,
+    Transaction, fetch_segment_names, fold_key_index_totals, fold_read_versions,
+    fold_write_version,
 };
 pub use key_epoch::{
     EpochDefect, KEY_EPOCH_FORMAT_VERSION, KEY_EPOCH_MAX_READ_VERSION, KEY_EPOCH_MIN_READ_VERSION,
