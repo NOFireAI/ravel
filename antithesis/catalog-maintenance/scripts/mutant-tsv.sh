@@ -8,8 +8,9 @@
 MUTANT_AREAS="catalog resharding maintenance"
 # How many mutants each area ships (ADR-4326 decision 3). build.sh refuses a
 # server binary whose tsv files give another count, and mutant_names refuses
-# an area of MUTANT_AREAS that has no count here, so an area added to one
-# list and not the other fails before any build or run.
+# an area of MUTANT_AREAS that has no count here, before any build or run.
+# An area with a count here and not in MUTANT_AREAS fails only build.sh's
+# check, as an area whose tsv files give it no mutant.
 EXPECTED_MUTANTS="catalog=5 resharding=2 maintenance=2"
 MUTANT_TSV_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
