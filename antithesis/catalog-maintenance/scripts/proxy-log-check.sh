@@ -12,7 +12,8 @@
 # be read; the reason on stdout.
 set -uo pipefail
 LOG="${1:?s3proxy log}"
-STARTUP='s3-proxy: .* connections, open-file limit [0-9a-z]* ([0-9]* needed)'
+LIMIT='open-file limit [0-9a-z]* ([a-z0-9 ]*, [0-9]* needed)'
+STARTUP="s3-proxy: .* connections, $LIMIT"
 EMFILE='Too many open files'
 
 [ -s "$LOG" ] || { echo "the s3proxy log $LOG is empty or unreadable"; exit 1; }
@@ -24,7 +25,7 @@ for n in "$starts" "$emfile"; do
     esac
 done
 [ "$starts" -gt 0 ] || { echo "the s3proxy log $LOG holds no startup line stating the open-file limit"; exit 1; }
-limits=$(grep -o -- 'open-file limit [0-9a-z]* ([0-9]* needed)' "$LOG" | sort -u | tr '\n' ' ')
+limits=$(grep -o -- "$LIMIT" "$LOG" | sort -u | tr '\n' ' ')
 if [ "$emfile" -gt 0 ]; then
     echo "s3proxy logged '$EMFILE' $emfile times (${limits% })"
     exit 1

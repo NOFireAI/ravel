@@ -37,8 +37,8 @@
 //! the connection. A connection whose thread cannot be spawned is refused
 //! the same way. The control port has its own cap,
 //! [`MAX_CONTROL_CONNECTIONS`]. Both caps assume descriptors to spare: the
-//! binary refuses to start under a soft open-file limit below
-//! [`NOFILE_NEEDED`].
+//! binary raises its soft open-file limit to the hard limit and refuses to
+//! start if it is still below [`NOFILE_NEEDED`].
 
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -95,8 +95,8 @@ pub const FDS_PER_CONNECTION: usize = 10;
 pub const FDS_PER_CONTROL_CONNECTION: usize = 2;
 /// The descriptors outside every connection: stdio, the two listeners and
 /// one socket per accept loop outside any slot (the handoff clone, or a
-/// connection being turned away), seven, with room for the files the runtime,
-/// the coverage instrumentation and name resolution open.
+/// connection being turned away), seven, with room for the files the runtime
+/// and the coverage instrumentation open.
 const PROCESS_FDS: usize = 64;
 /// How long the accept loop may block writing a refusal.
 const REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -111,6 +111,17 @@ pub const fn nofile_needed(connections: usize, control: usize) -> u64 {
 
 /// The open-file limit the proxy's caps need.
 pub const NOFILE_NEEDED: u64 = nofile_needed(MAX_CONNECTIONS, MAX_CONTROL_CONNECTIONS);
+
+/// The soft open-file limit to ask for at startup: the hard limit when it is
+/// finite and above the soft limit (`None` is unlimited). An unbounded hard
+/// limit is left alone, since Linux refuses an unbounded soft limit past
+/// `fs.nr_open`.
+pub fn raised_soft(soft: Option<u64>, hard: Option<u64>) -> Option<u64> {
+    match (soft, hard) {
+        (Some(soft), Some(hard)) if hard > soft => Some(hard),
+        _ => None,
+    }
+}
 
 /// Check the soft open-file limit (`None` is unlimited) against
 /// [`NOFILE_NEEDED`]. Below it, a connection under the cap can fail for lack
@@ -864,8 +875,16 @@ mod tests {
         assert_eq!(nofile_needed(0, 0), 64);
         assert_eq!(nofile_needed(1, 0), 74);
         assert_eq!(nofile_needed(0, 1), 66);
-        assert_eq!(nofile_needed(512, 8), 512 * 10 + 8 * 2 + 64);
         assert_eq!(NOFILE_NEEDED, 5200);
+    }
+
+    #[test]
+    fn the_soft_open_file_limit_is_raised_only_to_a_finite_higher_hard_limit() {
+        assert_eq!(raised_soft(Some(1024), Some(524288)), Some(524288));
+        assert_eq!(raised_soft(Some(1024), Some(1024)), None);
+        assert_eq!(raised_soft(Some(65536), Some(1024)), None);
+        assert_eq!(raised_soft(Some(1024), None), None);
+        assert_eq!(raised_soft(None, None), None);
     }
 
     #[test]
