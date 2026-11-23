@@ -540,6 +540,43 @@ pub fn generations(
     Ok(history)
 }
 
+/// The new-count key check of the reshard profile: for each of `tokens`
+/// (acknowledged tokens at shards the increase added, in hours HEAD has
+/// folded), the keys of `resolved` (what `rlog footprint` resolved under a
+/// HEAD that held still) that hold its rows, by shard. That is the token's
+/// level-0 data object (`<prefix>l/l0/<shard>/<writer>.<epoch>.<seq>.`,
+/// `ravel_commit::keys::data_key`) or, once compacted, an output part of its
+/// bucket (`<prefix>l/l1/<shard>/<hour>/`). A shard maps to no key when HEAD
+/// served none of its tokens' rows.
+#[cfg(any(test, feature = "reshard"))]
+pub fn new_shard_keys(
+    tenant_prefix: &str,
+    resolved: &[String],
+    tokens: &[crate::token::Token],
+) -> std::collections::BTreeMap<u32, Vec<String>> {
+    let mut found: std::collections::BTreeMap<u32, BTreeSet<String>> = Default::default();
+    for t in tokens {
+        let l0 = format!(
+            "{tenant_prefix}l/l0/{:04}/{}.{}.{:020}.",
+            t.shard, t.writer, t.epoch, t.seq
+        );
+        let l1 = format!(
+            "{tenant_prefix}l/l1/{:04}/{}/",
+            t.shard,
+            ravel_antithesis_catalog_driver::keys::hour_string(u64::from(t.hour))
+        );
+        for key in resolved {
+            if (key.starts_with(&l0) || key.starts_with(&l1)) && key.ends_with(DATA_SUFFIX) {
+                found.entry(t.shard).or_default().insert(key.clone());
+            }
+        }
+    }
+    found
+        .into_iter()
+        .map(|(shard, keys)| (shard, keys.into_iter().collect()))
+        .collect()
+}
+
 /// Compaction records (`l1.<input_set_hash16>.cmt`) among the listed logs
 /// commit keys under `tenant_prefix`.
 pub fn compaction_records<'a>(
@@ -1028,6 +1065,34 @@ parts: 1
         // A record from before generations existed: its scalar count.
         assert_eq!(ceiling_at(record(1, 4, &[]), up), Ok(4));
         assert_eq!(ceiling_at(record(2, 6, &[]), up), Ok(6));
+    }
+
+    #[test]
+    fn the_new_count_check_finds_each_added_shards_data() {
+        let writer = "0b6e7c1a-1d2e-4f50-9a6b-7c8d9e0f1a2b";
+        let tok = |shard, seq| crate::token::Token {
+            shard,
+            writer: writer.to_string(),
+            epoch: 1_794_931_200,
+            seq,
+            hour: 498_722,
+        };
+        let resolved: Vec<String> = [
+            // Shard 4's write, still a level-0 object.
+            format!("t/0a0b/l/l0/0004/{writer}.1794931200.00000000000000000003.ab12.rseg"),
+            // Shard 5's bucket, compacted into an output part of that hour.
+            "t/0a0b/l/l1/0005/20261123T02/0011223344556677.cd34.rseg".to_string(),
+            // Another hour's output part on shard 5, and shard 3's object.
+            "t/0a0b/l/l1/0005/20261123T03/0011223344556677.ef56.rseg".to_string(),
+            format!("t/0a0b/l/l0/0003/{writer}.1794931200.00000000000000000003.ab12.rseg"),
+        ]
+        .into();
+        let found = new_shard_keys("t/0a0b/", &resolved, &[tok(4, 3), tok(5, 9)]);
+        assert_eq!(found.keys().copied().collect::<Vec<_>>(), vec![4, 5]);
+        assert_eq!(found[&4], vec![resolved[0].clone()]);
+        assert_eq!(found[&5], vec![resolved[1].clone()]);
+        // A token whose object HEAD did not resolve names nothing.
+        assert!(new_shard_keys("t/0a0b/", &resolved, &[tok(4, 8)]).is_empty());
     }
 
     #[test]

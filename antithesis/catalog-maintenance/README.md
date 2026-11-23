@@ -667,9 +667,10 @@ last result. `refuse-read <key>` answers every GET and HEAD of exactly that
 key 503 unsent, as a store failing those reads would, in a set of its own that
 `thaw-read <key>` and `pass` lift; it leaves every PUT rule, every other
 method on the key and every other key as they were. Every other rule judges
-only PUTs. Nothing in this driver sets `refuse-read` yet: the reshard profile
-(#4340) sets it on the tenant's provisioning record, `t/<h>/l/prov`, to fail
-the servers' view refresh and reach the stale-writer fence. A killed or
+only PUTs. The plain driver never sets `refuse-read`: `driver-reshard`, the
+reshard-ownership profile's driver, sets it on the tenant's provisioning
+record, `t/<h>/l/prov`, to fail the servers' view refresh and reach the
+stale-writer fence (`../reshard-ownership/README.md`). A killed or
 restarted proxy has no rules, so a race it interrupts leaves the servers on
 the plain path and the race reports not reached.
 
@@ -721,16 +722,18 @@ A name `<area>/<stem>` selects its area by the part before `/`: the scripts
 accept it when that area's `.tsv` lists it, and `local-run.sh` reads its
 property from that same `.tsv`.
 
-The scripts accepting a name does not make its mutant falsifiable here. This
-profile never reshards (the driver seeds 4 shards and never changes the
-count), and a `resharding/` mutant changes behaviour only across a shard-count
-change, so it changes nothing a timeline here can see. The record race
-does make a server a compaction loser, but over the same inputs with the
-winner part present, so the situation a `maintenance/` mutant needs (a
-divergent input set, or a missing winner part) never arises. Either way the
-mutant's property is never falsified, and a local or Antithesis run of it
-exits 1 at the end. Do not launch one before the reshard profile and its
-forced races (#4340) land.
+The scripts accepting a name does not make its mutant falsifiable in every
+profile. The plain driver never reshards (it seeds 4 shards and never changes
+the count), and a `resharding/` mutant changes behaviour only across a
+shard-count change, so under this workload's own config it changes nothing a
+timeline can see: run the `resharding/` mutants under
+`WORKLOAD_PROFILE=reshard-ownership` (`../reshard-ownership/README.md`),
+whose driver reshards. The record race does make a server a compaction
+loser, but over the same inputs with the winner part present, so the
+situation a `maintenance/` mutant needs (a divergent input set, or a missing
+winner part) arises in neither profile yet: a local or Antithesis run of one
+exits 1 at the end. Do not launch one before those forced races (D5 item 7 of
+the #4340 step 5 decision) land.
 
 The corrupt-HEAD mutant switches off the HEAD guard of both delete passes,
 and each pass asserts `CorruptHeadFailsClosedOnDeletePaths` under its own
@@ -842,7 +845,17 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   only an instrumented one reaches those assertions. The stock `ravel-cli`
   stays uninstrumented and runs every call above. The driver runs
   `ravel-cli-ant` only through `AntCli` (`driver/src/cli.rs`), which points
-  its SDK output at `/tmp/sdk-cli.jsonl`; no rule calls it yet.
+  its SDK output at `/tmp/sdk-cli.jsonl`; only `driver-reshard` calls it.
+  The image carries that second driver too, `driver-reshard`: the same crate
+  built with its `reshard` feature (`driver/src/reshard.rs`), which the
+  reshard-ownership profile runs (`../reshard-ownership/README.md`). The
+  instrumentation check covers it like `driver`. It is a binary of its own
+  because the SDK registers every assertion a binary holds when it starts,
+  so the plain driver carries none of the reshard profile's literals and
+  this workload's expected set is unchanged.
+- `WORKLOAD_PROFILE=reshard-ownership` before `local-run.sh` or `launch.sh`
+  runs the reshard-ownership profile instead (`scripts/profile.sh`): its
+  config directory, test name, owned areas and required assertions.
 - `scripts/local-run.sh <out-dir> [seconds]` starts the stack under the
   run's compose file, runs the workload for `seconds` (default 240) before
   the driver's forced `eventually`, and exits 0 only if all of these hold:

@@ -21,12 +21,21 @@ RUN cargo build --release --locked \
  && mkdir -p /out /symbols \
  && cp target/x86_64-unknown-linux-gnu/release/driver target/x86_64-unknown-linux-gnu/release/s3-proxy /out/ \
  && cp /out/driver /out/s3-proxy /symbols/
+# The reshard-ownership profile's driver: the same crate with its reshard
+# feature, built after the plain one so the plain binary is copied first.
+RUN cargo build --release --locked --bin driver --features reshard \
+      --config 'build.target = "x86_64-unknown-linux-gnu"' \
+      --config 'target.x86_64-unknown-linux-gnu.rustflags = ["-Ccodegen-units=1", "-Cpasses=sancov-module", "-Cllvm-args=-sanitizer-coverage-level=3", "-Cllvm-args=-sanitizer-coverage-trace-pc-guard", "-Cllvm-args=-sanitizer-coverage-pc-table", "-Clink-args=-Wl,--build-id"]' \
+ && cp target/x86_64-unknown-linux-gnu/release/driver /out/driver-reshard \
+ && cp /out/driver-reshard /symbols/
 
 FROM debian:trixie-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl jq procps \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/driver /usr/local/bin/driver
+# The reshard-ownership profile runs this one (antithesis/reshard-ownership).
+COPY --from=build /out/driver-reshard /usr/local/bin/driver-reshard
 # The s3proxy container runs this image with the proxy as its entrypoint.
 COPY --from=build /out/s3-proxy /usr/local/bin/s3-proxy
 COPY --from=build /symbols /symbols

@@ -45,6 +45,36 @@ impl Token {
             self.seq
         )
     }
+
+    /// The token as the server's header carries it, the inverse of
+    /// [`decode`]: base64url without padding over
+    /// `v2:<shard>:<writer>:<epoch>:<seq>:<hour>`.
+    #[cfg(any(test, feature = "reshard"))]
+    pub fn encode(&self) -> String {
+        base64url_encode(
+            format!(
+                "v2:{}:{}:{}:{}:{}",
+                self.shard, self.writer, self.epoch, self.seq, self.hour
+            )
+            .as_bytes(),
+        )
+    }
+}
+
+#[cfg(any(test, feature = "reshard"))]
+fn base64url_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let acc = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, &b)| acc | (u32::from(b) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[((acc >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
 }
 
 /// Decode one token as the server's `Ravel-Commit-Token` header carries it.
@@ -488,7 +518,10 @@ mod tests {
             ("-_8", &[0xfb, 0xff]),
         ] {
             assert_eq!(base64url_decode(enc).as_deref(), Some(dec), "{enc}");
+            assert_eq!(base64url_encode(dec), enc);
         }
+        assert_eq!(decode(TOKEN).expect("token").encode(), TOKEN);
+        assert_eq!(decode(TOKEN2).expect("token").encode(), TOKEN2);
         // Non-zero spare bits are not a canonical encoding.
         assert_eq!(base64url_decode("YR"), None);
         assert_eq!(base64url_decode("Y"), None);

@@ -1,0 +1,219 @@
+# Ravel reshard-ownership profile for Antithesis
+# (antithesis/reshard-ownership/README.md, ADR-4326 decision 4).
+#
+# The catalog-maintenance topology (antithesis/catalog-maintenance/config/
+# docker-compose.yaml, whose comments describe every service) over the same
+# images, with one difference: the driver container runs driver-reshard, the
+# catalog-maintenance driver built with its reshard feature. Before the
+# sealing jump it reshards the tenant from 4 to 6 shards through
+# ravel-cli-ant, and its eventually forces the stale-writer fence, a decrease
+# back to 4 with a straggler burst, and a forged token read. Every other
+# service and setting is the catalog-maintenance compose file's, so the
+# profile runs every catalog race, jump and audit across the reshards.
+#
+# No service has a restart policy: Antithesis restarts the containers it
+# kills or stops, and a policy would restart them early and cancel the fault.
+
+x-ravel-store: &ravel-store
+  RAVEL_S3_ENDPOINT: http://rustfs:9000
+  RAVEL_S3_ALLOW_HTTP: "true"
+  RAVEL_S3_BUCKET: ravel
+  RAVEL_S3_REGION: us-east-1
+  RAVEL_S3_ACCESS_KEY: ravel
+  RAVEL_S3_SECRET_KEY: ravel-dev-secret
+
+x-faketime-env: &faketime-env
+  LD_PRELOAD: /faketime/libfaketimeMT.so.1
+  FAKETIME_TIMESTAMP_FILE: /faketime/offset
+  FAKETIME_CACHE_DURATION: "2"
+  FAKETIME_DONT_FAKE_MONOTONIC: "1"
+
+x-faketime-done: &faketime-done
+  condition: service_completed_successfully
+
+x-ravel-server: &ravel-server
+  image: ravel-antithesis-server:catalog-maintenance
+  platform: linux/amd64
+  init: true
+  entrypoint: ["/faketime/run", "/usr/local/bin/ravel-antithesis-entrypoint"]
+  environment:
+    <<: [*ravel-store, *faketime-env]
+    RAVEL_S3_ENDPOINT: http://s3proxy:9000
+    FAKETIME_CHECK_BINARY: /usr/local/bin/ravel-server
+    RUST_LOG: info
+    # Empty selects no mutant. scripts/mutant-config.sh (with
+    # WORKLOAD_PROFILE=reshard-ownership) writes a copy of this file that
+    # names one, over the catalog-maintenance-mutants images.
+    RAVEL_ANTITHESIS_MUTANT: ""
+  volumes: ["faketime:/faketime:ro"]
+  depends_on:
+    faketime: *faketime-done
+    init:
+      condition: service_completed_successfully
+    s3proxy:
+      condition: service_started
+
+services:
+  faketime:
+    container_name: faketime
+    hostname: faketime
+    image: ravel-antithesis-server:catalog-maintenance
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/ravel-antithesis-faketime-setup"]
+    volumes: ["faketime:/faketime"]
+
+  rustfs:
+    container_name: rustfs
+    hostname: rustfs
+    image: ghcr.io/rustfs/rustfs:1.0.0-glibc@sha256:bffcab0c9d647aab0055d1c69d340b202d0909966b385932d4ead1aeb7602858
+    platform: linux/amd64
+    entrypoint: ["/faketime/run", "/entrypoint.sh"]
+    command: ["/data"]
+    user: "0:0"
+    environment:
+      <<: *faketime-env
+      FAKETIME_CHECK_BINARY: /usr/bin/rustfs
+      RUSTFS_ACCESS_KEY: ravel
+      RUSTFS_SECRET_KEY: ravel-dev-secret
+      RUSTFS_DURABILITY_MODE: strict
+      RUSTFS_DRIVE_SYNC_ENABLE: "true"
+    volumes: ["faketime:/faketime:ro"]
+    depends_on:
+      faketime: *faketime-done
+
+  init:
+    container_name: init
+    hostname: init
+    image: ravel-antithesis-server:catalog-maintenance
+    platform: linux/amd64
+    entrypoint: ["/faketime/run", "/usr/local/bin/ravel-antithesis-init"]
+    environment:
+      <<: [*ravel-store, *faketime-env]
+      FAKETIME_CHECK_BINARY: /usr/local/bin/ravel-cli
+    volumes: ["faketime:/faketime:ro"]
+    depends_on:
+      faketime: *faketime-done
+      rustfs:
+        condition: service_started
+
+  s3proxy:
+    container_name: s3proxy
+    hostname: s3proxy
+    image: ravel-antithesis-driver:catalog-maintenance
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/s3-proxy"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      S3_PROXY_LISTEN: 0.0.0.0:9000
+      S3_PROXY_CONTROL: 0.0.0.0:9001
+      S3_PROXY_UPSTREAM: rustfs:9000
+      RAVEL_S3_BUCKET: ravel
+    depends_on:
+      rustfs:
+        condition: service_started
+
+  ravel1:
+    <<: *ravel-server
+    container_name: ravel1
+    hostname: ravel1
+    command: &all-command
+      - "--mode"
+      - "all"
+      - "--store"
+      - "s3"
+      - "--startup-store-deadline"
+      - "300s"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      - "--listen-grpc"
+      - "0.0.0.0:4317"
+      # The default count, for a tenant with no provisioning record; the
+      # seeded tenant's record decides its count, and the reshards change it.
+      - "--shards"
+      - "4"
+      - "--tenant-token"
+      - "cm-token=cm-tenant"
+      - "--tenant-hash-unkeyed"
+      - "--max-flush-delay"
+      - "500ms"
+      - "--max-flush-delay-idle"
+      - "5s"
+      - "--min-flush-bytes"
+      - "262144"
+      - "--fold-interval-secs"
+      - "15"
+
+  ravel2:
+    <<: *ravel-server
+    container_name: ravel2
+    hostname: ravel2
+    command: *all-command
+
+  maint1:
+    <<: *ravel-server
+    container_name: maint1
+    hostname: maint1
+    command: &maintain-command
+      - "--mode"
+      - "maintain"
+      - "--store"
+      - "s3"
+      - "--startup-store-deadline"
+      - "300s"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      - "--shards"
+      - "4"
+      - "--maintain-tenant"
+      - "cm-tenant"
+      - "--tenant-hash-unkeyed"
+      - "--maintain-key-file"
+      - "/etc/ravel/maintain.key"
+      - "--maintain-interval-secs"
+      - "20"
+      - "--fold-interval-secs"
+      - "15"
+
+  maint2:
+    <<: *ravel-server
+    container_name: maint2
+    hostname: maint2
+    command: *maintain-command
+
+  driver:
+    container_name: driver
+    hostname: driver
+    image: ravel-antithesis-driver:catalog-maintenance
+    platform: linux/amd64
+    entrypoint: ["/faketime/run"]
+    # The one difference from the catalog-maintenance compose file.
+    command: ["/usr/local/bin/driver-reshard"]
+    environment:
+      <<: [*ravel-store, *faketime-env]
+      FAKETIME_CHECK_BINARY: /usr/local/bin/driver-reshard
+      RAVEL_NODES: http://ravel1:4318,http://ravel2:4318
+      RAVEL_MAINTAIN_NODES: http://maint1:4318,http://maint2:4318
+      RAVEL_TOKEN: cm-token
+      RAVEL_TENANT: cm-tenant
+      S3_PROXY_CONTROL: s3proxy:9001
+      SEED_HOURS: "6"
+      SEED_HOUR_STRIDE: "2"
+      SEED_RECORDS_PER_HOUR: "50"
+      WORKLOAD_MAX_WRITES: "3000"
+      CLOCK_JUMP_FILE: /faketime/offset
+      # Above the increase's two-hour lead, so the sealing jump activates it.
+      CLOCK_JUMP_SECS: "9000"
+      CLOCK_SWEEP_HORIZON_JUMP_SECS: "91200"
+      CLOCK_SWEEP_WINDOW_JUMP_SECS: "22200"
+      HEAD_CACHE_TTL_SECS: "30"
+    volumes: ["faketime:/faketime"]
+    depends_on:
+      faketime: *faketime-done
+      init:
+        condition: service_completed_successfully
+
+volumes:
+  faketime: {}

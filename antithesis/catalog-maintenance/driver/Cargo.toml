@@ -17,6 +17,12 @@ path = "src/lib.rs"
 name = "driver"
 path = "src/main.rs"
 
+[features]
+# The reshard-ownership profile's driver (src/reshard.rs), built as a second
+# binary, driver-reshard, so the plain driver's assertion catalog stays as it
+# was: the SDK registers every assertion a binary holds at start.
+reshard = []
+
 [[bin]]
 name = "s3-proxy"
 path = "src/bin/s3_proxy.rs"
