@@ -89,7 +89,9 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-deny
+          # The version .brig/Dockerfile's CARGO_DENY_VERSION pins.
+          tool: cargo-deny@0.20.2
+          fallback: none
       - name: cargo deny check
         run: cargo deny check
       # deny.toml ignores RUSTSEC-2026-0194/-0195 on the premise that no
@@ -238,7 +240,9 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
-          tool: cargo-deny
+          # The version .brig/Dockerfile's CARGO_DENY_VERSION pins.
+          tool: cargo-deny@0.20.2
+          fallback: none
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - name: Try precise updates per advisory
