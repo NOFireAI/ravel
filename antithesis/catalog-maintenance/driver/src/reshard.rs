@@ -368,8 +368,9 @@ fn move_unsettled(s: &Shared, reason: &str, by_s: &dyn Fn(u64) -> u64) -> bool {
 /// The fence situation (D2): an acknowledged write per node, so each router
 /// holds a view; then the proxy refuses every GET and HEAD of the
 /// provisioning record; after the refresh interval a write per node routes
-/// on its grace-extended view; every clock moves to the refusal's hour plus
-/// the two-hour lead, past every view's horizon; a write per node is fenced;
+/// on its grace-extended view; every clock moves 60 s past the start of the
+/// hour the stale-view wait ends in plus the two-hour lead, past every view's
+/// horizon; a write per node is fenced;
 /// the refusal is lifted and every node must serve again.
 fn fence(s: &Shared) -> bool {
     let n = s.ravel.nodes.len();
