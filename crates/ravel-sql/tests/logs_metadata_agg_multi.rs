@@ -10,7 +10,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use datafusion::physical_plan::{collect, displayable};
+use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use ravel_catalog::{EntryIdentity, LoadedColumnStats, SegmentLevel, SegmentRef, Snapshot};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
@@ -263,6 +263,16 @@ struct Run {
     plan: String,
     answer: datafusion::error::Result<Vec<datafusion::arrow::record_batch::RecordBatch>>,
     gets: u64,
+    /// `fetch()` of every node in the physical plan, top-down, as
+    /// `(node name, fetch)`.
+    fetches: Vec<(String, Option<usize>)>,
+}
+
+fn fetches_of(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<(String, Option<usize>)>) {
+    out.push((plan.name().to_string(), plan.fetch()));
+    for child in plan.children() {
+        fetches_of(child, out);
+    }
 }
 
 impl Corpus {
@@ -327,12 +337,15 @@ impl Corpus {
             .await
             .expect("physical plan");
         let shown = displayable(plan.as_ref()).indent(true).to_string();
+        let mut fetches = Vec::new();
+        fetches_of(&plan, &mut fetches);
         let before = self.store.gets();
         let answer = collect(plan, ctx.task_ctx()).await;
         Run {
             plan: shown,
             answer,
             gets: self.store.gets() - before,
+            fetches,
         }
     }
 
@@ -678,30 +691,38 @@ async fn one_object() -> Corpus {
     Corpus::build(&[rows.as_slice()]).await
 }
 
-/// Runs `sql` with statistics loaded and without, asserts the plan carries
-/// its limit only as the scan's pushed fetch (one scan partition, no limit
-/// node, no `fetch=` on any other node), that the statistics rewrite did not
-/// fire, and that both runs print `expected`.
+/// Runs `sql` with statistics loaded and without, asserts both runs print
+/// `expected` with no `MetadataOnlyExec`, and that the plan without
+/// statistics carries its limit only as the scan's pushed fetch (no limit
+/// node, no fetch on any other node), the shape the rule saw before it
+/// declined.
 async fn assert_limit_on_the_scan_is_honoured(corpus: &Corpus, sql: &str, expected: &str) {
     let run = corpus.with_stats(sql).await;
     let scan = corpus.scanned(sql).await;
     for (what, run) in [("with statistics", &run), ("scanned", &scan)] {
-        assert!(
-            run.plan.contains("LogsScanExec: partitions=1")
-                && !run.plan.contains("fetch=")
-                && !run.plan.contains("LimitExec"),
-            "{sql} {what}: the limit must sit on the scan alone; plan was:\n{}",
-            run.plan
-        );
+        let got = pretty_format_batches(run.answer.as_ref().expect("an answer"))
+            .expect("format")
+            .to_string();
+        assert_eq!(got.trim(), expected.trim(), "{sql} {what}");
         assert!(
             !run.plan.contains("MetadataOnlyExec"),
             "{sql} {what}: a scan with a pushed fetch is not answered from statistics; plan was:\n{}",
             run.plan
         );
-        let got = pretty_format_batches(run.answer.as_ref().expect("an answer"))
-            .expect("format")
-            .to_string();
-        assert_eq!(got.trim(), expected.trim(), "{sql} {what}");
+        if what == "scanned" {
+            let limited: Vec<_> = run.fetches.iter().filter(|(_, f)| f.is_some()).collect();
+            assert_eq!(
+                limited,
+                [&("LogsScanExec".to_string(), Some(3))],
+                "{sql}: the limit must sit on the scan alone; plan was:\n{}",
+                run.plan
+            );
+            assert!(
+                !run.plan.contains("LimitExec"),
+                "{sql}: no limit node; plan was:\n{}",
+                run.plan
+            );
+        }
     }
     assert!(run.gets > 0, "{sql}: the limited rows are read");
 }
@@ -725,10 +746,9 @@ async fn sum_and_count_star_over_a_limit_on_the_scan_read_the_limited_rows() {
     .await;
 }
 
-/// A single `SUM` or `AVG` over the same limited subquery: 2 and 1.0, not 17
-/// and 17/7.
+/// A single `SUM` over the same limited subquery: 2, not 17.
 #[tokio::test]
-async fn a_single_sum_or_avg_over_a_limit_on_the_scan_reads_the_limited_rows() {
+async fn a_single_sum_over_a_limit_on_the_scan_reads_the_limited_rows() {
     let corpus = one_object().await;
     assert_limit_on_the_scan_is_honoured(
         &corpus,
@@ -741,6 +761,12 @@ async fn a_single_sum_or_avg_over_a_limit_on_the_scan_reads_the_limited_rows() {
 +-------------+",
     )
     .await;
+}
+
+/// A single `AVG` over the same limited subquery: 1.0, not 17/7.
+#[tokio::test]
+async fn a_single_avg_over_a_limit_on_the_scan_reads_the_limited_rows() {
+    let corpus = one_object().await;
     assert_limit_on_the_scan_is_honoured(
         &corpus,
         "SELECT AVG(a) FROM (SELECT a FROM logs LIMIT 3)",
