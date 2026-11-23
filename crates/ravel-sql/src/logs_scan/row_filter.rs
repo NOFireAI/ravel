@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{AsArray, UInt32Array};
 use datafusion::arrow::compute::{filter, filter_record_batch};
-use datafusion::arrow::datatypes::{DataType, SchemaRef, UInt32Type};
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef, UInt32Type};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -49,6 +49,16 @@ impl RowFilters {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.exprs.is_empty()
+    }
+
+    /// The conjuncts with `rewrite` applied to each, typed against `schema`
+    /// (the resolved full `logs` schema), or `None` when it changes none.
+    pub(super) fn rewritten(
+        &self,
+        schema: &Schema,
+        rewrite: RewriteExpr,
+    ) -> DFResult<Option<RowFilters>> {
+        Ok(rewrite_all(&self.exprs, schema, rewrite)?.map(RowFilters::new))
     }
 
     /// The names of the columns the conjuncts read, each once, in first-use
@@ -148,6 +158,29 @@ impl fmt::Display for RowFilters {
     }
 }
 
+/// An expression rewrite that keeps the columns the expression reads, typed
+/// against the schema the expression is bound to.
+pub(crate) type RewriteExpr =
+    fn(Arc<dyn PhysicalExpr>, &Schema) -> DFResult<Transformed<Arc<dyn PhysicalExpr>>>;
+
+/// `exprs` with `rewrite` applied to each, or `None` when it changes none.
+fn rewrite_all(
+    exprs: &[Arc<dyn PhysicalExpr>],
+    schema: &Schema,
+    rewrite: RewriteExpr,
+) -> DFResult<Option<Vec<Arc<dyn PhysicalExpr>>>> {
+    let mut changed = false;
+    let out = exprs
+        .iter()
+        .map(|e| {
+            let t = rewrite(Arc::clone(e), schema)?;
+            changed |= t.transformed;
+            Ok(t.data)
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    Ok(changed.then_some(out))
+}
+
 /// [`RowFilters`] bound to one scan's build schema.
 pub(crate) struct BoundRowFilters {
     exprs: Vec<Arc<dyn PhysicalExpr>>,
@@ -162,6 +195,29 @@ pub(crate) struct BoundRowFilters {
 }
 
 impl BoundRowFilters {
+    /// These filters with `rewrite` applied to every conjunct, typed against
+    /// `build_schema` (the schema they are bound to) and, for the read-only
+    /// copies, against [`Self::read_schema`]. A rewrite that keeps the columns
+    /// an expression reads keeps every position recorded here valid.
+    pub(super) fn rewritten(
+        &self,
+        build_schema: &Schema,
+        rewrite: RewriteExpr,
+    ) -> DFResult<BoundRowFilters> {
+        let exprs =
+            rewrite_all(&self.exprs, build_schema, rewrite)?.unwrap_or_else(|| self.exprs.clone());
+        let read_exprs = rewrite_all(&self.read_exprs, &self.read_schema, rewrite)?
+            .unwrap_or_else(|| self.read_exprs.clone());
+        Ok(BoundRowFilters {
+            exprs,
+            keep: self.keep.clone(),
+            output: Arc::clone(&self.output),
+            reads: self.reads.clone(),
+            read_schema: Arc::clone(&self.read_schema),
+            read_exprs,
+        })
+    }
+
     /// `batch`, built in the build schema, with every row some conjunct does
     /// not hold true for removed and the build-only columns dropped. Adds the
     /// rows removed to `dropped`.
