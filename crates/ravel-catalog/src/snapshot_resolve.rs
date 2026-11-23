@@ -660,28 +660,6 @@ impl Catalog {
         Ok(Some(decoded))
     }
 
-    /// Read HEAD, through the TTL cache unless `bypass_cache`. Any failure
-    /// short of a `shard_count` or `tenant_hash` mismatch is logged and
-    /// folded into `None` (fall back to listing). A `NotFound` on a cached
-    /// read is itself cached for `head_cache_ttl` (see
-    /// [`crate::cache::HeadCache::insert_absent`]), so a tenant with no HEAD
-    /// yet costs one HEAD GET per TTL rather than one per resolve; any other
-    /// failure is not cached and the next resolve GETs again. A `shard_count` mismatch
-    /// is a loud error, but under
-    /// ADR-0052 section 5 "mismatch" no longer means "not equal to this
-    /// process's static `shard_count`": the head's `shard_count` is the
-    /// fan-out ceiling at fold time, so it is validated against the ceiling
-    /// this reader computes from the generation history (`generations`) for
-    /// the head's watermark hour, and an older head that simply predates a
-    /// reshard (a lower `shard_generation_count`) is accepted because Phase 1
-    /// listing covers the newer hours it lacks. A head claiming more
-    /// generations than this reader knows forces exactly one fresh record
-    /// re-read before failing closed (see
-    /// [`Self::validate_head_against_generations`]). A `tenant_hash` mismatch
-    /// is likewise loud (ADR-0050 §2): a HEAD naming a different tenant is an
-    /// isolation breach, so it hard-fails instead of silently falling back to
-    /// a listing pass that could still be influenced by the wrong index.
-    #[allow(clippy::too_many_arguments)]
     /// [`Catalog::read_head`], adding its wall time to `head_wait` when it
     /// issued a store request. A lookup the HEAD cache answered adds nothing.
     #[allow(clippy::too_many_arguments)]
@@ -713,6 +691,28 @@ impl Catalog {
         head
     }
 
+    /// Read HEAD, through the TTL cache unless `bypass_cache`. Any failure
+    /// short of a `shard_count` or `tenant_hash` mismatch is logged and
+    /// folded into `None` (fall back to listing). A `NotFound` on a cached
+    /// read is itself cached for `head_cache_ttl` (see
+    /// [`crate::cache::HeadCache::insert_absent`]), so a tenant with no HEAD
+    /// yet costs one HEAD GET per TTL rather than one per resolve; any other
+    /// failure is not cached and the next resolve GETs again. A `shard_count` mismatch
+    /// is a loud error, but under
+    /// ADR-0052 section 5 "mismatch" no longer means "not equal to this
+    /// process's static `shard_count`": the head's `shard_count` is the
+    /// fan-out ceiling at fold time, so it is validated against the ceiling
+    /// this reader computes from the generation history (`generations`) for
+    /// the head's watermark hour, and an older head that simply predates a
+    /// reshard (a lower `shard_generation_count`) is accepted because Phase 1
+    /// listing covers the newer hours it lacks. A head claiming more
+    /// generations than this reader knows forces exactly one fresh record
+    /// re-read before failing closed (see
+    /// [`Self::validate_head_against_generations`]). A `tenant_hash` mismatch
+    /// is likewise loud (ADR-0050 §2): a HEAD naming a different tenant is an
+    /// isolation breach, so it hard-fails instead of silently falling back to
+    /// a listing pass that could still be influenced by the wrong index.
+    #[allow(clippy::too_many_arguments)]
     async fn read_head(
         &self,
         tenant: &TenantHash,
