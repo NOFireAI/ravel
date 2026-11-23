@@ -32,7 +32,7 @@ mod token;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -288,10 +288,9 @@ struct Shared {
     head_key: Mutex<Option<String>>,
     /// The tenant's logs provisioning record, `t/<tenant hash>/l/prov`.
     prov_key: String,
-    /// The tenant's shard ceiling as of `shards_hour` ([`Shared::shards`]).
-    shards: AtomicU32,
-    /// The unix hour, by the driver's clock, `shards` was read for.
-    shards_hour: AtomicU64,
+    /// The tenant's shard history as last read from `prov_key`
+    /// ([`Shared::history`]).
+    history: Mutex<audit::ShardHistory>,
     /// Whether an audit has seen a compaction record, for the multiset
     /// check's details.
     compacted: AtomicBool,
@@ -488,6 +487,7 @@ impl Shared {
             let k = self.begin_attempt(w.id);
             let n = node();
             let sent = self.ticks.fetch_add(1, Ordering::SeqCst);
+            let sent_ns = now_ns();
             let reply = self.ravel.export(
                 n,
                 "/v1/logs",
@@ -498,7 +498,7 @@ impl Shared {
                 WRITE_TIMEOUT,
             );
             let attempt = classify(&reply);
-            self.record_ack(w.id, n, sent, &attempt);
+            self.record_ack(w.id, n, (sent, sent_ns), &attempt);
             self.finish_attempt(w.id, k, attempt.clone());
             let retryable = match attempt {
                 Attempt::NoResponse => true,
@@ -525,24 +525,41 @@ impl Shared {
     }
 
     /// Record which node acknowledged an attempt, under which writer
-    /// identity, and when, for a token read's restart evidence.
-    fn record_ack(&self, id: u64, node: usize, sent: u64, attempt: &Attempt) {
+    /// identity, when, and at which shard count, for a token read's restart
+    /// evidence. `sent` is the attempt's tick and its send time by the
+    /// driver's clock. The count is the one the send's hour, the answer's
+    /// hour and every token's hour all route at: the server routed the rows
+    /// between the two, and a flush hands rows back only in an hour that
+    /// routes at another count, so the writer identity then belongs to that
+    /// count's shard set.
+    fn record_ack(&self, id: u64, node: usize, (sent, sent_ns): (u64, u64), attempt: &Attempt) {
         let Attempt::Acked { header } = attempt else {
             return;
         };
         let answered = self.ticks.fetch_add(1, Ordering::SeqCst);
-        match token::decode_header(header).map(|t| t.into_iter().next()) {
-            Ok(Some((_, first))) => lock(&self.acks).record(
+        let answered_ns = now_ns();
+        let tokens = match token::decode_header(header) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("write {id}: the commit-token header does not decode: {e}");
+                return;
+            }
+        };
+        let hours = [sent_ns / NS_PER_HOUR, answered_ns / NS_PER_HOUR]
+            .into_iter()
+            .chain(tokens.iter().map(|(_, t)| u64::from(t.hour)));
+        let count = self.history(answered_ns / NS_PER_HOUR).routed_count(hours);
+        if let Some((_, first)) = tokens.into_iter().next() {
+            lock(&self.acks).record(
                 id,
                 token::Ack {
                     node,
                     writer: first.writer,
                     sent,
                     answered,
+                    count,
                 },
-            ),
-            Ok(None) => {}
-            Err(e) => println!("write {id}: the commit-token header does not decode: {e}"),
+            );
         }
     }
 
@@ -1106,29 +1123,42 @@ impl Shared {
     }
 
     /// The tenant's shard ceiling at the driver's current hour, which bounds
-    /// every sweep pass, bucket scan and shard draw. A reshard activates at
-    /// least two hours after it is appended, so the ceiling of an hour never
-    /// changes within it: the cache is read again from the provisioning
-    /// record only once the hour moves, by a clock move or in real time. A
-    /// record that cannot be read keeps the ceiling the cache had, and the
-    /// next call reads it again.
+    /// every sweep pass, bucket scan and shard draw.
     fn shards(&self) -> u32 {
         let hour = now_ns() / NS_PER_HOUR;
-        if self.shards_hour.load(Ordering::SeqCst) != hour {
-            let was = self.shards.load(Ordering::SeqCst);
+        self.history(hour).ceiling(hour)
+    }
+
+    /// The tenant's shard history, read again from the provisioning record
+    /// when the last read was for another hour than `hour`. A reshard
+    /// activates at least two hours after it is appended, so what a read
+    /// says of its own hour and the next never changes: the record is read
+    /// again only once the hour moves, by a clock move or in real time. A
+    /// record that cannot be read keeps the history the cache had, and the
+    /// next call reads it again.
+    fn history(&self, hour: u64) -> MutexGuard<'_, audit::ShardHistory> {
+        let mut history = lock(&self.history);
+        if history.read_hour != hour {
+            let was = history.ceiling(history.read_hour);
             let read = self.store.get(&self.prov_key);
-            match audit::shard_ceiling(&self.prov_key, read, hour, seed::SHARDS) {
-                Ok(ceiling) => {
-                    self.shards.store(ceiling, Ordering::SeqCst);
-                    self.shards_hour.store(hour, Ordering::SeqCst);
+            match audit::generations(&self.prov_key, read, seed::SHARDS) {
+                Ok(generations) => {
+                    *history = audit::ShardHistory {
+                        generations,
+                        read_hour: hour,
+                    };
+                    let ceiling = history.ceiling(hour);
                     if ceiling != was {
                         println!("shards: the ceiling at hour {hour} is {ceiling}, was {was}");
                     }
                 }
-                Err(e) => println!("shards: keeping the ceiling {was} at hour {hour}: {e}"),
+                Err(e) => println!(
+                    "shards: at hour {hour}, keeping the history read at hour {}: {e}",
+                    history.read_hour
+                ),
             }
         }
-        self.shards.load(Ordering::SeqCst)
+        history
     }
 
     /// One sweep of every shard below the ceiling; returns how many
@@ -3018,9 +3048,14 @@ fn seed(cfg: &Config, store: &Store, cli: &Cli, deadline: Instant) -> Plan {
 }
 
 /// The tenant's provisioning-record key, found through the HEAD key `catalog
-/// inspect --json` prints, with its shard ceiling and the hour it was read
-/// for. Setup gives up rather than start on a guessed ceiling.
-fn read_ceiling(tenant: &str, store: &Store, cli: &Cli, deadline: Instant) -> (String, u32, u64) {
+/// inspect --json` prints, with its shard history. Setup gives up rather than
+/// start on a guessed ceiling.
+fn read_history(
+    tenant: &str,
+    store: &Store,
+    cli: &Cli,
+    deadline: Instant,
+) -> (String, audit::ShardHistory) {
     let mut found = None;
     wait_for(
         "the shard ceiling is read from the provisioning record",
@@ -3045,10 +3080,17 @@ fn read_ceiling(tenant: &str, store: &Store, cli: &Cli, deadline: Instant) -> (S
                 .ok_or_else(|| format!("unexpected HEAD key {head_key}"))?;
             let key = audit::provisioning_key(&prefix);
             let hour = now_ns() / NS_PER_HOUR;
-            let ceiling = audit::shard_ceiling(&key, store.get(&key), hour, seed::SHARDS)
+            let generations = audit::generations(&key, store.get(&key), seed::SHARDS)
                 .map_err(|e| e.to_string())?;
-            println!("shards: the ceiling at hour {hour} is {ceiling} ({key})");
-            found = Some((key, ceiling, hour));
+            let history = audit::ShardHistory {
+                generations,
+                read_hour: hour,
+            };
+            println!(
+                "shards: the ceiling at hour {hour} is {} ({key})",
+                history.ceiling(hour)
+            );
+            found = Some((key, history));
             Ok(())
         },
     );
@@ -3098,7 +3140,7 @@ fn main(tc: TestCase) {
         store.list("antithesis/").map(|_| ())
     });
     let plan = seed(&cfg, &store, &cli, setup_deadline);
-    let (prov_key, shards, shards_hour) = read_ceiling(&cfg.tenant, &store, &cli, setup_deadline);
+    let (prov_key, history) = read_history(&cfg.tenant, &store, &cli, setup_deadline);
     let seeded = plan.expected(cfg.inject_swap);
     let ravel = Ravel::new(cfg.nodes.clone(), cfg.token.clone()).unwrap_or_else(|e| die(&e));
     let maint = Ravel::new(cfg.maint_nodes.clone(), cfg.token.clone()).unwrap_or_else(|e| die(&e));
@@ -3143,8 +3185,7 @@ fn main(tc: TestCase) {
         max_writes,
         head_key: Mutex::new(None),
         prov_key,
-        shards: AtomicU32::new(shards),
-        shards_hour: AtomicU64::new(shards_hour),
+        history: Mutex::new(history),
         compacted: AtomicBool::new(false),
         clock,
         jump: Mutex::new(None),
