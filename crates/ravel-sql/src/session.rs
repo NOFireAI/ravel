@@ -155,6 +155,7 @@ use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
 use crate::compact_slices::CompactSlices;
 use crate::config::{DEFAULT_SPILL_MERGE_FAN_IN, SqlConfig};
+use crate::empty_compare::EmptyStringCompare;
 use crate::exchange_floor::FinalExchangeFloor;
 use crate::first_groups::FirstGroupsLimit;
 use crate::group_keys::DictionaryGroupKeysAsViews;
@@ -1074,6 +1075,15 @@ fn build_session_inner(
     if let Some(max_limit) = config.partition_topk_max_limit {
         builder = builder.with_physical_optimizer_rule(Arc::new(LogsPartitionTopK::new(max_limit)));
     }
+    // Issue #4660: evaluate `x = ''` and `x <> ''` over a string or binary
+    // `x` from value lengths, in `FilterExec` predicates and in the `logs`
+    // scan's row filters. After every rule that matches a predicate's shape
+    // (`MetadataOnlyAggregate`'s `<>`) or rebuilds a scan with its row
+    // filters, so each of them sees the comparison as planned; scan pushdown
+    // is decided on the logical plan, before any of these. It touches no
+    // aggregate, so `CompactSlices` and the profile rule see the same shape
+    // either way. See `crate::empty_compare`.
+    builder = builder.with_physical_optimizer_rule(Arc::new(EmptyStringCompare));
     // Issue #2720: give an aggregate's output slices buffers of their own
     // before a `RepartitionExec` or a sort charges each slice the whole
     // materialized output. Appended after every rule above because each of

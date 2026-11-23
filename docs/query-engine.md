@@ -201,6 +201,33 @@ extrema, and the column-statistics rewrite below refuses it, so `COUNT(*)`,
 The same comparison AND-ed with a shape the scan does not evaluate, in one
 unsplit expression, stays `Inexact`.
 
+A comparison of a string or binary expression with the empty literal by `=`
+or `<>`, either operand order, is evaluated in a filter from value lengths
+instead of value bytes. The `empty_string_compare` physical optimizer rule
+(`crates/ravel-sql/src/empty_compare.rs`) replaces each such comparison in a
+`FilterExec` predicate and in the scan's row filter with `EmptyCompareExpr`,
+shown in EXPLAIN as `empty_eq(x)` or `empty_ne(x)`: `"SearchPhrase" <> ''`
+reads `row_filters=[empty_ne(SearchPhrase)]` on the scan line and
+`"SearchPhrase" = ''` reads `FilterExec: empty_eq(SearchPhrase@..)`. A value
+in an offsets layout (`Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`) is empty
+when its two offsets are equal, and one in a view layout when the view's
+length is zero; over a dictionary the test runs once per dictionary value and
+is taken through the keys, so a declared `str` column, which reaches a filter
+as `Dictionary(Int32, Utf8)`, is tested once per dictionary entry. A NULL
+operand gives NULL, as arrow's comparison kernel does. That kernel compares
+bytes, and for an empty value it makes a zero-length `memcmp` against the
+literal's empty buffer, whose pointer is unmapped; on a c7a.metal host whose
+libc `memcmp` reads under an AVX-512 mask whatever the length, those calls
+were measured at about 51 ns each instead of 2 ns and 57 percent of
+the cycles of ClickBench's `WHERE "SearchPhrase" <> '' ORDER BY
+"SearchPhrase" LIMIT 10` on v0.34.0. The rule is appended after every rule
+that matches a comparison's shape or rebuilds the scan from its row filters
+(`MetadataOnlyAggregate`, `TopKLateMaterialization` and the `logs` TopK
+rules), so each of them sees the comparison as planned, and which
+comparisons the scan evaluates is decided on the logical plan before any
+physical rule runs. A comparison against a non-empty literal, and one in a
+projection, an aggregate argument or a join filter, is left as it is.
+
 A scan carrying such a comparison under an `ORDER BY ... LIMIT k` whose
 global sort reads it through a partition concatenation
 (`CoalescePartitionsExec`), projections and cooperative wrappers only gets a

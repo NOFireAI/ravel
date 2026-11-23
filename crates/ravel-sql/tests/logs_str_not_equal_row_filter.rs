@@ -528,7 +528,7 @@ async fn answers_match_the_residual_on_every_value_shape() {
         );
         let shown = format!("{}", displayable(plan.as_ref()).indent(true));
         assert!(
-            shown.contains("row_filters=[s != ]"),
+            shown.contains("row_filters=[empty_ne(s)]"),
             "{sql}: EXPLAIN shows the conjunct by column name: {shown}"
         );
     }
@@ -915,14 +915,16 @@ fn scan_line(plan: &Arc<dyn ExecutionPlan>) -> String {
 
 /// T1 through SQL: the planned and optimized plans of `s <> ''` and
 /// `'' <> s`, alone and beside a `ts` bound, hold no `FilterExec`, and the
-/// scan's EXPLAIN line names the conjunct's column (`row_filters=[s != ]`)
-/// rather than printing a full-schema index that does not match its
-/// `projection=[...]`. The shapes near it keep a `FilterExec`, and the
-/// conjunct beside a `LIKE` leaves a `FilterExec` holding the `LIKE` only.
+/// scan's EXPLAIN line names the conjunct's column
+/// (`row_filters=[empty_ne(s)]`, the length-only form `crate::empty_compare`
+/// installs, issue #4660) rather than printing a full-schema index that does
+/// not match its `projection=[...]`. The shapes near it keep a `FilterExec`,
+/// and the conjunct beside a `LIKE` leaves a `FilterExec` holding the `LIKE`
+/// only.
 ///
 /// Flipped: a `leaf_is_exact` that does not recognize the shape leaves a
 /// `FilterExec` and fails "no FilterExec"; printing the bound expression
-/// (`s@4 != `) fails "by column name".
+/// (`empty_ne(s@4)`) fails "by column name".
 #[tokio::test]
 async fn exact_not_equal_conjunct_is_exact_and_leaves_no_filter() {
     let (store, segments) = t3_fixture().await;
@@ -937,7 +939,7 @@ async fn exact_not_equal_conjunct_is_exact_and_leaves_no_filter() {
         assert_no_filter(&plan, sql);
         let line = scan_line(&plan);
         assert!(
-            line.contains("projection=[ts], row_filters=[s != ]"),
+            line.contains("projection=[ts], row_filters=[empty_ne(s)]"),
             "{sql}: by column name: {line}"
         );
         assert!(!line.contains('@'), "{sql}: no column index: {line}");
@@ -976,7 +978,10 @@ async fn exact_not_equal_conjunct_is_exact_and_leaves_no_filter() {
         predicate.to_lowercase().contains("like") && !predicate.contains("!="),
         "{sql}: the FilterExec holds the LIKE only: {predicate}"
     );
-    assert!(scan_line(&plan).contains("row_filters=[s != ]"), "{sql}");
+    assert!(
+        scan_line(&plan).contains("row_filters=[empty_ne(s)]"),
+        "{sql}"
+    );
     let mut got = timestamps(&got);
     got.sort_unstable();
     assert_eq!(got, [10, 11], "{sql}");
@@ -1173,7 +1178,7 @@ async fn clickbench_shapes_plan_without_a_filter_over_the_scan() {
             "{sql}: the scan reports target_partitions partitions: {shown}"
         );
         assert!(
-            scan_line(&plan).contains("row_filters=[SearchPhrase != ]"),
+            scan_line(&plan).contains("row_filters=[empty_ne(SearchPhrase)]"),
             "{sql}: the <> is in the scan: {shown}"
         );
         let filters = nodes(&plan, "FilterExec");

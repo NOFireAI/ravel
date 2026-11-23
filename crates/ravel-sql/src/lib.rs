@@ -72,6 +72,7 @@ mod dedup;
 pub mod distributed;
 #[cfg(feature = "flight-sql")]
 pub mod distributed_rlog;
+mod empty_compare;
 mod error;
 pub mod esql;
 mod exchange_floor;
@@ -188,6 +189,9 @@ pub use distributed_rlog::{
     ALERTS_ORDER_COLS, AUDIT_ORDER_COLS, DistributedSliceScanExec, LOGS_ORDER_COLS,
     distributed_alerts_plan, distributed_audit_plan, distributed_logs_plan, distributed_slice_plan,
     sort_slice_fragment,
+};
+pub use empty_compare::{
+    EMPTY_STRING_COMPARE_RULE, EmptyCompareExpr, EmptyStringCompare, empty_compare,
 };
 pub use error::{
     ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_SPILL_DISABLED_MARKER,
