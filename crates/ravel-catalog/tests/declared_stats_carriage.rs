@@ -25,12 +25,16 @@ use ravel_catalog::{
     DEFAULT_MAX_FLUSH_LIFETIME_NS, PartLimits, SegmentLevel, SegmentRef, decode_part, encode_part,
     read_snapshot_entry,
 };
-use ravel_commit::declared_stats::{stamp_commit_record, stamp_compaction_part};
+use ravel_commit::declared_stats::{
+    DeclaredStatDefect, stamp_commit_record, stamp_compaction_part,
+};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::{keys, signal};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
-use ravel_proto::catalog::v1::SnapshotEntry;
+use ravel_proto::catalog::v1::{
+    DeclaredColumnMinMax, DeclaredColumnStatValue, SnapshotEntry, declared_column_stat_value::Kind,
+};
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionInputIdentity, CompactionPart, CompactionRecord,
 };
@@ -80,6 +84,43 @@ fn bool_stat(name: &str, min: bool, max: bool, null_count: u64) -> DeclaredColum
         null_count,
     )
     .expect("valid bool stat")
+}
+
+/// An I64 stat (ADR-4628) carrying the exact sum and zero count, built exactly
+/// as the writer that computed them would stamp them.
+fn i64_full(
+    name: &str,
+    min: i64,
+    max: i64,
+    null_count: u64,
+    sum: i128,
+    zero_count: u64,
+) -> DeclaredColumnStat {
+    i64_stat(name, min, max, null_count)
+        .with_sum(sum)
+        .expect("valid sum")
+        .with_zero_count(zero_count)
+        .expect("valid zero count")
+}
+
+/// A BOOL stat carrying its zero (`false`) count; BOOL columns carry no sum.
+fn bool_zero(
+    name: &str,
+    min: bool,
+    max: bool,
+    null_count: u64,
+    zero_count: u64,
+) -> DeclaredColumnStat {
+    bool_stat(name, min, max, null_count)
+        .with_zero_count(zero_count)
+        .expect("valid zero count")
+}
+
+/// A sum past `i64::MAX`, so the encoder writes field 7 (`sum_wide`, 16 bytes)
+/// and leaves field 6 absent. For a column whose `100` non-null rows are each
+/// `i64::MAX`, the only in-bounds sum is `100 * i64::MAX`, which is this value.
+fn wide_sum() -> i128 {
+    100i128 * i128::from(i64::MAX)
 }
 
 /// Content hash of the record `l0_record` builds for `seq`, so a test can find
@@ -642,4 +683,292 @@ async fn compaction_part_stamps_fold_exactly_as_commit_record_stamps_do() {
     assert_eq!(all_null.min(), None);
     assert_eq!(all_null.max(), None);
     assert_eq!(all_null.null_count(), 10);
+}
+
+/// ADR-4628: the sum and zero count a stamp carries ride the same carriage as
+/// min, max and null count. A narrow sum in field 6, a wide one in field 7, and
+/// zero counts on an I64 and a BOOL column fold onto the sealed entry and read
+/// back off it unchanged; the sealed `SegmentRef` equals the one the live
+/// listing resolves; and the raw field-15 entry shows the wide sum as 16 bytes
+/// in field 7 with field 6 absent.
+#[tokio::test]
+async fn folded_sum_and_zero_count_reach_the_resolved_segment_ref_unchanged() {
+    let store = Arc::new(MemoryStore::new());
+    let hour = 500_500u32;
+    let now = now_at_seal(hour);
+
+    let stats = vec![
+        i64_full("Narrow", 0, 10, 0, 500, 7),
+        i64_stat("Wide", i64::MAX, i64::MAX, 0)
+            .with_sum(wide_sum())
+            .expect("wide sum"),
+        bool_zero("Flag", false, true, 0, 40),
+    ];
+    let rec = l0_record(1, hour, 100, &stats);
+    put_l0(store.as_ref(), &rec).await;
+
+    // Above the watermark, resolved by listing the commit record.
+    let listing_catalog = Catalog::new(store.clone(), config()).expect("catalog");
+    let listed = resolve_all(&listing_catalog, hour, now).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        segment_with_hash(&listed, l0_hash_byte(1))
+            .declared_column_stats
+            .as_slice(),
+        stats.as_slice()
+    );
+
+    // The fold copies the validated stamps, sum and zero count included.
+    let catalog = Catalog::new(store.clone(), config()).expect("catalog");
+    let entries = fold_and_read_entries(&store, &catalog, now).await;
+    assert_eq!(entries.len(), 1);
+    let entry = entry_with_hash(&entries, l0_hash_byte(1));
+    let read = read_snapshot_entry(entry);
+    assert!(read.dropped().is_empty());
+    assert_eq!(read.covered().to_vec(), stats);
+
+    // The raw field-15 entries: a wide sum is 16 bytes in field 7 with field 6
+    // absent, a narrow one is field 6 with no field 7, and the BOOL carries a
+    // zero count and no sum of any width.
+    let raw = |name: &str| {
+        entry
+            .declared_column_stats
+            .iter()
+            .find(|e| e.name == name)
+            .expect("column present in the raw entry")
+    };
+    assert_eq!(raw("Narrow").sum, Some(500));
+    assert!(raw("Narrow").sum_wide.is_empty());
+    assert_eq!(raw("Narrow").zero_count, Some(7));
+    assert_eq!(raw("Wide").sum, None);
+    assert_eq!(raw("Wide").sum_wide.len(), 16);
+    assert_eq!(raw("Wide").zero_count, None);
+    assert_eq!(raw("Flag").sum, None);
+    assert!(raw("Flag").sum_wide.is_empty());
+    assert_eq!(raw("Flag").zero_count, Some(40));
+
+    // Below the watermark: the sealed resolve equals the live listing.
+    let sealed = resolve_all(&catalog, hour, now).await;
+    assert_eq!(sealed.len(), 1);
+    let seg = segment_with_hash(&sealed, l0_hash_byte(1));
+    assert_eq!(seg.declared_column_stats.as_slice(), stats.as_slice());
+    assert_eq!(
+        seg.declared_column_stats,
+        segment_with_hash(&listed, l0_hash_byte(1)).declared_column_stats
+    );
+    // Field by field on the two sums and a zero count, so a carriage that
+    // dropped one field cannot hide behind the whole-struct comparison of two
+    // equally-wrong values.
+    let wide = seg
+        .declared_column_stats
+        .column("Wide")
+        .expect("Wide covered");
+    assert_eq!(wide.sum(), Some(wide_sum()));
+    let narrow = seg
+        .declared_column_stats
+        .column("Narrow")
+        .expect("Narrow covered");
+    assert_eq!(narrow.sum(), Some(500));
+    assert_eq!(narrow.zero_count(), Some(7));
+}
+
+/// The compaction-part carrier (`CompactionPart` field 12) carries the sum and
+/// zero count exactly as a commit record does, gated against the part's own row
+/// count, with the wide sum again landing in field 7.
+#[tokio::test]
+async fn compaction_part_sum_and_zero_count_fold_exactly_as_commit_record_stamps_do() {
+    let store = Arc::new(MemoryStore::new());
+    let hour = 500_600u32;
+    let now = now_at_seal(hour);
+
+    let input = l0_record(1, hour, 100, &[i64_stat("Narrow", 0, 10, 0)]);
+    put_l0(store.as_ref(), &input).await;
+
+    // Recomputed over the rows the part holds, never merged from the input.
+    let p_stats = vec![
+        i64_full("Narrow", 0, 10, 0, 300, 5),
+        i64_stat("Wide", i64::MAX, i64::MAX, 0)
+            .with_sum(wide_sum())
+            .expect("wide sum"),
+        bool_zero("Flag", false, true, 0, 12),
+    ];
+    put_compaction_record(
+        store.as_ref(),
+        hour,
+        &[&input],
+        vec![part(0, hour, 0x33, 100, &p_stats)],
+    )
+    .await;
+
+    let listing_catalog = Catalog::new(store.clone(), config()).expect("catalog");
+    let listed = resolve_all(&listing_catalog, hour, now).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        segment_with_hash(&listed, 0x33)
+            .declared_column_stats
+            .as_slice(),
+        p_stats.as_slice()
+    );
+
+    let catalog = Catalog::new(store.clone(), config()).expect("catalog");
+    let entries = fold_and_read_entries(&store, &catalog, now).await;
+    assert_eq!(entries.len(), 1);
+    let entry = entry_with_hash(&entries, 0x33);
+    assert_eq!(entry.level, 1);
+    let read = read_snapshot_entry(entry);
+    assert!(read.dropped().is_empty());
+    assert_eq!(read.covered().to_vec(), p_stats);
+    let raw = |name: &str| {
+        entry
+            .declared_column_stats
+            .iter()
+            .find(|e| e.name == name)
+            .expect("column present in the raw entry")
+    };
+    assert_eq!(raw("Wide").sum, None);
+    assert_eq!(raw("Wide").sum_wide.len(), 16);
+    assert_eq!(raw("Narrow").sum, Some(300));
+    assert_eq!(raw("Narrow").zero_count, Some(5));
+    assert_eq!(raw("Flag").zero_count, Some(12));
+
+    let sealed = resolve_all(&catalog, hour, now).await;
+    assert_eq!(sealed.len(), 1);
+    assert_eq!(
+        segment_with_hash(&sealed, 0x33)
+            .declared_column_stats
+            .as_slice(),
+        p_stats.as_slice()
+    );
+    assert_eq!(
+        segment_with_hash(&sealed, 0x33).declared_column_stats,
+        segment_with_hash(&listed, 0x33).declared_column_stats
+    );
+}
+
+/// A snapshot entry carrying a defective aggregate -- both sum fields present
+/// at once (ADR-4628 decision 2, "one encoding per value") -- is dropped whole
+/// on read. The mirror must copy BOTH fields through for the predicate to see
+/// the conflict: a mirror that kept only one would let the entry decode.
+#[test]
+fn an_entry_with_both_sum_fields_is_dropped_whole_on_read() {
+    let i64_val = |v: i64| {
+        Some(DeclaredColumnStatValue {
+            kind: Some(Kind::I64(v)),
+        })
+    };
+    let defective = DeclaredColumnMinMax {
+        name: "Both".to_string(),
+        declared_type: DeclaredStatType::I64.tag(),
+        min: i64_val(0),
+        max: i64_val(10),
+        null_count: 0,
+        sum: Some(5),
+        sum_wide: vec![0u8; 16],
+        zero_count: None,
+    };
+    let valid = DeclaredColumnMinMax {
+        name: "Fine".to_string(),
+        declared_type: DeclaredStatType::I64.tag(),
+        min: i64_val(0),
+        max: i64_val(10),
+        null_count: 0,
+        sum: Some(5),
+        sum_wide: Vec::new(),
+        zero_count: None,
+    };
+    let mut entry = stamp_free_entry();
+    entry.declared_column_stats = vec![defective, valid];
+    let read = read_snapshot_entry(&entry);
+    assert_eq!(read.dropped().len(), 1);
+    assert_eq!(
+        read.dropped()[0].reason,
+        DeclaredStatDefect::BothSumFields {
+            name: "Both".to_string(),
+        }
+    );
+    // The sibling with one sum field is unaffected: a defect is per entry.
+    assert_eq!(read.covered().len(), 1);
+    assert_eq!(read.covered()[0].name(), "Fine");
+    assert_eq!(read.column("Both"), None);
+}
+
+/// A `DeclaredColumnMinMax` as a writer that predates ADR-4628 encodes it:
+/// fields 1-5 and no field 6, 7 or 8 in the schema at all. Its min/max are the
+/// unchanged `DeclaredColumnStatValue` message, so this twin shares the real
+/// one.
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyDeclaredColumnMinMax {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(uint32, tag = "2")]
+    declared_type: u32,
+    #[prost(message, optional, tag = "3")]
+    min: Option<DeclaredColumnStatValue>,
+    #[prost(message, optional, tag = "4")]
+    max: Option<DeclaredColumnStatValue>,
+    #[prost(uint64, tag = "5")]
+    null_count: u64,
+}
+
+/// A stamped entry whose stamp carries only fields 1-5 (no sum, no zero count)
+/// is byte-identical to the pre-ADR-4628 schema's, and decodes to the same
+/// stamp with the new fields absent. Pins the bytes the current encoder writes
+/// for a fixed stamp: absent fields 6-8 occupy no bytes, so an older reader's
+/// record and a newer one's agree exactly.
+#[test]
+fn a_stamp_written_before_fields_six_to_eight_decodes_unchanged() {
+    let current = DeclaredColumnMinMax {
+        name: "EventDate".to_string(),
+        declared_type: DeclaredStatType::I64.tag(),
+        min: Some(DeclaredColumnStatValue {
+            kind: Some(Kind::I64(-5)),
+        }),
+        max: Some(DeclaredColumnStatValue {
+            kind: Some(Kind::I64(19_000)),
+        }),
+        null_count: 12,
+        sum: None,
+        sum_wide: Vec::new(),
+        zero_count: None,
+    };
+    let legacy = LegacyDeclaredColumnMinMax {
+        name: current.name.clone(),
+        declared_type: current.declared_type,
+        min: current.min,
+        max: current.max,
+        null_count: current.null_count,
+    };
+    assert_eq!(
+        current.encode_to_vec(),
+        legacy.encode_to_vec(),
+        "a stamp with fields 6-8 absent is byte-identical to the pre-ADR-4628 schema's"
+    );
+
+    // Build an entry carrying it, round-trip through the part codec, and read it
+    // back: the stamp is covered with min/max/null intact and no sum or zero
+    // count.
+    let mut entry = stamp_free_entry();
+    entry.sample_count = 100;
+    entry.declared_column_stats = vec![current.clone()];
+    let encoded = encode_part(
+        [0x44; 16],
+        1,
+        9,
+        entry.ingest_hour_bucket,
+        std::slice::from_ref(&entry),
+    )
+    .expect("encode part");
+    let decoded = decode_part(&encoded, &PartLimits::default()).expect("part decodes");
+    assert_eq!(decoded.entries.len(), 1);
+    let stamp = &decoded.entries[0].declared_column_stats[0];
+    assert_eq!(stamp.sum, None);
+    assert!(stamp.sum_wide.is_empty());
+    assert_eq!(stamp.zero_count, None);
+    let read = read_snapshot_entry(&decoded.entries[0]);
+    let covered = read.column("EventDate").expect("EventDate covered");
+    assert_eq!(covered.min(), Some(DeclaredStatValue::I64(-5)));
+    assert_eq!(covered.max(), Some(DeclaredStatValue::I64(19_000)));
+    assert_eq!(covered.null_count(), 12);
+    assert_eq!(covered.sum(), None);
+    assert_eq!(covered.zero_count(), None);
 }

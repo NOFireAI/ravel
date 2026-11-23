@@ -106,13 +106,16 @@ fn value_to_commit(value: &DeclaredColumnStatValue) -> commit_pb::DeclaredColumn
     commit_pb::DeclaredColumnStatValue { kind }
 }
 
-/// One commit-side entry as its catalog-side mirror. Total and lossless for
-/// fields 1 to 5: the two messages are field-for-field identical by
-/// construction (ADR-0873 decision 1), including the value kinds and a
-/// present-but-empty value message, which is a defect the reader must still
-/// see rather than one this conversion may quietly normalise away. Fields 6
-/// to 8 (ADR-4628) are not carried yet and are written absent, which a reader
-/// treats as unknown.
+/// One commit-side entry as its catalog-side mirror. Total and lossless: the
+/// two messages are field-for-field identical by construction (ADR-0873
+/// decision 1, ADR-4628 decision 1), including the value kinds, a
+/// present-but-empty value message, and the ADR-4628 sum and zero count (fields
+/// 6 to 8), all of which a defect the reader must still see rather than one
+/// this conversion may quietly normalise away. The sum's two fields are copied
+/// byte for byte and not chosen between: a defective entry carrying both field
+/// 6 and field 7, or a field 7 of the wrong length, has to reach the
+/// `decode`-side predicate unchanged so it is dropped there, exactly as a
+/// present-but-empty value is.
 fn entry_to_proto(entry: &commit_pb::DeclaredColumnMinMax) -> DeclaredColumnMinMax {
     DeclaredColumnMinMax {
         name: entry.name.clone(),
@@ -120,13 +123,14 @@ fn entry_to_proto(entry: &commit_pb::DeclaredColumnMinMax) -> DeclaredColumnMinM
         min: entry.min.as_ref().map(value_to_proto),
         max: entry.max.as_ref().map(value_to_proto),
         null_count: entry.null_count,
-        sum: None,
-        sum_wide: Vec::new(),
-        zero_count: None,
+        sum: entry.sum,
+        sum_wide: entry.sum_wide.clone(),
+        zero_count: entry.zero_count,
     }
 }
 
-/// The same conversion in the read direction.
+/// The same conversion in the read direction, equally verbatim for fields 6 to
+/// 8.
 fn entry_to_commit(entry: &DeclaredColumnMinMax) -> commit_pb::DeclaredColumnMinMax {
     commit_pb::DeclaredColumnMinMax {
         name: entry.name.clone(),
@@ -134,9 +138,9 @@ fn entry_to_commit(entry: &DeclaredColumnMinMax) -> commit_pb::DeclaredColumnMin
         min: entry.min.as_ref().map(value_to_commit),
         max: entry.max.as_ref().map(value_to_commit),
         null_count: entry.null_count,
-        sum: None,
-        sum_wide: Vec::new(),
-        zero_count: None,
+        sum: entry.sum,
+        sum_wide: entry.sum_wide.clone(),
+        zero_count: entry.zero_count,
     }
 }
 
@@ -722,19 +726,43 @@ mod tests {
         ]
     }
 
+    /// `sum_wide` (field 7) bytes, drawn so invalid encodings appear as often
+    /// as the one valid 16-byte width: an empty vector, exactly 16 bytes, and a
+    /// free-length vector that lands on the wrong length and, paired with a
+    /// present `sum`, on the both-fields-set defect.
+    fn arb_sum_wide() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            Just(Vec::new()),
+            prop::collection::vec(any::<u8>(), 16..=16),
+            prop::collection::vec(any::<u8>(), 0..20),
+        ]
+    }
+
     fn arb_entry_message() -> impl Strategy<Value = DeclaredColumnMinMax> {
-        (".{0,8}", 0u32..8, arb_value(), arb_value(), any::<u64>()).prop_map(
-            |(name, declared_type, min, max, null_count)| DeclaredColumnMinMax {
-                name,
-                declared_type,
-                min,
-                max,
-                null_count,
-                sum: None,
-                sum_wide: Vec::new(),
-                zero_count: None,
-            },
+        (
+            ".{0,8}",
+            0u32..8,
+            arb_value(),
+            arb_value(),
+            any::<u64>(),
+            any::<Option<i64>>(),
+            arb_sum_wide(),
+            any::<Option<u64>>(),
         )
+            .prop_map(
+                |(name, declared_type, min, max, null_count, sum, sum_wide, zero_count)| {
+                    DeclaredColumnMinMax {
+                        name,
+                        declared_type,
+                        min,
+                        max,
+                        null_count,
+                        sum,
+                        sum_wide,
+                        zero_count,
+                    }
+                },
+            )
     }
 
     proptest! {
