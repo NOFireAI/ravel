@@ -411,8 +411,8 @@ Decision 3 states when a chunk seals by `B` and the row cap alone. As
 built, a chunk's buffers doubled while every doubled buffer still fit `B`,
 and after that a buffer that had to grow took exactly its new length
 rounded up to 64 bytes, allocating a replacement and copying itself for
-nearly every row. On ClickBench statements 34 and 35 that exact growth
-moved at least 1.49 TB through memmove to write 2.87 GB of spill.
+nearly every row. On ClickBench line 34 that exact growth moved at least
+1.49 TB through memmove to write 2.87 GB of spill.
 
 A chunk that still takes rows now grows a buffer only to at least twice its
 capacity (and at least its new length rounded up to 64 bytes). When that
