@@ -11,7 +11,7 @@
      "basis": "predicted: 20.0 GB of L0 at the 0.16 shrink T8 measured on cardinality (26.7 GB to 4.33 GB, #4118), split into 256 MiB parts per (shard, ingest hour) bucket, gives 20 to 32 parts; with no shrink, 75 to 128"},
     {"name": "ravel_only_l1_series_query_ms", "file": "stamps.json", "path": "ravel_only.l1.series_query_ms", "min": 0, "max": 30000,
      "basis": "predicted: 2 GETs per L1 part plus the catalog section bytes; the provenance decode is skipped since #4461; a quarter of the 120 s deadline"},
-    {"name": "ravel_only_l1_store_get_calls_delta", "file": "stamps.json", "path": "ravel_only.l1.readback.store_get_calls.delta", "min": 20, "max": 400,
-     "basis": "predicted: 2 to 3 GETs per part over 20 to 130 parts"}
+    {"name": "ravel_only_l1_series_store_get_calls", "file": "stamps.json", "path": "ravel_only.l1.readback.series_store_get_calls", "min": 20, "max": 400,
+     "basis": "predicted: 2 to 3 GETs per part over 20 to 130 parts; counts the series listing alone (query_cost.series), not the whole read-back"}
   ]
 }

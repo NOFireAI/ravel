@@ -1156,6 +1156,46 @@ pub struct Readback {
     pub query_stats: BTreeMap<String, ReadbackQueryStats>,
 }
 
+/// The queries of a failed read-back that answered before the one that
+/// failed, keyed as in [`Readback::query_ms`]. Only a read-back whose
+/// [`READBACK_QUERY_SERIES`] listing answered has one, so `series_count` is
+/// always the listing's own answer. The failed query has no entry in any map.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadbackPartial {
+    /// The query that failed.
+    pub failed_query: String,
+    /// The read-back attempt that failed, 1 for the first.
+    pub attempt: u32,
+    /// Distinct series `/api/v1/series` returned over the replay window.
+    pub series_count: u64,
+    /// As [`Readback::query_ms`], for the queries that answered.
+    pub query_ms: BTreeMap<String, u64>,
+    /// As [`Readback::query_windows`], for the queries that answered.
+    pub query_windows: BTreeMap<String, u32>,
+    /// As [`Readback::query_cost`], for the queries that answered.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub query_cost: BTreeMap<String, ReadbackQueryCost>,
+    /// As [`Readback::query_stats`], for the queries that answered.
+    pub query_stats: BTreeMap<String, ReadbackQueryStats>,
+}
+
+/// A read-back that failed ([`readback_over_http_with_partial`]): the error,
+/// and what answered before it when the series listing did.
+#[derive(Debug)]
+pub struct ReadbackFailure {
+    pub error: LaneError,
+    pub partial: Option<Box<ReadbackPartial>>,
+}
+
+impl From<LaneError> for ReadbackFailure {
+    fn from(error: LaneError) -> Self {
+        ReadbackFailure {
+            error,
+            partial: None,
+        }
+    }
+}
+
 /// What one named read-back query's answers say it cost.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "stats")]
@@ -1291,6 +1331,12 @@ pub struct ReadbackQueryCost {
     /// that were not segment fetches (the split the harness's
     /// `readback-folded` stamp makes). `None` when either is.
     pub process_catalog_get_delta: Option<i64>,
+    /// The change in `ravel_store_bytes_total{op="get"}` across the query,
+    /// the bytes successful GETs returned, process-wide. `None` when either
+    /// scrape lacks that family, when the GET counters are `None`, and in a
+    /// report written before the field existed.
+    #[serde(default)]
+    pub process_store_get_bytes_delta: Option<i64>,
     /// Why the `process_*` figures are `None`: a scrape failed or lacked a
     /// family, or a counter went down across the query (a restart reset it).
     pub process_error: Option<String>,
@@ -4709,6 +4755,18 @@ pub async fn readback_over_http(
     row: &SystemIngestResult,
     plan: &ReadbackPlan,
 ) -> Result<Readback, LaneError> {
+    readback_over_http_with_partial(config, row, plan)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+/// [`readback_over_http`], keeping on a failure the queries of the failed
+/// attempt that answered before it ([`ReadbackPartial`]).
+pub async fn readback_over_http_with_partial(
+    config: &ReadbackConfig,
+    row: &SystemIngestResult,
+    plan: &ReadbackPlan,
+) -> Result<Readback, ReadbackFailure> {
     // A plan with no window reads nothing, so a repeat cannot change it.
     let settle = match (plan.min_ts_ms, plan.max_ts_ms) {
         (Some(_), Some(_)) => Duration::from_secs(config.settle_secs),
@@ -4718,7 +4776,14 @@ pub async fn readback_over_http(
     let mut attempts = 0u32;
     loop {
         attempts = attempts.saturating_add(1);
-        let mut readback = read_back_once(config, row, plan).await?;
+        let mut readback = read_back_once(config, row, plan)
+            .await
+            .map_err(|mut failure| {
+                if let Some(partial) = &mut failure.partial {
+                    partial.attempt = attempts;
+                }
+                failure
+            })?;
         let elapsed = started.elapsed();
         if readback.matches_expected || elapsed >= settle {
             readback.attempts = attempts;
@@ -4735,13 +4800,8 @@ async fn read_back_once(
     config: &ReadbackConfig,
     row: &SystemIngestResult,
     plan: &ReadbackPlan,
-) -> Result<Readback, LaneError> {
+) -> Result<Readback, ReadbackFailure> {
     let expected = plan.expected();
-    let system = row.system.clone();
-    let fail = |detail: String| LaneError::Readback {
-        system: system.clone(),
-        detail,
-    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(config.timeout_secs.max(1)))
         .build()
@@ -4763,20 +4823,8 @@ async fn read_back_once(
     let window = [("start", seconds(min_ts)), ("end", seconds(max_ts))];
     let count_windows = readback_count_windows(min_ts, max_ts, READBACK_COUNT_WINDOW);
     let window_count = u32::try_from(count_windows.len()).unwrap_or(u32::MAX);
-    let mut query_windows = BTreeMap::new();
-
-    let mut query_ms = BTreeMap::new();
-    // Each query's wall time goes into `query_ms` under `name`, and a failed
-    // query's detail says how long it ran before it failed.
-    let mut timed = |name: String, started: std::time::Instant, result: Result<u64, String>| {
-        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        query_ms.insert(name.clone(), ms);
-        result.map_err(|detail| fail(format!("query {name} failed after {ms} ms: {detail}")))
-    };
-
+    let mut done = ReadbackProgress::new(&row.system);
     let metrics_url = config.metrics_url.as_deref();
-    let mut query_cost = BTreeMap::new();
-    let mut query_stats = BTreeMap::new();
 
     let before = scrape_get_counters(&client, metrics_url).await;
     let started = std::time::Instant::now();
@@ -4789,14 +4837,15 @@ async fn read_back_once(
             &window,
         )
         .await;
-    let series_count = timed(READBACK_QUERY_SERIES.to_string(), started, result)?;
-    query_stats.insert(
+    let series_count = done.timed(READBACK_QUERY_SERIES, started, result)?;
+    done.series_count = Some(series_count);
+    done.query_stats.insert(
         READBACK_QUERY_SERIES.to_string(),
         ReadbackQueryStats::series(),
     );
     if let Some(before) = before {
         let after = scrape_get_counters(&client, metrics_url).await;
-        query_cost.insert(
+        done.query_cost.insert(
             READBACK_QUERY_SERIES.to_string(),
             ReadbackQueryCost::between(before, after, Vec::new()),
         );
@@ -4804,19 +4853,21 @@ async fn read_back_once(
     let mut sample_count = 0u64;
     for (index, (probe, _)) in plan.float_probes().into_iter().enumerate() {
         let name = format!("{READBACK_QUERY_SAMPLES}.{index}");
-        query_windows.insert(name.clone(), window_count);
+        done.query_windows.insert(name.clone(), window_count);
         let before = scrape_get_counters(&client, metrics_url).await;
         let mut calls = Vec::new();
         let started = std::time::Instant::now();
         let result = reader
             .windowed_count(&probe.selector, &count_windows, &mut calls)
             .await;
-        sample_count += timed(name.clone(), started, result)?;
-        query_stats.insert(name.clone(), ReadbackQueryStats::per_call(&calls));
+        sample_count += done.timed(&name, started, result)?;
+        done.query_stats
+            .insert(name.clone(), ReadbackQueryStats::per_call(&calls));
         if let Some(before) = before {
             let after = scrape_get_counters(&client, metrics_url).await;
             let stats = calls.into_iter().map(|c| c.stats).collect();
-            query_cost.insert(name, ReadbackQueryCost::between(before, after, stats));
+            done.query_cost
+                .insert(name, ReadbackQueryCost::between(before, after, stats));
         }
     }
     let histogram_series_count = match expected.histogram_series_count {
@@ -4831,8 +4882,8 @@ async fn read_back_once(
                     &window,
                 )
                 .await;
-            let count = timed(READBACK_QUERY_HISTOGRAM_SERIES.to_string(), started, result)?;
-            query_stats.insert(
+            let count = done.timed(READBACK_QUERY_HISTOGRAM_SERIES, started, result)?;
+            done.query_stats.insert(
                 READBACK_QUERY_HISTOGRAM_SERIES.to_string(),
                 ReadbackQueryStats::series(),
             );
@@ -4845,18 +4896,15 @@ async fn read_back_once(
         plan.probes.get(&PayloadClass::NativeHistogram),
     ) {
         (Some(_), Some(probe)) => {
-            query_windows.insert(READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(), window_count);
+            done.query_windows
+                .insert(READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(), window_count);
             let mut calls = Vec::new();
             let started = std::time::Instant::now();
             let result = reader
                 .windowed_count(&probe.selector, &count_windows, &mut calls)
                 .await;
-            let count = timed(
-                READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(),
-                started,
-                result,
-            )?;
-            query_stats.insert(
+            let count = done.timed(READBACK_QUERY_HISTOGRAM_SAMPLES, started, result)?;
+            done.query_stats.insert(
                 READBACK_QUERY_HISTOGRAM_SAMPLES.to_string(),
                 ReadbackQueryStats::per_call(&calls),
             );
@@ -4872,7 +4920,7 @@ async fn read_back_once(
         (Some(_), Some((marker_ts, _)), Some(probe)) => {
             let started = std::time::Instant::now();
             let result = reader.instant_series(&probe.selector, marker_ts).await;
-            Some(timed(READBACK_QUERY_STALE_MARKER.to_string(), started, result)? == 0)
+            Some(done.timed(READBACK_QUERY_STALE_MARKER, started, result)? == 0)
         }
         _ => None,
     };
@@ -4920,18 +4968,81 @@ async fn read_back_once(
         expected,
         attempts: 1,
         settled_after_ms: 0,
-        query_ms,
-        query_windows,
-        query_cost,
-        query_stats,
+        query_ms: done.query_ms,
+        query_windows: done.query_windows,
+        query_cost: done.query_cost,
+        query_stats: done.query_stats,
     })
+}
+
+/// The queries of one read-back that have answered so far.
+struct ReadbackProgress<'a> {
+    system: &'a str,
+    series_count: Option<u64>,
+    query_ms: BTreeMap<String, u64>,
+    query_windows: BTreeMap<String, u32>,
+    query_cost: BTreeMap<String, ReadbackQueryCost>,
+    query_stats: BTreeMap<String, ReadbackQueryStats>,
+}
+
+impl<'a> ReadbackProgress<'a> {
+    fn new(system: &'a str) -> Self {
+        ReadbackProgress {
+            system,
+            series_count: None,
+            query_ms: BTreeMap::new(),
+            query_windows: BTreeMap::new(),
+            query_cost: BTreeMap::new(),
+            query_stats: BTreeMap::new(),
+        }
+    }
+
+    /// Records `name`'s wall time when it answered. A failure's detail says
+    /// how long it ran, and its partial holds what answered before it, once
+    /// the series listing has (`series_count` set).
+    fn timed(
+        &mut self,
+        name: &str,
+        started: std::time::Instant,
+        result: Result<u64, String>,
+    ) -> Result<u64, ReadbackFailure> {
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let detail = match result {
+            Ok(value) => {
+                self.query_ms.insert(name.to_string(), ms);
+                return Ok(value);
+            }
+            Err(detail) => detail,
+        };
+        self.query_windows.remove(name);
+        let partial = self.series_count.map(|series_count| {
+            Box::new(ReadbackPartial {
+                failed_query: name.to_string(),
+                attempt: 1,
+                series_count,
+                query_ms: std::mem::take(&mut self.query_ms),
+                query_windows: std::mem::take(&mut self.query_windows),
+                query_cost: std::mem::take(&mut self.query_cost),
+                query_stats: std::mem::take(&mut self.query_stats),
+            })
+        });
+        Err(ReadbackFailure {
+            error: LaneError::Readback {
+                system: self.system.to_string(),
+                detail: format!("query {name} failed after {ms} ms: {detail}"),
+            },
+            partial,
+        })
+    }
 }
 
 /// `ravel_store_calls_total{op="get"}` and
 /// `ravel_cache_misses_total{cache="fetch"}`, each summed over every series
-/// of its family that carries the label, or why they could not be read.
+/// of its family that carries the label, or why they could not be read; then
+/// `ravel_store_bytes_total{op="get"}` summed the same way, `None` when the
+/// scrape failed or carries no such sample.
 #[derive(Clone, Debug, PartialEq)]
-struct GetCounters(Result<(f64, f64), String>);
+struct GetCounters(Result<(f64, f64), String>, Option<f64>);
 
 /// The GET counters at `metrics_url`; `None` when no URL is configured, so
 /// the caller records no cost.
@@ -4956,7 +5067,14 @@ async fn scrape_get_counters(
             .map_err(|e| format!("GET {url} body read failed: {e}"))
     }
     .await;
-    Some(GetCounters(text.and_then(|text| get_counters(&text))))
+    let bytes = text
+        .as_ref()
+        .ok()
+        .and_then(|text| sum_samples(text, "ravel_store_bytes_total", ("op", "get")));
+    Some(GetCounters(
+        text.and_then(|text| get_counters(&text)),
+        bytes,
+    ))
 }
 
 /// The two GET counters of a Prometheus text exposition; a family with no
@@ -5033,7 +5151,11 @@ impl ReadbackQueryCost {
         stats: Vec<serde_json::Value>,
     ) -> Self {
         let phases = phase_totals(&stats);
-        let after = after.unwrap_or(GetCounters(Err("no metrics URL".to_string())));
+        let after = after.unwrap_or(GetCounters(Err("no metrics URL".to_string()), None));
+        let bytes = match (before.1, after.1) {
+            (Some(b0), Some(b1)) if b1 >= b0 => Some((b1 - b0) as i64),
+            _ => None,
+        };
         let deltas = match (before.0, after.0) {
             (Ok((gets0, misses0)), Ok((gets1, misses1))) => {
                 if gets1 < gets0 || misses1 < misses0 {
@@ -5054,6 +5176,7 @@ impl ReadbackQueryCost {
                 process_store_get_delta: Some(store),
                 process_fetch_miss_delta: Some(misses),
                 process_catalog_get_delta: Some(store - misses),
+                process_store_get_bytes_delta: bytes,
                 process_error: None,
             },
             Err(e) => ReadbackQueryCost {
@@ -8572,11 +8695,15 @@ mod tests {
                          ravel_store_calls_total{{mode=\"all\",op=\"get\"}} {}\n\
                          ravel_store_calls_total{{op=\"get\",shard=\"1\"}} {}\n\
                          ravel_store_calls_total{{mode=\"all\",op=\"put\"}} {}\n\
+                         ravel_store_bytes_total{{mode=\"all\",op=\"get\"}} {}\n\
+                         ravel_store_bytes_total{{mode=\"all\",op=\"put\"}} {}\n\
                          ravel_cache_misses_total{{cache=\"fetch\"}} {}\n\
                          ravel_cache_misses_total{{cache=\"list\"}} {}\n",
                         10 * k,
                         k,
                         100 * k,
+                        1000 * k,
+                        7 * k,
                         3 * k,
                         50 * k
                     )
@@ -8605,6 +8732,7 @@ mod tests {
             process_store_get_delta: Some(11),
             process_fetch_miss_delta: Some(3),
             process_catalog_get_delta: Some(8),
+            process_store_get_bytes_delta: Some(1000),
             process_error: None,
         };
         let answer = serde_json::json!({
@@ -8659,8 +8787,8 @@ mod tests {
         let refused = get_counters(text).expect_err("no fetch-miss family");
         assert!(refused.contains("ravel_cache_misses_total"), "{refused}");
         let cost = ReadbackQueryCost::between(
-            GetCounters(get_counters(text)),
-            Some(GetCounters(get_counters(text))),
+            GetCounters(get_counters(text), None),
+            Some(GetCounters(get_counters(text), None)),
             Vec::new(),
         );
         assert_eq!(cost.process_catalog_get_delta, None);
@@ -8688,8 +8816,8 @@ mod tests {
             {"phase": "resolve", "s3GetRequests": 3, "s3GetWireBytes": 10, "s3ListRequests": 1},
         ]});
         let cost = ReadbackQueryCost::between(
-            GetCounters(get_counters(before)),
-            Some(GetCounters(get_counters(after))),
+            GetCounters(get_counters(before), None),
+            Some(GetCounters(get_counters(after), None)),
             vec![answer],
         );
         assert_eq!(cost.process_store_get_delta, None);

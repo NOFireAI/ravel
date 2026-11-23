@@ -1601,6 +1601,169 @@ fn readback_only_reads_a_kept_report_back_without_writing() {
     assert_eq!(short_observer.writes(), 0, "no write was sent");
 }
 
+/// A Ravel-like query API for `--readback-only` whose series listing answers
+/// seven series and costs 3 GETs of 300 bytes on its `/metrics`, and whose
+/// every `/api/v1/query` costs 100 GETs of 10,000 bytes and answers 500.
+/// With `fail_listing` the listing answers 500 too.
+fn partial_readback_stub(runtime: &tokio::runtime::Runtime, fail_listing: bool) -> String {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let gets = std::sync::Arc::new(AtomicU64::new(0));
+    let bytes = std::sync::Arc::new(AtomicU64::new(0));
+    let (series_gets, series_bytes) = (gets.clone(), bytes.clone());
+    let (query_gets, query_bytes) = (gets.clone(), bytes.clone());
+    let refused = || {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "query refused",
+        )
+            .into_response()
+    };
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/series",
+            axum::routing::get(move || {
+                series_gets.fetch_add(3, Ordering::SeqCst);
+                series_bytes.fetch_add(300, Ordering::SeqCst);
+                async move {
+                    if fail_listing {
+                        return refused();
+                    }
+                    let data: Vec<serde_json::Value> = (0..7)
+                        .map(|i| serde_json::json!({"__name__": "m", "i": i.to_string()}))
+                        .collect();
+                    axum::Json(serde_json::json!({"status": "success", "data": data}))
+                        .into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/v1/query",
+            axum::routing::get(move || {
+                query_gets.fetch_add(100, Ordering::SeqCst);
+                query_bytes.fetch_add(10_000, Ordering::SeqCst);
+                async move { refused() }
+            }),
+        )
+        .route(
+            "/metrics",
+            axum::routing::get(move || {
+                let (g, b) = (gets.load(Ordering::SeqCst), bytes.load(Ordering::SeqCst));
+                async move {
+                    format!(
+                        "ravel_store_calls_total{{mode=\"all\",op=\"get\"}} {g}\n\
+                         ravel_store_bytes_total{{mode=\"all\",op=\"get\"}} {b}\n\
+                         ravel_cache_misses_total{{cache=\"fetch\"}} 0\n"
+                    )
+                }
+            }),
+        );
+    spawn_stub(runtime, app)
+}
+
+/// `--readback-only` over the Ravel row of a kept `ingest.json` against
+/// [`partial_readback_stub`], returning its exit code, stdout as JSON and
+/// stderr.
+fn readback_only_against_partial_stub(
+    fail_listing: bool,
+) -> (Option<i32>, serde_json::Value, String) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let observer = StubObserver {
+        token: Some(stub_commit_token()),
+        ..StubObserver::default()
+    };
+    let url = spawn_stub(
+        &runtime,
+        stub_receiver_with(StubTsdb::default(), true, observer),
+    );
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    replay_ravel_row(&url, 2, &ingest_json);
+    let query_url = partial_readback_stub(&runtime, fail_listing);
+    let metrics_url = format!("{query_url}/metrics");
+    let anchor = on_grid_anchor().to_string();
+    let (code, stdout, stderr) = run_readback_only(&[
+        "--ingest-report",
+        ingest_json.to_str().expect("utf-8 path"),
+        "--readback-system",
+        "ravel",
+        "--anchor-ms",
+        &anchor,
+        "--ravel-query-url",
+        &query_url,
+        "--ravel-metrics-url",
+        &metrics_url,
+    ]);
+    let output = serde_json::from_str(&stdout).expect("stdout is JSON");
+    (code, output, stderr)
+}
+
+/// A read-back whose series listing answers and whose first sample query
+/// fails with a 500 exits 1 with `readback_error` naming `samples.0`, no
+/// `readback` and no `matches_expected`, and keeps the listing's own figures
+/// in `readback_partial`: its seven series, its wall time (and no
+/// `samples.0` entry), and its own GET calls and bytes, 3 and 300, not the
+/// 103 and 10,300 scraped around the whole read-back.
+///
+/// TO SEE THIS FAIL: in `run_readback_only` drop `failure.partial` (no
+/// `readback_partial`), or in `read_back_once` scrape the series listing's
+/// `after` counters once the read-back ends (its GET delta reads 103).
+#[test]
+fn readback_only_keeps_the_listing_when_a_later_query_fails() {
+    let _serial = serial();
+    let (code, output, stderr) = readback_only_against_partial_stub(false);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("reading ravel back failed"), "{stderr}");
+    assert!(output.get("readback").is_none(), "{output}");
+    let error = output["readback_error"].as_str().expect("readback_error");
+    assert!(error.contains("query samples.0 failed after"), "{error}");
+    assert!(error.contains("500"), "{error}");
+    let partial = &output["readback_partial"];
+    assert!(partial.get("matches_expected").is_none(), "{output}");
+    assert_eq!(partial["failed_query"], "samples.0", "{output}");
+    assert_eq!(partial["attempt"], 1, "{output}");
+    assert_eq!(partial["series_count"], 7, "{output}");
+    let query_ms = partial["query_ms"].as_object().expect("query_ms");
+    assert!(query_ms["series"].is_u64(), "{output}");
+    assert!(!query_ms.contains_key("samples.0"), "{output}");
+    assert_eq!(query_ms.len(), 1, "{output}");
+    let cost = partial["query_cost"].as_object().expect("query_cost");
+    assert_eq!(cost.len(), 1, "{output}");
+    assert_eq!(cost["series"]["process_store_get_delta"], 3, "{output}");
+    assert_eq!(
+        cost["series"]["process_store_get_bytes_delta"], 300,
+        "{output}"
+    );
+    assert!(
+        partial["query_windows"]
+            .as_object()
+            .expect("query_windows")
+            .is_empty(),
+        "{output}"
+    );
+}
+
+/// A read-back whose series listing itself fails has no listing figures to
+/// keep: `readback_error` names the listing and `readback_partial` is absent.
+///
+/// TO SEE THIS FAIL: in `ReadbackProgress::timed`, build the partial without
+/// requiring `series_count` (with `series_count: 0`).
+#[test]
+fn readback_only_has_no_partial_when_the_listing_fails() {
+    let _serial = serial();
+    let (code, output, stderr) = readback_only_against_partial_stub(true);
+    assert_eq!(code, Some(1), "{stderr}");
+    let error = output["readback_error"].as_str().expect("readback_error");
+    assert!(error.contains("query series failed after"), "{error}");
+    assert!(output.get("readback_partial").is_none(), "{output}");
+    assert!(output.get("readback").is_none(), "{output}");
+}
+
 /// Each `--readback-only` refusal exits 64 with a message naming the
 /// problem, prints no JSON and sends no write: a write endpoint flag, a
 /// missing flag, a system that is not portable or has no query URL, a

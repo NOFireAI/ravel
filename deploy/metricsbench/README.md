@@ -2169,12 +2169,24 @@ For each catalog state (`l0` and `l1`), `stamps.json` holds these keys under
 - `objects`: the object counts by kind: `data` (L0), `l1`, `commit`,
   `qualify`, `other` and `total`.
 - `catalog_objects`: the catalog's L0 and L1 data object counts.
+- `postings_built`: the `postings_built` of the fold report that built the
+  snapshot (`stage1-STATE-fold.json`), or null when that report is missing
+  or unreadable.
 - `readback`: what the read-back produced:
   - `verdict`;
   - `series_query_ms`;
+  - `series_store_get_calls` and `series_store_get_bytes`: the GETs and GET
+    bytes the series listing alone caused, from the read-back's
+    `query_cost.series` (`process_store_get_delta` and
+    `process_store_get_bytes_delta`), null when it carries none;
+  - `series_figures_from`: where the listing's figures came from:
+    `readback`, `readback_partial` (a later query failed after the listing
+    answered, case ro9), `readback_error` (the time the error names) or
+    null;
   - `store_get_calls` and `store_get_bytes`, from
     `ravel_store_calls_total` and `ravel_store_bytes_total` with
-    `op="get"`, each with `before`, `after` and `delta`;
+    `op="get"`, each with `before`, `after` and `delta`, over the whole
+    read-back;
   - `error`;
   - `missing`.
 - `verdict` and `series_query_ms`, repeated from `readback`.
@@ -2183,7 +2195,9 @@ The verdict is one of these:
 
 - `matched`;
 - `mismatch`, which fails the step (case ro5);
-- `error`, which fails the step;
+- `error`, which fails the step. When the series listing answered and a
+  later query failed, the listing's time and GETs are still stamped from
+  `readback_partial` (case ro9).
 - `refused (budget)`, when the series listing answered 422. The run goes on,
   and `series_query_ms` is the elapsed time that the error names (case
   ro4).
@@ -2218,11 +2232,15 @@ conditions that could still differ, each with the `l0` and `l1` value and a
 - `server`: the recreate before each read-back (`stage1.l0_restart`,
   `stage1.l1_restart`), whose flags carry `--disable-fold`.
 - `covers_ingest`: both snapshots reach the hour the ingest ended.
+- `postings_built`: each state's `postings_built`. `same` only when both are
+  true or both false; a fold report that is missing or unreadable (null)
+  differs (case ro10).
 
 `fold` restates that both folds are the same command, and `catalog_level`
 names the variable measured. `differs` lists the conditions marked
 `differs`, and `attributable_to_compaction` is true only when it is empty.
 When it is true, the L1-minus-L0 deltas of `series_query_ms`,
+`readback.series_store_get_calls`, `readback.series_store_get_bytes`,
 `readback.store_get_calls.delta` and `readback.store_get_bytes.delta` are
 attributable to the compaction: the GET counters are process-wide, and no
 background fold runs in either read-back to add its own GETs. When it is

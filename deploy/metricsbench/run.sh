@@ -463,7 +463,10 @@
 #               (ravel_only.l1.catalog) and runs no pass: stage1.l1 and
 #               stage1.l1_compare say skipped. ravel_only.differences then
 #               names each condition other than catalog level that could
-#               differ between the two read-backs, same or differs
+#               differ between the two read-backs, same or differs,
+#               postings_built among them: ravel_only.STATE.postings_built
+#               is stamped from <out>/stage1-STATE-fold.json, null when
+#               that report is missing or unreadable, and null differs
 #   objects-l1  as objects-l0, into <out>/ravel-objects-l1.json and
 #               <out>/ravel-only-l1.objects.jsonl (ravel_only.l1.objects,
 #               the L1 parts under its l1 kind, and .catalog_objects)
@@ -474,9 +477,12 @@
 # refused (budget) when the series listing answered 422, or deadline when it
 # answered 504 with the server's "query exceeded its deadline of D"),
 # series_query_ms (from the error's "query series failed after N ms" on a 422
-# or a deadline, else the deadline D it names), and Ravel's
+# or a deadline, else the deadline D it names), series_store_get_calls and
+# series_store_get_bytes (the series listing's own GETs from query_cost.series),
+# series_figures_from (readback, or readback_partial when a later query failed
+# after the listing answered, or readback_error), and Ravel's
 # ravel_store_calls_total and ravel_store_bytes_total for op="get" before and
-# after the read-back with their deltas; ravel_only.l0.series_query_ms,
+# after the whole read-back with their deltas; ravel_only.l0.series_query_ms,
 # .verdict and the same under l1 repeat the two headline figures. A mismatch
 # or error fails the read-back step, and so does any of those figures missing
 # (a miss); refused (budget) and deadline go on to the next step. The
@@ -1295,7 +1301,8 @@ elif op == "ravel-only-readback":
                     seen = True
         return int(total) if seen else None
     stamp = {"file": os.path.basename(out_path), "exit_code": int(code), "verdict": None,
-             "error": None, "series_query_ms": None}
+             "error": None, "series_query_ms": None, "series_figures_from": None,
+             "series_store_get_calls": None, "series_store_get_bytes": None}
     for key, name in (("store_get_calls", "ravel_store_calls_total"),
                       ("store_get_bytes", "ravel_store_bytes_total")):
         a, b = metric(before, name, {"op": "get"}), metric(after, name, {"op": "get"})
@@ -1308,17 +1315,33 @@ elif op == "ravel-only-readback":
         stamp["verdict"] = "error"
         stamp["error"] = f"{os.path.basename(out_path)} is not JSON ({type(e).__name__})"
     rb = doc.get("readback") if isinstance(doc, dict) else None
+    # The series listing's own figures: from the read-back, else from the
+    # queries that answered before a later one failed (readback_partial).
+    listing = None
     if isinstance(rb, dict):
         stamp["verdict"] = "matched" if rb.get("matches_expected") is True else "mismatch"
         if stamp["verdict"] == "mismatch":
             stamp["error"] = "; ".join(rb.get("mismatches") or []) or "matches_expected not true"
-        qms = rb.get("query_ms")
-        v = qms.get("series") if isinstance(qms, dict) else None
-        if isinstance(v, int) and not isinstance(v, bool):
-            stamp["series_query_ms"] = v
+        listing = ("readback", rb)
     elif isinstance(doc, dict) and isinstance(doc.get("readback_error"), str):
         stamp["error"] = doc["readback_error"]
         stamp["verdict"], stamp["series_query_ms"] = grade_readback_error(doc["readback_error"])
+        if stamp["series_query_ms"] is not None:
+            stamp["series_figures_from"] = "readback_error"
+        if isinstance(doc.get("readback_partial"), dict):
+            listing = ("readback_partial", doc["readback_partial"])
+    if listing is not None:
+        source, part = listing
+        stamp["series_figures_from"] = source
+        qms = part.get("query_ms")
+        v = qms.get("series") if isinstance(qms, dict) else None
+        stamp["series_query_ms"] = v if whole(v) else None
+        qc = part.get("query_cost")
+        cost = qc.get("series") if isinstance(qc, dict) else None
+        cost = cost if isinstance(cost, dict) else {}
+        for key, cost_key in (("series_store_get_calls", "process_store_get_delta"),
+                           ("series_store_get_bytes", "process_store_get_bytes_delta")):
+            stamp[key] = cost.get(cost_key) if whole(cost.get(cost_key)) else None
     elif stamp["verdict"] is None:
         stamp["verdict"] = "error"
         stamp["error"] = f"{os.path.basename(out_path)} carries neither readback nor readback_error"
@@ -1378,6 +1401,15 @@ elif op == "ravel-only-catalog":
     print(json.dumps(stamp))
     if uncovered:
         sys.exit(3)
+elif op == "ravel-only-postings":
+    # A catalog fold --json report: its postings_built as JSON, null when the
+    # report is missing, unreadable or carries no boolean postings_built.
+    (report_path,) = args
+    try:
+        v = load(report_path).get("postings_built")
+    except (OSError, ValueError, AttributeError):
+        v = None
+    print(json.dumps(v if isinstance(v, bool) else None))
 elif op == "ravel-only-differences":
     # stamps.json after both catalog states are stamped: every condition
     # other than catalog level that could differ between readback-l0 and
@@ -1388,6 +1420,7 @@ elif op == "ravel-only-differences":
         ro = load(stamps_path)["ravel_only"]
         a, b = ro["l0"]["catalog"], ro["l1"]["catalog"]
         assert isinstance(a, dict) and isinstance(b, dict)
+        pa, pb = ro["l0"].get("postings_built"), ro["l1"].get("postings_built")
     except (OSError, ValueError, KeyError, TypeError, AssertionError) as e:
         print(f"ravel_only.l0.catalog or ravel_only.l1.catalog could not be read ({type(e).__name__})")
         sys.exit(4)
@@ -1402,11 +1435,13 @@ elif op == "ravel-only-differences":
         "server": field(a.get("server"), b.get("server"), a.get("server") == b.get("server")),
         "covers_ingest": field(a.get("covers_ingest"), b.get("covers_ingest"),
                                a.get("covers_ingest") is True and b.get("covers_ingest") is True),
+        "postings_built": field(pa, pb, isinstance(pa, bool) and pa == pb),
         "fold": "the same in both states by construction: ravel-server stopped, then ravel-cli catalog fold --writers-stopped --key-index-leaves with the label index on (stage1.l0_fold, stage1.l1_fold)",
     }
     doc["server"]["basis"] = "the ravel-server recreate before each read-back (stage1.STATE_restart); its flags carry --disable-fold, so no background fold runs during either read-back"
     doc["label_index"]["basis"] = "same when every snapshot part carries a label_value leaf in both states, as the series route reads it"
-    differs = [k for k in ("label_index", "server", "covers_ingest") if doc[k]["verdict"] != "same"]
+    doc["postings_built"]["basis"] = "the fold report's postings_built (ravel_only.STATE.postings_built, from stage1-STATE-fold.json); same only when both are true or both false, so an unreadable report differs"
+    differs = [k for k in ("label_index", "server", "covers_ingest", "postings_built") if doc[k]["verdict"] != "same"]
     doc["differs"] = differs
     doc["attributable_to_compaction"] = not differs
     print(json.dumps(doc))
@@ -5066,7 +5101,9 @@ ravel_only_objects() {
 # that does not cover the ingest refuses the read-back: STEP fails (exit 70)
 # and ravel_only.STATE.readback names what is missing.
 ravel_only_catalog() {
-  local state="$1" step="$2" code=0 line uncovered
+  local state="$1" step="$2" code=0 line uncovered postings
+  postings="$(py ravel-only-postings "${out_dir}/stage1-${state}-fold.json")" || postings=null
+  stamp_set "ravel_only.${state}.postings_built" "${postings:-null}"
   line="$(py ravel-only-catalog "$STAMPS" "$state" "$INGEST_END_HOUR" "${out_dir}/stage1-${state}.inspect.txt")" ||
     code=$?
   case "$code" in

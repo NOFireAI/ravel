@@ -467,7 +467,16 @@
 #                                       ro8b: the same on L1, the deadline
 #                                       as the ms; ro8c: a 504 without the
 #                                       deadline message and ro8d: the
-#                                       message on a 500 exit 70.
+#                                       message on a 500 exit 70; ro9: a
+#                                       samples query failing after the L1
+#                                       listing answered stamps the
+#                                       listing's time and GETs from
+#                                       readback_partial, exit 70; ro10:
+#                                       ravel-only-differences on
+#                                       postings_built (L0 true and L1
+#                                       false, both true, one report
+#                                       unreadable or unstamped) and
+#                                       ravel-only-postings on fold reports.
 #                                       stage1-check.sh: the ci band file
 #                                       clean on z1 (arm figures n/a), za
 #                                       (the reference prune band n/a),
@@ -1494,7 +1503,8 @@ printf 'metricsbench_ingest env token=%s\n' "${METRICSBENCH_RAVEL_TOKEN:+set}" >
 # listing past the server's query deadline (exit 1), 504noms the same
 # without the elapsed time, naming only the deadline; 504other a 504
 # without the deadline message and 500deadline the deadline message on a
-# 500 (exit 1 each).
+# 500 (exit 1 each); partial a samples query failing after the series
+# listing answered, with the listing's figures in readback_partial (exit 1).
 if [ "${1:-}" = "--readback-only" ]; then
   mode="${STUB_READBACK_ONLY_EXIT:-0}"
   if [ -n "${STUB_READBACK_ONLY_SEQ:-}" ]; then
@@ -1504,14 +1514,15 @@ if [ "${1:-}" = "--readback-only" ]; then
     mode="${seq_[$((n <= ${#seq_[@]} ? n - 1 : ${#seq_[@]} - 1))]}"
   fi
   case "$mode" in
-    0) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":1000,"sample_count":120000,"matches_expected":true,"mismatches":[],"query_ms":{"series":12,"samples.0":5}}}' ;;
+    0) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":1000,"sample_count":120000,"matches_expected":true,"mismatches":[],"query_ms":{"series":12,"samples.0":5},"query_cost":{"series":{"process_store_get_delta":40,"process_store_get_bytes_delta":2048}}}}' ;;
     1) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed: 503"}' ;;
     422) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed after 4321 ms: GET /api/v1/series answered 422 Unprocessable Entity: series budget exceeded"}' ;;
     504) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed after 120013 ms: GET /api/v1/series answered 504 Gateway Timeout: query exceeded its deadline of 120s"}' ;;
     504noms) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed: GET /api/v1/series answered 504 Gateway Timeout: {\"status\":\"error\",\"errorType\":\"timeout\",\"error\":\"query exceeded its deadline of 120s\"}"}' ;;
     504other) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed after 60004 ms: GET /api/v1/series answered 504 Gateway Timeout: upstream request timeout"}' ;;
     500deadline) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed after 120013 ms: GET /api/v1/series answered 500 Internal Server Error: query exceeded its deadline of 120s"}' ;;
-    mismatch) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":999,"sample_count":120000,"matches_expected":false,"mismatches":["series_count 999, want 1000"],"query_ms":{"series":14,"samples.0":5}}}' ;;
+    mismatch) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":999,"sample_count":120000,"matches_expected":false,"mismatches":["series_count 999, want 1000"],"query_ms":{"series":14,"samples.0":5},"query_cost":{"series":{"process_store_get_delta":40,"process_store_get_bytes_delta":2048}}}}' ;;
+    partial) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"the read-back over ravel'"'"'s query API failed: query samples.0 failed after 9 ms: GET /api/v1/query answered 500 Internal Server Error: query refused","readback_partial":{"failed_query":"samples.0","attempt":1,"series_count":1000,"query_ms":{"series":37},"query_windows":{},"query_cost":{"series":{"process_store_get_delta":41,"process_store_get_bytes_delta":999}}}}' ;;
     noms) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":1000,"sample_count":120000,"matches_expected":true,"mismatches":[],"query_ms":{"samples.0":5}}}' ;;
   esac
   case "$mode" in
@@ -3971,7 +3982,7 @@ else
   fail "ro1: the catalog inspects are not one per state before its read-back ($(grep -cE 'catalog inspect' "${LOG}"))"
 fi
 check "ro1: stage1.l0_catalog and stage1.l1_catalog each name their own inspect file, both written" 'all(j("stamps.json")["stage1"][f"{S}_catalog"]["file"] == f"stage1-{S}.inspect.txt" and os.path.getsize(os.path.join(out, f"stage1-{S}.inspect.txt")) > 0 for S in ("l0", "l1"))'
-check "ro1: ravel_only.differences names every condition, all the same, the delta attributable to compaction" 'j("stamps.json")["ravel_only"]["differences"]["differs"] == [] and j("stamps.json")["ravel_only"]["differences"]["attributable_to_compaction"] is True and all(j("stamps.json")["ravel_only"]["differences"][k]["verdict"] == "same" for k in ("label_index", "server", "covers_ingest")) and j("stamps.json")["ravel_only"]["differences"]["label_index"]["l0"] == "3 of 3 parts carry a label_value leaf"'
+check "ro1: ravel_only.differences names every condition, all the same, the delta attributable to compaction" 'j("stamps.json")["ravel_only"]["differences"]["differs"] == [] and j("stamps.json")["ravel_only"]["differences"]["attributable_to_compaction"] is True and all(j("stamps.json")["ravel_only"]["differences"][k]["verdict"] == "same" for k in ("label_index", "server", "covers_ingest", "postings_built")) and j("stamps.json")["ravel_only"]["l0"]["postings_built"] is False and j("stamps.json")["ravel_only"]["l1"]["postings_built"] is False and j("stamps.json")["ravel_only"]["differences"]["postings_built"]["l0"] is False and j("stamps.json")["ravel_only"]["differences"]["label_index"]["l0"] == "3 of 3 parts carry a label_value leaf"'
 check "ro1: the L1 bucket count holds the two L1 parts compact-tenant wrote, the L0 one none" 'j("stamps.json")["ravel_only"]["l1"]["objects"]["l1"] == {"count": 2, "bytes": 800} and j("stamps.json")["ravel_only"]["l0"]["objects"]["l1"] == {"count": 0, "bytes": 0} and j("stamps.json")["ravel_only"]["l1"]["objects"]["data"]["count"] == 300 and j("stamps.json")["ravel_only"]["l1"]["objects"]["other"] == {"count": 1, "bytes": 5} and j("stamps.json")["ravel_only"]["l1"]["objects"]["total"]["count"] == 305'
 expect_no_log "ro1: no query step" "metricsbench_query"
 expect_no_log "ro1: no Prometheus call" "127.0.0.1:9090"
@@ -4010,7 +4021,7 @@ fi
 check "ro1: a matched ingest read-back stamps series_query_ms as null" 'j("stamps.json")["ravel_only"]["ingest_readback"] == {"exit_code": 0, "verdict": "matched", "error": None, "series_query_ms": None}'
 if grep -qF Traceback "${ERR}"; then fail "ro1: no traceback in stderr ($(grep -m1 -A3 Traceback "${ERR}"))"; else pass "ro1: no traceback in stderr"; fi
 check "ro1: stamped non-comparable, a Ravel-only diagnostic, the query step skipped" 'j("stamps.json")["comparability"] == "non-comparable" and j("stamps.json")["comparability_reason"] == "Ravel-only diagnostic" and j("stamps.json")["query"].startswith("skipped: Ravel-only diagnostic") and j("stamps.json")["query_scrapes"].startswith("skipped: Ravel-only diagnostic") and j("stamps.json")["ravel_only"]["enabled"] is True and j("stamps.json")["ravel_only"]["ingest_readback"]["verdict"] == "matched"'
-check "ro1: each catalog state stamps its objects, listing time, verdict and GET counters" 'all(j("stamps.json")["ravel_only"][s]["verdict"] == "matched" and j("stamps.json")["ravel_only"][s]["series_query_ms"] == 12 and j("stamps.json")["ravel_only"][s]["readback"]["store_get_calls"]["delta"] == 100 and j("stamps.json")["ravel_only"][s]["readback"]["store_get_bytes"]["delta"] == 4096 and j("stamps.json")["ravel_only"][s]["readback"]["store_get_bytes"]["before"] + 4096 == j("stamps.json")["ravel_only"][s]["readback"]["store_get_bytes"]["after"] and j("stamps.json")["ravel_only"][s]["readback"]["missing"] == [] and isinstance(j("stamps.json")["ravel_only"][s]["objects"]["data"]["count"], int) and isinstance(j("stamps.json")["ravel_only"][s]["catalog_objects"]["l1_objects"], int) for s in ("l0", "l1"))'
+check "ro1: each catalog state stamps its objects, listing time, verdict and GET counters" 'all(j("stamps.json")["ravel_only"][s]["verdict"] == "matched" and j("stamps.json")["ravel_only"][s]["series_query_ms"] == 12 and j("stamps.json")["ravel_only"][s]["readback"]["store_get_calls"]["delta"] == 100 and j("stamps.json")["ravel_only"][s]["readback"]["store_get_bytes"]["delta"] == 4096 and j("stamps.json")["ravel_only"][s]["readback"]["store_get_bytes"]["before"] + 4096 == j("stamps.json")["ravel_only"][s]["readback"]["store_get_bytes"]["after"] and j("stamps.json")["ravel_only"][s]["readback"]["missing"] == [] and j("stamps.json")["ravel_only"][s]["readback"]["series_store_get_calls"] == 40 and j("stamps.json")["ravel_only"][s]["readback"]["series_store_get_bytes"] == 2048 and j("stamps.json")["ravel_only"][s]["readback"]["series_figures_from"] == "readback" and isinstance(j("stamps.json")["ravel_only"][s]["objects"]["data"]["count"], int) and isinstance(j("stamps.json")["ravel_only"][s]["catalog_objects"]["l1_objects"], int) for s in ("l0", "l1"))'
 check "ro1: the l1 arm reads the snapshot and runs no pass" 'j("stamps.json")["stage1"]["l1"].startswith("skipped: Ravel-only diagnostic") and j("stamps.json")["stage1"]["l1_compare"].startswith("skipped: Ravel-only diagnostic") and isinstance(j("stamps.json")["stage1"]["l1_catalog"]["parts"], int) and j("stamps.json")["stage1"]["l1_max_part_bytes"] == "default"'
 expect_no_log "ro1: without MB_L1_MAX_PART_BYTES compact-tenant gets no --max-l1-part-bytes" "--max-l1-part-bytes"
 for f in fold-flags.help.txt readback-l0.json readback-l1.json ravel-metrics-before-readback-l0.txt ravel-metrics-after-readback-l1.txt ravel-objects-l0.json ravel-objects-l1.json ravel-only-l0.objects.jsonl ravel-only-l1.objects.jsonl; do
@@ -4132,6 +4143,55 @@ expect_no_log "ro8c: no compaction after the failed read-back" "compact-tenant"
 STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="500deadline" run_stage1 ro8d history --ravel-only
 expect_rc ro8d 70
 check "ro8d: a 500 naming the deadline is stamped error and fails readback-l0" 'j("stamps.json")["ravel_only"]["l0"]["verdict"] == "error" and j("stamps.json")["failed_step"] == "readback-l0" and j("stamps.json")["status"] == "failed"'
+# ro9: a samples query that fails after the L1 series listing answered keeps
+# the listing's time and GETs from readback_partial; the step still fails.
+STUB_CLOCK="${RO_CLOCK}" MB_STAGE1=1 MB_STAGE1_ARMS=l1 STUB_READBACK_ONLY_SEQ="0 partial" run_stage1 ro9 history --ravel-only
+expect_rc ro9 70
+check "ro9: the l1 stamp carries the listing's figures from readback_partial, verdict error" 'j("stamps.json")["ravel_only"]["l1"]["readback"]["series_figures_from"] == "readback_partial" and j("stamps.json")["ravel_only"]["l1"]["readback"]["series_query_ms"] == 37 and j("stamps.json")["ravel_only"]["l1"]["series_query_ms"] == 37 and j("stamps.json")["ravel_only"]["l1"]["readback"]["series_store_get_calls"] == 41 and j("stamps.json")["ravel_only"]["l1"]["readback"]["series_store_get_bytes"] == 999 and j("stamps.json")["ravel_only"]["l1"]["verdict"] == "error" and j("stamps.json")["ravel_only"]["l1"]["readback"]["error"].endswith("query samples.0 failed after 9 ms: GET /api/v1/query answered 500 Internal Server Error: query refused") and j("stamps.json")["ravel_only"]["l1"]["readback"]["missing"] == []'
+check "ro9: the partial read-back fails readback-l1, the l0 stamp from its read-back" 'j("stamps.json")["failed_step"] == "readback-l1" and j("stamps.json")["status"] == "failed" and j("stamps.json")["ravel_only"]["l0"]["readback"]["series_figures_from"] == "readback" and j("stamps.json")["ravel_only"]["l0"]["readback"]["series_store_get_calls"] == 40'
+expect_err "ro9: the failure names the step and the verdict" "step readback-l1 failed: metricsbench_ingest --readback-only exited 1, verdict error: "
+
+# ro10: ravel-only-differences on postings_built, run as an op on stamps
+# that differ in it alone, and ravel-only-postings on fold reports.
+RD="${TMP}/ro10"
+mkdir -p "${RD}"
+sed -n "/^read -r -d '' PYLIB <<'PY'\$/,/^PY\$/p" "${SCRIPT}" | sed '1d;$d' >"${RD}/mbpylib.py"
+ro10_diff() {
+  local name="$1" l0="$2" l1="$3"
+  python3 -I -c 'import json,sys; c={"parts":3,"label_value_leaf_parts":3,"server":"recreated","covers_ingest":True}; ro={"l0":{"catalog":c},"l1":{"catalog":c}}
+for s,v in (("l0",sys.argv[2]),("l1",sys.argv[3])):
+    if v != "absent": ro[s]["postings_built"]=json.loads(v)
+json.dump({"ravel_only":ro},open(sys.argv[1],"w"))' "${RD}/${name}.stamps.json" "$l0" "$l1"
+  rc=0
+  (cd "${RD}" && python3 -I -c 'import sys; sys.path.insert(0, "."); import mbpylib' ravel-only-differences "${name}.stamps.json" >"${name}.out" 2>&1) || rc=$?
+}
+ro10_check() {
+  local label="$1" name="$2" expr="$3"
+  if [ "${rc}" -eq 0 ] && python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if eval(sys.argv[2]) else 1)' "${RD}/${name}.out" "$expr"; then
+    pass "$label"
+  else
+    fail "$label (exit ${rc}: $(cat "${RD}/${name}.out"))"
+  fi
+}
+ro10_diff split true false
+ro10_check "ro10: postings_built true on L0 and false on L1 differs, not attributable" split 'd["postings_built"]["verdict"] == "differs" and d["postings_built"]["l0"] is True and d["postings_built"]["l1"] is False and d["differs"] == ["postings_built"] and d["attributable_to_compaction"] is False'
+ro10_diff both true true
+ro10_check "ro10: postings_built true in both is the same, attributable" both 'd["postings_built"]["verdict"] == "same" and d["differs"] == [] and d["attributable_to_compaction"] is True'
+ro10_diff missing true null
+ro10_check "ro10: an L1 report that could not be read (null) differs" missing 'd["postings_built"]["verdict"] == "differs" and d["postings_built"]["l1"] is None and d["differs"] == ["postings_built"] and d["attributable_to_compaction"] is False'
+ro10_diff absent true absent
+ro10_check "ro10: an L1 state with no postings_built stamp differs" absent 'd["postings_built"]["l1"] is None and d["differs"] == ["postings_built"]'
+printf '{"postings_built": true}\n' >"${RD}/fold-true.json"
+printf 'not json\n' >"${RD}/fold-bad.json"
+printf '{"postings_built": "yes"}\n' >"${RD}/fold-str.json"
+for pair in fold-true.json:true fold-bad.json:null fold-str.json:null fold-absent.json:null; do
+  got="$(cd "${RD}" && python3 -I -c 'import sys; sys.path.insert(0, "."); import mbpylib' ravel-only-postings "${pair%%:*}" 2>&1)" || got="exit $?: ${got}"
+  if [ "${got}" = "${pair#*:}" ]; then
+    pass "ro10: ravel-only-postings ${pair%%:*} prints ${pair#*:}"
+  else
+    fail "ro10: ravel-only-postings ${pair%%:*} printed ${got}, want ${pair#*:}"
+  fi
+done
 
 # ro7: the Ravel-only shape on the real-S3 lane (issue #4481): Ravel's store
 # on PREFIX-ravel, createbuckets checking that bucket alone, no Mimir, the
@@ -4710,7 +4770,8 @@ expect_check_err "check series si8: the switch off leaves the series figures mis
 
 # The Ravel-only history band file (issue #3941's pre-registration) against
 # case ro8's run: its L0 listing reached the deadline at 120013 ms, its L1
-# read-back matched in 12 ms with 100 GETs, and the object counts are set to
+# read-back matched in 12 ms with 40 GETs on its series listing (100 over
+# the whole read-back), and the object counts are set to
 # history's (87,608 L0 data objects, 24 L1 parts). A copy with the L1
 # listing at 40000 ms is out of band.
 RO_BANDS="${HERE}/../stage1-bands.ravel-only.history.json"
@@ -4723,7 +4784,7 @@ if [ "${rc}" -eq 0 ] && [ "${RO_FIGURES}" -eq 5 ] && [ "$(grep -c '^ok ' "${CHEC
   grep -qxF 'ok ravel_only_l0_series_query_ms = 120013 in [100000, 130000] (stamps.json ravel_only.l0.series_query_ms)' "${CHECK_OUT}" &&
   grep -qxF 'ok ravel_only_l1_parts = 24 in [20, 130] (stamps.json ravel_only.l1.objects.l1.count)' "${CHECK_OUT}" &&
   grep -qxF 'ok ravel_only_l1_series_query_ms = 12 in [0, 30000] (stamps.json ravel_only.l1.series_query_ms)' "${CHECK_OUT}" &&
-  grep -qxF 'ok ravel_only_l1_store_get_calls_delta = 100 in [20, 400] (stamps.json ravel_only.l1.readback.store_get_calls.delta)' "${CHECK_OUT}"; then
+  grep -qxF 'ok ravel_only_l1_series_store_get_calls = 40 in [20, 400] (stamps.json ravel_only.l1.readback.series_store_get_calls)' "${CHECK_OUT}"; then
   pass "check ravel-only: every one of the ${RO_FIGURES} figures in band on a history-shaped Ravel-only run"
 else
   fail "check ravel-only: exit ${rc}, stdout $(cat "${CHECK_OUT}"), stderr $(cat "${CHECK_ERR}")"
