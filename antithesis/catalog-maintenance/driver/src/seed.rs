@@ -17,6 +17,8 @@ use parquet::arrow::ArrowWriter;
 
 use ravel_antithesis_driver::otlp::{LOG_REC_ATTR, LOG_WRITE_ATTR};
 
+/// The shard count the seeded load writes the tenant at, before any reshard.
+pub const SHARDS: u32 = 4;
 /// Seeded write ids start here, far above any live write id.
 pub const SEED_WRITE_BASE: u64 = 1 << 40;
 const NS_PER_HOUR: u64 = 3_600_000_000_000;
@@ -133,7 +135,7 @@ impl Plan {
             "--signal".into(),
             "logs".into(),
             "--shards".into(),
-            "4".into(),
+            SHARDS.to_string(),
             "--batch-rows".into(),
             self.per_hour.to_string(),
             "--ingest-hour-stride".into(),

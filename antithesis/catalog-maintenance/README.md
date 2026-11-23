@@ -68,6 +68,18 @@ During setup, before any ravel-server starts, the driver:
    report fails setup. Records every seeded `(write, record)` in its model.
 4. PUTs the seed marker `antithesis/catalog-maintenance/seeded`.
 
+The load also writes the tenant's provisioning record `t/<tenant hash>/l/prov`.
+The seed is the only call that names a shard count. The driver's fold,
+compaction and footprint calls pass no `--shards`, so each takes the count
+from that record. The driver bounds its sweep passes, its bucket scans and the
+`sweep` rule's shard by the shard ceiling: the largest count of any generation
+in the record activated by the current hour, as `compact-tenant` computes it.
+The driver reads the record with a raw S3 GET once at setup, and again each
+time its clock enters a new hour, since a reshard activates two or more hours
+after it is appended. A tenant without a record is still at 4 shards. If the
+record cannot be read or decoded, setup fails, and later the driver keeps the
+ceiling it last read.
+
 Every ravel-server entrypoint (`ravel/entrypoint.sh`) waits for that marker
 before it execs the server. `ravel-cli load` refuses a tenant that already
 holds a HEAD or a commit, and stops if a fold runs during the load, so no
@@ -91,9 +103,9 @@ compaction record is seen the workload jumps the clock twice more.
 | Rule | What it does |
 |---|---|
 | `write_logs` | A strict OTLP log write to `ravel1` or `ravel2`, retried on no response, 429 or 503. |
-| `fold` | `ravel-cli catalog fold --tenant cm-tenant --signal logs --shards 4`, then `catalog inspect --json`. |
-| `compact` | `ravel-cli maintain compact-tenant --tenant cm-tenant --signal logs --shards 4`, then the upper-bound check on one node. |
-| `sweep` | `ravel-cli maintain sweep --tenant cm-tenant --signal logs --shard <0..3>`, which deletes what the GC rules allow. |
+| `fold` | `ravel-cli catalog fold --tenant cm-tenant --signal logs`, then `catalog inspect --json`. |
+| `compact` | `ravel-cli maintain compact-tenant --tenant cm-tenant --signal logs`, then the upper-bound check on one node. |
+| `sweep` | `ravel-cli maintain sweep --tenant cm-tenant --signal logs --shard <n>`, a shard below the shard ceiling, which deletes what the GC rules allow. |
 | `jump_clock` | Rarely, once at least `CLOCK_JUMP_MIN_ACKED` (20) live writes are acked and no write is in flight, moves every clock forward by `CLOCK_JUMP_SECS`. Once per timeline. After that jump and once an audit decoded a compaction record, the same rule instead takes the sweep jumps below, also once per timeline. |
 | `corrupt_head` | Rarely, PUTs garbage over the HEAD through raw S3. A read then falls back to listing and the next fold rebuilds HEAD. |
 | `race_folds` | Rarely, once HEAD is known: one fold race ("The forced races"). |
@@ -209,7 +221,7 @@ plain run.
    `failed to fetch part <key>: object not found`, and the audit counts
    that key as named. A part fetch failing for any other cause gives no
    verdict for that pass.
-3. `ravel-cli rlog footprint --tenant cm-tenant --shards 4 --json` lists
+3. `ravel-cli rlog footprint --tenant cm-tenant --json` lists
    every data object the catalog resolves for the tenant and fetches each. A
    data object the store does not hold fails the command with `failed to
    fetch <key>: object not found`; the audit counts that key as resolved only
@@ -406,7 +418,8 @@ the driver, holding its write gate throughout:
 2. moves every clock forward by `CLOCK_SWEEP_HORIZON_JUMP_SECS` (config
    91200 s), with the same offset write, checks and reread wait as the
    sealing jump;
-3. folds, then sweeps all four shards, which writes the markers;
+3. folds, then sweeps every shard below the shard ceiling, which writes the
+   markers;
 4. moves every clock forward by `CLOCK_SWEEP_WINDOW_JUMP_SECS` (config
    22200 s), the same way.
 

@@ -1098,6 +1098,7 @@ dependencies = [
  "arrow-schema",
  "hegeltest",
  "parquet",
+ "prost",
  "ravel-antithesis-driver",
  "reqwest",
  "serde_json",
