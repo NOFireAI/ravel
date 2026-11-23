@@ -749,7 +749,11 @@ carry the `org.ravel.antithesis.ref` label, and the server image also
 `org.ravel.antithesis.features`. Besides the instrumentation check, the build
 checks that the server binary registers every mutant name of the three areas
 and refuses unless the per-area counts are exactly catalog 5, resharding 2 and
-maintenance 2, the mutants ADR-4326 decision 3 ships. The default build (no
+maintenance 2, the mutants ADR-4326 decision 3 ships. Those counts are
+`EXPECTED_MUTANTS` in `scripts/mutant-tsv.sh`, beside the area list, and every
+script that reads the names (the build check, `mutant-config.sh`, and so
+`local-run.sh` and `launch.sh`) refuses an area of the list that has no count
+there. The default build (no
 `MUTANTS`) is unchanged: features `sql,antithesis`, tag
 `catalog-maintenance`.
 

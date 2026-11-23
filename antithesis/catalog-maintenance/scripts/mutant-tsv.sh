@@ -6,12 +6,35 @@
 # shellcheck shell=bash
 
 MUTANT_AREAS="catalog resharding maintenance"
+# How many mutants each area ships (ADR-4326 decision 3). build.sh refuses a
+# server binary whose tsv files give another count, and mutant_names refuses
+# an area of MUTANT_AREAS that has no count here, so an area added to one
+# list and not the other fails before any build or run.
+EXPECTED_MUTANTS="catalog=5 resharding=2 maintenance=2"
 MUTANT_TSV_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
+# Prints the expected mutant count of area $1 from EXPECTED_MUTANTS. Returns
+# 1, with the reason on stderr, when EXPECTED_MUTANTS gives it none.
+mutant_expected() {
+    local area="$1" pair
+    for pair in $EXPECTED_MUTANTS; do
+        if [ "${pair%%=*}" = "$area" ]; then
+            echo "${pair#*=}"
+            return 0
+        fi
+    done
+    echo "area '$area' of MUTANT_AREAS ($MUTANT_AREAS) has no expected mutant count in EXPECTED_MUTANTS ($EXPECTED_MUTANTS)" >&2
+    return 1
+}
+
 # Prints every mutant name of every area in MUTANT_AREAS, one per line.
-# Returns 1, with the reason on stderr, when an area's tsv cannot be read.
+# Returns 1, with the reason on stderr, when an area has no expected count
+# or its tsv cannot be read.
 mutant_names() {
     local area tsv
+    for area in $MUTANT_AREAS; do
+        mutant_expected "$area" > /dev/null || return 1
+    done
     for area in $MUTANT_AREAS; do
         tsv="$MUTANT_TSV_ROOT/formal/tla/$area/antithesis-mutants.tsv"
         if [ ! -r "$tsv" ]; then
