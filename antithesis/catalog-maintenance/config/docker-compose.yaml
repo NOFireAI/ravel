@@ -152,7 +152,8 @@ services:
     entrypoint: ["/usr/local/bin/s3-proxy"]
     # Each relayed connection holds up to 10 descriptors, so the 512-connection
     # cap needs 5200 (proxy::NOFILE_NEEDED), far above the usual default soft
-    # limit of 1024; the proxy refuses to start below it.
+    # limit of 1024. The proxy also raises its soft limit to the hard limit
+    # and refuses to start if that is still below 5200.
     ulimits:
       nofile:
         soft: 65536

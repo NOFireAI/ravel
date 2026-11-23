@@ -8,14 +8,18 @@
 //! `0.0.0.0:9001`), `S3_PROXY_UPSTREAM` (default `rustfs:9000`) and
 //! `RAVEL_S3_BUCKET` (default `ravel`).
 //!
-//! It refuses to start under a soft open-file limit below what its
-//! connection caps need (`proxy::NOFILE_NEEDED`), and its startup line
-//! states the limit beside the cap.
+//! At startup it raises its soft open-file limit to the hard limit, as
+//! ravel-server does, since container runtimes commonly leave the soft limit
+//! at 1024 under a far higher hard limit. It refuses to start if the limit
+//! in force is still below what its connection caps need
+//! (`proxy::NOFILE_NEEDED`), and its startup line states the limit, how it
+//! was reached and the cap.
 
 use std::net::TcpListener;
 use std::sync::Arc;
 
 use antithesis_instrumentation as _;
+use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
 use ravel_antithesis_catalog_driver::proxy::{self, Rules, Slots};
 
@@ -30,8 +34,35 @@ fn bind(addr: &str) -> TcpListener {
     })
 }
 
+/// Raise the soft open-file limit to the hard limit, then return the soft
+/// limit in force and how it was reached.
+fn raise_nofile() -> (Option<u64>, String) {
+    let before = getrlimit(Resource::Nofile);
+    let source = match proxy::raised_soft(before.current, before.maximum) {
+        None => "inherited".to_string(),
+        Some(target) => {
+            let raised = Rlimit {
+                current: Some(target),
+                maximum: before.maximum,
+            };
+            match setrlimit(Resource::Nofile, raised) {
+                Ok(()) => format!("raised from {}", render(before.current)),
+                Err(e) => {
+                    eprintln!("s3-proxy: raising the soft open-file limit to {target}: {e}");
+                    "raise refused".to_string()
+                }
+            }
+        }
+    };
+    (getrlimit(Resource::Nofile).current, source)
+}
+
+fn render(limit: Option<u64>) -> String {
+    limit.map_or_else(|| "unlimited".to_string(), |n| n.to_string())
+}
+
 fn main() {
-    let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile).current;
+    let (nofile, nofile_source) = raise_nofile();
     if let Err(e) = proxy::check_nofile(nofile) {
         eprintln!("s3-proxy: refusing to start: {e}");
         std::process::exit(1);
@@ -54,9 +85,9 @@ fn main() {
     }
     println!(
         "s3-proxy: {listen} to {upstream} (bucket {bucket}), control on {control}, at most {} \
-         connections, open-file limit {} ({} needed), {} s socket timeout",
+         connections, open-file limit {} ({nofile_source}, {} needed), {} s socket timeout",
         proxy::MAX_CONNECTIONS,
-        nofile.map_or_else(|| "unlimited".to_string(), |n| n.to_string()),
+        render(nofile),
         proxy::NOFILE_NEEDED,
         proxy::IO_TIMEOUT.as_secs()
     );
