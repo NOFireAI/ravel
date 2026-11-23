@@ -334,3 +334,416 @@ fn by_views(views: &ScalarBuffer<u128>, nulls: Option<&NullBuffer>, negated: boo
         .collect();
     BooleanArray::new(values, nulls.cloned())
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use datafusion::arrow::array::{
+        ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray, Int32Array, LargeBinaryArray,
+        LargeStringArray, Scalar, StringArray, StringViewArray,
+    };
+    use datafusion::arrow::compute::cast;
+    use datafusion::arrow::compute::kernels::cmp::{eq, neq};
+    use datafusion::arrow::datatypes::Int32Type;
+    use datafusion::physical_expr::expressions::{Column, NotExpr};
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// Empty values, non-empty values and NULLs, with an empty value first so
+    /// a slice starting at row 1 begins on an empty value whose start offset
+    /// is not 0.
+    const ROWS: [Option<&str>; 8] = [
+        Some("a"),
+        Some(""),
+        None,
+        Some("bc"),
+        Some(""),
+        Some("longer than twelve bytes"),
+        None,
+        Some(""),
+    ];
+
+    /// No empty value, so a dictionary over these rows has no `''` entry.
+    const NO_EMPTY: [Option<&str>; 6] = [Some("a"), None, Some("bc"), Some("a"), Some("x"), None];
+
+    /// `rows` as a `Dictionary(Int32, Utf8)` over `values`, each present row
+    /// keyed to its value's position there and each NULL row keyed NULL.
+    fn dictionary(rows: &[Option<&str>], values: &[&str]) -> ArrayRef {
+        let keys: Int32Array = rows
+            .iter()
+            .map(|r| r.map(|v| values.iter().position(|x| *x == v).expect("a value") as i32))
+            .collect();
+        Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                keys,
+                Arc::new(StringArray::from(values.to_vec())),
+            )
+            .expect("dictionary"),
+        )
+    }
+
+    /// Every layout of `rows`: offsets (`Utf8`, `LargeUtf8`, `Binary`,
+    /// `LargeBinary`), views (`Utf8View`, `BinaryView`), and a dictionary over
+    /// values that hold `''` exactly when `rows` does, with neither `''` nor
+    /// the first row's value at key 0.
+    fn layouts(rows: &[Option<&str>]) -> Vec<(&'static str, ArrayRef)> {
+        let bytes: Vec<Option<&[u8]>> = rows.iter().map(|r| r.map(str::as_bytes)).collect();
+        let mut values = vec!["unused"];
+        for v in rows.iter().flatten() {
+            if !values.contains(v) {
+                values.push(v);
+            }
+        }
+        vec![
+            (
+                "Utf8",
+                Arc::new(StringArray::from(rows.to_vec())) as ArrayRef,
+            ),
+            ("LargeUtf8", Arc::new(LargeStringArray::from(rows.to_vec()))),
+            ("Utf8View", Arc::new(StringViewArray::from(rows.to_vec()))),
+            ("Binary", Arc::new(BinaryArray::from(bytes.clone()))),
+            (
+                "LargeBinary",
+                Arc::new(LargeBinaryArray::from(bytes.clone())),
+            ),
+            ("BinaryView", Arc::new(BinaryViewArray::from(bytes))),
+            ("Dictionary", dictionary(rows, &values)),
+        ]
+    }
+
+    /// A dictionary whose values array is itself sliced (its first offset is
+    /// not 0) and holds a NULL entry, keyed through NULL keys too: rows `''`,
+    /// `''`, NULL (entry), NULL (key), `'z'`, `''`.
+    fn sliced_values_dictionary() -> (ArrayRef, Vec<Option<&'static str>>) {
+        let values = StringArray::from(vec![Some("q"), Some(""), None, Some("z"), Some("")]);
+        let values = values.slice(1, 4);
+        let keys = Int32Array::from(vec![Some(3), Some(0), Some(1), None, Some(2), Some(0)]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict");
+        let rows = vec![Some(""), Some(""), None, None, Some("z"), Some("")];
+        (Arc::new(dict), rows)
+    }
+
+    /// The verdicts SQL gives for `rows`: NULL for a NULL row, else whether
+    /// the value is empty (or not, when `negated`).
+    fn expected(rows: &[Option<&str>], negated: bool) -> Vec<Option<bool>> {
+        rows.iter()
+            .map(|r| r.map(|v| v.is_empty() != negated))
+            .collect()
+    }
+
+    fn verdicts(array: &BooleanArray) -> Vec<Option<bool>> {
+        array.iter().collect()
+    }
+
+    /// Arrow's own `=`/`<>` kernel against an empty scalar of `array`'s type,
+    /// the evaluation the rule replaces.
+    fn kernel(array: &ArrayRef, negated: bool) -> BooleanArray {
+        let empty = cast(&StringArray::from(vec![""]), array.data_type()).expect("cast");
+        let scalar = Scalar::new(empty);
+        if negated {
+            neq(array, &scalar).expect("neq")
+        } else {
+            eq(array, &scalar).expect("eq")
+        }
+    }
+
+    /// T3: every layout, unsliced and sliced at a non-zero offset, with NULL
+    /// rows inside the slice, gives SQL's verdict for each row and arrow's
+    /// kernel's answer, for `=` and `<>`.
+    ///
+    /// Flipped: dropping the validity (`BooleanArray::new(values, None)`)
+    /// fails at the NULL rows of every slice; reading lengths from a start
+    /// offset of 0 instead of the slice's first offset fails at row 0 of the
+    /// slice from row 1, which is `''`; testing the dictionary's keys instead
+    /// of its values fails at the first row keyed to an entry other than 0.
+    #[test]
+    fn every_layout_matches_the_rows_when_sliced_and_null() {
+        for rows in [&ROWS[..], &NO_EMPTY[..]] {
+            for (name, array) in layouts(rows) {
+                for (offset, len) in [(0, rows.len()), (1, rows.len() - 1), (2, 3), (3, 0)] {
+                    let sliced = array.slice(offset, len);
+                    let want_rows = &rows[offset..offset + len];
+                    for negated in [false, true] {
+                        let got = empty_compare(sliced.as_ref(), negated).expect("evaluates");
+                        let at = format!("{name} rows {offset}..+{len} negated={negated}");
+                        assert_eq!(verdicts(&got), expected(want_rows, negated), "{at}");
+                        assert_eq!(
+                            verdicts(&got),
+                            verdicts(&kernel(&sliced, negated)),
+                            "{at}: arrow's kernel"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// T3: a dictionary over a sliced values array with a NULL entry: the
+    /// verdict is taken through each key, NULL for a NULL key and for a key
+    /// naming the NULL entry, for the whole array and a slice of it.
+    #[test]
+    fn a_dictionary_over_sliced_values_takes_each_verdict_through_its_key() {
+        let (dict, rows) = sliced_values_dictionary();
+        for (offset, len) in [(0, rows.len()), (1, 4)] {
+            let sliced = dict.slice(offset, len);
+            for negated in [false, true] {
+                let got = empty_compare(sliced.as_ref(), negated).expect("evaluates");
+                let at = format!("rows {offset}..+{len} negated={negated}");
+                assert_eq!(
+                    verdicts(&got),
+                    expected(&rows[offset..offset + len], negated),
+                    "{at}"
+                );
+                assert_eq!(
+                    verdicts(&got),
+                    verdicts(&kernel(&sliced, negated)),
+                    "{at}: arrow's kernel"
+                );
+            }
+        }
+    }
+
+    /// A scalar operand gives a scalar verdict, NULL for a NULL scalar.
+    #[test]
+    fn a_scalar_operand_gives_a_scalar_verdict() {
+        let schema = Schema::empty();
+        let batch = RecordBatch::new_empty(Arc::new(schema));
+        for (value, negated, want) in [
+            (ScalarValue::Utf8(Some(String::new())), false, Some(true)),
+            (ScalarValue::Utf8(Some("a".into())), false, Some(false)),
+            (ScalarValue::Utf8(Some("a".into())), true, Some(true)),
+            (ScalarValue::Utf8(None), true, None),
+        ] {
+            let expr = EmptyCompareExpr::new(Arc::new(Literal::new(value.clone())), negated);
+            match expr.evaluate(&batch).expect("evaluates") {
+                ColumnarValue::Scalar(ScalarValue::Boolean(got)) => {
+                    assert_eq!(got, want, "{value:?} negated={negated}")
+                }
+                other => panic!("{value:?}: not a boolean scalar: {other:?}"),
+            }
+        }
+    }
+
+    fn column_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("t", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("b", DataType::Binary, true),
+        ])
+    }
+
+    fn col(name: &str) -> Arc<dyn PhysicalExpr> {
+        let index = column_schema().index_of(name).expect("column");
+        Arc::new(Column::new(name, index))
+    }
+
+    fn lit(value: ScalarValue) -> Arc<dyn PhysicalExpr> {
+        Arc::new(Literal::new(value))
+    }
+
+    fn bin(
+        l: Arc<dyn PhysicalExpr>,
+        op: Operator,
+        r: Arc<dyn PhysicalExpr>,
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(l, op, r))
+    }
+
+    fn empty_utf8() -> ScalarValue {
+        ScalarValue::Utf8(Some(String::new()))
+    }
+
+    fn rewritten(expr: Arc<dyn PhysicalExpr>) -> (bool, String) {
+        let t = rewrite_expr(expr, &column_schema()).expect("rewrite");
+        (t.transformed, t.data.to_string())
+    }
+
+    /// T1 at the expression: `=` and `<>` with the empty literal on either
+    /// side, typed `Utf8`, dictionary or `Binary`, become `empty_eq(..)` and
+    /// `empty_ne(..)`, also inside `NOT` and `OR`. A non-empty literal, two
+    /// columns, a NULL literal, another operator and a non-string operand are
+    /// left as they were.
+    #[test]
+    fn rewrites_only_the_empty_literal_comparison() {
+        let dict_empty = ScalarValue::Dictionary(Box::new(DataType::Int32), Box::new(empty_utf8()));
+        let rewrites = [
+            (
+                bin(col("s"), Operator::NotEq, lit(empty_utf8())),
+                "empty_ne(s@0)",
+            ),
+            (
+                bin(col("s"), Operator::Eq, lit(empty_utf8())),
+                "empty_eq(s@0)",
+            ),
+            (
+                bin(lit(empty_utf8()), Operator::NotEq, col("s")),
+                "empty_ne(s@0)",
+            ),
+            (
+                bin(lit(empty_utf8()), Operator::Eq, col("s")),
+                "empty_eq(s@0)",
+            ),
+            (
+                bin(col("d"), Operator::NotEq, lit(dict_empty.clone())),
+                "empty_ne(d@3)",
+            ),
+            (
+                bin(lit(dict_empty), Operator::Eq, col("d")),
+                "empty_eq(d@3)",
+            ),
+            (
+                bin(
+                    col("b"),
+                    Operator::NotEq,
+                    lit(ScalarValue::Binary(Some(Vec::new()))),
+                ),
+                "empty_ne(b@4)",
+            ),
+            (
+                Arc::new(NotExpr::new(bin(col("s"), Operator::Eq, lit(empty_utf8())))),
+                "NOT empty_eq(s@0)",
+            ),
+            (
+                bin(
+                    bin(col("s"), Operator::NotEq, lit(empty_utf8())),
+                    Operator::Or,
+                    bin(col("n"), Operator::Eq, lit(ScalarValue::Int64(Some(1)))),
+                ),
+                "empty_ne(s@0) OR n@2 = 1",
+            ),
+        ];
+        for (expr, want) in rewrites {
+            let before = expr.to_string();
+            assert_eq!(rewritten(expr), (true, want.to_string()), "{before}");
+        }
+        let untouched = [
+            bin(
+                col("s"),
+                Operator::NotEq,
+                lit(ScalarValue::Utf8(Some("x".into()))),
+            ),
+            bin(col("s"), Operator::Eq, col("t")),
+            bin(col("s"), Operator::NotEq, lit(ScalarValue::Utf8(None))),
+            bin(col("s"), Operator::Lt, lit(empty_utf8())),
+            bin(col("s"), Operator::IsDistinctFrom, lit(empty_utf8())),
+            bin(col("n"), Operator::Eq, lit(empty_utf8())),
+            bin(col("n"), Operator::NotEq, lit(ScalarValue::Int64(Some(0)))),
+        ];
+        for expr in untouched {
+            let before = expr.to_string();
+            assert_eq!(rewritten(expr), (false, before.clone()), "{before}");
+        }
+    }
+
+    /// The scan's EXPLAIN form: `fmt_sql` names the operand's column.
+    #[test]
+    fn displays_by_name() {
+        let expr = EmptyCompareExpr::new(col("s"), true);
+        assert_eq!(expr.to_string(), "empty_ne(s@0)");
+        assert_eq!(
+            datafusion::physical_expr_common::physical_expr::fmt_sql(&expr).to_string(),
+            "empty_ne(s)"
+        );
+        let expr = EmptyCompareExpr::new(col("s"), false);
+        assert_eq!(
+            datafusion::physical_expr_common::physical_expr::fmt_sql(&expr).to_string(),
+            "empty_eq(s)"
+        );
+    }
+
+    /// One generated case: rows, a layout, a slice and an operator.
+    #[derive(Debug, Clone)]
+    struct Case {
+        rows: Vec<Option<String>>,
+        layout: usize,
+        /// For the dictionary layouts: which NULL rows are keyed to a NULL
+        /// entry rather than given a NULL key.
+        null_entry: Vec<bool>,
+        offset: usize,
+        len: usize,
+        negated: bool,
+    }
+
+    const LAYOUTS: usize = 9;
+
+    fn case() -> impl Strategy<Value = Case> {
+        let value = prop_oneof![
+            3 => Just(String::new()),
+            1 => Just("a".to_string()),
+            1 => Just("bc".to_string()),
+            1 => Just("longer than twelve bytes".to_string()),
+        ];
+        (
+            proptest::collection::vec(proptest::option::weighted(0.8, value), 0..40),
+            0..LAYOUTS,
+            any::<bool>(),
+            any::<u64>(),
+            any::<u64>(),
+        )
+            .prop_flat_map(|(rows, layout, negated, a, b)| {
+                let n = rows.len();
+                let offset = (a % (n as u64 + 1)) as usize;
+                let len = (b % ((n - offset) as u64 + 1)) as usize;
+                proptest::collection::vec(any::<bool>(), n).prop_map(move |null_entry| Case {
+                    rows: rows.clone(),
+                    layout,
+                    null_entry,
+                    offset,
+                    len,
+                    negated,
+                })
+            })
+    }
+
+    /// The case's rows in its layout, unsliced. Layouts 7 and 8 are
+    /// dictionaries with a NULL entry; 8's values array is itself sliced.
+    fn build(case: &Case) -> ArrayRef {
+        let rows: Vec<Option<&str>> = case.rows.iter().map(|r| r.as_deref()).collect();
+        if case.layout < 7 {
+            return Arc::clone(&layouts(&rows)[case.layout].1);
+        }
+        let mut values: Vec<Option<&str>> = vec![Some("pre"), Some("unused"), None];
+        for v in rows.iter().flatten() {
+            if !values.contains(&Some(*v)) {
+                values.push(Some(*v));
+            }
+        }
+        let keys: Int32Array = rows
+            .iter()
+            .zip(&case.null_entry)
+            .map(|(r, to_entry)| match r {
+                Some(v) => Some(values.iter().position(|x| *x == Some(*v)).expect("value") as i32),
+                None => to_entry.then_some(2),
+            })
+            .collect();
+        let values = StringArray::from(values);
+        let (keys, values) = if case.layout == 8 {
+            let keys: Int32Array = keys.iter().map(|k| k.map(|k| k - 1)).collect();
+            (keys, values.slice(1, values.len() - 1))
+        } else {
+            (keys, values)
+        };
+        Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict"))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// T4: random rows in a random layout, sliced at random, with NULLs
+        /// (and NULL dictionary entries): the expression equals arrow's `eq`
+        /// or `neq` kernel against an empty scalar, row for row.
+        #[test]
+        fn prop_matches_arrows_kernel(case in case()) {
+            let sliced = build(&case).slice(case.offset, case.len);
+            let got = empty_compare(sliced.as_ref(), case.negated).expect("evaluates");
+            prop_assert_eq!(verdicts(&got), verdicts(&kernel(&sliced, case.negated)));
+        }
+    }
+}
