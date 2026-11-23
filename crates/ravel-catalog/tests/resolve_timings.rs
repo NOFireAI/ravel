@@ -157,7 +157,11 @@ async fn the_four_parts_sum_to_the_resolves_elapsed_time() {
     assert!(timings.list_wave >= DELAY, "{timings:?}");
     assert!(timings.other >= DELAY, "{timings:?}");
     assert!(timings.total() >= DELAY, "{timings:?}");
+    // hygiene-allow: wall-clock -- the call's elapsed time is the subject: the
+    // parts must account for it, so they can sit only below it.
     assert!(timings.total() <= elapsed, "{timings:?} over {elapsed:?}");
+    // hygiene-allow: wall-clock -- as above; the gap is the time outside the
+    // catalog's first and last clock reads.
     assert!(
         elapsed - timings.total() < OUTSIDE_TOLERANCE,
         "{timings:?} leave {:?} of {elapsed:?} unaccounted",
