@@ -10560,6 +10560,13 @@ pub(crate) mod tests {
         assert_eq!(report.bucket_spill_bytes_read, 9_000);
         assert_eq!(report.bucket_spill_rows_written, 400);
         assert_eq!(
+            (
+                report.bucket_route_resize_bytes,
+                report.bucket_route_chunks_sealed
+            ),
+            (0, 16)
+        );
+        assert_eq!(
             report.exchange_spill_bytes_written + report.bucket_spill_bytes_written,
             report.spill_bytes_written
         );
