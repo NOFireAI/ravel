@@ -238,8 +238,10 @@ async fn present(store: &dyn ObjectStoreBackend, key: &str) -> bool {
 /// objects in place, failing the `l0_data_count == 0` assertion after the
 /// horizon.
 ///
-/// ADR-4628 test 11: the superseded inputs' raw commit records, which carry
-/// their declared-column stamps, are gone from `c/` after the horizon too.
+/// ADR-4628 test 11: the superseded inputs' raw commit records are gone from
+/// `c/` after the horizon too. This bucket holds metrics records, which carry
+/// no declared-column stamp; a logs record's stamp lives inside the record, so
+/// what this pins is the record's lifetime, not a stamp's contents.
 #[tokio::test]
 async fn rewrite_raw_l0_inputs_swept_only_after_horizon() {
     let store = MemoryStore::new();
