@@ -11,5 +11,5 @@ it Overwrites the claim with `state = done`. The witness records
 changed), so the clause `~ok => afterVer = beforeVer` fails.
 
 Why it matters: a stale owner completing with Overwrite destroys the newer
-owner's claim. The proposed design marks completion with CasVersion, so a stale
+owner's claim. The design marks completion with CasVersion, so a stale
 owner's completion is a no-op.
