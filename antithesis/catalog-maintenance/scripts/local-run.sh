@@ -358,6 +358,17 @@ for svc in driver $SERVERS; do
     docker compose cp "$svc:/tmp/sdk.jsonl" "$OUT/sdk-$svc.jsonl" > /dev/null 2>&1 \
         || echo "no sdk output from $svc" >> "$OUT/missing-sdk.txt"
 done
+# ravel-cli-ant writes its own SDK file in the driver container
+# (driver/src/cli.rs), and only when the driver runs it, so its absence is no
+# failure. It joins the sdk-*.jsonl globs below, never driver-assertions.txt:
+# its catalog declares every area's assertions, not the driver's.
+rm -f "$OUT/sdk-cli.jsonl"
+if docker compose cp driver:/tmp/sdk-cli.jsonl "$OUT/sdk-cli.jsonl" > /dev/null 2>&1; then
+    echo "sdk-cli.jsonl: collected from ravel-cli-ant"
+else
+    rm -f "$OUT/sdk-cli.jsonl"
+    echo "sdk-cli.jsonl: none, the driver container holds no /tmp/sdk-cli.jsonl"
+fi
 collect_logs
 docker compose stop > /dev/null 2>&1
 [ -s "$OUT/missing-sdk.txt" ] && fail "SDK output missing: $(tr '\n' ' ' < "$OUT/missing-sdk.txt")"
