@@ -838,12 +838,11 @@ async fn min_max_over_a_limit_on_the_scan_read_the_limited_rows() {
 }
 
 /// A lone `COUNT(*)` over the limited subquery is DataFusion's
-/// `AggregateStatistics` answer from the scan's fetch-narrowed exact row count
-/// (`LogsScanExec::apply_fetch_to_statistics`): the constant 3, with no
-/// `MetadataOnlyExec` and no data-object GET. The pushed fetch keeps the
-/// scan's statistics exact; only this rule declines it.
+/// `AggregateStatistics` answer, the constant 3 with no `MetadataOnlyExec` and
+/// no data-object GET: that rule runs while the limit is still a node above
+/// the scan, so this rule never sees the shape.
 #[tokio::test]
-async fn a_lone_count_star_over_a_limit_on_the_scan_is_the_narrowed_row_count() {
+async fn a_lone_count_star_over_a_limit_is_the_limited_row_count() {
     let corpus = one_object().await;
     let sql = "SELECT COUNT(*) FROM (SELECT a FROM logs LIMIT 3)";
     for run in [corpus.with_stats(sql).await, corpus.scanned(sql).await] {
