@@ -555,6 +555,26 @@ pub enum MaintainError {
     InvalidRlogRunBlockTarget(#[from] crate::config::RlogRunBlockTargetError),
     #[error("RLOG compaction refused before writing any part: {0}")]
     InvalidRlogLevel2Setting(#[from] crate::config::RlogLevel2SettingError),
+    /// One series alone carries more of a reader-limited quantity than an
+    /// RSEG part may hold and still decode under the reader's default limits
+    /// (`ravel_segment::max_provenance_samples`,
+    /// `ravel_segment::max_run_total`). Parts split only between series, so
+    /// no split can fit it: the bucket's compaction fails, nothing is
+    /// published, and its L0 inputs stay live. Checked from the input
+    /// catalogs before the first page fetch, so no part has been written.
+    #[error(
+        "RSEG compaction failed: series {series_id} alone carries {count} {quantity}, over the {bound} one part may hold under the reader's default limits; parts split only between series, so nothing is written or published and the L0 inputs stay live"
+    )]
+    SeriesOverPartReaderBound {
+        /// Hex id of the series.
+        series_id: String,
+        /// What was counted: `flagged provenance samples` or `runs`.
+        quantity: &'static str,
+        /// That series' count.
+        count: u64,
+        /// The most one part may hold.
+        bound: u64,
+    },
     #[error("compaction invariant breach: {0}")]
     Invariant(String),
     /// The ADR-1702 read gate returned no result for a maintenance decode or

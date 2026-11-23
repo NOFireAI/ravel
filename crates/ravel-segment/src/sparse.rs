@@ -42,10 +42,10 @@ use crate::format::{
 };
 use crate::reader::{
     DictResolver, RUN_LIVE_BYTES_CHUNK, RunEntry, SampleProvenance, SeriesEntry, SeriesEntryV4,
-    ValueKind, check_run_total_live_budget, check_series_counts_v2, decode_section_bytes,
-    find_section, index_label_dict, parse_schema_list_v2, parse_schema_ref_block_v2,
-    parse_series_ids_v2, parse_value_ord_block_all_v2, skip_provenance_extension, take_block,
-    take_encoded_i64_block, take_u32_le,
+    ValueKind, check_provenance_live_budget, check_run_total_live_budget, check_series_counts_v2,
+    decode_section_bytes, find_section, index_label_dict, parse_schema_list_v2,
+    parse_schema_ref_block_v2, parse_series_ids_v2, parse_value_ord_block_all_v2,
+    skip_provenance_extension, take_block, take_encoded_i64_block, take_u32_le,
 };
 use crate::varint::{read_uvarint, write_uvarint};
 use crate::writer::WrittenSegment;
@@ -738,17 +738,7 @@ fn parse_chunk_provenance(
         return Err(SegmentError::EmptyProvenanceExtension);
     }
 
-    // Bound the live decode as the whole-section reader does: four i64 columns
-    // plus one `SampleProvenance` per flagged sample.
-    let live_bytes = prov_sample_total
-        .checked_mul(4 * 8 + std::mem::size_of::<SampleProvenance>() as u64)
-        .ok_or(SegmentError::FieldOverflow)?;
-    if live_bytes > limits.max_section_uncompressed_bytes {
-        return Err(SegmentError::ProvenanceLiveBudgetExceeded {
-            live_bytes,
-            cap: limits.max_section_uncompressed_bytes,
-        });
-    }
+    check_provenance_live_budget(prov_sample_total, limits)?;
     let prov_total = usize::try_from(prov_sample_total).map_err(|_| SegmentError::FieldOverflow)?;
 
     // Admitted before allocation, as the whole-section reader does: the
