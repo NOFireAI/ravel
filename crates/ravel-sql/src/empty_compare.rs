@@ -21,7 +21,7 @@
 //! The operand's validity carries over, so a NULL operand gives NULL, as the
 //! kernel's does. A declared `Str` column reaches a filter as
 //! `Dictionary(Int32, Utf8)`, so its `<>` runs the test once per dictionary
-//! entry; a plain page's dictionary has one entry per row.
+//! entry; on a plain page those entries are the rows' own values.
 //!
 //! [`EmptyStringCompare`] installs the expression in the two places a filter
 //! runs in a `logs` plan: a `FilterExec` predicate, and the row filter a
@@ -570,6 +570,9 @@ mod tests {
     /// `empty_ne(..)`, also inside `NOT` and `OR`. A non-empty literal, two
     /// columns, a NULL literal, another operator and a non-string operand are
     /// left as they were.
+    ///
+    /// Flipped: a rule that looks for the literal on the right only leaves
+    /// `'' != s` and fails at that row.
     #[test]
     fn rewrites_only_the_empty_literal_comparison() {
         let dict_empty = ScalarValue::Dictionary(Box::new(DataType::Int32), Box::new(empty_utf8()));

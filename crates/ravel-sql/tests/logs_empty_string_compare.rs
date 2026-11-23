@@ -198,14 +198,19 @@ async fn assert_layouts(provider: &LogsTableProvider, ctx: &SessionContext) {
     assert_eq!(seen, [1, 2, 3], "every block scanned");
 }
 
-/// T1: the rewritten expression's EXPLAIN name, per statement, or `None`
-/// where nothing is rewritten. `<>` on a declared `Str` column is the scan's
-/// row filter (`row_filters=[empty_ne(s)]`); `=` stays in a `FilterExec`
-/// (`FilterExec: empty_eq(s@..)`).
+/// T1: the rewritten expression's EXPLAIN name per statement, and no
+/// `empty_eq`/`empty_ne` where nothing is rewritten. `<>` on a declared `Str`
+/// column is the scan's row filter (`row_filters=[empty_ne(s)]`); `=` stays
+/// in a `FilterExec` (`FilterExec: empty_eq(s@..)`).
 ///
-/// Flipped: a rule that does not look on the literal's left side leaves
-/// `'' <> s` and `'' = s` as `s != ` and fails "rewritten"; one that matches
-/// any literal rewrites `s <> 'x'` and fails "not rewritten".
+/// DataFusion's simplifier already moves the column of `'' <> s` to the left
+/// before the physical plan, so these statements cannot tell whether the
+/// rule looks on the literal's left side; the expression-level test
+/// `rewrites_only_the_empty_literal_comparison` in `crate::empty_compare`
+/// pins that.
+///
+/// Flipped: a rule that matches any non-NULL literal rewrites `s <> 'x'` and
+/// fails "not rewritten".
 #[tokio::test]
 async fn the_rewrite_appears_only_for_the_empty_literal() {
     let (store, segments) = fixture().await;
@@ -266,8 +271,10 @@ async fn the_rewrite_appears_only_for_the_empty_literal() {
 /// answers are pinned outright.
 ///
 /// Flipped (in `crate::empty_compare`): dropping the operand's validity makes
-/// a NULL `s` read as `''` (`empty_eq`) or not (`empty_ne`) and fails "the
-/// reference answer" on the `IS NOT TRUE` and `IS NULL` statements.
+/// a NULL `Utf8` row read as `''` and fails "the reference answer" at
+/// `'' = lower(arrow_cast(s, 'Utf8'))` (a dictionary's NULL keys still null
+/// the verdict through the take); testing the dictionary's keys instead of
+/// its values fails it at the first statement, `s <> ''`.
 #[tokio::test]
 async fn answers_match_the_kernel_in_every_layout() {
     let (store, segments) = fixture().await;
