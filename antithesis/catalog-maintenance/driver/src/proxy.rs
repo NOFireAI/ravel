@@ -21,6 +21,11 @@
 //!   same way, as a set of its own that `thaw-key` lifts without touching the
 //!   refuse rules. The driver freezes HEAD around each clock move (README.md,
 //!   "The clock jump"), sometimes inside a race that refuses HEAD itself.
+//! - `refuse-read <key>`, `thaw-read <key>`: answer every GET and HEAD of
+//!   exactly that key `503 SlowDown` without forwarding it, as a store
+//!   failing those reads would, as a set of its own that `thaw-read` lifts.
+//!   Every other method on the key, and every request for another key, is
+//!   judged as without it.
 //! - `held`: `held <key> <age_ms>`, or `none`.
 //! - `held-result`: `<key> <status>` of the last forwarded held request, or
 //!   `none`.
@@ -241,6 +246,8 @@ struct State {
     refuse_keys: BTreeSet<String>,
     /// The keys `freeze-key` refuses, apart from `refuse_keys`.
     frozen_keys: BTreeSet<String>,
+    /// The keys whose GETs and HEADs `refuse-read` refuses.
+    refuse_read_keys: BTreeSet<String>,
     /// The key and upstream status of the last forwarded held request.
     held_result: Option<(String, u16)>,
 }
@@ -300,6 +307,12 @@ impl Rules {
             ("thaw-key", key) if !key.is_empty() => {
                 s.frozen_keys.remove(key);
             }
+            ("refuse-read", key) if !key.is_empty() => {
+                s.refuse_read_keys.insert(key.to_string());
+            }
+            ("thaw-read", key) if !key.is_empty() => {
+                s.refuse_read_keys.remove(key);
+            }
             ("release", "") => {
                 s.hold_next_record = false;
                 s.hold_key = None;
@@ -327,11 +340,14 @@ impl Rules {
     /// until released or `cap` passes, then is forwarded with its status
     /// captured.
     pub fn admit(&self, method: &str, key: &str, cap: Duration) -> Admit {
+        let mut s = self.lock();
+        if matches!(method, "GET" | "HEAD") && s.refuse_read_keys.contains(key) {
+            return Admit::Refuse;
+        }
         if method != "PUT" {
             return Admit::Forward;
         }
         let record = keys::parse_record_key(key).is_some();
-        let mut s = self.lock();
         if s.refuse_keys.contains(key)
             || s.frozen_keys.contains(key)
             || (record && s.refuse_records)
@@ -605,6 +621,18 @@ pub fn refusal() -> Vec<u8> {
     .into_bytes()
 }
 
+/// The answer to a refused request of `method`: [`refusal`], without its
+/// body for a HEAD, whose answer never carries one.
+pub fn refusal_to(method: &str) -> Vec<u8> {
+    let mut reply = refusal();
+    if method == "HEAD"
+        && let Some(end) = reply.windows(4).position(|w| w == b"\r\n\r\n")
+    {
+        reply.truncate(end + 4);
+    }
+    reply
+}
+
 /// Relay one client connection to `upstream`, every read and write on
 /// either side bounded by `io_timeout`.
 pub fn relay(
@@ -657,13 +685,14 @@ fn requests(
                 // connection before the client reads the 503. Either way the
                 // PUT fails, which is all the refuse rules' callers (the two
                 // sweep situations) rely on; a caller that reads the store's
-                // answer to a refused PUT must drain the body first.
+                // answer to a refused PUT must drain the body first. A
+                // refused GET or HEAD has no body to drain.
                 // No pipelining: the previous answer has been read already.
                 // Write the refusal before shutting `up` down: that shutdown
                 // ends the answers thread's copy, which then shuts the client
                 // down, so a shutdown first races this write to nothing.
                 let mut w = client.try_clone()?;
-                w.write_all(&refusal())?;
+                w.write_all(&refusal_to(&head.method))?;
                 w.flush()?;
                 let _ = up.shutdown(Shutdown::Both);
                 return Ok(());
@@ -1012,6 +1041,77 @@ mod tests {
         assert_eq!(rules.admit("PUT", head, cap), Admit::Forward);
         assert!(rules.apply("freeze-key").starts_with("error"));
         assert!(rules.apply("thaw-key").starts_with("error"));
+    }
+
+    const PROV: &str = "t/0a0b/l/prov";
+
+    #[test]
+    fn a_read_refusal_refuses_get_and_head_of_its_key_only() {
+        let rules = Rules::default();
+        let cap = Duration::from_millis(10);
+        assert_eq!(rules.admit("GET", PROV, cap), Admit::Forward);
+        assert_eq!(rules.apply(&format!("refuse-read {PROV}")), "ok");
+        assert_eq!(rules.admit("GET", PROV, cap), Admit::Refuse);
+        assert_eq!(rules.admit("HEAD", PROV, cap), Admit::Refuse);
+        // Another key's read, a LIST (the bucket itself, key ""), and every
+        // other method on the key are judged as without the rule.
+        assert_eq!(rules.admit("GET", "t/0a0b/l/prov2", cap), Admit::Forward);
+        assert_eq!(rules.admit("GET", HEAD_KEY, cap), Admit::Forward);
+        assert_eq!(rules.admit("HEAD", RECORD, cap), Admit::Forward);
+        assert_eq!(rules.admit("GET", "", cap), Admit::Forward);
+        assert_eq!(rules.admit("PUT", PROV, cap), Admit::Forward);
+        assert_eq!(rules.admit("DELETE", PROV, cap), Admit::Forward);
+        assert_eq!(rules.admit("PUT", RECORD, cap), Admit::Forward);
+        assert!(rules.apply("refuse-read").starts_with("error"));
+        assert!(rules.apply("thaw-read").starts_with("error"));
+    }
+
+    #[test]
+    fn thaw_read_lifts_a_read_refusal() {
+        let rules = Rules::default();
+        let cap = Duration::from_millis(10);
+        rules.apply(&format!("refuse-read {PROV}"));
+        rules.apply(&format!("refuse-read {HEAD_KEY}"));
+        assert_eq!(rules.apply(&format!("thaw-read {PROV}")), "ok");
+        assert_eq!(rules.admit("GET", PROV, cap), Admit::Forward);
+        assert_eq!(rules.admit("HEAD", PROV, cap), Admit::Forward);
+        // Only that key's.
+        assert_eq!(rules.admit("GET", HEAD_KEY, cap), Admit::Refuse);
+    }
+
+    #[test]
+    fn pass_lifts_a_read_refusal() {
+        let rules = Rules::default();
+        let cap = Duration::from_millis(10);
+        rules.apply(&format!("refuse-read {PROV}"));
+        assert_eq!(rules.apply("pass"), "ok");
+        assert_eq!(rules.admit("GET", PROV, cap), Admit::Forward);
+        assert_eq!(rules.admit("HEAD", PROV, cap), Admit::Forward);
+    }
+
+    #[test]
+    fn read_and_put_refusals_of_one_key_lift_apart() {
+        let rules = Rules::default();
+        let cap = Duration::from_millis(10);
+        rules.apply(&format!("refuse-key {PROV}"));
+        rules.apply(&format!("freeze-key {PROV}"));
+        rules.apply(&format!("refuse-read {PROV}"));
+        assert_eq!(rules.admit("PUT", PROV, cap), Admit::Refuse);
+        assert_eq!(rules.admit("GET", PROV, cap), Admit::Refuse);
+        // thaw-key lifts neither the read refusal nor refuse-key.
+        rules.apply(&format!("thaw-key {PROV}"));
+        assert_eq!(rules.admit("GET", PROV, cap), Admit::Refuse);
+        assert_eq!(rules.admit("PUT", PROV, cap), Admit::Refuse);
+        // thaw-read lifts the read refusal and leaves the PUT refusals.
+        rules.apply(&format!("freeze-key {PROV}"));
+        rules.apply(&format!("thaw-read {PROV}"));
+        assert_eq!(rules.admit("GET", PROV, cap), Admit::Forward);
+        assert_eq!(rules.admit("PUT", PROV, cap), Admit::Refuse);
+        rules.apply("pass");
+        rules.apply(&format!("freeze-key {PROV}"));
+        rules.apply(&format!("refuse-read {PROV}"));
+        rules.apply(&format!("thaw-read {PROV}"));
+        assert_eq!(rules.admit("PUT", PROV, cap), Admit::Refuse);
     }
 
     #[test]
@@ -1430,6 +1530,52 @@ mod tests {
         assert_eq!(seen.lock().expect("locks").len(), put.len() + chunked.len());
     }
 
+    #[test]
+    fn refused_reads_are_answered_unsent_and_other_reads_relayed() {
+        let (up, seen) = upstream();
+        let rules = Arc::new(Rules::default());
+        let addr = proxy(up, Arc::clone(&rules));
+        assert_eq!(rules.apply(&format!("refuse-read {PROV}")), "ok");
+        for (method, want) in [("GET", refusal()), ("HEAD", refusal_to("HEAD"))] {
+            let mut conn = TcpStream::connect(&addr).expect("connects");
+            conn.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("sets a read timeout");
+            conn.write_all(
+                format!("{method} /ravel/{PROV} HTTP/1.1\r\nHost: s3proxy:9000\r\n\r\n").as_bytes(),
+            )
+            .expect("writes");
+            let mut answer = Vec::new();
+            conn.read_to_end(&mut answer).expect("reads to the close");
+            assert_eq!(answer, want, "{method}");
+        }
+        // The HEAD answer is the GET answer's head, with no body.
+        let get = String::from_utf8(refusal()).expect("text");
+        let head = String::from_utf8(refusal_to("HEAD")).expect("text");
+        let (get_head, body) = get.split_once("\r\n\r\n").expect("a head end");
+        assert!(body.contains("<Code>SlowDown</Code>"));
+        assert_eq!(head, format!("{get_head}\r\n\r\n"));
+        assert!(head.starts_with("HTTP/1.1 503 "));
+        assert_eq!(refusal_to("GET"), refusal());
+        assert_eq!(refusal_to("PUT"), refusal());
+        // Neither refused read reached the upstream.
+        assert!(seen.lock().expect("locks").is_empty());
+
+        // Another key's GET, and the key's own once thawed, are relayed.
+        let mut conn = TcpStream::connect(&addr).expect("connects");
+        let mut r = BufReader::new(conn.try_clone().expect("clones"));
+        let other = format!("GET /ravel/{HEAD_KEY} HTTP/1.1\r\nHost: s3proxy:9000\r\n\r\n");
+        conn.write_all(other.as_bytes()).expect("writes");
+        assert!(answer(&mut r).starts_with("HTTP/1.1 200"));
+        assert_eq!(rules.apply(&format!("thaw-read {PROV}")), "ok");
+        let prov = format!("HEAD /ravel/{PROV} HTTP/1.1\r\nHost: s3proxy:9000\r\n\r\n");
+        conn.write_all(prov.as_bytes()).expect("writes");
+        assert!(answer(&mut r).starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            String::from_utf8(seen.lock().expect("locks").clone()).expect("text"),
+            format!("{other}{prov}")
+        );
+    }
+
     /// Hold one PUT of `key` under `rule`, release it, and return the
     /// client's answer and the `held-result` reply after it.
     fn hold_and_release(status: u16, rule: &str, key: &str) -> (String, String) {
@@ -1531,9 +1677,17 @@ mod tests {
             Ok("ok".to_string())
         );
         assert!(control(&addr, "hold-key").is_err());
+        assert_eq!(
+            control(&addr, &format!("refuse-read {PROV}")),
+            Ok("ok".to_string())
+        );
+        assert_eq!(rules.admit("GET", PROV, HOLD_CAP), Admit::Refuse);
+        assert!(control(&addr, "refuse-read").is_err());
+        assert!(control(&addr, "thaw-read").is_err());
         assert!(control(&addr, "bogus").is_err());
         assert_eq!(control(&addr, "pass"), Ok("ok".to_string()));
         assert_eq!(rules.admit("PUT", RECORD, HOLD_CAP), Admit::Forward);
+        assert_eq!(rules.admit("GET", PROV, HOLD_CAP), Admit::Forward);
         assert!(control("127.0.0.1:1", "held").is_err());
     }
 }
