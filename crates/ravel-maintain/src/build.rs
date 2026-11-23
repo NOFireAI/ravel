@@ -38,7 +38,8 @@
 //! runs) and its run total are each kept at or under the most the reader's
 //! catalog decode accepts under the default `ReaderLimits`
 //! (`ravel_segment::max_provenance_samples`, `ravel_segment::max_run_total`),
-//! so the compactor never publishes a part its own reader refuses. That bound
+//! so the reader does not refuse a published part on either of the two. The
+//! reader's page and section size limits are not checked here. The reader bound
 //! is checked BEFORE a series is added: a series that would take the pending
 //! part over it closes the part first. A single series that is over the bound
 //! on its own cannot be split, since the check is between series; the bucket
