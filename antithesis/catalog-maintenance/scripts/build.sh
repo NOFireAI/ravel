@@ -123,15 +123,33 @@ check() {
     if [ "${3:-}" = mutants ]; then
         check_registered_mutants "$image" "$dir/$bin" "/symbols/$bin" || return 1
     fi
+    # driver-reshard is the driver built with its reshard feature, and only
+    # that build holds the reshard profile's assertion literals; the plain
+    # driver must hold none, or catalog-maintenance's expected set changes.
+    case "${3:-}" in
+        reshard | plain-driver)
+            local held=no
+            grep -qaF "$RESHARD_LITERAL" "$dir/$bin" && held=yes
+            if [ "$3" = reshard ] && [ "$held" = no ]; then
+                echo "FAIL $image: /symbols/$bin lacks \"$RESHARD_LITERAL\", so it is not the reshard build"; return 1
+            fi
+            if [ "$3" = plain-driver ] && [ "$held" = yes ]; then
+                echo "FAIL $image: /symbols/$bin holds \"$RESHARD_LITERAL\", a reshard-only literal"; return 1
+            fi
+            echo "ok $image: /symbols/$bin holds the reshard literal: $held"
+            ;;
+    esac
     rm -rf "$dir"
 }
+# A literal only driver/src/reshard.rs asserts.
+RESHARD_LITERAL="reshard: a generation activated"
 MODE=plain
 [ "$FEATURES" = sql,antithesis ] || MODE=mutants
 rc=0
 if [ "$WHAT" = all ] || [ "$WHAT" = server ]; then check "$SERVER" ravel-server "$MODE" || rc=1; fi
 if [ "$WHAT" = all ] || [ "$WHAT" = driver ]; then
-    check "$DRIVER" driver || rc=1
-    check "$DRIVER" driver-reshard || rc=1
+    check "$DRIVER" driver plain-driver || rc=1
+    check "$DRIVER" driver-reshard reshard || rc=1
     check "$DRIVER" s3-proxy || rc=1
     check "$DRIVER" ravel-cli-ant || rc=1
 fi

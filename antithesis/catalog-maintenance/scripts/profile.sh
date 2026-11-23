@@ -26,7 +26,9 @@ case "$WORKLOAD_PROFILE" in
         ;;
     reshard-ownership)
         PROFILE_TEST_NAME=ravel-reshard-ownership
-        PROFILE_OWNED_TSV="resharding maintenance"
+        # It runs the whole catalog-maintenance workload as well, so it owns
+        # the catalog area too.
+        PROFILE_OWNED_TSV="catalog resharding maintenance"
         # The first is reached only by the divergent-input record race, D5
         # item 7 of the #4340 step 5 decision; the second only when a
         # maintain worker warm-starts from a peer's memo snapshot, which the
