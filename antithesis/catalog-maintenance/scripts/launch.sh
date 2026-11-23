@@ -10,18 +10,24 @@
 #             ravel-server container, over the catalog-maintenance-mutants
 #             images (MUTANTS=1 scripts/build.sh). Unset or empty launches
 #             the plain run.
+#   WORKLOAD_PROFILE=reshard-ownership  launch the reshard-ownership profile
+#             (antithesis/reshard-ownership): its config and test name
+#             (ravel-reshard-ownership, -mutant for a mutant run), over the
+#             same images. Default catalog-maintenance (scripts/profile.sh).
 set -euo pipefail
 HOURS="${1:?max compute hours}"
-DESC="${2:-ravel catalog maintenance}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-CONFIG="$HERE/../config"
+# shellcheck source=profile.sh
+. "$HERE/profile.sh" || exit 1
+DESC="${2:-ravel ${WORKLOAD_PROFILE//-/ }}"
+CONFIG="$PROFILE_DIR/config"
 CHECKOUT=$(git -C "$HERE" rev-parse HEAD)
 MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
 TAG=catalog-maintenance
-TEST_NAME=ravel-catalog-maintenance
+TEST_NAME="$PROFILE_TEST_NAME"
 if [ -n "$MUTANT" ]; then
     TAG=catalog-maintenance-mutants
-    TEST_NAME=ravel-catalog-maintenance-mutant
+    TEST_NAME="$PROFILE_TEST_NAME-mutant"
     # Refuses a name that is not one of the mutants mutant-tsv.sh lists,
     # before anything else is checked.
     tmp=$(mktemp -d)
@@ -81,7 +87,7 @@ snouty launch --launcher basic_test --config "$CONFIG" \
     --fault-tolerance high_availability \
     --fault-exclusions '^driver$' \
     --setup-timeout 15m \
-    --param attrs.workload=catalog-maintenance \
+    --param attrs.workload="$WORKLOAD_PROFILE" \
     --param attrs.mutant="${MUTANT:-none}" \
     --param attrs.ravel_ref="$REF" \
     --param attrs.plugin_version=0.1.1
