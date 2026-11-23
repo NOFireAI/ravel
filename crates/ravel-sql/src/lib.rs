@@ -153,10 +153,10 @@ pub use bucket_spill_tuning::{
     routed_chunk_charge, spill_consumers, spill_slots, with_bucket_spill_tuning,
 };
 pub use bucketed_final_aggregate::{
-    BUCKET_SPILL_BATCHES_WRITTEN, BUCKET_SPILL_BYTES_READ, BUCKET_SPILL_ROWS_READ,
-    BUCKET_SPILL_UNDERSHOOT, BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX,
-    BUCKETED_FINAL_AGGREGATE_MAX_BITS, BUCKETED_FINAL_AGGREGATE_RULE, BucketedFinalAggregateExec,
-    BucketedFinalAggregateRule,
+    BUCKET_ROUTE_CHUNKS_SEALED, BUCKET_ROUTE_RESIZE_BYTES, BUCKET_SPILL_BATCHES_WRITTEN,
+    BUCKET_SPILL_BYTES_READ, BUCKET_SPILL_ROWS_READ, BUCKET_SPILL_UNDERSHOOT,
+    BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX, BUCKETED_FINAL_AGGREGATE_MAX_BITS,
+    BUCKETED_FINAL_AGGREGATE_RULE, BucketedFinalAggregateExec, BucketedFinalAggregateRule,
 };
 pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
