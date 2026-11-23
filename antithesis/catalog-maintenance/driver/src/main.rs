@@ -2299,16 +2299,16 @@ impl Shared {
     fn lifecycle_read(&self, w: &Write, node: usize, twice: bool, reason: &str) -> bool {
         let Some(prefix) = self.tenant_prefix() else {
             println!("token read: no HEAD key known yet");
-            return true;
+            return false;
         };
         let Some(header) = w.acked_header() else {
-            return true;
+            return false;
         };
         let tokens = match token::decode_header(header) {
             Ok(t) => t,
             Err(e) => {
                 println!("token read: write {}: {e}", w.id);
-                return true;
+                return false;
             }
         };
         let (listings, records) = self.token_buckets(&prefix, &tokens);

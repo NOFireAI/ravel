@@ -97,13 +97,18 @@ SETUP_LIMIT=900
 # unreadable-HEAD sweep (README.md, "The forced races"; about 2200 s between
 # them at their waits' bounds), folds, compacts and audits, takes the two
 # sweep jumps (each with its reread and serving waits), sweeps, folds, audits
-# again and reads; 4800 s bounds all of it. On top of that each of its up to
-# 18 clock moves (the jump, the 11 race nudges, three moves of the unfolded
-# sweep, one of the unreadable-HEAD sweep, the two sweep jumps) first holds
-# HEAD still for 50 s and keeps it frozen through one reread (README.md, "HEAD
-# holds still before every move"): 60 s each. After the window jump the
-# driver waits up to 150 s more for a server sweep to delete an input.
-END_LIMIT=$((SECS + 4800 + 18 * 60 + 150))
+# again and reads; 4800 s bounds all of it. The fresh compaction read
+# (README.md, "The fresh compaction read") adds 900 s: its compact-bucket
+# timeout (300 s), the 120 s wait for the record, six token reads at their
+# 30 s timeout with one 2 s retry each (372 s), and its writes, which ack in
+# well under a second each once faults stopped. On top of that each of its up
+# to 19 clock moves (the jump, the 11 race nudges, three moves of the unfolded
+# sweep, one of the unreadable-HEAD sweep, the fresh compaction's nudge, the
+# two sweep jumps) first holds HEAD still for 50 s and keeps it frozen through
+# one reread (README.md, "HEAD holds still before every move"): 60 s each.
+# After the window jump the driver waits up to 150 s more for a server sweep
+# to delete an input.
+END_LIMIT=$((SECS + 4800 + 900 + 19 * 60 + 150))
 SERVERS="ravel1 ravel2 maint1 maint2"
 MULTISET="catalog: compaction preserves the acked multiset"
 UPPER="catalog: no scan shows a phantom or an excess copy"
