@@ -3,8 +3,9 @@
 
 nextest assigns a test to leg `xxh64(test_name, seed 0) % N`, where the name
 is the test's name inside its binary, without the binary id (nextest-runner
-`partition.rs`, fixed for the 0.9 series). CI installs nextest unpinned, so
-`replay` checks the rule against a real run before anything is sized on it.
+`partition.rs`, fixed for the 0.9 series). CI pins the nextest version, and
+a bump of that pin could change the rule, so `replay` checks it against the
+run being measured before anything is sized on it.
 
 Input: one nextest log per leg, in leg order: a CI job log as downloaded
 (`gh api --allow-escape-sequences repos/O/R/actions/jobs/ID/logs`), or any

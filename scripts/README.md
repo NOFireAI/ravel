@@ -140,10 +140,11 @@ connection, a pushed-but-broken main).
 - `scripts/nextest-partition-sim.py hash|replay|simulate`: a copy of
   nextest's `--partition hash:M/N` rule (`xxh64(test name, 0) % N`, the
   name without its binary id), for sizing the `check-shard` and
-  `flight-sql-shard` matrices (ADR-4583 decision 4). It reads one downloaded
+  `flight-sql-shard` matrices (epic #4583). It reads one downloaded
   CI job log per leg, in leg order. `replay` exits 1 when any test ran on a
-  leg the rule does not give it, which is how a nextest release that changed
-  the rule shows up; run it on the logs before trusting `simulate`.
+  leg the rule does not give it, which is how a bump of CI's pinned nextest
+  that changed the rule shows up; run it on the logs before trusting
+  `simulate`.
   `simulate --legs 4,5` prints each leg's summed test seconds at each count
   and the slowest leg's estimated wall time (summed seconds over
   `--parallelism`, 3.8 by default for a four-vCPU runner), and `--band
