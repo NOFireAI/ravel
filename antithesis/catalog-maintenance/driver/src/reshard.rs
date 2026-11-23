@@ -48,6 +48,12 @@ const BURST_LEAD_S: u64 = 30;
 /// Decrease cycles the eventually runs: the second only if the first left
 /// no straggler.
 const DECREASE_CYCLES: u32 = 2;
+/// Records, and streams, of the activation and burst writes. A stream's
+/// shard follows from its resource (`wl-svc-<i>`, the same for every
+/// write), so a write reaches a shard only if one of its streams hashes
+/// there: 8 streams reached shard 5 and never shard 4 at 6 shards, 32 reach
+/// every shard (CHECKS-1, 2c).
+const WIDE_WRITE: u32 = 32;
 /// Writes the eventually adds, at most, for both new shards to acknowledge.
 const ACTIVATION_WRITES: u32 = 24;
 /// Stragglers the eventually reads back, at most.
@@ -334,7 +340,7 @@ fn activation_writes(s: &Shared) {
         if lock(&s.reshard.added_shards).is_superset(&want) {
             break;
         }
-        write_to(s, 8, (i as usize) % n);
+        write_to(s, WIDE_WRITE, (i as usize) % n);
     }
     println!(
         "reshard: shards the increase added that acknowledged a write: {:?}",
@@ -485,7 +491,7 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
             .map(|(k, &delay)| {
                 scope.spawn(move || {
                     std::thread::sleep(delay.saturating_sub(started.elapsed()));
-                    s.write_with_id(8, 8, &mut || k % n)
+                    s.write_with_id(WIDE_WRITE, WIDE_WRITE, &mut || k % n)
                 })
             })
             .collect();

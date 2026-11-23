@@ -38,9 +38,11 @@ record (D3).
    9000 s jump is longer than that lead, so it always activates it. From then
    on live writes route at 6 shards.
 2. **Activation writes** (the eventually, first of its forced situations):
-   writes of 8 records over 8 streams until both added shards, 4 and 5, have
-   acknowledged one, at most 24. A folded post-activation hour then holds data
-   at both.
+   writes of 32 records over 32 streams until both added shards, 4 and 5,
+   have acknowledged one, at most 24. A stream's shard follows from its
+   resource name, which is the same in every write, so a narrower write may
+   never reach one of them. A folded post-activation hour then holds data at
+   both.
 3. **The fence** (D2). A write acknowledged by each `--mode all` node, so each
    router holds a cached view of the record. Then the proxy's `refuse-read
    t/<h>/l/prov` answers every GET and HEAD of the record 503. After 75 s,
