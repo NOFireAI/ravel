@@ -68,10 +68,12 @@ if [ "$WHAT" = all ] || [ "$WHAT" = driver ]; then
 fi
 
 # The binary must register every mutant name mutant-tsv.sh lists, and the
-# per-area counts must be exactly the mutants ADR-4326 decision 3 ships, so a
-# tsv that lost or gained a mutant line, or a reader that skips an area or
-# counts none: lines, fails here rather than in a run.
-EXPECTED_MUTANTS="catalog=5 resharding=2 maintenance=2"
+# per-area counts must be exactly the mutants ADR-4326 decision 3 ships
+# (EXPECTED_MUTANTS, in mutant-tsv.sh), so a tsv that lost or gained a mutant
+# line, or a reader that skips an area or counts none: lines, fails here
+# rather than in a run. mutant_names itself refuses an area of MUTANT_AREAS
+# with no expected count, and the loop below fails an expected area the tsv
+# files give no mutant.
 check_registered_mutants() {
     local image="$1" binary="$2" shown="${3:-$2}" names name pair area want got total=0 bad="" summary=""
     names=$(mutant_names) || { echo "FAIL $image: could not read the mutant names"; return 1; }
