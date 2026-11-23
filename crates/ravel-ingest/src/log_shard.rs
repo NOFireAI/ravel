@@ -1239,9 +1239,14 @@ impl LogFlushCtx {
             // derives every `null_count` as `sample_count - non_null`, so no
             // stamp it emits is one this flush's own reader would drop (decision
             // 3). An empty declared set or an empty stamp list leaves the field
-            // absent, the legal default.
+            // absent, the legal default. The sum and zero count ride along
+            // unless the process opted out (ADR-4628 decision 8).
             if !declared_columns.is_empty() {
-                let stamps = declared_stats.build_stamps(&declared_columns, record.sample_count);
+                let stamps = declared_stats.build_stamps(
+                    &declared_columns,
+                    record.sample_count,
+                    self.config.emit_declared_stat_aggregates,
+                );
                 if !stamps.is_empty() {
                     ravel_commit::declared_stats::stamp_commit_record(&mut record, &stamps);
                 }
