@@ -886,7 +886,9 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   built with its `reshard` feature (`driver/src/reshard.rs`), which the
   reshard-ownership profile runs (`../reshard-ownership/README.md`). The
   instrumentation check covers it like `driver`; that README says why it is
-  a binary of its own.
+  a binary of its own. The check also greps both drivers for a literal only
+  `reshard.rs` asserts (`reshard: a generation activated`): `driver-reshard`
+  must hold it, and `driver` must not.
 - `WORKLOAD_PROFILE=reshard-ownership` before `local-run.sh` or `launch.sh`
   runs the reshard-ownership profile instead (`scripts/profile.sh`): its
   config directory, test name, owned areas and required assertions.

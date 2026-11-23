@@ -4,7 +4,8 @@ A profile of the catalog-maintenance workload (ADR-4326 decision 4,
 `../catalog-maintenance/README.md`): the same topology, images, scripts and
 driver crate, with the tenant resharded from 4 to 6 shards and back under the
 running workload. It owns the `resharding` and `maintenance` areas, whose
-mutants run here (ADR-4326, per-workload amendment). It implements D5 item 6
+mutants run here (ADR-4326, per-workload amendment), and the `catalog` area
+of the workload it runs whole ("The expected set"). It implements D5 item 6
 of the #4340 Phase E step 5 decision, with the pre-registered rows of its D6.
 
 ## What differs from catalog-maintenance
@@ -133,9 +134,12 @@ profile:
 ## The expected set
 
 The owned areas are `resharding` and `maintenance`, the areas whose `.tsv`
-files name the mutants that run here, plus the driver's own literals; every
-other area's unreached always-assertion is listed, not gated
-(`../catalog-maintenance/README.md`, "The expected set").
+files name the mutants that run here, and `catalog`, since the profile runs
+the whole catalog-maintenance workload and every catalog mutant runs here
+too; plus the driver's own literals. Every other area's unreached
+always-assertion is listed, not gated (`../catalog-maintenance/README.md`,
+"The expected set"). Every `catalog: ` always-assertion was hit in each of
+three local runs of this profile, so owning the area adds no pending entry.
 
 Two owned always-assertions have no forced situation here yet.
 `scripts/profile.sh` names both in `PROFILE_PENDING`, and `local-run.sh`
