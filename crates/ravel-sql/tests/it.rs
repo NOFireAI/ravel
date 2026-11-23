@@ -104,6 +104,8 @@ mod logs_key_idx_reader_rule;
 mod logs_limit_hint;
 #[path = "logs_metadata_agg.rs"]
 mod logs_metadata_agg;
+#[path = "logs_metadata_agg_multi.rs"]
+mod logs_metadata_agg_multi;
 #[path = "logs_not_equal_route.rs"]
 mod logs_not_equal_route;
 #[path = "logs_partition_topk.rs"]
