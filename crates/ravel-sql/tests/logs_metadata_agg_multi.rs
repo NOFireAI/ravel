@@ -7,6 +7,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
+use datafusion::arrow::compute::concat_batches;
+use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::physical_plan::{collect, displayable};
 use ravel_catalog::{EntryIdentity, LoadedColumnStats, SegmentLevel, SegmentRef, Snapshot};
 use ravel_logseg::writer::ObjectIdentity;
@@ -351,15 +354,279 @@ fn line_30() -> String {
     format!("SELECT {} FROM logs", terms.join(", "))
 }
 
-#[tokio::test]
-async fn dump_plans() {
-    let corpus = Corpus::two().await;
-    for sql in [LINE_3.to_string(), line_30()] {
-        for exact in [false, true] {
-            let run = corpus
-                .run(&sql, Some(Arc::clone(&corpus.stats)), Vec::new(), exact)
-                .await;
-            println!("exact_typed={exact}\n{}", run.plan);
+/// The answer as one row of columns, failing the test on an error.
+fn columns(run: &Run) -> Vec<ArrayRef> {
+    let batches = run.answer.as_ref().expect("an answer");
+    let batch = concat_batches(&batches[0].schema(), batches).expect("concat");
+    assert_eq!(batch.num_rows(), 1, "one row");
+    batch.columns().to_vec()
+}
+
+fn i64_at(column: &ArrayRef) -> Option<i64> {
+    let array = column.as_any().downcast_ref::<Int64Array>().expect("Int64");
+    (!array.is_null(0)).then(|| array.value(0))
+}
+
+fn f64_at(column: &ArrayRef) -> Option<f64> {
+    let array = column
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Float64");
+    (!array.is_null(0)).then(|| array.value(0))
+}
+
+fn assert_answered(run: &Run, what: &str) {
+    assert!(
+        run.plan.contains("MetadataOnlyExec: metadata_only=true, rows=1")
+            && !run.plan.contains("LogsScanExec"),
+        "{what}: answered from statistics; plan was:\n{}",
+        run.plan
+    );
+    assert_eq!(run.gets, 0, "{what}: CountingStore::gets() moved");
+}
+
+fn assert_scanned(run: &Run, what: &str) {
+    assert!(
+        run.plan.contains("LogsScanExec") && !run.plan.contains("MetadataOnlyExec"),
+        "{what}: must scan; plan was:\n{}",
+        run.plan
+    );
+    assert!(run.gets > 0, "{what}: a scan reads data objects");
+}
+
+/// Same values, same types, NULL for NULL, and float answers equal bit for
+/// bit; or the same error.
+fn assert_same_answer(left: &Run, right: &Run, what: &str) {
+    match (&left.answer, &right.answer) {
+        (Err(l), Err(r)) => assert_eq!(l.to_string(), r.to_string(), "{what}: same error"),
+        (Ok(_), Ok(_)) => {
+            let (l, r) = (columns(left), columns(right));
+            assert_eq!(l.len(), r.len(), "{what}: width");
+            for (i, (l, r)) in l.iter().zip(&r).enumerate() {
+                assert_eq!(l.data_type(), r.data_type(), "{what}: column {i} type");
+                assert_eq!(l.to_data(), r.to_data(), "{what}: column {i} value");
+                if let (Some(lf), Some(rf)) = (
+                    l.as_any().downcast_ref::<Float64Array>(),
+                    r.as_any().downcast_ref::<Float64Array>(),
+                ) {
+                    assert_eq!(
+                        lf.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        rf.values().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{what}: column {i} bits"
+                    );
+                }
+            }
         }
+        (l, r) => panic!(
+            "{what}: one path errored: {:?} vs {:?}",
+            l.as_ref().err(),
+            r.as_ref().err()
+        ),
+    }
+}
+
+/// The fixture's figures, recomputed from the rows rather than trusted.
+fn fixture_sums() -> (i64, i64, i64, i64) {
+    let rows = SEG_A.iter().chain(SEG_B);
+    let a: Vec<i64> = rows.clone().filter_map(|r| r.1).collect();
+    let w: Vec<i64> = rows.filter_map(|r| r.2).collect();
+    (
+        a.iter().sum(),
+        a.len() as i64,
+        w.iter().sum(),
+        w.len() as i64,
+    )
+}
+
+/// T1, ClickBench line 3: `SUM(a), COUNT(*), AVG(w)` is one `MetadataOnlyExec`
+/// with no data-object GET, and each column carries its own figure: the
+/// row count 9 (not a column's non-null count, 7 or 8) for `COUNT(*)`, `a`'s
+/// sum for `SUM`, `w`'s sum over `w`'s count for `AVG`. Both session kinds.
+#[tokio::test]
+async fn line_3_is_answered_from_statistics() {
+    let (a_sum, a_count, w_sum, w_count) = fixture_sums();
+    assert_eq!((a_sum, a_count, w_sum, w_count), (17, 7, 10405, 8));
+    let corpus = Corpus::two().await;
+    for exact_typed in [false, true] {
+        let run = corpus
+            .run(LINE_3, Some(Arc::clone(&corpus.stats)), Vec::new(), exact_typed)
+            .await;
+        assert_answered(&run, "line 3");
+        let cols = columns(&run);
+        assert_eq!(i64_at(&cols[0]), Some(17), "SUM(a)");
+        assert_eq!(i64_at(&cols[1]), Some(9), "COUNT(*)");
+        assert_eq!(f64_at(&cols[2]), Some(10405.0 / 8.0), "AVG(w)");
+        let scan = corpus.run(LINE_3, None, Vec::new(), exact_typed).await;
+        assert_scanned(&scan, "line 3 without statistics");
+        assert_same_answer(&run, &scan, "line 3");
+    }
+}
+
+/// T1, ClickBench line 30: all ninety `SUM(w + k)` terms are answered from
+/// statistics, `10405 + 8k` each, with no data-object GET, and equal the scan.
+#[tokio::test]
+async fn line_30_is_answered_from_statistics() {
+    let sql = line_30();
+    let corpus = Corpus::two().await;
+    for exact_typed in [false, true] {
+        let run = corpus
+            .run(&sql, Some(Arc::clone(&corpus.stats)), Vec::new(), exact_typed)
+            .await;
+        assert_answered(&run, "line 30");
+        let cols = columns(&run);
+        assert_eq!(cols.len(), 90);
+        for (k, col) in cols.iter().enumerate() {
+            assert_eq!(i64_at(col), Some(10405 + 8 * k as i64), "SUM(w + {k})");
+        }
+        let scan = corpus.run(&sql, None, Vec::new(), exact_typed).await;
+        assert_scanned(&scan, "line 30 without statistics");
+        assert_same_answer(&run, &scan, "line 30");
+    }
+}
+
+/// `EXPLAIN` of a multi-aggregate statement keeps the one-line
+/// `MetadataOnlyExec` form.
+#[tokio::test]
+async fn explain_shows_the_metadata_only_line_for_several_aggregates() {
+    let corpus = Corpus::two().await;
+    let run = corpus
+        .run(
+            &format!("EXPLAIN {LINE_3}"),
+            Some(Arc::clone(&corpus.stats)),
+            Vec::new(),
+            false,
+        )
+        .await;
+    let batches = run.answer.as_ref().expect("explain output");
+    let text = pretty_format_batches(batches).expect("format").to_string();
+    assert!(
+        text.contains("MetadataOnlyExec: metadata_only=true, rows=1"),
+        "explain was:\n{text}"
+    );
+}
+
+/// T2: over a column with no non-null row `SUM` and `AVG` are NULL while
+/// `COUNT(*)` stays the exact row count, beside a column that has values;
+/// same values and types as the scan.
+#[tokio::test]
+async fn null_sums_beside_an_exact_count_match_the_scan() {
+    let rows: &[Row] = &[(0, None, Some(5)), (10, None, Some(6)), (20, None, None)];
+    let corpus = Corpus::build(&[rows]).await;
+    let sql = "SELECT SUM(a), AVG(a), COUNT(*), SUM(w), SUM(a + 3) FROM logs";
+    let run = corpus.with_stats(sql).await;
+    assert_answered(&run, "all-NULL column");
+    let cols = columns(&run);
+    assert_eq!(i64_at(&cols[0]), None, "SUM over no non-null row");
+    assert_eq!(f64_at(&cols[1]), None, "AVG over no non-null row");
+    assert_eq!(i64_at(&cols[2]), Some(3), "COUNT(*)");
+    assert_eq!(i64_at(&cols[3]), Some(11), "SUM(w)");
+    assert_eq!(i64_at(&cols[4]), None, "SUM(a + 3) over no non-null row");
+    assert_same_answer(&run, &corpus.scanned(sql).await, "all-NULL column");
+}
+
+/// T2: `SUM(x + 1)` at the 64-bit edge. Rows `i64::MAX` and `-i64::MAX` sum
+/// to 0, so `SUM(a + 1)` is exactly 2 with no per-row wrap on either path;
+/// rows `i64::MAX` and 0 make `SUM(a + 1)` pass `i64::MAX`, and both paths
+/// fail with the same overflow error rather than wrap.
+#[tokio::test]
+async fn sum_plus_literal_at_the_64_bit_edge_matches_the_scan() {
+    let fits: &[Row] = &[(0, Some(i64::MAX), Some(1)), (10, Some(-i64::MAX), Some(1))];
+    let corpus = Corpus::build(&[fits]).await;
+    let sql = "SELECT SUM(a), SUM(a + 1), COUNT(*) FROM logs";
+    let run = corpus.with_stats(sql).await;
+    assert_answered(&run, "edge, fits");
+    let cols = columns(&run);
+    assert_eq!(
+        (i64_at(&cols[0]), i64_at(&cols[1]), i64_at(&cols[2])),
+        (Some(0), Some(2), Some(2))
+    );
+    assert_same_answer(&run, &corpus.scanned(sql).await, "edge, fits");
+
+    let over: &[Row] = &[(0, Some(i64::MAX), Some(1)), (10, Some(0), Some(1))];
+    let corpus = Corpus::build(&[over]).await;
+    let sql = "SELECT SUM(a + 1), COUNT(*) FROM logs";
+    let run = corpus.with_stats(sql).await;
+    assert!(
+        run.plan.contains("MetadataOnlyExec"),
+        "edge, overflows: plan was:\n{}",
+        run.plan
+    );
+    assert!(run.answer.is_err(), "SUM(a + 1) passes i64::MAX");
+    let scan = corpus.scanned(sql).await;
+    assert!(scan.answer.is_err(), "the scan overflows too");
+    assert_same_answer(&run, &scan, "edge, overflows");
+}
+
+/// T3: one segment without a statistics object declines the whole statement.
+#[tokio::test]
+async fn a_segment_without_statistics_declines_the_statement() {
+    let corpus = Corpus::two().await;
+    let partial = loaded(vec![(&corpus.segs[0], stats_of(SEG_A))]);
+    let run = corpus.run(LINE_3, Some(partial), Vec::new(), false).await;
+    assert_scanned(&run, "missing stats object");
+    assert_same_answer(&run, &corpus.scanned(LINE_3).await, "missing stats object");
+}
+
+/// T3: `w` without a stored sum on one segment declines the statement that
+/// reads `w` and `a` together, while a statement on `a` alone with the same
+/// statistics is still answered: the check is per column.
+#[tokio::test]
+async fn one_column_without_a_sum_declines_the_statement() {
+    let corpus = Corpus::two().await;
+    let mut b = stats_of(SEG_B);
+    b[1].sum = None;
+    let stats = loaded(vec![
+        (&corpus.segs[0], stats_of(SEG_A)),
+        (&corpus.segs[1], b),
+    ]);
+    let run = corpus
+        .run(LINE_3, Some(Arc::clone(&stats)), Vec::new(), false)
+        .await;
+    assert_scanned(&run, "w without a sum");
+    assert_same_answer(&run, &corpus.scanned(LINE_3).await, "w without a sum");
+
+    let a_only = "SELECT SUM(a), COUNT(*) FROM logs";
+    let run = corpus.run(a_only, Some(stats), Vec::new(), false).await;
+    assert_answered(&run, "a alone");
+    let cols = columns(&run);
+    assert_eq!((i64_at(&cols[0]), i64_at(&cols[1])), (Some(17), Some(9)));
+}
+
+/// T3: a pending erasure declines the statement; the scan applies it.
+#[tokio::test]
+async fn a_pending_erasure_declines_the_statement() {
+    let corpus = Corpus::two().await;
+    let erasure = || {
+        vec![ravel_proto::commit::v1::ErasureRequest {
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: "a".to_string(),
+                value: "5".to_string(),
+            }],
+            ..Default::default()
+        }]
+    };
+    let run = corpus
+        .run(LINE_3, Some(Arc::clone(&corpus.stats)), erasure(), false)
+        .await;
+    assert_scanned(&run, "pending erasure");
+    let scan = corpus.run(LINE_3, None, erasure(), false).await;
+    assert_same_answer(&run, &scan, "pending erasure");
+}
+
+/// T3: one aggregate the statistics cannot answer beside answerable ones
+/// declines the whole statement, and the scan's answer is the same as with no
+/// statistics at all.
+#[tokio::test]
+async fn an_unanswerable_aggregate_declines_the_statement() {
+    let corpus = Corpus::two().await;
+    for sql in [
+        "SELECT SUM(a), COUNT(*), SUM(DISTINCT w) FROM logs",
+        "SELECT SUM(a), COUNT(*), SUM(w) FILTER (WHERE a > 0) FROM logs",
+        "SELECT SUM(a), AVG(CAST(w AS DOUBLE)) FROM logs",
+        "SELECT SUM(a), COUNT(*), MIN(w) FROM logs",
+    ] {
+        let run = corpus.with_stats(sql).await;
+        assert_scanned(&run, sql);
+        assert_same_answer(&run, &corpus.scanned(sql).await, sql);
     }
 }
