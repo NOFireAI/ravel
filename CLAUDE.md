@@ -441,6 +441,8 @@ syntax and exit codes:
 - `check-promql-unreachable.sh`: every `unreachable!` in ravel-promql
   carries an `unreachable-allow` marker with a reason.
 - `check-release-profile.sh`: published binaries are built optimised.
+- `check-rust-image-versions.sh`: every rust image tag in a Dockerfile
+  names the version `rust-toolchain.toml` pins.
 - `check-quick-xml-entry-points.sh`, and
   `check-quick-xml-shipped-reachability.sh` (supply-chain job only): the
   RUSTSEC-2026-0194/-0195 ignore names every parent and no release build
