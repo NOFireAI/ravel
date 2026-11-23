@@ -32,6 +32,19 @@
 //! ([`crate::publish::verify_already_existed_parts`]) instead of being repaired
 //! from a retained copy.
 //!
+//! Two criteria decide a part boundary. The first is the stored-size estimate
+//! above, checked after a series is added. The second is what the reader will
+//! decode: a part's flagged provenance samples (the samples of its run-merged
+//! runs) and its run total are each kept at or under the most the reader's
+//! catalog decode accepts under the default `ReaderLimits`
+//! (`ravel_segment::max_provenance_samples`, `ravel_segment::max_run_total`),
+//! so the compactor never publishes a part its own reader refuses. That bound
+//! is checked BEFORE a series is added: a series that would take the pending
+//! part over it closes the part first. A single series that is over the bound
+//! on its own cannot be split, since the check is between series; the bucket
+//! fails with [`MaintainError::SeriesOverPartReaderBound`] before its first
+//! page fetch and stays at L0.
+//!
 //! Format-migration note (ADR-0066 decision 5): an input recorded *below* the
 //! current output version (its commit record's `segment_format_version` is older
 //! than [`OUTPUT_FORMAT_VERSION`]) cannot be copied verbatim, so its object key
@@ -55,7 +68,8 @@
 //! re-encoded) in ascending id order and the window's fetched buffers are then
 //! dropped, so peak fetch buffering is one window's worth. A part accumulates
 //! re-encoded series across windows until its estimated STORED bytes reach
-//! `max_l1_part_bytes`, checked between series. Of the terms that track the
+//! `max_l1_part_bytes`, or the next series would take it over the reader
+//! bound, checked between series. Of the terms that track the
 //! data, the pending output part and one series' decoded samples are the
 //! largest. Neither is sized by a config knob: one series' decoded samples grow
 //! with that series, and the pending part runs one whole series past
@@ -85,6 +99,7 @@ use ravel_segment::{
     CompactionMetaV4, ExemplarInput, IngestBounds, ReaderLimits, RunEntry, RunInputV4, RunInputV7,
     RunValuePageV4, SampleProvenance, SegmentIdentity, SegmentWriter, SeriesInputV7, SeriesValues,
     ValueKind, decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
+    max_provenance_samples, max_run_total,
 };
 use ravel_types::{LabelSet, Sample, SeriesId};
 use tokio::sync::Semaphore;
@@ -316,13 +331,27 @@ pub async fn build_parts(
     charges.add_plan_index(builds_bytes);
     charges.release_plan_index(by_series_bytes);
 
+    // A series over the reader bound on its own fails the bucket here, before
+    // any page is fetched or any part written.
+    let reader_bounds = PartReaderBounds::for_limits(part_reader_limits());
+    for build in &builds {
+        reader_bounds.check_series(&build.series_id, build.reader_load())?;
+    }
+
     // One shared cap for every window's fetches (windows run sequentially, so
     // this bounds total in-flight GETs at `FETCH_CONCURRENCY`).
     let semaphore = Semaphore::new(FETCH_CONCURRENCY);
     let limits = ReaderLimits::default();
 
     let mut parts = Vec::new();
-    let mut part_index: u32 = 0;
+    let output = PartOutput {
+        store,
+        config,
+        bucket,
+        ingest_bounds: &ingest_bounds,
+        input_set_hash,
+        input_set_hash16: &input_set_hash16,
+    };
 
     // The rolling output part: series already decoded, merged, and re-encoded
     // whose accumulated ENCODED STORED bytes have not yet reached
@@ -355,10 +384,11 @@ pub async fn build_parts(
     // bytes reach the cap (the fetch-buffer bound; the last series closes the
     // final window). Fetch that window's pages (coalesced + concurrent),
     // materialize each series in ascending id order into a run-merged
-    // `SeriesInputV7`, and flush a part whenever the pending part's stored-size
-    // estimate reaches the target. A single series whose own stored bytes exceed
-    // it becomes its own part. Series stay in ascending id order throughout, so every part is a
-    // contiguous, disjoint id range.
+    // `SeriesInputV7`, close the pending part before a series that would take
+    // it over the reader bound, and flush a part whenever the pending part's
+    // stored-size estimate reaches the target. A single series whose own stored
+    // bytes exceed the target becomes its own part. Series stay in ascending id
+    // order throughout, so every part is a contiguous, disjoint id range.
     let mut window_start = 0usize;
     let mut window_input_bytes: u64 = 0;
     for i in 0..builds.len() {
@@ -393,6 +423,21 @@ pub async fn build_parts(
                 })
                 .await??;
             charges.release_decoded(decoded_bytes);
+            let load = PartReaderLoad::of_series(&series_v7);
+            reader_bounds.check_series(&series_v7.series_id, load)?;
+            if !pending.is_empty()
+                && !reader_bounds.admits(pending_estimate.reader_load().plus(load))
+            {
+                close_part(
+                    &output,
+                    &mut pending,
+                    &mut pending_exemplars,
+                    &mut pending_estimate,
+                    &mut charges,
+                    &mut parts,
+                )
+                .await?;
+            }
             pending_estimate.push_series(&series_v7);
             pending.push(series_v7);
             if let Some(mut records) = exemplars_by_series.remove(&build.series_id.0) {
@@ -402,39 +447,15 @@ pub async fn build_parts(
             }
             charges.set_writer(pending_estimate.bytes());
             if pending_estimate.bytes() >= config.max_l1_part_bytes {
-                let mut part = flush_part(
-                    bucket,
-                    config,
-                    &ingest_bounds,
-                    input_set_hash,
-                    &input_set_hash16,
-                    part_index,
-                    std::mem::take(&mut pending),
-                    std::mem::take(&mut pending_exemplars),
-                    pending_estimate.bytes(),
+                close_part(
+                    &output,
+                    &mut pending,
+                    &mut pending_exemplars,
+                    &mut pending_estimate,
+                    &mut charges,
+                    &mut parts,
                 )
                 .await?;
-                note_encoded_part(&mut charges, &part);
-                put_and_release_part(
-                    store,
-                    &mut part,
-                    config.dry_run,
-                    ledger,
-                    config.compat_run.as_ref(),
-                )
-                .await?;
-                charges.set_writer(0);
-                // Cancellation checkpoint 4: a part boundary, after the PUT
-                // returned.
-                crate::claim_guard::checkpoint(
-                    config,
-                    store,
-                    crate::claim_guard::Checkpoint::PartBoundary,
-                )
-                .await?;
-                parts.push(part);
-                part_index += 1;
-                pending_estimate.reset();
             }
         }
         charges.release_fetched(window_raw_bytes);
@@ -443,34 +464,17 @@ pub async fn build_parts(
         window_input_bytes = 0;
     }
 
-    // The tail part: whatever series remain below the stored-size target.
+    // The tail part: whatever series remain below both bounds.
     if !pending.is_empty() {
-        let mut part = flush_part(
-            bucket,
-            config,
-            &ingest_bounds,
-            input_set_hash,
-            &input_set_hash16,
-            part_index,
-            pending,
-            pending_exemplars,
-            pending_estimate.bytes(),
+        close_part(
+            &output,
+            &mut pending,
+            &mut pending_exemplars,
+            &mut pending_estimate,
+            &mut charges,
+            &mut parts,
         )
         .await?;
-        note_encoded_part(&mut charges, &part);
-        put_and_release_part(
-            store,
-            &mut part,
-            config.dry_run,
-            ledger,
-            config.compat_run.as_ref(),
-        )
-        .await?;
-        charges.set_writer(0);
-        // Cancellation checkpoint 4 for the tail part.
-        crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
-            .await?;
-        parts.push(part);
     }
 
     // Exemplar conservation, the ADR-0018 overlap-harmlessness rule applied to
@@ -495,6 +499,66 @@ pub async fn build_parts(
 
     drop(charges);
     Ok(parts)
+}
+
+/// What every part of one `build_parts` call is written against.
+struct PartOutput<'a> {
+    store: &'a dyn ObjectStoreBackend,
+    config: &'a CompactorConfig,
+    bucket: &'a Bucket,
+    ingest_bounds: &'a IngestBounds,
+    input_set_hash: &'a [u8; 32],
+    input_set_hash16: &'a str,
+}
+
+/// Encode, PUT and record the pending part, then start the next one empty.
+/// The part's index is its position in `parts`.
+async fn close_part(
+    output: &PartOutput<'_>,
+    pending: &mut Vec<SeriesInputV7>,
+    pending_exemplars: &mut Vec<ExemplarInput>,
+    pending_estimate: &mut PartSizeEstimate,
+    charges: &mut MergeCharges<'_>,
+    parts: &mut Vec<BuiltPart>,
+) -> Result<()> {
+    let PartOutput {
+        store,
+        config,
+        bucket,
+        ingest_bounds,
+        input_set_hash,
+        input_set_hash16,
+    } = *output;
+    let part_index = u32::try_from(parts.len())
+        .map_err(|_| MaintainError::Invariant("RSEG part index exceeds u32".into()))?;
+    let mut part = flush_part(
+        bucket,
+        config,
+        ingest_bounds,
+        input_set_hash,
+        input_set_hash16,
+        part_index,
+        std::mem::take(pending),
+        std::mem::take(pending_exemplars),
+        pending_estimate.bytes(),
+    )
+    .await?;
+    note_encoded_part(charges, &part);
+    put_and_release_part(
+        store,
+        &mut part,
+        config.dry_run,
+        config.request_ledger.as_ref(),
+        config.compat_run.as_ref(),
+    )
+    .await?;
+    charges.set_writer(0);
+    // Cancellation checkpoint 4: a part boundary, after the PUT returned.
+    crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
+        .await?;
+    parts.push(part);
+    pending_estimate.reset();
+    Ok(())
 }
 
 /// Per-entry heap a `BTreeMap<[u8; 16], Vec<_>>` pays beyond the vector's own
@@ -543,6 +607,28 @@ struct SeriesBuild<'a> {
     labels: &'a LabelSet,
     runs: Vec<(&'a str, &'a RunPlan)>,
     page_bytes: u64,
+}
+
+impl SeriesBuild<'_> {
+    /// The reader load [`materialize_series`] will produce for this series,
+    /// from the catalog alone: one output run either way, and with two or more
+    /// input runs every input sample in the merged run, each carrying
+    /// provenance. A single-run series is copied (or re-encoded) without a
+    /// provenance column.
+    fn reader_load(&self) -> PartReaderLoad {
+        let provenance_samples = if self.runs.len() >= 2 {
+            self.runs
+                .iter()
+                .map(|(_, run)| u64::from(run.sample_count))
+                .sum()
+        } else {
+            0
+        };
+        PartReaderLoad {
+            provenance_samples,
+            runs: 1,
+        }
+    }
 }
 
 /// The fetched, coalesced byte regions of one batch, keyed by input object
@@ -831,6 +917,104 @@ const STORED_EXEMPLAR_FIXED_BYTES: u64 = 40;
 /// charged there, once per part, exactly as a series label is.
 const STORED_EXEMPLAR_ATTR_BYTES: u64 = 4;
 
+/// What a part's catalog decode charges against the reader's live budgets:
+/// its flagged provenance samples and its run total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PartReaderLoad {
+    provenance_samples: u64,
+    runs: u64,
+}
+
+impl PartReaderLoad {
+    fn of_series(series: &SeriesInputV7) -> Self {
+        let provenance_samples = series
+            .runs
+            .iter()
+            .filter_map(|run| run.provenance.as_ref())
+            .map(|column| column.len() as u64)
+            .sum();
+        Self {
+            provenance_samples,
+            runs: series.runs.len() as u64,
+        }
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            provenance_samples: self
+                .provenance_samples
+                .saturating_add(other.provenance_samples),
+            runs: self.runs.saturating_add(other.runs),
+        }
+    }
+}
+
+/// The largest [`PartReaderLoad`] a part may carry and still decode, on both
+/// catalog paths, under the limits it was derived from.
+#[derive(Debug, Clone, Copy)]
+struct PartReaderBounds {
+    provenance_samples: u64,
+    runs: u64,
+}
+
+impl PartReaderBounds {
+    fn for_limits(limits: ReaderLimits) -> Self {
+        Self {
+            provenance_samples: max_provenance_samples(limits),
+            runs: max_run_total(limits),
+        }
+    }
+
+    fn admits(&self, load: PartReaderLoad) -> bool {
+        load.provenance_samples <= self.provenance_samples && load.runs <= self.runs
+    }
+
+    /// Refuses a series that is over a bound on its own: no part boundary can
+    /// fit it.
+    fn check_series(&self, series_id: &SeriesId, load: PartReaderLoad) -> Result<()> {
+        let over = if load.provenance_samples > self.provenance_samples {
+            Some((
+                "flagged provenance samples",
+                load.provenance_samples,
+                self.provenance_samples,
+            ))
+        } else if load.runs > self.runs {
+            Some(("runs", load.runs, self.runs))
+        } else {
+            None
+        };
+        match over {
+            Some((quantity, count, bound)) => Err(MaintainError::SeriesOverPartReaderBound {
+                series_id: series_id.to_hex(),
+                quantity,
+                count,
+                bound,
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PART_READER_LIMITS: std::cell::Cell<Option<ReaderLimits>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The limits a part's reader bounds derive from: the defaults every reader
+/// of a published part decodes it under. A unit test may substitute smaller
+/// limits on its own thread; no non-test build can.
+fn part_reader_limits() -> ReaderLimits {
+    #[cfg(test)]
+    if let Some(limits) = TEST_PART_READER_LIMITS.with(std::cell::Cell::get) {
+        return limits;
+    }
+    ReaderLimits::default()
+}
+
+#[cfg(test)]
+mod reader_bound_tests;
+
 /// The estimated stored size of the in-progress part, the figure compared
 /// against [`CompactorConfig::max_l1_part_bytes`].
 ///
@@ -851,8 +1035,12 @@ const STORED_EXEMPLAR_ATTR_BYTES: u64 = 4;
 /// estimate only decides where parts split, never correctness: the writer
 /// produces the same bytes for a given series set however the series were
 /// partitioned across parts.
+///
+/// It also carries the part's [`PartReaderLoad`], the second split criterion.
+/// That one is a count, not an estimate: it is what the reader will charge.
 struct PartSizeEstimate {
     bytes: u64,
+    reader_load: PartReaderLoad,
     /// LABEL_DICT interns each distinct string once per object, so a string is
     /// charged once per part rather than once per series or exemplar that
     /// names it. A part that closes and reopens on the same label pays for it
@@ -864,6 +1052,7 @@ impl PartSizeEstimate {
     fn new() -> Self {
         Self {
             bytes: STORED_PART_FIXED_BYTES,
+            reader_load: PartReaderLoad::default(),
             charged_dict: HashSet::new(),
         }
     }
@@ -872,11 +1061,16 @@ impl PartSizeEstimate {
     /// dictionary, since the new object interns its own strings from scratch.
     fn reset(&mut self) {
         self.bytes = STORED_PART_FIXED_BYTES;
+        self.reader_load = PartReaderLoad::default();
         self.charged_dict.clear();
     }
 
     fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    fn reader_load(&self) -> PartReaderLoad {
+        self.reader_load
     }
 
     fn charge_dict_string(&mut self, s: &str) {
@@ -890,6 +1084,7 @@ impl PartSizeEstimate {
     }
 
     fn push_series(&mut self, series: &SeriesInputV7) {
+        self.reader_load = self.reader_load.plus(PartReaderLoad::of_series(series));
         self.bytes = self.bytes.saturating_add(STORED_SERIES_FIXED_BYTES);
         for label in series.labels.iter() {
             self.charge_dict_string(&label.name);

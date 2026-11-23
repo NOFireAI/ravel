@@ -1707,6 +1707,49 @@ pub(crate) fn check_run_total_live_budget(
     Ok(())
 }
 
+/// The largest run total one object's catalog may carry and still decode
+/// under `limits` on both catalog paths: the whole-section SERIES_META charges
+/// [`RUN_LIVE_BYTES_DENSE`] per run of the object, a chunk frame charges
+/// [`RUN_LIVE_BYTES_CHUNK`] per run of the frame, and a frame's run total is at
+/// most the object's. A writer that keeps an object at or under this count
+/// cannot trip [`check_run_total_live_budget`] on either path.
+pub fn max_run_total(limits: ReaderLimits) -> u64 {
+    limits.max_section_uncompressed_bytes / RUN_LIVE_BYTES_DENSE.max(RUN_LIVE_BYTES_CHUNK)
+}
+
+/// Live bytes the reader charges per flagged provenance sample against
+/// `limits.max_section_uncompressed_bytes`: the four decoded i64 provenance
+/// columns plus one [`SampleProvenance`].
+pub const PROVENANCE_LIVE_BYTES_PER_SAMPLE: u64 = 4 * 8 + SAMPLE_PROVENANCE_BYTES;
+
+/// The largest flagged provenance sample total one object's catalog may carry
+/// and still decode under `limits` on both catalog paths: the whole-section
+/// SERIES_META checks the object's total and a chunk frame checks its own,
+/// which is at most the object's.
+pub fn max_provenance_samples(limits: ReaderLimits) -> u64 {
+    limits.max_section_uncompressed_bytes / PROVENANCE_LIVE_BYTES_PER_SAMPLE
+}
+
+/// Rejects a flagged provenance sample total whose live decode, at
+/// [`PROVENANCE_LIVE_BYTES_PER_SAMPLE`] each, would exceed
+/// `limits.max_section_uncompressed_bytes`. Runs before any provenance column
+/// is allocated.
+pub(crate) fn check_provenance_live_budget(
+    prov_sample_total: u64,
+    limits: ReaderLimits,
+) -> Result<(), SegmentError> {
+    let live_bytes = prov_sample_total
+        .checked_mul(PROVENANCE_LIVE_BYTES_PER_SAMPLE)
+        .ok_or(SegmentError::FieldOverflow)?;
+    if live_bytes > limits.max_section_uncompressed_bytes {
+        return Err(SegmentError::ProvenanceLiveBudgetExceeded {
+            live_bytes,
+            cap: limits.max_section_uncompressed_bytes,
+        });
+    }
+    Ok(())
+}
+
 fn parse_series_meta_tail_v4(
     meta_bytes: &[u8],
     pos: &mut usize,
@@ -2032,17 +2075,7 @@ fn parse_provenance_extension(
         return Err(SegmentError::EmptyProvenanceExtension);
     }
 
-    // Bound the live decode the same way the run-major columns are bounded:
-    // four i64 columns plus one 32-byte `SampleProvenance` per flagged sample.
-    let live_bytes = prov_sample_total
-        .checked_mul(4 * 8 + std::mem::size_of::<SampleProvenance>() as u64)
-        .ok_or(SegmentError::FieldOverflow)?;
-    if live_bytes > limits.max_section_uncompressed_bytes {
-        return Err(SegmentError::ProvenanceLiveBudgetExceeded {
-            live_bytes,
-            cap: limits.max_section_uncompressed_bytes,
-        });
-    }
+    check_provenance_live_budget(prov_sample_total, limits)?;
     let prov_total = to_usize(prov_sample_total)?;
 
     // Both halves of the live decode are admitted before either is
@@ -3464,5 +3497,61 @@ mod tests {
             after.unknown_section_kinds,
             vec![UNKNOWN_KIND, UNKNOWN_KIND + 1, UNKNOWN_KIND + 2]
         );
+    }
+}
+
+#[cfg(test)]
+mod live_bound_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn limits(cap: u64) -> ReaderLimits {
+        ReaderLimits {
+            max_section_uncompressed_bytes: cap,
+            ..ReaderLimits::default()
+        }
+    }
+
+    #[test]
+    fn default_limits_give_the_documented_bounds() {
+        assert_eq!(PROVENANCE_LIVE_BYTES_PER_SAMPLE, 64);
+        assert_eq!(max_provenance_samples(ReaderLimits::default()), 16_777_216);
+        assert_eq!(RUN_LIVE_BYTES_DENSE, 236);
+        assert_eq!(RUN_LIVE_BYTES_CHUNK, 240);
+        assert_eq!(max_run_total(ReaderLimits::default()), 4_473_924);
+    }
+
+    proptest! {
+        /// `max_provenance_samples` is the largest flagged-sample total the
+        /// provenance live-budget check accepts: the bound passes, one more
+        /// is refused.
+        #[test]
+        fn provenance_bound_is_the_largest_accepted_total(cap in 0u64..(1u64 << 40)) {
+            let l = limits(cap);
+            let bound = max_provenance_samples(l);
+            prop_assert!(check_provenance_live_budget(bound, l).is_ok());
+            let over = check_provenance_live_budget(bound + 1, l);
+            prop_assert!(
+                matches!(over, Err(SegmentError::ProvenanceLiveBudgetExceeded { .. })),
+                "bound + 1 accepted at cap {cap}: {over:?}"
+            );
+        }
+
+        /// `max_run_total` is accepted by both catalog paths' run-total check,
+        /// and one more run is refused by the chunk-frame check, the stricter
+        /// of the two.
+        #[test]
+        fn run_bound_is_the_largest_total_both_paths_accept(cap in 0u64..(1u64 << 40)) {
+            let l = limits(cap);
+            let bound = max_run_total(l);
+            prop_assert!(check_run_total_live_budget(bound, RUN_LIVE_BYTES_DENSE, l).is_ok());
+            prop_assert!(check_run_total_live_budget(bound, RUN_LIVE_BYTES_CHUNK, l).is_ok());
+            let over = check_run_total_live_budget(bound + 1, RUN_LIVE_BYTES_CHUNK, l);
+            prop_assert!(
+                matches!(over, Err(SegmentError::RunTotalLiveBudgetExceeded { .. })),
+                "bound + 1 accepted at cap {cap}: {over:?}"
+            );
+        }
     }
 }
