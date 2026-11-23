@@ -332,8 +332,8 @@ pub async fn build_parts(
     charges.add_plan_index(builds_bytes);
     charges.release_plan_index(by_series_bytes);
 
-    // A series over the reader bound on its own fails the bucket here, before
-    // any page is fetched or any part written.
+    // A series over the reader bound on its own refuses the bucket here,
+    // before any page is fetched or any part written.
     let reader_bounds = PartReaderBounds::for_limits(part_reader_limits());
     for build in &builds {
         reader_bounds.check_series(&build.series_id, build.reader_load())?;
@@ -425,7 +425,18 @@ pub async fn build_parts(
                 .await??;
             charges.release_decoded(decoded_bytes);
             let load = PartReaderLoad::of_series(&series_v7);
-            reader_bounds.check_series(&series_v7.series_id, load)?;
+            // The pre-fetch check above admitted this series' predicted load,
+            // and earlier parts may already be PUT, so a materialized series
+            // over the bound is a prediction breach, not a refusal.
+            if let Some((quantity, count, bound)) = reader_bounds.over(load) {
+                return Err(MaintainError::Invariant(format!(
+                    "series {} materialized {count} {quantity}, over the part reader bound of \
+                     {bound}, though its predicted load was {:?} and the materialized load is \
+                     {load:?}",
+                    series_v7.series_id.to_hex(),
+                    build.reader_load(),
+                )));
+            }
             if !pending.is_empty()
                 && !reader_bounds.admits(pending_estimate.reader_load().plus(load))
             {
@@ -970,10 +981,9 @@ impl PartReaderBounds {
         load.provenance_samples <= self.provenance_samples && load.runs <= self.runs
     }
 
-    /// Refuses a series that is over a bound on its own: no part boundary can
-    /// fit it.
-    fn check_series(&self, series_id: &SeriesId, load: PartReaderLoad) -> Result<()> {
-        let over = if load.provenance_samples > self.provenance_samples {
+    /// The quantity `load` is over a bound in, with its count and the bound.
+    fn over(&self, load: PartReaderLoad) -> Option<(&'static str, u64, u64)> {
+        if load.provenance_samples > self.provenance_samples {
             Some((
                 "flagged provenance samples",
                 load.provenance_samples,
@@ -983,8 +993,13 @@ impl PartReaderBounds {
             Some(("runs", load.runs, self.runs))
         } else {
             None
-        };
-        match over {
+        }
+    }
+
+    /// Refuses a series that is over a bound on its own: no part boundary can
+    /// fit it.
+    fn check_series(&self, series_id: &SeriesId, load: PartReaderLoad) -> Result<()> {
+        match self.over(load) {
             Some((quantity, count, bound)) => Err(MaintainError::SeriesOverPartReaderBound {
                 series_id: series_id.to_hex(),
                 quantity,

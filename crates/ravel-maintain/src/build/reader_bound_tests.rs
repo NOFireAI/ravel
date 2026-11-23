@@ -66,7 +66,11 @@ fn tenant_hash() -> ravel_types::TenantHash {
 }
 
 fn bucket() -> Bucket {
-    Bucket::new(tenant_hash(), Signal::Metrics, SHARD, HOUR)
+    bucket_at(HOUR)
+}
+
+fn bucket_at(hour: u32) -> Bucket {
+    Bucket::new(tenant_hash(), Signal::Metrics, SHARD, hour)
 }
 
 fn sealed_now_ns() -> i64 {
@@ -121,9 +125,9 @@ fn plans(flagged_by_position: &[usize]) -> Vec<Plan> {
 /// One sample as `(series id, ts, value bits)`.
 type Row = ([u8; 16], i64, u64);
 
-fn sample(position: usize, k: usize) -> Sample {
+fn sample(hour: u32, position: usize, k: usize) -> Sample {
     Sample {
-        ts_ns: i64::from(HOUR) * NS_PER_HOUR + k as i64,
+        ts_ns: i64::from(hour) * NS_PER_HOUR + k as i64,
         value: (position * 100_000 + k) as f64,
     }
 }
@@ -131,13 +135,22 @@ fn sample(position: usize, k: usize) -> Sample {
 /// The two L0 inputs' series and every sample the compaction must carry, as
 /// `(series id, ts, value bits)` sorted.
 fn inputs(plans: &[Plan]) -> ([Vec<SeriesInputV3>; 2], Vec<Row>) {
+    inputs_at(HOUR, plans)
+}
+
+/// [`inputs`] for the bucket at `hour`.
+fn inputs_at(hour: u32, plans: &[Plan]) -> ([Vec<SeriesInputV3>; 2], Vec<Row>) {
     let mut by_input: [Vec<SeriesInputV3>; 2] = [Vec::new(), Vec::new()];
     let mut rows = Vec::new();
     for (position, plan) in plans.iter().enumerate() {
         let samples: Vec<Sample> = if plan.flagged == 0 {
-            (0..PLAIN_SAMPLES).map(|k| sample(position, k)).collect()
+            (0..PLAIN_SAMPLES)
+                .map(|k| sample(hour, position, k))
+                .collect()
         } else {
-            (0..plan.flagged).map(|k| sample(position, k)).collect()
+            (0..plan.flagged)
+                .map(|k| sample(hour, position, k))
+                .collect()
         };
         rows.extend(
             samples
@@ -174,9 +187,19 @@ fn inputs(plans: &[Plan]) -> ([Vec<SeriesInputV3>; 2], Vec<Row>) {
 
 /// Seeds one L0 input (data object and commit record); returns its data key.
 async fn seed(store: &dyn ObjectStoreBackend, seq: u64, series: Vec<SeriesInputV3>) -> String {
+    seed_at(store, HOUR, seq, series).await
+}
+
+/// [`seed`] into the bucket at `hour`.
+async fn seed_at(
+    store: &dyn ObjectStoreBackend,
+    hour: u32,
+    seq: u64,
+    series: Vec<SeriesInputV3>,
+) -> String {
     let th = tenant_hash();
     let writer_id = Uuid::from_u128(u128::from(seq));
-    let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+    let created = i64::from(hour) * NS_PER_HOUR + (seq as i64) * 1_000_000;
     let identity = SegmentIdentity {
         tenant_hash: th.0,
         shard: SHARD,
@@ -223,7 +246,7 @@ async fn seed(store: &dyn ObjectStoreBackend, seq: u64, series: Vec<SeriesInputV
         max_ingest_ts_ns: created,
         segment_format_version: u32::from(VERSION_V7),
         created_unix_ns: created,
-        ingest_hour_bucket: HOUR,
+        ingest_hour_bucket: hour,
     })
     .expect("build commit record");
     let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
@@ -453,11 +476,11 @@ async fn parts_split_before_the_series_that_would_pass_the_run_bound() {
     assert_eq!(got, rows);
 }
 
-/// One series over the bound on its own cannot be split: the bucket fails
+/// One series over the bound on its own cannot be split: the bucket is refused
 /// with the typed error, writes nothing, and its L0 inputs stay listed and
 /// readable.
 #[tokio::test]
-async fn a_single_series_over_the_bound_fails_the_bucket_and_writes_nothing() {
+async fn a_single_series_over_the_bound_refuses_the_bucket_and_writes_nothing() {
     const BOUND: u64 = 1_000;
     let limits = limits_for_provenance_bound(BOUND);
     let _limits = LimitsOverride::set(limits);
@@ -504,4 +527,289 @@ async fn a_single_series_over_the_bound_fails_the_bucket_and_writes_nothing() {
         let got = store.get(key, GetRange::Full).await.expect("L0 input");
         open_from_full(&got.data, ReaderLimits::default()).expect("L0 input still reads");
     }
+}
+
+/// The three sealed hours of the shard-scan tests: the middle one holds one
+/// series over the bound.
+const HELD_HOURS: [u32; 3] = [HOUR - 2, HOUR - 1, HOUR];
+const OVER_BOUND_HOUR: u32 = HOUR - 1;
+const SHARD_BOUND: u64 = 1_000;
+const OVER_BOUND_COUNT: u64 = 1_001;
+
+/// Seeds two L0 inputs into each of [`HELD_HOURS`]: the first and third
+/// hours carry series under [`SHARD_BOUND`], the middle hour one series of
+/// [`OVER_BOUND_COUNT`] flagged samples. Returns the over-bound series' hex
+/// id and the middle hour's data keys.
+async fn seed_three_hours(store: &dyn ObjectStoreBackend) -> (String, Vec<String>) {
+    let mut over = None;
+    let mut held_data = Vec::new();
+    for (i, hour) in HELD_HOURS.into_iter().enumerate() {
+        let flagged: &[usize] = if hour == OVER_BOUND_HOUR {
+            &[0, OVER_BOUND_COUNT as usize, 0]
+        } else {
+            &[0, 400, 0]
+        };
+        let plans = plans(flagged);
+        let ([first, second], _) = inputs_at(hour, &plans);
+        let seq = 10 * (i as u64 + 1);
+        let a = seed_at(store, hour, seq, first).await;
+        let b = seed_at(store, hour, seq + 1, second).await;
+        if hour == OVER_BOUND_HOUR {
+            over = Some(plans[1].id.to_hex());
+            held_data = vec![a, b];
+        }
+    }
+    (over.expect("the middle hour is seeded"), held_data)
+}
+
+async fn all_keys(store: &dyn ObjectStoreBackend) -> std::collections::BTreeSet<String> {
+    list_all(store, "")
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|m| m.key)
+        .collect()
+}
+
+/// The compaction record key and every part key of the one compaction
+/// record at `hour`.
+async fn published_keys(store: &dyn ObjectStoreBackend, hour: u32) -> Vec<String> {
+    use prost::Message;
+    let listing = crate::read::list_bucket(store, &bucket_at(hour))
+        .await
+        .expect("list bucket");
+    assert_eq!(
+        listing.compaction_record_keys.len(),
+        1,
+        "hour {hour}: one compaction record"
+    );
+    let record_key = listing.compaction_record_keys[0].clone();
+    let got = store
+        .get(&record_key, GetRange::Full)
+        .await
+        .expect("get record");
+    let record = CompactionRecord::decode(got.data.as_ref()).expect("decode record");
+    assert_eq!(record.inputs.len(), 2, "hour {hour}: both inputs compacted");
+    let mut out = vec![record_key];
+    for p in &record.parts {
+        out.push(keys::reconstruct_l1_part_key(&record, p).expect("part key"));
+    }
+    out
+}
+
+/// The middle hour holds no compaction record, and both its L0 inputs stay
+/// listed and readable.
+async fn assert_held_hour_untouched(store: &dyn ObjectStoreBackend, data_keys: &[String]) {
+    let listing = crate::read::list_bucket(store, &bucket_at(OVER_BOUND_HOUR))
+        .await
+        .expect("list bucket");
+    assert!(listing.compaction_record_keys.is_empty(), "{listing:?}");
+    assert_eq!(listing.commit_keys.len(), 2, "both L0 inputs stay live");
+    for key in data_keys {
+        let got = store.get(key, GetRange::Full).await.expect("L0 input");
+        open_from_full(&got.data, ReaderLimits::default()).expect("L0 input still reads");
+    }
+}
+
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    /// Installs a WARN capture on this thread for the guard's lifetime.
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        let writer = self.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        // A second, process-wide dispatcher keeps a callsite's interest
+        // computed across every live dispatcher rather than cached from the
+        // first thread to reach it.
+        static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log lock")).into_owned()
+    }
+}
+
+/// The one warning line the held bucket logs, naming its hour, the series,
+/// the quantity, the count and the bound.
+fn assert_held_warning(log: &str, series_id: &str) {
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("one series alone is over the reader bound of one part"))
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one held-bucket warning:\n{log}");
+    let line = lines[0];
+    for field in [
+        format!("ingest_hour_bucket={OVER_BOUND_HOUR}"),
+        format!("series_id={series_id}"),
+        "quantity=\"flagged provenance samples\"".to_string(),
+        format!("count={OVER_BOUND_COUNT}"),
+        format!("bound={SHARD_BOUND}"),
+    ] {
+        assert!(line.contains(&field), "{field} missing from: {line}");
+    }
+}
+
+/// A shard scan holds the hour whose series is over the bound and still
+/// compacts the hour after it: the scan returns Ok, the first and third hours
+/// are published, the middle hour writes nothing, and the cursor stops below
+/// it. A second pass over the same state refuses the middle hour again and
+/// writes no object.
+///
+/// Before the scan's reader-bound arm, the refusal reached the hard-error arm
+/// and the scan returned `Err` before the third hour; a scan that held the
+/// hour but stopped there would report one compaction, not two.
+#[tokio::test]
+async fn a_shard_scan_holds_the_over_bound_hour_and_compacts_the_later_one() {
+    let _limits = LimitsOverride::set(limits_for_provenance_bound(SHARD_BOUND));
+    let store = MemoryStore::new();
+    let (series_id, held_data) = seed_three_hours(&store).await;
+    let before = all_keys(&store).await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let config = CompactorConfig::default();
+    let scan = || {
+        crate::scan::scan_and_compact(
+            &store,
+            &clock,
+            &config,
+            tenant_hash(),
+            Signal::Metrics,
+            SHARD,
+        )
+    };
+
+    let log = Captured::default();
+    let guard = log.install();
+    let report = scan().await.expect("a held bucket does not fail the scan");
+    drop(guard);
+    assert_eq!(
+        report,
+        crate::ScanReport {
+            compacted: 2,
+            already_done: 0,
+            not_sealed: 0,
+            held_out_of_window: 0,
+            held_unknown_section: 0,
+            geometry_unsupported: 0,
+            held_reader_bound: 1,
+            cursor_advanced_to: Some(HELD_HOURS[0]),
+        }
+    );
+    assert_held_warning(&log.text(), &series_id);
+
+    let mut expected = before.clone();
+    expected.insert(
+        keys::maint_cursor_key(&tenant_hash(), Signal::Metrics, SHARD).expect("cursor key"),
+    );
+    for hour in [HELD_HOURS[0], HELD_HOURS[2]] {
+        expected.extend(published_keys(&store, hour).await);
+    }
+    let after = all_keys(&store).await;
+    assert_eq!(
+        after, expected,
+        "only the outer hours' records and parts and the cursor were written"
+    );
+    assert_held_hour_untouched(&store, &held_data).await;
+
+    let report = scan().await.expect("the second pass holds it again");
+    assert_eq!(
+        report,
+        crate::ScanReport {
+            compacted: 0,
+            already_done: 1,
+            not_sealed: 0,
+            held_out_of_window: 0,
+            held_unknown_section: 0,
+            geometry_unsupported: 0,
+            held_reader_bound: 1,
+            cursor_advanced_to: None,
+        }
+    );
+    assert_eq!(
+        all_keys(&store).await,
+        after,
+        "the second pass wrote nothing"
+    );
+}
+
+/// The maintenance loop's claimed path holds the same hour: the pass counts
+/// it under `held_reader_bound`, compacts both other hours, logs the series,
+/// and marks the held hour's claim completed rather than leaving it to age
+/// out under its lease. Without the claim-completing arm in
+/// `compact_bucket_scoped`, the held hour's claim stays `Running`.
+#[tokio::test]
+async fn the_maintain_pass_holds_the_over_bound_hour_and_completes_its_claim() {
+    use prost::Message;
+    use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
+    use ravel_proto::sys::v1::{ClaimState, CompactionClaim};
+
+    let _limits = LimitsOverride::set(limits_for_provenance_bound(SHARD_BOUND));
+    let store = MemoryStore::new();
+    let (series_id, held_data) = seed_three_hours(&store).await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let config = CompactorConfig {
+        claim_participant: Some(crate::ClaimParticipant::new(
+            Uuid::from_u128(77),
+            std::sync::Arc::new(clock.clone()) as std::sync::Arc<dyn crate::Clock>,
+        )),
+        ..CompactorConfig::default()
+    };
+
+    let log = Captured::default();
+    let guard = log.install();
+    let report = crate::scan::scan_and_maintain(
+        &store,
+        &clock,
+        &config,
+        &crate::config::RetentionConfig::default(),
+        &crate::NoLeases,
+        tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("a held bucket does not fail the pass");
+    drop(guard);
+    assert_eq!(report.compacted, 2, "{report:?}");
+    assert_eq!(report.held_reader_bound, 1, "{report:?}");
+    assert_eq!(report.geometry_unsupported, 0, "{report:?}");
+    assert_eq!(report.claims_acquired, 2, "{report:?}");
+    assert_held_warning(&log.text(), &series_id);
+    for hour in [HELD_HOURS[0], HELD_HOURS[2]] {
+        published_keys(&store, hour).await;
+    }
+    assert_held_hour_untouched(&store, &held_data).await;
+
+    let mut states = Vec::new();
+    for meta in list_all(&store, COMPACTION_CLAIMS_PREFIX)
+        .await
+        .expect("list claims")
+    {
+        let got = store
+            .get(&meta.key, GetRange::Full)
+            .await
+            .expect("get claim");
+        let claim = CompactionClaim::decode(got.data.as_ref()).expect("claim decodes");
+        states.push(ClaimState::try_from(claim.state).expect("known state"));
+    }
+    assert_eq!(states, vec![ClaimState::Completed; 3]);
 }

@@ -559,11 +559,13 @@ pub enum MaintainError {
     /// RSEG part may hold and still decode under the reader's default limits
     /// (`ravel_segment::max_provenance_samples`,
     /// `ravel_segment::max_run_total`). Parts split only between series, so
-    /// no split can fit it: the bucket's compaction fails, nothing is
-    /// published, and its L0 inputs stay live. Checked from the input
-    /// catalogs before the first page fetch, so no part has been written.
+    /// no split can fit it. Checked from the input catalogs before the first
+    /// page fetch, so nothing is written or published and the L0 inputs stay
+    /// live. A refusal, not a failure: the same build refuses the bucket
+    /// again, so a scan or maintain pass holds it and goes on
+    /// ([`MaintainError::is_reader_bound_refusal`]).
     #[error(
-        "RSEG compaction failed: series {series_id} alone carries {count} {quantity}, over the {bound} one part may hold under the reader's default limits; parts split only between series, so nothing is written or published and the L0 inputs stay live"
+        "RSEG compaction refused: series {series_id} alone carries {count} {quantity}, over the {bound} one part may hold under the reader's default limits; parts split only between series, so nothing is written or published and the L0 inputs stay live"
     )]
     SeriesOverPartReaderBound {
         /// Hex id of the series.
@@ -792,6 +794,15 @@ impl MaintainError {
             self,
             MaintainError::PartRangeWindow { .. } | MaintainError::PartKeySpace { .. }
         )
+    }
+
+    /// Whether this error refuses an RSEG compaction because one series alone
+    /// is over a part's reader bound
+    /// ([`MaintainError::SeriesOverPartReaderBound`]). Raised before any part
+    /// is written, and the same build refuses the bucket again, so a pass
+    /// holds the bucket and goes on to its other buckets instead of failing.
+    pub fn is_reader_bound_refusal(&self) -> bool {
+        matches!(self, MaintainError::SeriesOverPartReaderBound { .. })
     }
 
     /// Whether the `sys/compat` write policy refused this run

@@ -547,7 +547,9 @@ pub async fn maintain_bucket_with_reach(
 /// [`maintain_bucket_with_reach`], also returning the retention evaluation's
 /// [`ObservedExpiry`] (see [`retention_sweep_bucket_observed`], which takes
 /// `rewrite_bound`). A compaction refused for its part-index windows
-/// ([`MaintainError::is_part_index_refusal`]) is returned in the last
+/// ([`MaintainError::is_part_index_refusal`]) or for one series over a
+/// part's reader bound ([`MaintainError::is_reader_bound_refusal`]) is
+/// returned in the last
 /// element, not as the call's error, so the caller's pass goes on to the
 /// shard's other buckets; the compaction element is `None` then. `deleted`
 /// counts the retention physical sweep's deletes as
@@ -605,6 +607,9 @@ pub(crate) async fn maintain_bucket_observed(
                 // published, the same build refuses it again, and the pass
                 // goes on.
                 Err(err) if err.is_part_index_refusal() => (None, None, Some(err)),
+                // One series over a part's reader bound: nothing written, the
+                // same build refuses it again, and the pass goes on.
+                Err(err) if err.is_reader_bound_refusal() => (None, None, Some(err)),
                 Err(err) => return Err(err),
             }
         }
