@@ -47,7 +47,14 @@
 //! and exits 0 on a match, 1 on a mismatch or read-back error, and 64 on a
 //! usage refusal
 //! (`metricsbench_ingest_smoke::readback_only_reads_a_kept_report_back_without_writing`,
-//! `metricsbench_ingest_smoke::readback_only_refusals_exit_64`).
+//! `metricsbench_ingest_smoke::readback_only_refusals_exit_64`). When a query
+//! after the series listing fails, `readback_partial` sits beside
+//! `readback_error` with what answered first: `failed_query`, `attempt`,
+//! `series_count`, and `query_ms`, `query_windows`, `query_cost` (with
+//! `--ravel-metrics-url`) and `query_stats` of each query that answered. A
+//! failed listing leaves it out
+//! (`metricsbench_ingest_smoke::readback_only_keeps_the_listing_when_a_later_query_fails`,
+//! `metricsbench_ingest_smoke::readback_only_has_no_partial_when_the_listing_fails`).
 //!
 //! Reachable as `cargo run -p ravel-bench --bin metricsbench_ingest -- \
 //! --profile ci --store memory --steps 10 --anchor-ms 1700000010000`.
@@ -63,13 +70,13 @@ use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
     AnchorError, Band6Violation, DEFAULT_HTTP_BATCH_SIZE, DEFAULT_HTTP_SHARDS, FailedReplay,
     GeneratedStream, HttpReplayConfig, IN_PROCESS_SYSTEM, LaneError, MetricsIngestReport,
-    PayloadClass, ProfileRecord, RavelReplayConfig, Readback, ReadbackConfig, Receiver,
-    RowAccountingViolation, RowFailure, RunProvenance, STALL_GRACE, STALL_RECHECK, StallCeiling,
-    StalledRow, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
+    PayloadClass, ProfileRecord, RavelReplayConfig, Readback, ReadbackConfig, ReadbackPartial,
+    Receiver, RowAccountingViolation, RowFailure, RunProvenance, STALL_GRACE, STALL_RECHECK,
+    StallCeiling, StalledRow, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
     SystemQueryResult, build_profile_record, check_anchor, check_expected_digests_agree,
     check_row_accounting, check_row_band6, check_stream_band, query_after_replay,
-    readback_over_http, readback_plan_without_sending, replay_into_ravel,
-    replay_over_http_with_plan, workload_digest,
+    readback_over_http, readback_over_http_with_partial, readback_plan_without_sending,
+    replay_into_ravel, replay_over_http_with_plan, workload_digest,
 };
 use ravel_bench::metrics_workload::{Profile, WorkloadFile, load_workload};
 use ravel_types::TenantId;
@@ -1216,7 +1223,8 @@ fn check_report_field<T: PartialEq + std::fmt::Display>(
 }
 
 /// What `--readback-only` prints: the system, how many series the rebuilt
-/// plan holds, and the read-back or why it failed.
+/// plan holds, and the read-back or why it failed, with what answered before
+/// the failure when the series listing did.
 #[derive(Debug, serde::Serialize)]
 struct ReadbackOnlyOutput {
     system: String,
@@ -1225,6 +1233,8 @@ struct ReadbackOnlyOutput {
     readback: Option<Readback>,
     #[serde(skip_serializing_if = "Option::is_none")]
     readback_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    readback_partial: Option<ReadbackPartial>,
 }
 
 /// `--readback-only`: rebuild the named row's plan from the stream the
@@ -1308,10 +1318,14 @@ async fn run_readback_only(args: &Args) -> Result<ReadbackOnlyOutput, RunError> 
         plan_series_count: plan.series_count(),
         readback: None,
         readback_error: None,
+        readback_partial: None,
     };
-    match readback_over_http(&readback_cfg, &row, &plan).await {
+    match readback_over_http_with_partial(&readback_cfg, &row, &plan).await {
         Ok(readback) => output.readback = Some(readback),
-        Err(error) => output.readback_error = Some(error.to_string()),
+        Err(failure) => {
+            output.readback_error = Some(failure.error.to_string());
+            output.readback_partial = failure.partial.map(|p| *p);
+        }
     }
     Ok(output)
 }
