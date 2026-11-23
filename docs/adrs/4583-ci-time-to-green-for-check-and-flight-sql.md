@@ -70,7 +70,8 @@ nextest, because nextest runs every test in its own process.
 
 A Python copy of nextest's partition rule (`xxh64(test_name, 0) % N`, from
 nextest-runner's `partition.rs`, which says the rule is fixed for the 0.9
-series; CI installs nextest unpinned, so a later series could change it)
+series; CI pins the nextest version, so only a bump of the pin could
+change it)
 assigns all 16,164 `check` tests and all 4,733 `flight-sql` tests to the
 leg they ran on, with no exceptions. With the measured durations it
 predicts:
@@ -186,7 +187,7 @@ flowchart LR
    commits the copy under `scripts/` with a self-check that CI's
    `doc-scripts-rest` job runs, replaying a recorded assignment and failing
    on any misassigned test. The measurement replays the run it measures the
-   same way and refuses on any misassignment, so a nextest release that
+   same way and refuses on any misassignment, so a bump of the pinned nextest that
    changes the rule stops the decision instead of sizing it on a wrong
    split. Add a fifth leg to `check-shard` or `flight-sql-shard` where it
    shortens that job's slowest leg wall time (build, tests at summed
