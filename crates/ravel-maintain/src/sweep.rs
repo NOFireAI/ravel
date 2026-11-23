@@ -7345,9 +7345,11 @@ mod tests {
         );
     }
 
-    /// ADR-4628 test 11: a `.csnap` part a later fold replaced, with the
-    /// declared-column stamps its entries carry, is spared until it clears
-    /// the age gate and is gone after it; its replacement is spared.
+    /// ADR-4628 test 11: a `.csnap` part a later fold replaced, and with it
+    /// the declared-column stamps its entries would carry, is spared until it
+    /// clears the age gate and is gone after it; its replacement is spared.
+    /// The parts here are placeholder bytes, since the sweep reads HEAD and
+    /// the listing, never a part's body.
     #[tokio::test]
     async fn catalog_sweep_deletes_replaced_part_after_age_gate() {
         let tenant = tenant();
