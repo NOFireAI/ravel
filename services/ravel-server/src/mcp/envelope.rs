@@ -986,6 +986,28 @@ mod tests {
         }
     }
 
+    /// A memory refusal reaches the client as `budget_exceeded`, the class the
+    /// HTTP 422 corresponds to, and not the retryable `unavailable`
+    /// (ADR-2633 decision 5). Asserted on the serialized class a client reads,
+    /// as well as on the enum.
+    ///
+    /// FLIP: drop any one of the three memory patterns from
+    /// `ServiceError::from_query` and that case arrives as `unavailable`.
+    #[test]
+    fn a_memory_refusal_reaches_the_client_as_budget_exceeded() {
+        for (name, error) in crate::service::error::tests::memory_refusals() {
+            let failure = failure(&ServiceError::from_query(error));
+
+            assert_eq!(failure.class, FailureClass::BudgetExceeded, "{name}");
+            assert_eq!(
+                serde_json::to_value(failure.class).expect("class serializes"),
+                json!("budget_exceeded"),
+                "{name}"
+            );
+            assert!(failure.counter.is_none(), "{name}");
+        }
+    }
+
     /// The pooled figures and the per-phase split are both reported, and the
     /// split names every phase exactly once.
     #[test]
