@@ -387,22 +387,96 @@ impl std::fmt::Display for CeilingError {
     }
 }
 
-/// The tenant's shard ceiling at unix hour `hour`: the largest shard count of
-/// any generation activated at or before it, so a decrease keeps the retired
-/// shards in range (`shard_ceiling` in crates/ravel-catalog, which
-/// `maintain compact-tenant` checks `--shards` against). `read` is the GET of
-/// `key`; a record that does not exist is a tenant still at `missing`, the
-/// count the seed loads it at.
-pub fn shard_ceiling(
+/// One generation of a tenant's shard history: from `activation_hour` on, a
+/// write routes at `shard_count` shards until a later generation activates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Generation {
+    pub shard_count: u32,
+    pub activation_hour: u32,
+}
+
+/// The tenant's shard ceiling at unix hour `hour`: the largest count of any
+/// generation in `generations` activated at or before it, so a decrease
+/// keeps the retired shards in range (`shard_ceiling` in
+/// crates/ravel-catalog, which `maintain compact-tenant` checks `--shards`
+/// against).
+pub fn ceiling(generations: &[Generation], hour: u64) -> u32 {
+    generations
+        .iter()
+        .filter(|g| u64::from(g.activation_hour) <= hour)
+        .map(|g| g.shard_count)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The count a write routed at `hour` uses: that of the latest generation
+/// activated at or before it (`active_shard_count` in crates/ravel-catalog).
+pub fn active_count(generations: &[Generation], hour: u64) -> u32 {
+    generations
+        .iter()
+        .rfind(|g| u64::from(g.activation_hour) <= hour)
+        .map_or(0, |g| g.shard_count)
+}
+
+/// The shortest activation lead `provision reshard` accepts
+/// (`MIN_LEAD_HOURS` in services/ravel-cli/src/provision.rs): a generation
+/// appended in hour `h` activates at `h + 2` or later.
+pub const MIN_LEAD_HOURS: u64 = 2;
+
+/// The tenant's shard history as one read of its provisioning record, taken
+/// in unix hour `read_hour`, found it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardHistory {
+    pub generations: Vec<Generation>,
+    pub read_hour: u64,
+}
+
+impl ShardHistory {
+    pub fn ceiling(&self, hour: u64) -> u32 {
+        ceiling(&self.generations, hour)
+    }
+
+    /// The count every one of `hours` routes at, when this read proves it:
+    /// none of them is later than `read_hour + MIN_LEAD_HOURS - 1`, so no
+    /// generation appended after the read can have activated by then, and
+    /// all of them route at one count. `None` otherwise.
+    pub fn routed_count(&self, hours: impl IntoIterator<Item = u64>) -> Option<u32> {
+        let mut count = None;
+        for hour in hours {
+            if hour >= self.read_hour + MIN_LEAD_HOURS {
+                return None;
+            }
+            let c = active_count(&self.generations, hour);
+            match count {
+                None => count = Some(c),
+                Some(prev) if prev != c => return None,
+                Some(_) => {}
+            }
+        }
+        count
+    }
+}
+
+/// The generation history of the provisioning record `read` (the GET of
+/// `key`), checked as ravel-catalog's `read_generations` checks it. A record
+/// that does not exist is a tenant still at `missing`, the count the seed
+/// loads it at; a record from before generations existed is its scalar
+/// count from hour 0.
+pub fn generations(
     key: &str,
     read: Result<Option<Vec<u8>>, String>,
-    hour: u64,
     missing: u32,
-) -> Result<u32, CeilingError> {
+) -> Result<Vec<Generation>, CeilingError> {
     use prost::Message;
+    let from_zero = |shard_count| {
+        vec![Generation {
+            shard_count,
+            activation_hour: 0,
+        }]
+    };
     let bytes = match read {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => return Ok(missing),
+        Ok(None) => return Ok(from_zero(missing)),
         Err(detail) => {
             return Err(CeilingError::Read {
                 key: key.to_string(),
@@ -428,7 +502,7 @@ pub fn shard_ceiling(
     let in_range = |count: u32| (1..=MAX_SHARD_COUNT).contains(&count);
     if record.generations.is_empty() {
         return if in_range(record.shard_count) {
-            Ok(record.shard_count)
+            Ok(from_zero(record.shard_count))
         } else {
             Err(corrupt("shard_count out of range"))
         };
@@ -438,7 +512,7 @@ pub fn shard_ceiling(
             "generation 0's count is not the scalar shard_count",
         ));
     }
-    let mut ceiling = 0;
+    let mut history = Vec::with_capacity(record.generations.len());
     for (i, g) in record.generations.iter().enumerate() {
         if usize::try_from(g.generation).ok() != Some(i) {
             return Err(corrupt("generations are not dense from 0"));
@@ -458,11 +532,12 @@ pub fn shard_ceiling(
             }
             _ => {}
         }
-        if u64::from(g.activation_hour) <= hour {
-            ceiling = ceiling.max(g.shard_count);
-        }
+        history.push(Generation {
+            shard_count: g.shard_count,
+            activation_hour: g.activation_hour,
+        });
     }
-    Ok(ceiling)
+    Ok(history)
 }
 
 /// Compaction records (`l1.<input_set_hash16>.cmt`) among the listed logs
@@ -920,6 +995,15 @@ parts: 1
         out
     }
 
+    fn shard_ceiling(
+        key: &str,
+        read: Result<Option<Vec<u8>>, String>,
+        hour: u64,
+        missing: u32,
+    ) -> Result<u32, CeilingError> {
+        generations(key, read, missing).map(|g| ceiling(&g, hour))
+    }
+
     fn ceiling_at(bytes: Vec<u8>, hour: u32) -> Result<u32, CeilingError> {
         shard_ceiling(PROV, Ok(Some(bytes)), u64::from(hour), SEED)
     }
@@ -949,6 +1033,50 @@ parts: 1
     #[test]
     fn missing_record_is_the_seed_count() {
         assert_eq!(shard_ceiling(PROV, Ok(None), 498_721, SEED), Ok(SEED));
+    }
+
+    fn history(gens: &[(u32, u32)], read_hour: u64) -> ShardHistory {
+        let bytes = record(3, gens[0].0, gens);
+        ShardHistory {
+            generations: generations(PROV, Ok(Some(bytes)), SEED).expect("generations"),
+            read_hour,
+        }
+    }
+
+    #[test]
+    fn the_active_count_follows_the_latest_activated_generation() {
+        let up = 498_721;
+        let down = up + 3;
+        let h = history(&[(4, 0), (6, up), (4, down)], u64::from(down));
+        let active = |hour: u32| active_count(&h.generations, u64::from(hour));
+        assert_eq!(active(up - 1), 4);
+        assert_eq!(active(up), 6);
+        assert_eq!(active(down - 1), 6);
+        // After the decrease writes route at 4 again; the ceiling stays 6.
+        assert_eq!(active(down), 4);
+        assert_eq!(h.ceiling(u64::from(down)), 6);
+        assert_eq!(
+            generations(PROV, Ok(None), SEED),
+            Ok(vec![Generation {
+                shard_count: SEED,
+                activation_hour: 0
+            }])
+        );
+    }
+
+    #[test]
+    fn a_routed_count_is_known_only_inside_the_read_and_on_one_count() {
+        let up = 498_721_u64;
+        let h = history(&[(4, 0), (6, up as u32)], up - 2);
+        // Hours before the increase, inside the read's lead: count 4.
+        assert_eq!(h.routed_count([up - 2, up - 1]), Some(4));
+        // An hour a generation appended after the read could already route.
+        assert_eq!(h.routed_count([up - 1, up]), None);
+        let h = history(&[(4, 0), (6, up as u32)], up);
+        assert_eq!(h.routed_count([up, up + 1]), Some(6));
+        // Hours on two sides of an activation: no one count.
+        assert_eq!(h.routed_count([up - 1, up]), None);
+        assert_eq!(h.routed_count(std::iter::empty()), None);
     }
 
     #[test]

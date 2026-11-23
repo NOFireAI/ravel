@@ -333,21 +333,29 @@ pub fn inject_duplicate(counts: &mut HashMap<(u64, u32), u64>) -> bool {
 }
 
 /// One acknowledgement the driver received: which node, the writer identity
-/// its first token names, and the driver's ticks when the attempt was sent
-/// and when its answer arrived. Ticks come from one counter, so a tick
-/// ordering is an ordering in real time.
+/// its first token names, the driver's ticks when the attempt was sent and
+/// when its answer arrived, and the shard count it was routed at. Ticks come
+/// from one counter, so a tick ordering is an ordering in real time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ack {
     pub node: usize,
     pub writer: String,
     pub sent: u64,
     pub answered: u64,
+    /// The shard count every hour of the attempt routes at, from the send to
+    /// the answer and each token's hour (`audit::ShardHistory::routed_count`);
+    /// `None` when the provisioning record does not prove one count.
+    pub count: Option<u32>,
 }
 
-/// Every acknowledgement, per node and per write. A ravel-server process
-/// draws its log writer identity once, at start (the log router's shard set
-/// is built once per shard count, and this workload never reshards), so a
-/// node acknowledging under a new writer identity was restarted.
+/// Every acknowledgement, per node and per write. A ravel-server's log
+/// router builds one shard set per shard count, the first time that count
+/// routes, and each set draws its own writer identity, which lasts as long
+/// as the process. So within one process a writer identity changes only
+/// with the count, and a node acknowledging at one count under a new writer
+/// identity was restarted. A reshard rebuilds the set without a restart, so
+/// two acknowledgements at different counts, or at a count the record did
+/// not prove, are no restart evidence.
 #[derive(Debug, Default)]
 pub struct AckLedger {
     by_node: BTreeMap<usize, Vec<Ack>>,
@@ -367,16 +375,19 @@ impl AckLedger {
     /// Evidence that `node` restarted after `write` was acknowledged: an
     /// acknowledgement from `node` sent after the write's answer arrived (or
     /// the write's own, when `node` acknowledged it), and a later one, sent
-    /// after that one's answer, under another writer identity. `None` when
-    /// the acknowledgements show no such change.
+    /// after that one's answer, routed at the same known shard count under
+    /// another writer identity. `None` when the acknowledgements show no such
+    /// change.
     pub fn restarted_since(&self, write: u64, node: usize) -> Option<(Ack, Ack)> {
         let w = self.by_write.get(&write)?;
         let acks = self.by_node.get(&node)?;
-        let anchors = acks.iter().filter(|a| a.sent > w.answered || *a == w);
+        let anchors = acks
+            .iter()
+            .filter(|a| a.count.is_some() && (a.sent > w.answered || *a == w));
         for x in anchors {
             if let Some(y) = acks
                 .iter()
-                .find(|y| y.sent > x.answered && y.writer != x.writer)
+                .find(|y| y.sent > x.answered && y.count == x.count && y.writer != x.writer)
             {
                 return Some((x.clone(), y.clone()));
             }
@@ -632,12 +643,44 @@ mod tests {
     }
 
     fn ack(node: usize, writer: &str, sent: u64, answered: u64) -> Ack {
+        at(node, writer, sent, answered, Some(4))
+    }
+
+    fn at(node: usize, writer: &str, sent: u64, answered: u64, count: Option<u32>) -> Ack {
         Ack {
             node,
             writer: writer.into(),
             sent,
             answered,
+            count,
         }
+    }
+
+    #[test]
+    fn a_shard_set_rebuilt_for_a_reshard_is_not_a_restart() {
+        let mut l = AckLedger::default();
+        l.record(1, at(0, "a", 1, 2, Some(4)));
+        // The increase activates: the same process builds its 6-shard set
+        // under a new identity.
+        l.record(2, at(0, "b", 3, 4, Some(6)));
+        assert!(l.restarted_since(1, 0).is_none());
+        // The decrease activates: the process routes on its 4-shard set
+        // again, under the identity it had.
+        l.record(3, at(0, "a", 5, 6, Some(4)));
+        assert!(l.restarted_since(1, 0).is_none());
+        assert!(l.restarted_since(2, 0).is_none());
+        // An attempt whose hours the record did not pin to one count is no
+        // evidence either way, as an anchor or as the change.
+        l.record(4, at(0, "c", 7, 8, None));
+        l.record(5, at(0, "d", 9, 10, None));
+        assert!(l.restarted_since(1, 0).is_none());
+        assert!(l.restarted_since(4, 0).is_none());
+        // A new identity at a count the node already routed at: restarted.
+        l.record(6, at(0, "e", 11, 12, Some(6)));
+        let (x, y) = l.restarted_since(2, 0).expect("restart");
+        assert_eq!((x.writer.as_str(), y.writer.as_str()), ("b", "e"));
+        let (x, y) = l.restarted_since(1, 0).expect("restart");
+        assert_eq!((x.writer.as_str(), y.writer.as_str()), ("b", "e"));
     }
 
     #[test]
