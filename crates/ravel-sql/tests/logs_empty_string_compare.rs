@@ -256,8 +256,10 @@ async fn the_rewrite_appears_only_for_the_empty_literal() {
 }
 
 /// T2: each statement returns exactly the rows the same statement returns
-/// with the rule removed, over the three dictionary shapes of `s`, `s` cast
-/// to `Utf8` (offsets) and `Utf8View` (views), and the `Binary` column `b`,
+/// with the rule removed, over the three dictionary shapes of `s`, `s` as
+/// `Utf8` (offsets) and `Utf8View` (views) through `lower(arrow_cast(..))`,
+/// with each operand's type pinned by `arrow_typeof`, and the `Binary` column
+/// `b`,
 /// for `=` and `<>` in both operand orders and under `NOT`, `OR` and
 /// `IS NOT TRUE` / `IS NULL`, where a NULL operand's verdict decides the row.
 /// The rewrite is in every rewritten plan and in no reference plan. Two
@@ -286,14 +288,29 @@ async fn answers_match_the_kernel_in_every_layout() {
         "SELECT ts FROM logs WHERE s <> '' OR n = 3 ORDER BY ts",
         "SELECT ts FROM logs WHERE s = '' OR n = 3 ORDER BY ts",
         "SELECT ts FROM logs WHERE NOT (s = '' OR n = 3) ORDER BY ts",
-        "SELECT ts FROM logs WHERE arrow_cast(s, 'Utf8') <> '' ORDER BY ts",
-        "SELECT ts FROM logs WHERE '' = arrow_cast(s, 'Utf8') ORDER BY ts",
-        "SELECT ts FROM logs WHERE arrow_cast(s, 'Utf8View') <> '' ORDER BY ts",
-        "SELECT ts FROM logs WHERE (arrow_cast(s, 'Utf8View') = '') IS NOT FALSE ORDER BY ts",
+        "SELECT ts FROM logs WHERE lower(arrow_cast(s, 'Utf8')) <> '' ORDER BY ts",
+        "SELECT ts FROM logs WHERE '' = lower(arrow_cast(s, 'Utf8')) ORDER BY ts",
+        "SELECT ts FROM logs WHERE (lower(arrow_cast(s, 'Utf8')) = '') IS NOT FALSE ORDER BY ts",
+        "SELECT ts FROM logs WHERE lower(arrow_cast(s, 'Utf8View')) <> '' ORDER BY ts",
+        "SELECT ts FROM logs WHERE (lower(arrow_cast(s, 'Utf8View')) = '') IS NOT FALSE \
+         ORDER BY ts",
         "SELECT ts FROM logs WHERE b <> '' ORDER BY ts",
         "SELECT ts FROM logs WHERE '' = b ORDER BY ts",
         "SELECT ts FROM logs WHERE (b = '') IS NOT TRUE ORDER BY ts",
     ];
+    // A bare cast of `s` is unwrapped back to the dictionary column by the
+    // optimizer; `lower` over the cast keeps the operand in the cast's
+    // layout, and its values are already lower case.
+    for (operand, layout) in [
+        ("lower(arrow_cast(s, 'Utf8'))", "Utf8"),
+        ("lower(arrow_cast(s, 'Utf8View'))", "Utf8View"),
+        ("b", "Binary"),
+    ] {
+        let sql = format!("SELECT arrow_typeof({operand}) AS ty FROM logs LIMIT 1");
+        let (_, got) = run(&on, &sql).await;
+        let ty = got[0].column(0).as_string::<i32>().value(0).to_string();
+        assert_eq!(ty, layout, "{operand}");
+    }
     for sql in statements {
         let (reference_plan, reference) = run(&off, sql).await;
         let (plan, got) = run(&on, sql).await;
@@ -313,6 +330,12 @@ async fn answers_match_the_kernel_in_every_layout() {
             "{sql}: the reference is not rewritten: {reference_text}"
         );
         assert_eq!(nodes(&plan, "LogsScanExec").len(), 1, "{sql}");
+        if sql.contains("lower(") {
+            assert!(
+                text.contains("empty_eq(lower(") || text.contains("empty_ne(lower("),
+                "{sql}: the operand is the cast string: {text}"
+            );
+        }
     }
 
     let (_, got) = run(&on, statements[0]).await;
