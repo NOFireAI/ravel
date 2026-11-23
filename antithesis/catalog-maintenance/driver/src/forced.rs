@@ -26,14 +26,42 @@ const _: () = assert!(RELEASE_BY.as_secs() + 2 < HOLD_CAP.as_secs());
 pub const TAMPER_BY: Duration = Duration::from_secs(10);
 const _: () = assert!(TAMPER_BY.as_secs() + 8 <= HOLD_CAP.as_secs());
 
-/// How long after the store answered the released PUT the driver undoes its
-/// tamper: three of the servers' 20 s store request timeouts, so the
-/// loser's GET, HEAD and second GET of the record have all been answered
-/// before the record's version changes again. The bucket's hour seals for
-/// the fold `FOLD_SAFETY_MARGIN_S` (900 s) after it sealed for compaction,
-/// well past the whole race, so no fold folds the tampered record.
+/// How long after the store answered the released PUT the driver waits
+/// before it undoes its tamper once faults stopped: three of the servers'
+/// 20 s store request timeouts, so the loser's GET, HEAD and second GET of
+/// the record have been answered before the record's version changes again.
 pub const RESTORE_AFTER: Duration = Duration::from_secs(3 * crate::clock::STORE_REQUEST_TIMEOUT_S);
-const _: () = assert!(RESTORE_AFTER.as_secs() * 4 < crate::clock::FOLD_SAFETY_MARGIN_S);
+
+/// The same wait while faults may run: the servers' store client retries one
+/// operation for up to 180 s plus one 20 s request (`retry_timeout +
+/// request_timeout` in crates/ravel-object-store/src/s3.rs), so one of the
+/// loser's requests retried to that bound is still answered before the
+/// undo. Three retried to it would not be; README.md, "The forced races",
+/// names that residual.
+pub const RESTORE_AFTER_FAULTS: Duration = Duration::from_secs(200);
+
+/// How long the driver keeps retrying an undo the store refused before it
+/// leaves it pending for the next clock move or the eventually.
+pub const UNDO_FOR: Duration = Duration::from_secs(120);
+
+// The whole race after the nudge (the held wait, the tamper budget, the
+// held-result wait, the restore wait and the undo retries) stays inside the
+// `FOLD_SAFETY_MARGIN_S` (900 s) between the hour sealing for compaction and
+// sealing for the fold, so no fold folds a tampered record.
+const _: () = assert!(
+    120 + TAMPER_BY.as_secs() + 10 + 2 + RESTORE_AFTER_FAULTS.as_secs() + UNDO_FOR.as_secs()
+        < crate::clock::FOLD_SAFETY_MARGIN_S
+);
+
+/// The wait before the undo: [`RESTORE_AFTER_FAULTS`] while faults may run,
+/// [`RESTORE_AFTER`] once they stopped.
+pub fn restore_after(faults_may_run: bool) -> Duration {
+    if faults_may_run {
+        RESTORE_AFTER_FAULTS
+    } else {
+        RESTORE_AFTER
+    }
+}
 
 /// What a record race does to the store after the `ravel-cli` compaction
 /// published and before the driver releases the held server PUT.
@@ -766,6 +794,19 @@ mod tests {
         let mut other = hash.clone();
         other[7] ^= 1;
         assert!(diverge(&record_key_for(&other), &record).is_err());
+    }
+
+    #[test]
+    fn the_undo_waits_out_a_retried_request_while_faults_may_run() {
+        assert_eq!(restore_after(false), RESTORE_AFTER);
+        assert_eq!(restore_after(true), RESTORE_AFTER_FAULTS);
+        // One store operation retried to its bound: 180 s of retries plus
+        // one 20 s request.
+        assert!(
+            RESTORE_AFTER_FAULTS
+                >= Duration::from_secs(180 + crate::clock::STORE_REQUEST_TIMEOUT_S)
+        );
+        assert!(RESTORE_AFTER >= Duration::from_secs(3 * crate::clock::STORE_REQUEST_TIMEOUT_S));
     }
 
     #[test]

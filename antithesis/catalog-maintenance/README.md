@@ -536,7 +536,11 @@ sometimes-assertion that `local-run.sh` requires in a plain run.
 Every step is something the system must survive anyway: every clock moves
 forward together, never back; a `ravel-cli` maintenance run happens
 concurrently with the servers', which the CLI documents as safe; a store
-answers some PUTs late or refuses them. Each rule holds the driver's write
+answers some PUTs late or refuses them. Two races also change the store
+through raw S3, as the `corrupt_head` rule does: one rewrites a compaction
+record with a divergent input-set hash, the other deletes one of a
+record's parts, and each puts the original back before the race ends; the
+loser each one meets must fail closed. Each rule holds the driver's write
 gate throughout, so no live write and no planned jump lands inside a race.
 Each clock move outside the planned jumps prints `clock: moved forward by
 <N> s outside the planned jumps (<reason>)`, and the local loop adds those
@@ -664,14 +668,20 @@ exited and its record is in the store:
      `mo-missing-part-reports-converged` mutant skips the absent part and
      reports `Converged`, and `maintenance: a loser reports Converged only
      when the winner part is observed present in the store` goes false.
-9. Read `held-result`, wait 2 s, then 60 s more (`forced::RESTORE_AFTER`,
-   three of the servers' 20 s request timeouts) so the loser's GET, HEAD
-   and second GET of the record have been answered, and undo the tamper:
-   PUT the CLI's record back if the forged one is still there (a record a
-   mutant loser wrote stays; that loser had PUT its parts), or PUT the part
-   back if it is still absent. The hour seals for the fold 900 s after it
-   sealed for compaction, so no fold folds the tampered record, and no
-   query, audit or write of the driver runs while it holds the gate.
+9. Read `held-result`, wait 2 s, then wait for the loser's GET, HEAD and
+   second GET of the record to be answered: 60 s once faults stopped
+   (`forced::RESTORE_AFTER`, three of the servers' 20 s request timeouts),
+   200 s while they may run (`forced::RESTORE_AFTER_FAULTS`, one store
+   operation retried to its 180 s budget plus one request). Then undo the
+   tamper: PUT the CLI's record back if the forged one is still there (a
+   record a mutant loser wrote stays; that loser had PUT its parts), or PUT
+   the part back if it is still absent. An undo the store refuses is
+   retried for 120 s (`forced::UNDO_FOR`), then left pending, and every
+   later clock move and the `eventually` retry it before anything else.
+   The race, its waits included, ends inside the 900 s between the hour
+   sealing for compaction and sealing for the fold, so no fold folds the
+   tampered record, and no query, audit or write of the driver runs while
+   it holds the gate.
 10. `pass`. Asserted as `catalog: a server's compaction record PUT lost to a
     record whose input-set hash diverges from its own` or `catalog: a
     server's compaction record PUT lost to a record whose part is missing
@@ -701,14 +711,23 @@ names), and `MergeAttemptsConverge` requires a loser to report convergence
 only over parts it saw. A live write cannot add an input to the bucket
 instead: the bucket is sealed for compaction before the hold, and a
 different input set would hash to a different record key, so the two
-compactions would never meet. Neither tamper outlives the race.
+compactions would never meet. Each tamper is undone within its race,
+unless the store keeps refusing the undo (step 9).
 
-A residual: the tamper's own PUT or DELETE goes straight to rustfs and
+Two residuals, both only while faults run, where the divergent-record race
+can read as an overwrite on clean code: the loser HEADs the record at
+another version than it fetched when a version change lands between its
+GET and its HEAD. First, the tamper's own PUT goes straight to rustfs and
 takes milliseconds, but if it took longer than the 8 s left before the hold
-cap, the proxy would forward the held PUT first, and a forged record
-landing between the loser's GET and HEAD would read as an overwrite on
-clean code. The race does not count then (the release came after the cap),
-but the loser's always would already have gone false.
+cap, the proxy would forward the held PUT first and the forged record could
+land in that window; the race then does not count (the release came after
+the cap), but the loser's always would already have gone false. Second,
+the 200 s wait covers one of the loser's requests retried to its bound,
+not several: an undo after a loser whose GET and HEAD were both retried
+that long can land between them. A false evaluation in either case names
+the race in the driver's
+details (`tamper_in_place_at_release`, `released_at_age_ms`, `undo`), so
+it can be told from a mutant.
 
 ### The unfolded-record sweep (`sweep-superseded-no-head-gate`)
 
@@ -1040,7 +1059,7 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     fallback.
 - The local loop's bound on the driver's run after setup is `seconds` plus
   4800 s for the `eventually`, which runs the forced races before its fold,
-  plus 210 s for each of up to six divergent-record and missing-part races,
+  plus 330 s for each of up to six divergent-record and missing-part races,
   900 s for its fresh compaction read, 60 s for each of up to 25 clock
   moves, and 150 s for the wait after the window jump.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the

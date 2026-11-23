@@ -96,11 +96,12 @@ SETUP_LIMIT=900
 # up to six fold races, five record races, one unfolded-record sweep and one
 # unreadable-HEAD sweep (README.md, "The forced races"; about 2200 s between
 # them at their waits' bounds), up to three divergent-record and three
-# missing-part races (210 s each at their bounds: the 120 s wait for a held
+# missing-part races (330 s each at their bounds: the 120 s wait for a held
 # PUT, the 10 s compaction budget, the 10 s wait for the held result, 2 s,
-# and the 60 s before the tamper is undone), folds, compacts and audits,
-# takes the two sweep jumps (each with its reread and serving waits), sweeps,
-# folds, audits again and reads; 4800 s and the 6 * 210 s bound all of it.
+# the 60 s before the tamper is undone with faults stopped, and 120 s of
+# undo retries), folds, compacts and audits, takes the two sweep jumps (each
+# with its reread and serving waits), sweeps, folds, audits again and reads;
+# 4800 s and the 6 * 330 s bound all of it.
 # The fresh compaction read
 # (README.md, "The fresh compaction read") adds 900 s: its compact-bucket
 # timeout (300 s), the 120 s wait for the record, six token reads at their
@@ -112,7 +113,7 @@ SETUP_LIMIT=900
 # one reread (README.md, "HEAD holds still before every move"): 60 s each.
 # After the window jump the driver waits up to 150 s more for a server sweep
 # to delete an input.
-END_LIMIT=$((SECS + 4800 + 6 * 210 + 900 + 25 * 60 + 150))
+END_LIMIT=$((SECS + 4800 + 6 * 330 + 900 + 25 * 60 + 150))
 SERVERS="ravel1 ravel2 maint1 maint2"
 MULTISET="catalog: compaction preserves the acked multiset"
 UPPER="catalog: no scan shows a phantom or an excess copy"

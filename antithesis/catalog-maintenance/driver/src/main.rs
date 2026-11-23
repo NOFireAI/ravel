@@ -330,6 +330,9 @@ struct Shared {
     divergent_lost: AtomicBool,
     /// Whether a missing-part race reached its situation.
     part_missing_lost: AtomicBool,
+    /// Tamper undos the store kept refusing, retried before every clock
+    /// move and in the eventually.
+    pending_undos: Mutex<Vec<Undo>>,
     /// Set once the unfolded-record sweep took its first sweep jump; the rule
     /// runs it once per timeline.
     unfolded_started: AtomicBool,
@@ -1016,6 +1019,9 @@ impl Shared {
     /// container. A move of zero writes nothing. `Err` when the quiet wait
     /// gave the move up, before any write.
     fn shift_clock(&self, reason: &str, by_s: &dyn Fn(u64) -> u64) -> Result<Jump, String> {
+        // A tampered record race's hour must not seal for the fold with
+        // the tamper still in the store.
+        self.retry_pending_undos(reason);
         let frozen = self.quiet_head(reason)?;
         let before_ns = now_ns();
         let by_s = by_s(before_ns / NS_PER_SECOND);
@@ -1613,32 +1619,56 @@ impl Shared {
         }
     }
 
-    /// Put back what a tamper changed, if it is still in place, and say
-    /// what happened.
-    fn undo_tamper(&self, undo: &Undo) -> String {
+    /// One attempt to put back what a tamper changed, if it is still in
+    /// place: `Ok` with what happened, `Err` when the store refused.
+    fn undo_once(&self, undo: &Undo) -> Result<String, String> {
         let key = undo.key();
-        let mut last = String::new();
-        for attempt in 0..3 {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_secs(2));
-            }
-            let current = match self.store.get(key) {
-                Ok(current) => current,
-                Err(e) => {
-                    last = format!("reading {key}: {e}");
-                    continue;
+        let current = self
+            .store
+            .get(key)
+            .map_err(|e| format!("reading {key}: {e}"))?;
+        let Some(bytes) = undo.restore(current.as_deref()) else {
+            return Ok(format!(
+                "{key}: no longer as the tamper left it, left alone"
+            ));
+        };
+        self.store
+            .put(key, bytes)
+            .map_err(|e| format!("putting back {key}: {e}"))?;
+        Ok(format!("{key}: put back"))
+    }
+
+    /// Put back what a tamper changed, retrying for [`forced::UNDO_FOR`],
+    /// and say what happened. An undo the store kept refusing is left
+    /// pending: every later clock move and the eventually retry it first.
+    fn undo_tamper(&self, undo: Undo) -> String {
+        let deadline = Instant::now() + forced::UNDO_FOR;
+        loop {
+            match self.undo_once(&undo) {
+                Ok(done) => return done,
+                Err(e) if Instant::now() >= deadline => {
+                    println!("record race: could not undo the tamper, left pending: {e}");
+                    lock(&self.pending_undos).push(undo);
+                    return format!("pending: {e}");
                 }
-            };
-            let Some(bytes) = undo.restore(current.as_deref()) else {
-                return format!("{key}: no longer as the tamper left it, left alone");
-            };
-            match self.store.put(key, bytes) {
-                Ok(()) => return format!("{key}: put back"),
-                Err(e) => last = format!("putting back {key}: {e}"),
+                Err(_) => std::thread::sleep(Duration::from_secs(5)),
             }
         }
-        println!("record race: could not undo the tamper: {last}");
-        format!("failed: {last}")
+    }
+
+    /// Retry every undo left pending once; keep those the store still
+    /// refuses.
+    fn retry_pending_undos(&self, what: &str) {
+        let pending = std::mem::take(&mut *lock(&self.pending_undos));
+        for undo in pending {
+            match self.undo_once(&undo) {
+                Ok(done) => println!("{what}: pending tamper undo: {done}"),
+                Err(e) => {
+                    println!("{what}: pending tamper undo still refused: {e}");
+                    lock(&self.pending_undos).push(undo);
+                }
+            }
+        }
     }
 
     /// [`Shared::record_race`] once the proxy runs with no rules.
@@ -1769,17 +1799,15 @@ impl Shared {
         };
         // Undone whether or not the race reached its situation, once the
         // loser has had its GET, HEAD and GET of the record answered.
-        let undone = match &tampered {
-            Some(Ok((undo, _))) => {
-                std::thread::sleep(forced::RESTORE_AFTER);
-                Some(self.undo_tamper(undo))
+        let faults_may_run = !self.stop.stopping();
+        let (tamper_key, tamper_error, undone) = match tampered {
+            None => (None, None, None),
+            Some(Err(e)) => (None, Some(e), None),
+            Some(Ok((undo, error))) => {
+                std::thread::sleep(forced::restore_after(faults_may_run));
+                let key = undo.key().to_string();
+                (Some(key), error, Some(self.undo_tamper(undo)))
             }
-            _ => None,
-        };
-        let (tamper_key, tamper_error) = match &tampered {
-            None => (None, None),
-            Some(Ok((undo, error))) => (Some(undo.key().to_string()), error.clone()),
-            Some(Err(e)) => (None, Some(e.clone())),
         };
         let changed = match (&before, &after) {
             (Ok(Some(b)), Ok(Some(a))) => Some(a != b),
@@ -3096,6 +3124,7 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         println!("eventually: not recovered, ending the timeline");
         std::process::exit(0);
     }
+    s.retry_pending_undos("eventually");
 
     if lock(&s.jump).is_none() {
         if lock(&s.model).acked_logs.is_empty() {
@@ -3539,6 +3568,7 @@ fn main(tc: TestCase) {
         record_lost: AtomicBool::new(false),
         divergent_lost: AtomicBool::new(false),
         part_missing_lost: AtomicBool::new(false),
+        pending_undos: Mutex::new(Vec::new()),
         unfolded_started: AtomicBool::new(false),
         unfolded_reached: AtomicBool::new(false),
         unreadable_started: AtomicBool::new(false),
