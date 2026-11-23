@@ -1349,9 +1349,9 @@ into them. An operator with erasure obligations must budget them deliberately.
     restricted to `I64` and `BOOL` columns (proto/ravel/commit.proto,
     `DeclaredColumnStatValue`), so it cannot represent a `STR` or `BYTES`
     value, but it does hold numeric values. A retained stamp on a commit
-    record, a compaction record or a snapshot entry holds the min, max, sum
-    and zero count of each declared `I64` and `BOOL` column over the rows it
-    covers (the sum for `I64` only; ADR-4628). With the min and max, a sum
+    record, a compaction record or a snapshot entry holds the min and max of
+    each declared `I64` and `BOOL` column over the rows it covers, and can
+    hold its sum and zero count too (the sum for `I64` only; ADR-4628). With the min and max, a sum
     can recover an erased value: the pre-rewrite sum less the sum over the
     rows the rewrite kept is the sum of the erased rows, which for one
     erased row is its exact value, and a zero count can tell whether that

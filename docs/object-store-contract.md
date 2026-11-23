@@ -1813,9 +1813,10 @@ adapter contract:
    sweep lists.
 
    Numeric values are covered too. A retained stamp on a commit record, a
-   compaction record or a snapshot entry holds the min, max, sum and zero
-   count of each declared `I64` and `BOOL` column over the rows it covers
-   (the sum for `I64` only; ADR-4628, docs/catalog-and-mvcc.md). With the
+   compaction record or a snapshot entry holds the min and max of each
+   declared `I64` and `BOOL` column over the rows it covers, and can hold
+   its sum and zero count too (the sum for `I64` only; ADR-4628,
+   docs/catalog-and-mvcc.md). With the
    min and max, a sum can recover an erased value: the pre-rewrite sum less
    the sum over the rows the rewrite kept is the sum of the erased rows,
    which for one erased row is its exact value. The erasure guarantee
