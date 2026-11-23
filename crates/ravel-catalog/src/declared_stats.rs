@@ -126,7 +126,13 @@ fn entry_to_proto(entry: &commit_pb::DeclaredColumnMinMax) -> DeclaredColumnMinM
     }
 }
 
-/// The same conversion in the read direction.
+/// The same conversion in the read direction, total and lossless for fields
+/// 1 to 5 only. It drops fields 6 to 8 (ADR-4628) of the catalog entry before
+/// the shared predicate sees them, so [`read_snapshot_entry`] applies none of
+/// the ADR-4628 decision 2 clauses to a snapshot entry that carries them,
+/// while [`ravel_commit::declared_stats::read_commit_record`] drops the same
+/// bytes on a commit record. Nothing writes or reads those fields yet;
+/// carrying them through the mirror is a later ADR-4628 task.
 fn entry_to_commit(entry: &DeclaredColumnMinMax) -> commit_pb::DeclaredColumnMinMax {
     commit_pb::DeclaredColumnMinMax {
         name: entry.name.clone(),
@@ -347,6 +353,11 @@ pub(crate) fn carry_compaction_part(
 /// implementation of the predicate is a second thing to keep in agreement, and
 /// the ADR's reader-agreement rule exists because that divergence has already
 /// shipped once.
+///
+/// One known exception until the mirror carries fields 6 to 8 (ADR-4628): the
+/// conversion drops them, so the ADR-4628 decision 2 clauses on the sum and
+/// the zero count do not bind here, and an entry that carries a defective sum
+/// is covered here although a commit record with the same bytes drops it.
 pub fn read_snapshot_entry(entry: &SnapshotEntry) -> ValidatedDeclaredStats {
     let twin = commit_pb::CommitRecord {
         sample_count: entry.sample_count,
@@ -738,11 +749,14 @@ mod tests {
     }
 
     proptest! {
-        /// The mirror conversion is lossless in both directions, for every
-        /// shape the wire can hold including the defective ones. It has to be:
-        /// the read path converts a catalog entry to its commit twin to run
-        /// one shared predicate, so a conversion that normalised anything
-        /// would make the two carriers disagree about the same bytes.
+        /// The mirror conversion is lossless in both directions for fields 1
+        /// to 5, for every shape the wire can hold including the defective
+        /// ones. It has to be: the read path converts a catalog entry to its
+        /// commit twin to run one shared predicate, so a conversion that
+        /// normalised anything would make the two carriers disagree about the
+        /// same bytes. Fields 6 to 8 (ADR-4628) are not carried yet, so
+        /// `arb_entry_message` holds them absent and this test does not cover
+        /// them.
         #[test]
         fn mirror_conversion_round_trips(entry in arb_entry_message()) {
             let there_and_back = entry_to_proto(&entry_to_commit(&entry));
