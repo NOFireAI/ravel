@@ -926,6 +926,34 @@ async fn compact_bucket_scoped(
             );
             CompactionOutcome::ScratchLocked { path }
         }
+        // Like a part-index refusal below: returned as an error once the claim
+        // is released, and held by the scan and maintain passes.
+        Err(MaintainError::SeriesOverPartReaderBound {
+            series_id,
+            quantity,
+            count,
+            bound,
+        }) => {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                series_id = %series_id,
+                quantity,
+                count,
+                bound,
+                "compaction refused a bucket: one series alone is over the reader \
+                 bound of one part; nothing written or published, the L0 inputs \
+                 stay live and the bucket is held"
+            );
+            complete_refused_claim(store, bucket, guard).await;
+            return Err(MaintainError::SeriesOverPartReaderBound {
+                series_id,
+                quantity,
+                count,
+                bound,
+            });
+        }
         // No outcome carries a part-index refusal, so the run returns it as an
         // error after releasing its claim the way a refused outcome does; the
         // scan and maintain passes hold the bucket as refused and go on.
@@ -939,20 +967,7 @@ async fn compact_bucket_scoped(
                  their ranges' windows; nothing published, the L0 inputs stay live \
                  (ADR-3853)"
             );
-            if let Some(guard) = guard
-                && guard.cancelled_at().await.is_none()
-                && let Err(complete) = guard.complete(store).await
-            {
-                tracing::warn!(
-                    signal = ?bucket.signal,
-                    shard = bucket.shard,
-                    ingest_hour_bucket = bucket.ingest_hour_bucket,
-                    work_id = %guard.work_id_hex(),
-                    error = %complete,
-                    "compaction refused, and marking its claim completed failed; \
-                     the claim ages out under its lease (ADR-1029)"
-                );
-            }
+            complete_refused_claim(store, bucket, guard).await;
             return Err(err);
         }
         other => other?,
@@ -1012,6 +1027,30 @@ async fn acquire_claim(
         return Ok(BucketClaim::NotParticipating);
     }
     claim_bucket(store, config, bucket, "compaction").await
+}
+
+/// Marks a refused run's claim completed when the run still holds it, so the
+/// next pass need not wait out the lease. A failed mark is logged and the
+/// claim ages out under its lease (ADR-1029).
+async fn complete_refused_claim(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    guard: Option<crate::claim_guard::ClaimGuard>,
+) {
+    if let Some(guard) = guard
+        && guard.cancelled_at().await.is_none()
+        && let Err(complete) = guard.complete(store).await
+    {
+        tracing::warn!(
+            signal = ?bucket.signal,
+            shard = bucket.shard,
+            ingest_hour_bucket = bucket.ingest_hour_bucket,
+            work_id = %guard.work_id_hex(),
+            error = %complete,
+            "compaction refused, and marking its claim completed failed; \
+             the claim ages out under its lease (ADR-1029)"
+        );
+    }
 }
 
 /// The listing gates a compaction applies to the listing it plans from, and
