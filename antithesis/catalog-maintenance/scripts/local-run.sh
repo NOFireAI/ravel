@@ -23,6 +23,10 @@
 #             selected on every ravel-server container. The property the
 #             mutant must make false is the one its own area's
 #             formal/tla/<area>/antithesis-mutants.tsv names for it.
+#   WORKLOAD_PROFILE=reshard-ownership  the reshard-ownership profile
+#             (antithesis/reshard-ownership/README.md): its config, its owned
+#             areas and its required assertions on top of this workload's.
+#             Default catalog-maintenance (scripts/profile.sh).
 #
 # Exit 0: every gate passed (or, in the self-check, exactly the injected
 # failure appeared; in a mutant run, the mutant's property was evaluated
@@ -36,10 +40,12 @@ WL="$(cd "$HERE/.." && pwd)"
 OUT="${1:?out dir}"
 SECS="${2:-240}"
 MUTANT="${RAVEL_ANTITHESIS_MUTANT:-}"
-OWNED_TSV="$(cd "$WL/../.." && pwd)/formal/tla/catalog/antithesis-mutants.tsv"
+# shellcheck source=profile.sh
+. "$HERE/profile.sh" || exit 1
 # shellcheck source=mutant-tsv.sh
 . "$HERE/mutant-tsv.sh"
-COMPOSE_BASE="$WL/config/docker-compose.yaml"
+COMPOSE_BASE="$PROFILE_DIR/config/docker-compose.yaml"
+echo "profile $WORKLOAD_PROFILE: $COMPOSE_BASE"
 GATE=FAIL
 if [ "${WORKLOAD_INJECT_SWAPPED_RECORD:-}" = 1 ] && [ "${WORKLOAD_INJECT_STALE_TOKEN_RESULT:-}" = 1 ]; then
     echo "refused: the two self-checks are separate runs; unset one of WORKLOAD_INJECT_SWAPPED_RECORD and WORKLOAD_INJECT_STALE_TOKEN_RESULT"
@@ -109,6 +115,12 @@ SETUP_LIMIT=900
 # After the window jump the driver waits up to 150 s more for a server sweep
 # to delete an input.
 END_LIMIT=$((SECS + 4800 + 900 + 19 * 60 + 150))
+# The reshard profile's situations run first in the eventually: the
+# activation writes, the fence (a 75 s stale-view wait, one move, writes
+# that may each wait out a store timeout, and up to 300 s of recovery), and
+# up to two decrease cycles of up to three moves each, with their bursts and
+# straggler reads. Seven more moves of 60 s, and 1500 s for the rest.
+[ "$WORKLOAD_PROFILE" = reshard-ownership ] && END_LIMIT=$((END_LIMIT + 7 * 60 + 1500))
 SERVERS="ravel1 ravel2 maint1 maint2"
 MULTISET="catalog: compaction preserves the acked multiset"
 UPPER="catalog: no scan shows a phantom or an excess copy"
@@ -155,6 +167,36 @@ REQUIRED=(
     "catalog: a token read ran on a node restarted since the write"
     "commit: a commit token's stale-answer evidence read evaluated"
 )
+# The reshard profile (antithesis/reshard-ownership/README.md, "Required"),
+# the pre-registered rows of D6 of the #4340 step 5 decision: the increase's
+# generation append won its CAS (in ravel-cli-ant's own file) and a write
+# after the jump landed at an added shard; the fence situation was reached
+# (each node's grace routing and fence are checked per node below); a
+# decrease left a straggler, a read resolved it above the active count, and a
+# write after the decrease routed below 4; a forged token was refused and the
+# SUT evaluated its durability property; HEAD folded a post-activation hour
+# with data at both added shards.
+RESHARD_REQUIRED=(
+    "resharding: generation append CAS won"
+    "reshard: a generation activated"
+    "reshard: the clocks passed the writers' lead horizon while the provisioning record's reads were refused"
+    "reshard: a write routed before a decrease landed at a retired shard in its activation hour"
+    "resharding: a token resolved at a shard index above the active count"
+    "reshard: a write routed after the decrease activated was acknowledged"
+    "reshard: an acknowledged write sits below the shard count it was routed at"
+    "reshard: a forged token for a record never written was refused as unsatisfiable"
+    "resharding: a commit token whose record is durable resolves across a reshard"
+    "reshard: HEAD's footprint named data of a folded post-activation hour at every shard the increase added"
+)
+# Hit, and held, in each --mode all node's own SDK file.
+RESHARD_PER_NODE=(
+    "resharding: a stale writer routed on a grace-extended view"
+    "resharding: a writer past the lead horizon was fenced"
+    "resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops"
+)
+if [ "$WORKLOAD_PROFILE" = reshard-ownership ]; then
+    REQUIRED+=("${RESHARD_REQUIRED[@]}")
+fi
 mkdir -p "$OUT"
 export COMPOSE_FILE="$COMPOSE_BASE:$WL/local/docker-compose.local.yaml"
 export COMPOSE_PROJECT_NAME=ravel-antithesis-catalog
@@ -415,14 +457,23 @@ jq -rs '[.[].antithesis_assert // empty] | group_by(.message)[]
 # every assertion of this workload's own driver (the `clock: ` ones among
 # them). An unreached always-assertion of another area is listed, never
 # failed.
-owned_areas=$(awk -F '\t' '!/^#/ && $2 ~ /^[a-z0-9-]+\// { sub(/\/.*/, "", $2); print $2 }' "$OWNED_TSV" | sort -u)
-[ -n "$owned_areas" ] || abort "could not read the owned areas from $OWNED_TSV"
+owned_tsvs=()
+for area in $PROFILE_OWNED_TSV; do
+    owned_tsvs+=("$(cd "$WL/../.." && pwd)/formal/tla/$area/antithesis-mutants.tsv")
+done
+owned_areas=$(awk -F '\t' '!/^#/ && $2 ~ /^[a-z0-9-]+\// { sub(/\/.*/, "", $2); print $2 }' "${owned_tsvs[@]}" | sort -u)
+[ -n "$owned_areas" ] || abort "could not read the owned areas from ${owned_tsvs[*]}"
 jq -r '.antithesis_assert.message // empty' "$OUT/sdk-driver.jsonl" | sort -u > "$OUT/driver-assertions.txt" \
     || abort "could not read the driver's assertions"
 [ -s "$OUT/driver-assertions.txt" ] || abort "the driver declared no assertions"
 : > "$OUT/never-hit-owned.tsv"
 : > "$OUT/never-hit-other-areas.tsv"
+: > "$OUT/never-hit-pending.tsv"
 while IFS= read -r m; do
+    if [ -n "$PROFILE_PENDING" ] && printf '%s\n' "$PROFILE_PENDING" | grep -qxF -- "$m"; then
+        echo "$m" >> "$OUT/never-hit-pending.tsv"
+        continue
+    fi
     mine=""
     for area in $owned_areas; do
         case "$m" in "$area: "*) mine=1 ;; esac
@@ -439,10 +490,32 @@ if [ -s "$OUT/never-hit-other-areas.tsv" ]; then
     echo "not this workload's (owned: $(tr '\n' ' ' <<< "$owned_areas")and the driver's own), unreached and not gated:"
     sed 's/^/  /' "$OUT/never-hit-other-areas.tsv"
 fi
+if [ -s "$OUT/never-hit-pending.tsv" ]; then
+    echo "owned, unreached, and pending a forced situation not built yet (scripts/profile.sh), not gated:"
+    sed 's/^/  /' "$OUT/never-hit-pending.tsv"
+fi
 for m in "${REQUIRED[@]}"; do
     hits=$(awk -F '\t' -v m="$m" '$4 == m { print $3 }' "$OUT/assertions.tsv")
     [ -n "$hits" ] && [ "$hits" -gt 0 ] || fail "required assertion never held: $m"
 done
+if [ "$WORKLOAD_PROFILE" = reshard-ownership ]; then
+    # The fence on each node, from that node's own file: each node held a
+    # view, routed on it past the refresh interval, and stopped past the
+    # lead horizon.
+    for node in ravel1 ravel2; do
+        for m in "${RESHARD_PER_NODE[@]}"; do
+            held=$(jq -r --arg m "$m" 'select(.antithesis_assert.message == $m
+                    and .antithesis_assert.hit and .antithesis_assert.condition) | 1' \
+                "$OUT/sdk-$node.jsonl" 2>/dev/null | wc -l)
+            [ "$held" -gt 0 ] || fail "required assertion never held on $node: $m"
+        done
+    done
+    # Every node served again within 300 s of the fence's thaw-read.
+    thawed=$(jq -r 'select(.antithesis_assert.message == "catalog: the system recovers once faults stop"
+            and .antithesis_assert.hit and .antithesis_assert.condition
+            and .antithesis_assert.details.after == "thaw-read") | 1' "$OUT/sdk-driver.jsonl" | wc -l)
+    [ "$thawed" -gt 0 ] || fail "required assertion never held after the thaw-read: catalog: the system recovers once faults stop"
+fi
 
 if [ -n "$MUTANT" ]; then
     # The mutant's property decides; every other violation is reported.

@@ -839,6 +839,28 @@ mod tests {
         assert_eq!(init.matches("gc-config").count(), 0);
     }
 
+    /// The reshard-ownership profile's compose file is this workload's with
+    /// the driver container running `driver-reshard`
+    /// (antithesis/reshard-ownership/README.md): any other difference would
+    /// give the profile another topology than the one its README states.
+    #[test]
+    fn the_reshard_profile_compose_differs_only_in_its_driver_binary() {
+        fn settings(compose: &str) -> Vec<&str> {
+            compose
+                .lines()
+                .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+                .collect()
+        }
+        let plain = include_str!("../../config/docker-compose.yaml");
+        let reshard = include_str!("../../../reshard-ownership/config/docker-compose.yaml");
+        let binary = "/usr/local/bin/driver-reshard";
+        assert_eq!(reshard.matches(binary).count(), 2, "{binary}");
+        assert_eq!(
+            settings(&reshard.replace(binary, "/usr/local/bin/driver")),
+            settings(plain)
+        );
+    }
+
     #[test]
     fn a_clock_that_did_not_move_is_not_a_jump() {
         let before = 500_000 * NS_PER_HOUR;

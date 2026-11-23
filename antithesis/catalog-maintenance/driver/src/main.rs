@@ -25,6 +25,8 @@ mod clock;
 mod forced;
 mod multiset;
 mod race;
+#[cfg(feature = "reshard")]
+mod reshard;
 mod s3;
 mod seed;
 mod stop;
@@ -360,6 +362,9 @@ struct Shared {
     gate: RwLock<()>,
     stop: Stop,
     eventually_on: bool,
+    /// What the reshard profile has done so far.
+    #[cfg(feature = "reshard")]
+    reshard: reshard::State,
 }
 
 struct Workload(Arc<Shared>);
@@ -482,8 +487,19 @@ impl Shared {
     /// retried on a 503, a 429 or no response; `node` picks each attempt's
     /// node. Returns whether it was acknowledged.
     fn write(&self, records: u32, streams: u32, node: &mut dyn FnMut() -> usize) -> bool {
+        self.write_with_id(records, streams, node).1
+    }
+
+    /// [`Shared::write`], also returning the write's id; `None` when the
+    /// model is full and nothing was sent.
+    fn write_with_id(
+        &self,
+        records: u32,
+        streams: u32,
+        node: &mut dyn FnMut() -> usize,
+    ) -> (Option<u64>, bool) {
         let Some(w) = self.register(records) else {
-            return false;
+            return (None, false);
         };
         let body = otlp::logs_request(w.id, records, streams, w.ts_ns);
         for attempt_no in 0..=MAX_RETRIES {
@@ -506,14 +522,14 @@ impl Shared {
             let retryable = match attempt {
                 Attempt::NoResponse => true,
                 Attempt::Refused { status } => status == 503 || status == 429,
-                Attempt::Acked { .. } => return true,
+                Attempt::Acked { .. } => return (Some(w.id), true),
                 _ => false,
             };
             if !retryable || attempt_no == MAX_RETRIES {
                 break;
             }
         }
-        false
+        (Some(w.id), false)
     }
 
     fn begin_attempt(&self, id: u64) -> usize {
@@ -552,6 +568,11 @@ impl Shared {
             .into_iter()
             .chain(tokens.iter().map(|(_, t)| u64::from(t.hour)));
         let count = self.history(answered_ns / NS_PER_HOUR).routed_count(hours);
+        #[cfg(feature = "reshard")]
+        {
+            let decoded: Vec<token::Token> = tokens.iter().map(|(_, t)| t.clone()).collect();
+            reshard::observe_ack(self, id, sent_ns, &decoded, count);
+        }
         if let Some((_, first)) = tokens.into_iter().next() {
             lock(&self.acks).record(
                 id,
@@ -773,6 +794,10 @@ impl Shared {
             return;
         }
         let acked = lock(&self.model).acked_logs.len();
+        // The reshard profile appends its increase first, so this jump,
+        // longer than the shortest lead, activates it.
+        #[cfg(feature = "reshard")]
+        reshard::before_sealing_jump(self);
         // A move given up before its offset write leaves the slot empty, so a
         // later rule or the eventually takes the jump instead.
         let Ok(jump) = self.shift_clock(reason, &|_| self.clock.jump_s) else {
@@ -2078,6 +2103,8 @@ impl Shared {
                 watermark_hour: wm,
                 resolved: resolved.iter().cloned().collect(),
             });
+            #[cfg(feature = "reshard")]
+            reshard::check_new_shards(self, &prefix, wm, resolved);
         }
         // A text parse that found nothing, or other parts than the JSON
         // form lists, would check nothing and pass.
@@ -2926,6 +2953,10 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     if lock(&s.head_key).is_none() {
         let _ = s.inspect_json();
     }
+    // The reshard profile's situations run first, so every race, fold,
+    // compaction, sweep and read below runs across both reshards.
+    #[cfg(feature = "reshard")]
+    reshard::eventually(s);
     for _ in 0..FOLD_RACES_EVENTUALLY {
         if s.fold_overtaken.load(Ordering::SeqCst) {
             break;
@@ -3360,6 +3391,8 @@ fn main(tc: TestCase) {
         gate: RwLock::new(()),
         stop: Stop::default(),
         eventually_on,
+        #[cfg(feature = "reshard")]
+        reshard: reshard::State::default(),
     });
 
     for node in 0..shared.ravel.nodes.len() {

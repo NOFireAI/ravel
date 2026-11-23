@@ -82,7 +82,7 @@ impl Cli {
 /// scripts/local-run.sh collects it as `sdk-cli.jsonl`. In Antithesis the
 /// SDK's voidstar handler takes precedence over the variable.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "reshard")),
     expect(dead_code, reason = "the reshard profile is the first caller")
 )]
 pub const ANT_SDK_OUTPUT: &str = "/tmp/sdk-cli.jsonl";
@@ -94,7 +94,7 @@ pub const ANT_SDK_OUTPUT: &str = "/tmp/sdk-cli.jsonl";
 /// CLI's catalog declares every area's assertions, and local-run.sh reads
 /// the driver's file as the driver's own.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "reshard")),
     expect(dead_code, reason = "the reshard profile is the first caller")
 )]
 pub struct AntCli {
@@ -102,7 +102,7 @@ pub struct AntCli {
 }
 
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "reshard")),
     expect(dead_code, reason = "the reshard profile is the first caller")
 )]
 impl AntCli {

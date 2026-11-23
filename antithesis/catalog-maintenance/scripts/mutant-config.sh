@@ -1,5 +1,7 @@
 #!/bin/bash
-# Write a copy of config/ that runs one mutant (ADR-4326 decision 3): every
+# Write a copy of the profile's config/ (WORKLOAD_PROFILE, scripts/profile.sh:
+# this workload's, or antithesis/reshard-ownership/config) that runs one
+# mutant (ADR-4326 decision 3): every
 # image the workload builds names its catalog-maintenance-mutants tag, and
 # RAVEL_ANTITHESIS_MUTANT names the mutant on every ravel-server container
 # (ravel1, ravel2, maint1, maint2). launch.sh launches the copy; local-run.sh
@@ -15,9 +17,12 @@
 # the reason on stderr; nothing usable is left in dest-dir.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WL="$(cd "$HERE/.." && pwd)"
 # shellcheck source=mutant-tsv.sh
 . "$HERE/mutant-tsv.sh"
+# The profile whose config/ is copied (WORKLOAD_PROFILE, default
+# catalog-maintenance).
+# shellcheck source=profile.sh
+. "$HERE/profile.sh" || exit 1
 MUTANT="${1:?mutant name}"
 DEST="${2:?destination directory}"
 PLAIN_TAG=catalog-maintenance
@@ -43,7 +48,7 @@ if [ -e "$DEST" ] && [ -n "$(ls -A "$DEST")" ]; then
     refuse "$DEST exists and is not empty"
 fi
 mkdir -p "$DEST"
-cp -R "$WL/config/." "$DEST/"
+cp -R "$PROFILE_DIR/config/." "$DEST/"
 SRC="$DEST/docker-compose.yaml"
 OUTF="$DEST/docker-compose.yaml.tmp"
 

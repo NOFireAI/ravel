@@ -131,6 +131,7 @@ rc=0
 if [ "$WHAT" = all ] || [ "$WHAT" = server ]; then check "$SERVER" ravel-server "$MODE" || rc=1; fi
 if [ "$WHAT" = all ] || [ "$WHAT" = driver ]; then
     check "$DRIVER" driver || rc=1
+    check "$DRIVER" driver-reshard || rc=1
     check "$DRIVER" s3-proxy || rc=1
     check "$DRIVER" ravel-cli-ant || rc=1
 fi

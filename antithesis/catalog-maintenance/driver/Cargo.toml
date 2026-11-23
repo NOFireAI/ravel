@@ -17,6 +17,11 @@ path = "src/lib.rs"
 name = "driver"
 path = "src/main.rs"
 
+[features]
+# The reshard-ownership profile's driver (src/reshard.rs), built as a second
+# binary, driver-reshard; antithesis/reshard-ownership/README.md says why.
+reshard = []
+
 [[bin]]
 name = "s3-proxy"
 path = "src/bin/s3_proxy.rs"
