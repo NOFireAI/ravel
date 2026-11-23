@@ -553,8 +553,100 @@ async fn a_part_over_the_series_cap_gets_no_series_refs_and_one_at_it_does() {
 
     let (_, report, head) = fold_fixture_at_ppm(5_350).await;
     assert_eq!(report.metrics_series_index_parts_over_cap, 0, "{report:?}");
+    assert_eq!(report.metrics_series_index_over_cap_parts, Vec::new());
     assert_eq!(report.key_index_leaves_written, 4, "{report:?}");
     assert_eq!(leaf_fields(&head.parts[0]).len(), 4);
+}
+
+/// The fixture's per-field pairs: three label pairs for each of the six
+/// series, one class posting value per series, and one `class_objects`
+/// entry per (class, entry): 3 + 2 + 3 + 2 + 1.
+fn fixture_series_pairs() -> BTreeMap<String, u64> {
+    BTreeMap::from([
+        (METRICS_SERIES_LABEL_FIELD.to_string(), 18),
+        (METRICS_SERIES_CLASS_FIELD.to_string(), 6),
+        (METRICS_CLASS_OBJECTS_FIELD.to_string(), 11),
+    ])
+}
+
+/// The fixture's distinct entry sets: A {1, 2, 6}, B and F {1, 2},
+/// C {3, 4, 5}, D {3, 4} and E {6}, by writer.
+const FIXTURE_CLASSES: u64 = 5;
+const FIXTURE_SERIES: u64 = 6;
+
+/// An over-cap part is reported with its sizes: the published part's hash,
+/// the 1,026 leaf bytes against the 1,025-byte cap, each field's bytes equal
+/// to the leaves a fold under a cap it fits publishes for that field, and
+/// the fixture's pairs, class and series counts.
+#[tokio::test]
+async fn a_part_over_the_series_cap_reports_each_field_and_its_classes() {
+    let (_, built_report, built_head) = fold_fixture_at_ppm(5_350).await;
+    assert_eq!(built_report.metrics_series_index_over_cap_parts, Vec::new());
+    let mut published_bytes: BTreeMap<String, u64> = BTreeMap::new();
+    for leaf in &built_head.parts[0].key_index {
+        if is_series_index_field(Signal::Metrics, &leaf.field) {
+            *published_bytes.entry(leaf.field.clone()).or_insert(0) += leaf.size;
+        }
+    }
+    assert_eq!(published_bytes.len(), 3, "{published_bytes:?}");
+
+    let (_, report, head) = fold_fixture_at_ppm(5_349).await;
+    assert_eq!(report.metrics_series_index_parts_over_cap, 1, "{report:?}");
+    let [detail] = report.metrics_series_index_over_cap_parts.as_slice() else {
+        panic!("one over-cap part: {report:?}");
+    };
+    assert_eq!(detail.part_blake3, hex_encode(&head.parts[0].blake3));
+    assert_eq!(detail.leaf_bytes, Some(FIXTURE_SERIES_LEAF_BYTES));
+    assert_eq!(detail.cap, FIXTURE_SERIES_LEAF_BYTES - 1);
+    let field_bytes = detail.field_bytes.clone().expect("byte-cap branch");
+    assert_eq!(field_bytes, published_bytes);
+    assert_eq!(
+        field_bytes.values().sum::<u64>(),
+        FIXTURE_SERIES_LEAF_BYTES,
+        "{field_bytes:?}"
+    );
+    assert_eq!((detail.body_bytes, detail.body_ceiling), (None, None));
+    assert_eq!(detail.field_pairs, fixture_series_pairs());
+    assert_eq!(detail.classes, FIXTURE_CLASSES);
+    assert_eq!(detail.series, FIXTURE_SERIES);
+}
+
+/// Folds `objects` (`(writer_seq, shard, series)`, 10 samples each) at a
+/// 1 ppm series cap, which no part fits, and returns the one over-cap part.
+async fn over_cap_part_of(objects: &[(u64, u32, &[SeriesSpec])]) -> SeriesIndexOverCapPart {
+    let store = recording_store();
+    for &(seq, shard, series) in objects {
+        publish_series_object(store.as_ref(), shard, seq, KIDX_HOUR, series, 10).await;
+    }
+    let catalog = Catalog::new(
+        store.clone(),
+        CatalogConfig {
+            metrics_series_index_max_ratio_ppm: 1,
+            ..series_config(true)
+        },
+    )
+    .expect("catalog");
+    let report = fold_through(&catalog, Signal::Metrics, KIDX_HOUR).await;
+    assert_eq!(report.metrics_series_index_parts_over_cap, 1, "{report:?}");
+    let [detail] = report.metrics_series_index_over_cap_parts.as_slice() else {
+        panic!("one over-cap part: {report:?}");
+    };
+    detail.clone()
+}
+
+/// A class is a distinct entry set, not a `class_objects` entry: three
+/// series held by the same two objects are one class with two entries,
+/// and three series with three different entry sets are three classes
+/// with five entries.
+#[tokio::test]
+async fn the_over_cap_class_count_counts_distinct_entry_sets() {
+    let shared = over_cap_part_of(&[(1, 0, &[A, B, C]), (2, 0, &[A, B, C])]).await;
+    assert_eq!((shared.classes, shared.series), (1, 3), "{shared:?}");
+    assert_eq!(shared.field_pairs[METRICS_CLASS_OBJECTS_FIELD], 2);
+
+    let own = over_cap_part_of(&[(1, 0, &[A, B, C]), (2, 0, &[A]), (3, 0, &[B])]).await;
+    assert_eq!((own.classes, own.series), (3, 3), "{own:?}");
+    assert_eq!(own.field_pairs[METRICS_CLASS_OBJECTS_FIELD], 5);
 }
 
 /// One key whose posting exceeds the leaf body ceiling is `BodyOverCeiling`
@@ -572,6 +664,20 @@ async fn a_posting_over_the_body_ceiling_leaves_the_part_without_series_refs() {
     let (_, report, head) = fold_fixture_at_ppm(1_000_000).await;
     set_key_index_leaf_body_ceiling_for_test(None);
     assert_eq!(report.metrics_series_index_parts_over_cap, 1, "{report:?}");
+    assert_eq!(
+        report.metrics_series_index_over_cap_parts,
+        vec![SeriesIndexOverCapPart {
+            part_blake3: hex_encode(&head.parts[0].blake3),
+            leaf_bytes: None,
+            cap: FIXTURE_DATA_BYTES,
+            field_bytes: None,
+            body_bytes: Some(largest),
+            body_ceiling: Some(largest - 1),
+            field_pairs: fixture_series_pairs(),
+            classes: FIXTURE_CLASSES,
+            series: FIXTURE_SERIES,
+        }]
+    );
     assert!(
         head.parts[0]
             .key_index
@@ -1049,6 +1155,17 @@ async fn rebuild_key_index_defers_a_failed_read_and_counts_a_part_over_the_cap()
         .await
         .expect("rebuild");
     assert_eq!(report.series_index_parts_over_cap, 1, "{report:?}");
+    let [detail] = report.series_index_over_cap_parts.as_slice() else {
+        panic!("one over-cap part: {report:?}");
+    };
+    assert_eq!(detail.part_blake3, hex_encode(&head.parts[0].blake3));
+    assert_eq!(detail.leaf_bytes, Some(FIXTURE_SERIES_LEAF_BYTES));
+    assert_eq!(detail.cap, FIXTURE_SERIES_LEAF_BYTES - 1);
+    assert_eq!(detail.field_pairs, fixture_series_pairs());
+    assert_eq!(
+        (detail.classes, detail.series),
+        (FIXTURE_CLASSES, FIXTURE_SERIES)
+    );
     assert_eq!(report.parts_over_cap, 0, "{report:?}");
     assert_eq!(report.parts_rebuilt, 0, "{report:?}");
     assert_eq!(report.leaves_written, 0, "{report:?}");

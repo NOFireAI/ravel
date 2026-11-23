@@ -55,6 +55,7 @@ use crate::snapshot_format::{
 use crate::tenant_config::DeclaredTypedColumn;
 
 mod series_index;
+pub use series_index::SeriesIndexOverCapPart;
 pub(crate) use series_index::{
     BuiltSeriesIndex, SeriesIndexLimits, SeriesIndexOutcome, build_part_series_index,
     is_series_index_field,
@@ -461,8 +462,13 @@ pub struct FoldReport {
     /// of the part's entries' object bytes, or one key's posting or entries
     /// exceeded the leaf body ceiling. Zero unless
     /// [`CatalogConfig::metrics_series_index`](crate::CatalogConfig::metrics_series_index)
-    /// is on.
+    /// is on. Equal to the length of `metrics_series_index_over_cap_parts`.
     pub metrics_series_index_parts_over_cap: u64,
+    /// One element per part `metrics_series_index_parts_over_cap` counts, in
+    /// the order the publishing attempt built them: its leaf bytes against
+    /// its cap, the bytes and pairs of each of the three fields, and its
+    /// class and series counts. Empty when that counter is zero.
+    pub metrics_series_index_over_cap_parts: Vec<SeriesIndexOverCapPart>,
     /// Re-encoded metrics parts the publishing attempt built no
     /// `label_value` leaf for because a metrics erasure request was pending
     /// (or the pending-erasure LIST failed) when the fold started.
@@ -3908,6 +3914,8 @@ pub(crate) struct BuiltPartKeyIndex {
     /// The series index's outcome when the fold built it for the part
     /// ([`merge_series_index`]); `None` when it was not built.
     pub(crate) series_outcome: Option<SeriesIndexOutcome>,
+    /// The part's series-index sizes when `series_outcome` is `OverCap`.
+    pub(crate) series_over_cap: Option<SeriesIndexOverCapPart>,
 }
 
 /// Adds a part's series-index build to its generic leaves: its refs, kept
@@ -3921,6 +3929,7 @@ pub(crate) fn merge_series_index(built: &mut BuiltPartKeyIndex, series: BuiltSer
     built.uncovered_entries += series.uncovered_entries;
     built.field_pairs.extend(series.field_pairs);
     built.series_outcome = Some(series.outcome);
+    built.series_over_cap = series.over_cap;
 }
 
 /// What [`build_part_key_index`] does where the fold and the
@@ -4414,6 +4423,7 @@ pub(crate) async fn build_part_key_index(
                     field_passes,
                     stopped_on_failed_get: true,
                     series_outcome: None,
+                    series_over_cap: None,
                 });
             }
             first_pass = false;
@@ -4502,6 +4512,7 @@ pub(crate) async fn build_part_key_index(
             field_passes,
             stopped_on_failed_get: false,
             series_outcome: None,
+            series_over_cap: None,
         };
         for (name, field) in fields {
             built.field_pairs.insert(name, field.pairs);
@@ -5948,6 +5959,7 @@ impl Catalog {
             let mut total_part_bytes: u64 = 0;
             let mut metrics_label_index_parts_over_cap: u64 = 0;
             let mut metrics_series_index_parts_over_cap: u64 = 0;
+            let mut metrics_series_index_over_cap_parts: Vec<SeriesIndexOverCapPart> = Vec::new();
             let mut metrics_label_index_parts_erasure_gated: u64 = 0;
             let mut parts_reused: u64 = 0;
             let mut key_index_parts_missing_declared_leaves: u64 = 0;
@@ -6353,6 +6365,9 @@ impl Catalog {
                     if built.series_outcome == Some(SeriesIndexOutcome::OverCap) {
                         metrics_series_index_parts_over_cap += 1;
                     }
+                    if let Some(detail) = built.series_over_cap {
+                        metrics_series_index_over_cap_parts.push(detail);
+                    }
                     key_index_uncovered_entries += built.uncovered_entries;
                     key_index_leaves_written += built.refs.len() as u64;
                     key_index_leaf_bytes_written +=
@@ -6746,6 +6761,7 @@ impl Catalog {
                         key_index_carry_peak_held_bytes: counters.key_index_carry_peak_held_bytes,
                         metrics_label_index_parts_over_cap,
                         metrics_series_index_parts_over_cap,
+                        metrics_series_index_over_cap_parts,
                         metrics_label_index_parts_erasure_gated,
                         metrics_label_index_erasure_list_requests: counters
                             .metrics_label_index_erasure_list_requests,
@@ -8332,6 +8348,7 @@ fn no_op_report(
         key_index_carry_peak_held_bytes: counters.key_index_carry_peak_held_bytes,
         metrics_label_index_parts_over_cap: 0,
         metrics_series_index_parts_over_cap: 0,
+        metrics_series_index_over_cap_parts: Vec::new(),
         metrics_label_index_parts_erasure_gated: 0,
         metrics_label_index_erasure_list_requests: counters
             .metrics_label_index_erasure_list_requests,

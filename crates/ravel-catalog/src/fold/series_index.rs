@@ -205,6 +205,47 @@ pub(crate) struct BuiltSeriesIndex {
     /// Per field: postings values for the posting fields, entries for
     /// `class_objects`.
     pub(crate) field_pairs: BTreeMap<String, u64>,
+    /// The part's sizes; `Some` exactly when the outcome is `OverCap`.
+    pub(crate) over_cap: Option<SeriesIndexOverCapPart>,
+}
+
+/// The sizes of one metrics part the series-index build left with no series
+/// index because it was over the byte cap or a key was over the leaf body
+/// ceiling (ADR-4146 decision 2), as
+/// [`FoldReport::metrics_series_index_over_cap_parts`] and
+/// [`KeyIndexRebuildReport::series_index_over_cap_parts`](crate::KeyIndexRebuildReport::series_index_over_cap_parts)
+/// list them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SeriesIndexOverCapPart {
+    /// The part's BLAKE3, lowercase hex.
+    pub part_blake3: String,
+    /// The encoded bytes of the three fields' leaves, summed. `None` when a
+    /// key was over the leaf body ceiling, which stops the encode.
+    pub leaf_bytes: Option<u64>,
+    /// The part's series-index byte cap: its entries' object bytes times
+    /// [`CatalogConfig::metrics_series_index_max_ratio_ppm`](crate::CatalogConfig::metrics_series_index_max_ratio_ppm).
+    pub cap: u64,
+    /// The encoded leaf bytes of each of the three fields, summing to
+    /// `leaf_bytes`. `None` exactly when `leaf_bytes` is.
+    pub field_bytes: Option<BTreeMap<String, u64>>,
+    /// The body bytes of the leaf slice the encoder refused because one key
+    /// passed the leaf body ceiling; `None` on the byte-cap branch.
+    pub body_bytes: Option<u64>,
+    /// The leaf body ceiling that key passed; `None` on the byte-cap branch.
+    pub body_ceiling: Option<u64>,
+    /// Per field: postings values for `series_label` and `series_class`,
+    /// entries for `class_objects`.
+    pub field_pairs: BTreeMap<String, u64>,
+    /// Distinct entry sets among the part's series.
+    pub classes: u64,
+    /// Series of the part, one per distinct series key.
+    pub series: u64,
+}
+
+impl SeriesIndexOverCapPart {
+    fn pairs_of(&self, field: &str) -> u64 {
+        self.field_pairs.get(field).copied().unwrap_or(0)
+    }
 }
 
 /// One series of the build: the part entries holding it and its pairs.
@@ -605,31 +646,51 @@ pub(crate) async fn build_part_series_index(
     #[cfg(test)]
     SERIES_BUILD_LOG.with(|log| log.borrow_mut().push(record));
 
-    let not_built = |outcome| BuiltSeriesIndex {
+    let not_built = |outcome, over_cap| BuiltSeriesIndex {
         outcome,
         refs: Vec::new(),
         uncovered_entries: part_entry_count * METRICS_SERIES_INDEX_FIELDS.len() as u64,
         field_pairs: BTreeMap::new(),
+        over_cap,
     };
     if get_failed && caller == KeyIndexBuildCaller::Repair {
-        return Ok(not_built(SeriesIndexOutcome::Deferred));
+        return Ok(not_built(SeriesIndexOutcome::Deferred, None));
     }
     if uncovered.len() as u64 == part_entry_count {
-        return Ok(not_built(SeriesIndexOutcome::Uncovered));
+        return Ok(not_built(SeriesIndexOutcome::Uncovered, None));
     }
 
     let fields = series_index_entries(series, &uncovered);
+    let over_cap = |leaf_bytes, field_bytes, body_bytes, body_ceiling| SeriesIndexOverCapPart {
+        part_blake3: hex::encode(part_blake3),
+        leaf_bytes,
+        cap: limits.leaf_bytes_cap,
+        field_bytes,
+        body_bytes,
+        body_ceiling,
+        field_pairs: fields.pairs(),
+        classes: fields.classes,
+        series: fields.series_class.len() as u64,
+    };
     let encoded = match encode_series_index(tenant, part_blake3, part_entry_count, &fields, limits)
     {
         Ok(encoded) => encoded,
         Err(KeyIndexLeafEncodeError::BodyOverCeiling { body, ceiling }) => {
+            let detail = over_cap(None, None, Some(body), Some(ceiling));
             tracing::warn!(
                 tenant = %tenant.to_hex(),
+                part_blake3 = %detail.part_blake3,
                 body,
                 ceiling,
+                cap = detail.cap,
+                series_label_pairs = detail.pairs_of(METRICS_SERIES_LABEL_FIELD),
+                series_class_pairs = detail.pairs_of(METRICS_SERIES_CLASS_FIELD),
+                class_objects_pairs = detail.pairs_of(METRICS_CLASS_OBJECTS_FIELD),
+                classes = detail.classes,
+                series = detail.series,
                 "a series-index key exceeds the key-index leaf body ceiling; the part gets no series index"
             );
-            return Ok(not_built(SeriesIndexOutcome::OverCap));
+            return Ok(not_built(SeriesIndexOutcome::OverCap, Some(detail)));
         }
         Err(err) => {
             tracing::error!(
@@ -637,18 +698,41 @@ pub(crate) async fn build_part_series_index(
                 error = %err,
                 "series-index leaf encode refused; the part gets no series index"
             );
-            return Ok(not_built(SeriesIndexOutcome::Refused));
+            return Ok(not_built(SeriesIndexOutcome::Refused, None));
         }
     };
     let leaf_bytes: u64 = encoded.iter().map(|leaf| leaf.bytes.len() as u64).sum();
     if leaf_bytes > limits.leaf_bytes_cap {
+        let mut field_bytes: BTreeMap<String, u64> = METRICS_SERIES_INDEX_FIELDS
+            .iter()
+            .map(|(field, _)| (field.to_string(), 0))
+            .collect();
+        for leaf in &encoded {
+            *field_bytes.entry(leaf.leaf_ref.field.clone()).or_insert(0) += leaf.bytes.len() as u64;
+        }
+        let bytes_of = |field: &str| field_bytes.get(field).copied().unwrap_or(0);
+        let (series_label_bytes, series_class_bytes, class_objects_bytes) = (
+            bytes_of(METRICS_SERIES_LABEL_FIELD),
+            bytes_of(METRICS_SERIES_CLASS_FIELD),
+            bytes_of(METRICS_CLASS_OBJECTS_FIELD),
+        );
+        let detail = over_cap(Some(leaf_bytes), Some(field_bytes), None, None);
         tracing::warn!(
             tenant = %tenant.to_hex(),
+            part_blake3 = %detail.part_blake3,
             leaf_bytes,
-            cap = limits.leaf_bytes_cap,
+            cap = detail.cap,
+            series_label_bytes,
+            series_class_bytes,
+            class_objects_bytes,
+            series_label_pairs = detail.pairs_of(METRICS_SERIES_LABEL_FIELD),
+            series_class_pairs = detail.pairs_of(METRICS_SERIES_CLASS_FIELD),
+            class_objects_pairs = detail.pairs_of(METRICS_CLASS_OBJECTS_FIELD),
+            classes = detail.classes,
+            series = detail.series,
             "the part's series-index leaves would exceed the byte cap; the part gets no series index"
         );
-        return Ok(not_built(SeriesIndexOutcome::OverCap));
+        return Ok(not_built(SeriesIndexOutcome::OverCap, Some(detail)));
     }
     let mut refs = Vec::with_capacity(encoded.len());
     for leaf in encoded {
@@ -664,6 +748,7 @@ pub(crate) async fn build_part_series_index(
         refs,
         uncovered_entries: uncovered.len() as u64 * METRICS_SERIES_INDEX_FIELDS.len() as u64,
         field_pairs: fields.pairs(),
+        over_cap: None,
     })
 }
 
@@ -673,6 +758,8 @@ pub(crate) struct SeriesIndexEntries {
     pub(crate) series_class: Vec<KeyIndexPostingEntry>,
     pub(crate) class_objects: Vec<KeyIndexLeafEntry>,
     pub(crate) uncovered: Vec<u64>,
+    /// Distinct entry sets, each one class.
+    pub(crate) classes: u64,
 }
 
 impl SeriesIndexEntries {
@@ -750,6 +837,7 @@ fn series_index_entries(
         series_class,
         class_objects,
         uncovered: uncovered.iter().copied().collect(),
+        classes: class_sets.len() as u64,
     }
 }
 
