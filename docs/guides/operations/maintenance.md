@@ -446,7 +446,8 @@ A metrics segment also closes on a second criterion that no flag sets: what
 the reader decodes from one segment. A segment's flagged provenance samples
 (the samples of its run-merged runs) and its run total are each kept at or
 under the most the reader's catalog decode accepts under its default limits,
-so the compactor never publishes a segment its own reader refuses. This check
+so the reader does not refuse a published segment on either of the two. The
+reader's page and section size limits are not checked this way. The check on the two bounds
 runs before a series is added, so a series that would take the segment over
 the bound closes the segment first. Segments split only between series, so a
 single series that is over the bound on its own cannot be placed. The
