@@ -5,9 +5,9 @@
 //! Arrow's comparison kernel answers `x <> ''` by comparing each value's
 //! bytes with the literal's. When a value is itself empty, that is a
 //! zero-length `memcmp` whose second pointer is the literal's empty buffer,
-//! a dangling, unmapped address; a vectorised `memcmp` that reads through
-//! both pointers under a mask whatever the length then costs far more than
-//! the length test it amounts to. [`EmptyCompareExpr`] computes the same
+//! a dangling address; a libc `memcmp` that reads through both pointers
+//! under an AVX-512 mask whatever the length was measured at about 51 ns a
+//! call instead of about 2 ns. [`EmptyCompareExpr`] computes the same
 //! answer without reading a byte:
 //!
 //! - an offsets layout (`Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`): the
@@ -23,8 +23,8 @@
 //! `Dictionary(Int32, Utf8)`, so its `<>` runs the test once per dictionary
 //! entry; on a plain page those entries are the rows' own values.
 //!
-//! [`EmptyStringCompare`] installs the expression in the two places a filter
-//! runs in a `logs` plan: a `FilterExec` predicate, and the row filter a
+//! [`EmptyStringCompare`] installs the expression in two places a filter
+//! runs: a `FilterExec` predicate over any table, and the row filter a
 //! [`LogsScanExec`] evaluates on each batch it builds (ADR-0093, exact
 //! not-equal amendment). It replaces only `=` and `<>` between such an
 //! operand and a non-NULL empty literal, anywhere inside the predicate (under
@@ -453,10 +453,11 @@ mod tests {
     /// kernel's answer, for `=` and `<>`.
     ///
     /// Flipped: dropping the validity (`BooleanArray::new(values, None)`)
-    /// fails at the NULL rows of every slice; reading lengths from a start
-    /// offset of 0 instead of the slice's first offset fails at row 0 of the
-    /// slice from row 1, which is `''`; testing the dictionary's keys instead
-    /// of its values fails at the first row keyed to an entry other than 0.
+    /// fails at the NULL rows of the unsliced `Utf8` array; reading lengths
+    /// from a start offset of 0 instead of the slice's first offset fails at
+    /// row 0 of the `Utf8` slice from row 1, which is `''`; testing the
+    /// dictionary's keys instead of its values fails at the first `''` row,
+    /// whose entry is not at key 0.
     #[test]
     fn every_layout_matches_the_rows_when_sliced_and_null() {
         for rows in [&ROWS[..], &NO_EMPTY[..]] {
@@ -620,6 +621,18 @@ mod tests {
                     bin(col("n"), Operator::Eq, lit(ScalarValue::Int64(Some(1)))),
                 ),
                 "empty_ne(s@0) OR n@2 = 1",
+            ),
+            (
+                bin(
+                    bin(
+                        col("t"),
+                        Operator::Eq,
+                        lit(ScalarValue::Utf8(Some("x".into()))),
+                    ),
+                    Operator::And,
+                    bin(lit(empty_utf8()), Operator::Eq, col("s")),
+                ),
+                "t@1 = x AND empty_eq(s@0)",
             ),
         ];
         for (expr, want) in rewrites {
