@@ -162,7 +162,13 @@ pub fn winner_parts(record_key: &str, record: &[u8]) -> Result<Vec<String>, Stri
     parts
         .iter()
         .map(|p| {
-            if p.content_hash.len() != 32 || p.part_index > 9999 {
+            if p.part_index > 9999 {
+                return Err(format!(
+                    "{record_key}: part index {} does not fit the key's 4 digits",
+                    p.part_index
+                ));
+            }
+            if p.content_hash.len() != 32 {
                 return Err(format!(
                     "{record_key}: part {} has a {}-byte content hash",
                     p.part_index,
@@ -750,6 +756,11 @@ mod tests {
             short.encode_to_vec()
         };
         assert!(winner_parts(&record_key, &short).is_err());
+        // A part index past the key's 4 digits names no key either, and says
+        // so.
+        let wide = record_bytes(&hash, &[(10_000, 0xaa)]);
+        let err = winner_parts(&record_key, &wide).expect_err("index too wide");
+        assert!(err.contains("part index 10000"), "{err}");
     }
 
     #[test]

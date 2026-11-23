@@ -14,8 +14,9 @@
 //! losing to a concurrent compaction, the same with the winner record's
 //! input-set hash diverging or one of its parts gone, a sweep past a
 //! compaction record that HEAD has not folded, and a sweep past the
-//! protection horizon while HEAD is unreadable. Token reads read an acked write back with its commit
-//! tokens before and after its input is compacted, folded and swept, and
+//! protection horizon while HEAD is unreadable. Token reads read an acked
+//! write back with its commit tokens before and after its input is
+//! compacted, folded and swept, and
 //! judge every answer exactly against the model. The eventually stops
 //! faults, sweeps every shard and checks the whole multiset. See
 //! antithesis/catalog-maintenance/README.md for the properties.
@@ -333,6 +334,10 @@ struct Shared {
     /// Tamper undos the store kept refusing, retried before every clock
     /// move and in the eventually.
     pending_undos: Mutex<Vec<Undo>>,
+    /// Set once the eventually's stop-faults command returned (at once in
+    /// the local loop, which injects none). `stop.stopping()` is set
+    /// earlier, before that command runs.
+    faults_stopped: AtomicBool,
     /// Set once the unfolded-record sweep took its first sweep jump; the rule
     /// runs it once per timeline.
     unfolded_started: AtomicBool,
@@ -1020,8 +1025,18 @@ impl Shared {
     /// gave the move up, before any write.
     fn shift_clock(&self, reason: &str, by_s: &dyn Fn(u64) -> u64) -> Result<Jump, String> {
         // A tampered record race's hour must not seal for the fold with
-        // the tamper still in the store.
+        // the tamper still in the store, so no clock moves while an undo is
+        // pending.
         self.retry_pending_undos(reason);
+        let pending: Vec<String> = lock(&self.pending_undos)
+            .iter()
+            .map(|u| u.key().to_string())
+            .collect();
+        if !pending.is_empty() {
+            let e = format!("{reason}: no clock move while a tamper undo is pending: {pending:?}");
+            println!("{e}");
+            return Err(e);
+        }
         let frozen = self.quiet_head(reason)?;
         let before_ns = now_ns();
         let by_s = by_s(before_ns / NS_PER_SECOND);
@@ -1799,7 +1814,7 @@ impl Shared {
         };
         // Undone whether or not the race reached its situation, once the
         // loser has had its GET, HEAD and GET of the record answered.
-        let faults_may_run = !self.stop.stopping();
+        let faults_may_run = !self.faults_stopped.load(Ordering::SeqCst);
         let (tamper_key, tamper_error, undone) = match tampered {
             None => (None, None, None),
             Some(Err(e)) => (None, Some(e), None),
@@ -3114,6 +3129,7 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
             Err(e) => println!("eventually: running {cmd} failed: {e}"),
         }
     }
+    s.faults_stopped.store(true, Ordering::SeqCst);
     let recovered = s.wait_serving(Duration::from_secs(300), "eventually");
     assert_always!(
         recovered.is_ok(),
@@ -3569,6 +3585,7 @@ fn main(tc: TestCase) {
         divergent_lost: AtomicBool::new(false),
         part_missing_lost: AtomicBool::new(false),
         pending_undos: Mutex::new(Vec::new()),
+        faults_stopped: AtomicBool::new(false),
         unfolded_started: AtomicBool::new(false),
         unfolded_reached: AtomicBool::new(false),
         unreadable_started: AtomicBool::new(false),

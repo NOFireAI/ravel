@@ -676,12 +676,15 @@ exited and its record is in the store:
    tamper: PUT the CLI's record back if the forged one is still there (a
    record a mutant loser wrote stays; that loser had PUT its parts), or PUT
    the part back if it is still absent. An undo the store refuses is
-   retried for 120 s (`forced::UNDO_FOR`), then left pending, and every
-   later clock move and the `eventually` retry it before anything else.
-   The race, its waits included, ends inside the 900 s between the hour
-   sealing for compaction and sealing for the fold, so no fold folds the
-   tampered record, and no query, audit or write of the driver runs while
-   it holds the gate.
+   retried for 120 s (`forced::UNDO_FOR`), then left pending: every later
+   clock move and the `eventually` retry it before anything else, and no
+   clock moves while it stays pending (the move reports itself not taken,
+   as one whose HEAD would not hold still does). The race, its waits
+   included, ends inside the 900 s between the hour sealing for compaction
+   and sealing for the fold, and only a clock move seals it, so no fold
+   folds the tampered record; no query, audit or write of the driver runs
+   while the race holds the gate. "Faults may run" ends only once the
+   `eventually`'s stop-faults command returned, not when it started.
 10. `pass`. Asserted as `catalog: a server's compaction record PUT lost to a
     record whose input-set hash diverges from its own` or `catalog: a
     server's compaction record PUT lost to a record whose part is missing
