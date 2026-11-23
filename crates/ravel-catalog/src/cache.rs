@@ -1733,6 +1733,9 @@ mod tests {
                     min: None,
                     max: None,
                     null_count: 0,
+                    sum: None,
+                    sum_wide: Vec::new(),
+                    zero_count: None,
                 })
                 .collect(),
             ..record(tenant_hash, shard)

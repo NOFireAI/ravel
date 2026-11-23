@@ -3330,6 +3330,23 @@ answer, so it is never an error. A decoder validates each entry against the
 allowlist and drops (and counts) an entry whose declared type is ineligible
 or whose min/max kinds disagree with it; a defective statistic leaves that
 column uncovered and never makes the record unreadable.
+Each entry (`DeclaredColumnMinMax`) may also carry three aggregate fields
+(ADR-4628 decision 1): `sum` (field 6, `optional sint64`), the exact sum of
+the column's non-null values when it fits i64; `sum_wide` (field 7,
+`bytes`), the same sum as 16 bytes of little-endian two's complement,
+written only when it does not fit i64 and never beside field 6; and
+`zero_count` (field 8, `optional uint64`), the number of non-null rows whose
+value equals the type's zero (0 for I64, false for BOOL). A sum is written
+only for an I64 column. Each is absent when its producer did not compute it,
+which reads as unknown, and no producer writes them yet. A decoder drops and
+counts an entry whose aggregates break ADR-4628 decision 2: both sum fields
+present, a `sum_wide` of any length other than 16 or holding a value that
+fits i64, a sum on a non-I64 column or outside `[non_null * min, non_null *
+max]`, a nonzero sum over no non-null rows, a `zero_count` above the
+non-null count, a nonzero `zero_count` when zero lies outside `[min, max]`,
+or a `zero_count` below the non-null count when min and max are both zero.
+The fields are additive and `format_version` stays 1: an older reader
+ignores them and keeps the min, max, and null count it read before.
 `CompactionPart.declared_column_stats` (field 12) is the same statement over
 the same merged view, per compaction or erasure-rewrite output part. The
 producer is the compaction recompute (`crates/ravel-maintain/src/rlog.rs`),
