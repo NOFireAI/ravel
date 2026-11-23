@@ -49,8 +49,15 @@
 //! column's validity, fixed-width values, 16 bytes of view or offset per row
 //! and copied string bytes come. Strings are copied into the chunk's own
 //! data block, so a chunk keeps no input batch alive. A chunk seals when the
-//! next row would pass the budget or at `routed_chunk_rows` rows; a row
-//! larger than the budget takes a chunk of its own, charged at its size.
+//! next row would pass the budget, when one of its buffers would have to
+//! grow and doubling it would take the buffers' capacities past the budget,
+//! or at `routed_chunk_rows` rows; a row larger than the budget takes a
+//! chunk of its own, charged at its size. A filling chunk's buffers only
+//! ever double, never resize to an exact length, so the bytes growth copies
+//! are less than twice the bytes its rows append, for any budget and row
+//! shape (issue #4650), and a chunk seals only once it and the refused row
+//! measure more than half its budget. `bucket_route_resize_bytes` and
+//! `bucket_route_chunks_sealed` count the copies and the chunks sealed.
 //!
 //! The rule runs before `CompactSlices`, which wraps only `AggregateExec`, so
 //! a converted aggregate gets neither half of that rule: the slice compaction
@@ -1760,9 +1767,10 @@ impl Router {
     /// [`route`](Self::route) on a route with a variable-width column
     /// (ADR-4143 decision 3): each bucket fills one [`ByteChunk`] of
     /// `budget` bytes at a time, charged in full before a row is written,
-    /// and sealed when the next row would take it past the budget or past
-    /// `chunk_rows` rows. A row larger than the budget takes a chunk of its
-    /// own, charged at its size.
+    /// and sealed when the next row does not [`fit`](ByteChunk::fits) it:
+    /// past the budget, past the budget once a buffer doubles for it, or
+    /// past `chunk_rows` rows. A row larger than the budget takes a chunk of
+    /// its own, charged at its size.
     fn route_bytes(
         &mut self,
         columns: &[ArrayRef],
