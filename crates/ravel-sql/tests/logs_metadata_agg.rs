@@ -2307,10 +2307,11 @@ async fn sum_plus_literal_is_exact_from_stats_and_scan() {
     assert_eq!(single_i64(scan_answer), Some(2));
 }
 
-/// The same rows through a statement the statistics path declines, two
-/// aggregates, with statistics loaded: the scan reads the exact 2 as well.
+/// The same rows through a statement with a second aggregate beside the
+/// `SUM(x + 1)` (issue #4651): the statistics path answers both, the exact 2
+/// for the sum and 2 for `COUNT(*)`, and reads no data object.
 #[tokio::test]
-async fn sum_plus_literal_beside_a_second_aggregate_scans_exactly() {
+async fn sum_plus_literal_beside_a_second_aggregate_answers_exactly() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
     let rows = [(100, Some(i64::MAX)), (200, Some(-i64::MAX))];
     let seg = write_real_segment(&store, "logs/wrap.rlog", 1, &rows).await;
@@ -2329,12 +2330,14 @@ async fn sum_plus_literal_beside_a_second_aggregate_scans_exactly() {
         .expect("physical plan");
     let shown = plan_str(&plan);
     assert!(
-        shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
-        "two aggregates must scan; plan was:\n{shown}"
+        shown.contains("MetadataOnlyExec") && !shown.contains("LogsScanExec"),
+        "both aggregates are answered from statistics; plan was:\n{shown}"
     );
+    let before = store.gets();
     let answer = collect(plan, ctx.task_ctx())
         .await
-        .expect("the scanned answer");
+        .expect("the statistics answer");
+    assert_eq!(store.gets(), before, "no data object is read");
     assert_eq!(single_i64(&answer), Some(2));
     let count = answer[0]
         .column(1)
