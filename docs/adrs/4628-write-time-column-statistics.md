@@ -736,8 +736,11 @@ erasure (test 2). Q2 and Q29 meet it once #4651 has landed.
     compaction record and its parts are gone; the raw commit record case
     is the new assertion.
 12. Opt-out (decision 8, question 6b): with the opt-out set, so emission
-    is off, no producer writes fields 6 to 8, and the four statements scan
-    with answers equal to those over the same rows with emission on.
+    is off, no producer writes fields 6 to 8, and on an unfolded catalog
+    the four statements scan, with answers equal to those over the same
+    rows with emission on. On a folded catalog the `.cstat` answers of
+    decision 5 still apply, so the test asserts the scan only before the
+    fold.
 
 Then the A/B of decision 7.
 
