@@ -202,8 +202,8 @@ The same comparison AND-ed with a shape the scan does not evaluate, in one
 unsplit expression, stays `Inexact`.
 
 A comparison of a string or binary expression with the empty literal by `=`
-or `<>`, either operand order, is evaluated from value lengths, never from
-value bytes (issue #4660). The `empty_string_compare` physical optimizer rule
+or `<>`, either operand order, is evaluated in a filter from value lengths
+instead of value bytes. The `empty_string_compare` physical optimizer rule
 (`crates/ravel-sql/src/empty_compare.rs`) replaces each such comparison in a
 `FilterExec` predicate and in the scan's row filter with `EmptyCompareExpr`,
 shown in EXPLAIN as `empty_eq(x)` or `empty_ne(x)`: `"SearchPhrase" <> ''`
@@ -217,8 +217,8 @@ as `Dictionary(Int32, Utf8)`, is tested once per dictionary entry. A NULL
 operand gives NULL, as arrow's comparison kernel does. That kernel compares
 bytes, and for an empty value it makes a zero-length `memcmp` against the
 literal's empty buffer, whose pointer is unmapped; on a c7a.metal host whose
-libc `memcmp` reads under an AVX-512 mask whatever the length, issue #4660
-measured those calls at about 51 ns each instead of 2 ns and 57 percent of
+libc `memcmp` reads under an AVX-512 mask whatever the length, those calls
+were measured at about 51 ns each instead of 2 ns and 57 percent of
 the cycles of ClickBench's `WHERE "SearchPhrase" <> '' ORDER BY
 "SearchPhrase" LIMIT 10` on v0.34.0. The rule is appended after every rule
 that matches a comparison's shape or rebuilds the scan from its row filters
