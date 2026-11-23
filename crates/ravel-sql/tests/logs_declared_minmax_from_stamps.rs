@@ -272,6 +272,9 @@ fn f64_stamp_entry(name: &str) -> DeclaredColumnMinMax {
             kind: Some(StampKind::I64(19_400)),
         }),
         null_count: 0,
+        sum: None,
+        sum_wide: Vec::new(),
+        zero_count: None,
     }
 }
 

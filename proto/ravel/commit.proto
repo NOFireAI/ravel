@@ -82,6 +82,15 @@ message DeclaredColumnMinMax {
   // or the stored variant mismatches declared_type). non_null = the
   // record's row count minus this.
   uint64 null_count = 5;
+  // Exact sum of the column's non-null values in this object, when it
+  // fits i64. I64 columns only (ADR-4628 decision 1).
+  optional sint64 sum = 6;
+  // The same sum as 16 bytes, little-endian two's complement, written
+  // only when it does not fit i64. Never present beside field 6.
+  bytes sum_wide = 7;
+  // Rows whose value is non-null and equals the type's zero: 0 for I64,
+  // false for BOOL.
+  optional uint64 zero_count = 8;
 }
 
 // One input segment identity folded into a CompactionRecord's input list

@@ -442,6 +442,9 @@ fn stamped_entries() -> Vec<SnapshotEntry> {
             kind: Some(Kind::I64(19_000)),
         }),
         null_count: 0,
+        sum: None,
+        sum_wide: Vec::new(),
+        zero_count: None,
     }];
     entries
 }

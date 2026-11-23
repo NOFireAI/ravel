@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f3f994301c0f643187834e4f03fb3a77f8ac6167bd557bb9ab54779616e38b66 # shrinks to name = "0", declared_type = 3, min = None, max = None, null_count = 0
+cc 557c77911f98346eabced3f868693b5ddf9bbd339d57eb131e55b06afe3e9904 # shrinks to (stat, rows) = (DeclaredColumnStat { name: "UserID", declared_type: I64, min: Some(I64(-9223372036854775808)), max: Some(I64(-9223372036854775807)), null_count: 68812734814965806, sum: Some(-169506498006397372993727247196818722863), zero_count: Some(0) }, 18446744073709551615)
+cc 9a9b4ee681a9801fcd30b358f3db2f35b06b1b73b567488922552de708bf6f86 # shrinks to (stat, rows) = (DeclaredColumnStat { name: "UserID", declared_type: I64, min: Some(I64(-5633946674767976122)), max: Some(I64(1)), null_count: 287316052962511, sum: Some(667437782), zero_count: None }, 18446744073709551615)

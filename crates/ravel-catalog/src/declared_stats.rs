@@ -106,11 +106,13 @@ fn value_to_commit(value: &DeclaredColumnStatValue) -> commit_pb::DeclaredColumn
     commit_pb::DeclaredColumnStatValue { kind }
 }
 
-/// One commit-side entry as its catalog-side mirror. Total and lossless: the
-/// two messages are field-for-field identical by construction (ADR-0873
-/// decision 1), including the value kinds and a present-but-empty value
-/// message, which is a defect the reader must still see rather than one this
-/// conversion may quietly normalise away.
+/// One commit-side entry as its catalog-side mirror. Total and lossless for
+/// fields 1 to 5: the two messages are field-for-field identical by
+/// construction (ADR-0873 decision 1), including the value kinds and a
+/// present-but-empty value message, which is a defect the reader must still
+/// see rather than one this conversion may quietly normalise away. Fields 6
+/// to 8 (ADR-4628) are not carried yet and are written absent, which a reader
+/// treats as unknown.
 fn entry_to_proto(entry: &commit_pb::DeclaredColumnMinMax) -> DeclaredColumnMinMax {
     DeclaredColumnMinMax {
         name: entry.name.clone(),
@@ -118,6 +120,9 @@ fn entry_to_proto(entry: &commit_pb::DeclaredColumnMinMax) -> DeclaredColumnMinM
         min: entry.min.as_ref().map(value_to_proto),
         max: entry.max.as_ref().map(value_to_proto),
         null_count: entry.null_count,
+        sum: None,
+        sum_wide: Vec::new(),
+        zero_count: None,
     }
 }
 
@@ -129,6 +134,9 @@ fn entry_to_commit(entry: &DeclaredColumnMinMax) -> commit_pb::DeclaredColumnMin
         min: entry.min.as_ref().map(value_to_commit),
         max: entry.max.as_ref().map(value_to_commit),
         null_count: entry.null_count,
+        sum: None,
+        sum_wide: Vec::new(),
+        zero_count: None,
     }
 }
 
@@ -614,6 +622,9 @@ mod tests {
                 min: None,
                 max: None,
                 null_count: 7,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             DeclaredColumnMinMax {
                 name: "Ratio".to_string(),
@@ -621,6 +632,9 @@ mod tests {
                 min: None,
                 max: None,
                 null_count: 7,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             // Present value message with no kind set.
             DeclaredColumnMinMax {
@@ -629,6 +643,9 @@ mod tests {
                 min: Some(DeclaredColumnStatValue { kind: None }),
                 max: Some(DeclaredColumnStatValue { kind: None }),
                 null_count: 0,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
             entry_to_proto(&commit_stats::encode(&i64_stat("EventDate", 1, 2, 0))),
         ];
@@ -713,6 +730,9 @@ mod tests {
                 min,
                 max,
                 null_count,
+                sum: None,
+                sum_wide: Vec::new(),
+                zero_count: None,
             },
         )
     }
