@@ -80,7 +80,9 @@ fn ms(ns: u64) -> f64 {
 /// The statement's wall time per stage, rendered under `stats.timings`
 /// (ADR-2677 decision 4). These are wall-clock stages, not the request
 /// accounting buckets `stats.phases` names. The five executor stages run one
-/// after another; the scan figures overlap them, measured inside a scan
+/// after another; `resolveGenerationsMs`, `resolveListWaveMs`,
+/// `resolveRecordsMs` and `resolveOtherMs` split `resolveMs` and sum to it
+/// ([`crate::PhaseWallTiming`]). The scan figures overlap them, measured inside a scan
 /// created during `startMs` and drained during `drainMs`. `audit` is the caller's wait on its audit submission,
 /// which runs outside the executor.
 ///
@@ -97,6 +99,10 @@ pub fn timings_json(stats: &SqlStats, audit: Duration) -> Json {
     let mut rendered = json!({
         "attempts": stats.attempts,
         "resolveMs": ms(wall.resolve_ns),
+        "resolveGenerationsMs": ms(wall.resolve_generations_ns),
+        "resolveListWaveMs": ms(wall.resolve_list_wave_ns),
+        "resolveRecordsMs": ms(wall.resolve_records_ns),
+        "resolveOtherMs": ms(wall.resolve_other_ns),
         "planMs": ms(wall.plan_ns),
         "startMs": ms(wall.start_ns),
         "firstBatchMs": ms(wall.first_batch_ns),
@@ -679,6 +685,10 @@ mod tests {
         };
         stats.wall = crate::PhaseWallTiming {
             resolve_ns: 1_000_000,
+            resolve_generations_ns: 13_000_000,
+            resolve_list_wave_ns: 14_000_000,
+            resolve_records_ns: 15_000_000,
+            resolve_other_ns: 16_000_000,
             plan_ns: 2_000_000,
             start_ns: 3_000_000,
             first_batch_ns: 4_000_000,
@@ -711,6 +721,10 @@ mod tests {
         let always: std::collections::BTreeSet<&str> = [
             "attempts",
             "resolveMs",
+            "resolveGenerationsMs",
+            "resolveListWaveMs",
+            "resolveRecordsMs",
+            "resolveOtherMs",
             "planMs",
             "startMs",
             "firstBatchMs",
@@ -736,6 +750,10 @@ mod tests {
             assert_eq!(rendered["scans"].as_u64(), Some(scans));
             for (key, value) in [
                 ("resolveMs", 1.0),
+                ("resolveGenerationsMs", 13.0),
+                ("resolveListWaveMs", 14.0),
+                ("resolveRecordsMs", 15.0),
+                ("resolveOtherMs", 16.0),
                 ("planMs", 2.0),
                 ("startMs", 3.0),
                 ("firstBatchMs", 4.0),
