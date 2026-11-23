@@ -656,16 +656,22 @@ comes from them. Clean code deletes nothing while HEAD is unreadable.
 The proxy (`driver/src/proxy.rs`, `driver/src/bin/s3_proxy.rs`) forwards
 every byte unchanged, Host header included, so each SigV4 signature still
 verifies at rustfs, and parses only request heads, to frame bodies and to
-match a PUT's key against the rules: `hold-record` and `hold-key <key>` hold
-one PUT until `release`, and `refuse-records`/`refuse-key <key>` answer it 503
-unsent. A held PUT, under either hold rule, is forwarded on a dedicated
+match a request's method and key against the rules: `hold-record` and
+`hold-key <key>` hold one PUT until `release`, and
+`refuse-records`/`refuse-key <key>` answer it 503 unsent. A held PUT, under either hold rule, is forwarded on a dedicated
 upstream connection so the proxy can read its response status, and
 `held-result` reports that `<key> <status>`, which the fold race and the
 record race read to tell a lost CAS or create (412/409) from a win (200) or a
 refusal for another reason (403, 5xx). Setting either hold rule clears the
-last result. Only PUTs are judged. A killed or restarted proxy has no rules, so a
-race it interrupts leaves the servers on the plain path and the race reports
-not reached.
+last result. `refuse-read <key>` answers every GET and HEAD of exactly that
+key 503 unsent, as a store failing those reads would, in a set of its own that
+`thaw-read <key>` and `pass` lift; it leaves every PUT rule, every other
+method on the key and every other key as they were. Every other rule judges
+only PUTs. Nothing in this driver sets `refuse-read` yet: the reshard profile
+(#4340) sets it on the tenant's provisioning record, `t/<h>/l/prov`, to fail
+the servers' view refresh and reach the stale-writer fence. A killed or
+restarted proxy has no rules, so a race it interrupts leaves the servers on
+the plain path and the race reports not reached.
 
 Each relayed connection runs on two threads, and a network fault can leave a
 peer that never sends, reads or closes, so the proxy bounds both (#4568). It
