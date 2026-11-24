@@ -1,5 +1,5 @@
-//! Dominant-key combining before the hash exchange (issue #4676, ADR-0102
-//! decision 2's amendment of 2026-11-24).
+//! Dominant-key combining before the hash exchange (issue #4676, ADR-0102,
+//! amendment of 2026-11-24).
 //!
 //! A `Partial` aggregate partition that skips aggregation (the probe
 //! thresholds in `crate::session`) forwards one state row per input row. When
@@ -53,7 +53,8 @@
 //! the first follows a pass that freed its counter, which it did not trigger:
 //! at most `n / (k + 1) + 1` forwarded rows, `n / (2P) + 1` at `k = 2P - 1`.
 //! State is held only for keys holding a counter: at most `k` groups per
-//! input partition, each one key and one fixed-width state.
+//! input partition, each one key and one fixed-width state. A key whose hash
+//! collides with a held key's is outside this bound: it is always forwarded.
 //!
 //! # Memory
 //!

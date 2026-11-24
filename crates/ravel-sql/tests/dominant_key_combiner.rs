@@ -1,4 +1,4 @@
-//! Issue #4676 (ADR-0102 decision 2's amendment of 2026-11-24): the
+//! Issue #4676 (ADR-0102, amendment of 2026-11-24): the
 //! dominant-key combiner between a `Partial` aggregate and its hash exchange.
 //!
 //! The "off" side of every answer comparison is

@@ -1086,7 +1086,7 @@ fn build_session_inner(
     if let Some(max_limit) = config.partition_topk_max_limit {
         builder = builder.with_physical_optimizer_rule(Arc::new(LogsPartitionTopK::new(max_limit)));
     }
-    // Issue #4676 (ADR-0102 decision 2's amendment of 2026-11-24): combine a
+    // Issue #4676 (ADR-0102, amendment of 2026-11-24): combine a
     // dominant group key's rows between a `Partial` aggregate and its hash
     // exchange. After every rule above: each of them matches the
     // partial/exchange/final shape `EnforceDistribution` chose or walks an

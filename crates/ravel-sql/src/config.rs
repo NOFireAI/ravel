@@ -520,8 +520,8 @@ pub struct SqlConfig {
     /// `tests/skip_partial_aggregation.rs`.
     pub skip_partial_aggregation: bool,
     /// Whether a partial aggregate's dominant group keys are combined before
-    /// the hash exchange (issue #4676, ADR-0102 decision 2's amendment of
-    /// 2026-11-24). Default `true`.
+    /// the hash exchange (issue #4676, ADR-0102, amendment of 2026-11-24).
+    /// Default `true`.
     ///
     /// A partition that skips partial aggregation forwards every row, so a
     /// key holding most of a scan's rows sends most of them through the
