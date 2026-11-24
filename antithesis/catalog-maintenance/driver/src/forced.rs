@@ -52,9 +52,9 @@ pub const TAMPER_HELD_WAIT: Duration = Duration::from_secs(45);
 
 /// One raw S3 request at its bound: curl's `--max-time` (`s3::MAX_TIME_S`).
 const S3_S: u64 = crate::s3::MAX_TIME_S;
-/// One proxy control command at its bound: the 2 s connect and 5 s read
-/// timeouts of `proxy::control`.
-const PROXY_CMD_S: u64 = 7;
+/// One proxy control command at its bound: `proxy::control`'s single
+/// deadline, which its address resolution, connect, write and read share.
+const PROXY_CMD_S: u64 = proxy::CONTROL_DEADLINE.as_secs();
 /// `clock::reach_wait_s`: one reread interval plus a second. Also the most
 /// two processes' faked clocks differ by.
 const REACH_WAIT_S: u64 = crate::clock::FAKETIME_CACHE_DURATION_S + 1;
@@ -149,6 +149,51 @@ pub fn tamper_fits(now_s: u64, hour: u64) -> bool {
     now_s + TAMPER_TAIL_S <= undo_by_s(hour)
 }
 
+/// What a record race does at the tamper point.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TamperPlan {
+    /// Tamper with the published record.
+    Run,
+    /// No tamper, and why, for the race's details.
+    Skip(String),
+    /// No tamper and nothing to say: the plain race, or no record was
+    /// published, which `published_before_release` reports.
+    Nothing,
+}
+
+/// Whether a race with `tamper` tampers, once the `ravel-cli` compaction
+/// had `budget` to finish: only after it exited (`cli_finished`), only over
+/// a record it published, and only when [`tamper_fits`] (`fits`).
+pub fn tamper_plan(
+    tamper: Tamper,
+    published: bool,
+    cli_finished: bool,
+    fits: bool,
+    budget: Duration,
+    hour: u64,
+) -> TamperPlan {
+    if tamper == Tamper::None {
+        return TamperPlan::Nothing;
+    }
+    if !cli_finished {
+        return TamperPlan::Skip(format!(
+            "no tamper: the ravel-cli compaction had not exited within its {:.1} s budget",
+            budget.as_secs_f64()
+        ));
+    }
+    if !published {
+        return TamperPlan::Nothing;
+    }
+    if !fits {
+        return TamperPlan::Skip(format!(
+            "no tamper: the {TAMPER_TAIL_S} s from the tamper to the first undo attempt \
+             would end past hour {hour}'s undo deadline, {} s before its fold seal",
+            UNDO_ATTEMPT_S + REACH_WAIT_S
+        ));
+    }
+    TamperPlan::Run
+}
+
 /// The wait before the undo: [`restore_after`], cut short so the first
 /// undo attempt still starts by [`undo_by_s`].
 pub fn restore_wait(now_s: u64, hour: u64, faults_may_run: bool) -> Duration {
@@ -184,20 +229,56 @@ pub fn race_elapsed_s(now_s: u64, hour: u64) -> i64 {
     now_s as i64 - (fold_seal_s(hour) - FOLD_SEAL_AFTER_NUDGE_S) as i64
 }
 
+/// Whether the record a loser met changed after the release.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecordChange {
+    /// `after` matches what was in place at the release.
+    Unchanged,
+    /// `after` differs from it.
+    Changed,
+    /// A read failed or found nothing.
+    Unknown,
+    /// The forged record's PUT returned an error, so what was in place at
+    /// the release is not known.
+    ForgeFailed,
+}
+
+impl RecordChange {
+    /// The value of `record_bytes_changed_after_release` in the race's
+    /// details.
+    pub fn detail(&self) -> serde_json::Value {
+        match self {
+            RecordChange::Unchanged => serde_json::Value::Bool(false),
+            RecordChange::Changed => serde_json::Value::Bool(true),
+            RecordChange::Unknown => serde_json::Value::Null,
+            RecordChange::ForgeFailed => serde_json::Value::String(
+                "unknown: the forged record's PUT failed (see tamper_error)".to_string(),
+            ),
+        }
+    }
+}
+
 /// Whether the record a loser met changed after the release: `after`, read
 /// 2 s after it, against what was in place at the release, the forged
 /// record in a divergent-record race and the CLI's record otherwise.
-/// `None` when either read failed or found nothing.
+/// `undo_error` is the tamper's own request error: with a forged record it
+/// leaves the record at the release unknown.
 pub fn record_changed(
     before: Option<&[u8]>,
     after: Option<&[u8]>,
     undo: Option<&Undo>,
-) -> Option<bool> {
+    undo_error: Option<&str>,
+) -> RecordChange {
     let at_release = match undo {
+        Some(Undo::Record { .. }) if undo_error.is_some() => return RecordChange::ForgeFailed,
         Some(Undo::Record { forged, .. }) => Some(forged.as_slice()),
         _ => before,
     };
-    Some(after? != at_release?)
+    match (after, at_release) {
+        (Some(after), Some(at_release)) if after == at_release => RecordChange::Unchanged,
+        (Some(_), Some(_)) => RecordChange::Changed,
+        _ => RecordChange::Unknown,
+    }
 }
 
 /// The wait before the undo: [`RESTORE_AFTER_FAULTS`] while faults may run,
@@ -965,6 +1046,10 @@ mod tests {
         let reach = crate::clock::reach_wait_s(reread);
         let s3 = crate::s3::MAX_TIME_S;
         let serve_round = 2 * (2 + crate::READ_TIMEOUT.as_secs()) + 2 * 2 + 2;
+        // One control command: resolution, connect, write and read under
+        // one deadline.
+        assert_eq!(PROXY_CMD_S, proxy::CONTROL_DEADLINE.as_secs());
+        assert_eq!(PROXY_CMD_S, 7);
         let before_tamper = (reread + 30) // shift_clock: the move reaching the driver
             + reach // shift_clock: its reach wait
             + s3 // shift_clock: the GET of HEAD
@@ -992,6 +1077,16 @@ mod tests {
         assert_eq!(BEFORE_TAMPER_S, 372);
         assert_eq!(TAMPER_TAIL_S, 347);
         assert_eq!(TAMPER_RACE_S, 842);
+    }
+
+    #[test]
+    fn the_local_loop_budgets_each_tampering_race_at_its_bound() {
+        let script = include_str!("../../scripts/local-run.sh");
+        let set: Vec<&str> = script
+            .lines()
+            .filter(|l| l.starts_with("TAMPER_RACE_S="))
+            .collect();
+        assert_eq!(set, [format!("TAMPER_RACE_S={TAMPER_RACE_S}")]);
     }
 
     #[test]
@@ -1065,12 +1160,12 @@ mod tests {
         // Divergent-record race: the forged record still there is no
         // change, though it differs from the CLI's; a loser's own record is.
         assert_eq!(
-            record_changed(Some(b"cli"), Some(b"forged"), Some(&forged)),
-            Some(false)
+            record_changed(Some(b"cli"), Some(b"forged"), Some(&forged), None),
+            RecordChange::Unchanged
         );
         assert_eq!(
-            record_changed(Some(b"cli"), Some(b"loser"), Some(&forged)),
-            Some(true)
+            record_changed(Some(b"cli"), Some(b"loser"), Some(&forged), None),
+            RecordChange::Changed
         );
         // Otherwise the CLI's record is what the loser met.
         let part = Undo::Part {
@@ -1078,15 +1173,92 @@ mod tests {
             bytes: b"part".to_vec(),
         };
         assert_eq!(
-            record_changed(Some(b"cli"), Some(b"cli"), Some(&part)),
-            Some(false)
+            record_changed(Some(b"cli"), Some(b"cli"), Some(&part), None),
+            RecordChange::Unchanged
         );
         assert_eq!(
-            record_changed(Some(b"cli"), Some(b"loser"), None),
-            Some(true)
+            record_changed(Some(b"cli"), Some(b"loser"), None, None),
+            RecordChange::Changed
         );
-        assert_eq!(record_changed(Some(b"cli"), None, None), None);
-        assert_eq!(record_changed(None, Some(b"cli"), None), None);
+        assert_eq!(
+            record_changed(Some(b"cli"), None, None, None),
+            RecordChange::Unknown
+        );
+        assert_eq!(
+            record_changed(None, Some(b"cli"), None, None),
+            RecordChange::Unknown
+        );
+        assert_eq!(RecordChange::Unchanged.detail(), serde_json::json!(false));
+        assert_eq!(RecordChange::Changed.detail(), serde_json::json!(true));
+        assert_eq!(RecordChange::Unknown.detail(), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_failed_forge_reads_as_a_failed_forge_not_a_change() {
+        let forged = Undo::Record {
+            key: "r".to_string(),
+            original: b"cli".to_vec(),
+            forged: b"forged".to_vec(),
+        };
+        // The forged PUT errored and the CLI's record is still there: it
+        // differs from the forged bytes, and that is no change by a loser.
+        let change = record_changed(Some(b"cli"), Some(b"cli"), Some(&forged), Some("503"));
+        assert_eq!(change, RecordChange::ForgeFailed);
+        let detail = change.detail();
+        assert!(
+            detail
+                .as_str()
+                .is_some_and(|d| d.contains("forged record's PUT failed")),
+            "{detail}"
+        );
+        // A failed part DELETE leaves the record judged as before.
+        let part = Undo::Part {
+            key: "p".to_string(),
+            bytes: b"part".to_vec(),
+        };
+        assert_eq!(
+            record_changed(Some(b"cli"), Some(b"cli"), Some(&part), Some("503")),
+            RecordChange::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_skipped_tamper_says_why() {
+        let budget = Duration::from_millis(9800);
+        let plan = |tamper, published, finished, fits| {
+            tamper_plan(tamper, published, finished, fits, budget, HOUR)
+        };
+        assert_eq!(plan(Tamper::Diverge, true, true, true), TamperPlan::Run);
+        assert_eq!(plan(Tamper::DeletePart, true, true, true), TamperPlan::Run);
+        // The plain race never tampers, and says nothing.
+        assert_eq!(plan(Tamper::None, true, true, true), TamperPlan::Nothing);
+        assert_eq!(plan(Tamper::None, true, false, false), TamperPlan::Nothing);
+        // An unfinished CLI is the reason, whether or not the race fits.
+        let unfinished = TamperPlan::Skip(
+            "no tamper: the ravel-cli compaction had not exited within its 9.8 s budget"
+                .to_string(),
+        );
+        assert_eq!(plan(Tamper::Diverge, true, false, true), unfinished);
+        assert_eq!(plan(Tamper::Diverge, true, false, false), unfinished);
+        assert_eq!(plan(Tamper::DeletePart, false, false, true), unfinished);
+        // A CLI that exited without publishing leaves nothing to tamper.
+        assert_eq!(
+            plan(Tamper::Diverge, false, true, true),
+            TamperPlan::Nothing
+        );
+        // The deadline check is tamper_fits: the tail against the undo
+        // deadline.
+        let TamperPlan::Skip(late) = plan(Tamper::Diverge, true, true, false) else {
+            panic!("a race that does not fit must skip");
+        };
+        assert!(
+            late.contains(&format!("the {TAMPER_TAIL_S} s from the tamper")),
+            "{late}"
+        );
+        assert!(
+            late.contains(&format!("hour {HOUR}'s undo deadline")),
+            "{late}"
+        );
     }
 
     #[test]

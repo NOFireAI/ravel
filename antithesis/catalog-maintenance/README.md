@@ -690,11 +690,15 @@ still ends before the hour seals for the fold (`forced::tamper_fits`):
    The faked clocks run in real time, so the hour seals for the fold 870 s
    after the nudge whether or not the driver moves a clock. The race keeps
    every tamper inside that: `forced::TAMPER_RACE_S`, the whole race with
-   every wait, raw S3 request (30 s each), proxy command (7 s each) and
-   serving round (70 s) at its bound, the undo retries and their last
-   attempt included, is 842 s, and a const assertion holds it at or below
-   870 s. At run time the driver also reads its own clock: it tampers only
-   when the rest of the race still fits (`forced::tamper_fits`), cuts the
+   every wait, raw S3 request (30 s each), proxy command (7 s each:
+   `proxy::CONTROL_DEADLINE`, one deadline that the command's address
+   resolution, connect, write and read share) and serving round (70 s) at
+   its bound, the undo retries and their last attempt included, is 842 s,
+   and a const assertion holds it at or below 870 s. At run time the driver
+   also reads its own clock: it tampers only when the CLI exited and the
+   rest of the race still fits (`forced::tamper_plan`,
+   `forced::tamper_fits`), and the race's `tamper_error` says which of the
+   two stopped a tamper. It cuts the
    wait before the undo so the first attempt starts in time
    (`forced::restore_wait`). An undo attempt that starts later than one
    attempt and one clock skew before the seal (`forced::undo_by_s`) fires
@@ -1096,9 +1100,12 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     fallback.
 - The local loop's bound on the driver's run after setup is `seconds` plus
   4800 s for the `eventually`, which runs the forced races before its fold,
-  plus 250 s for each of up to six divergent-record and missing-part races,
-  900 s for its fresh compaction read, 60 s for each of up to 25 clock
-  moves, and 150 s for the wait after the window jump.
+  plus `forced::TAMPER_RACE_S` (842 s) for each of up to six
+  divergent-record and missing-part races, 900 s for its fresh compaction
+  read, 60 s for each of up to 25 clock moves, 150 s for the wait after the
+  window jump, and 2380 s for a drawn race or sweep still holding the
+  driver's gate when the `eventually` is due. `local-run.sh` holds its own
+  copy of the 842 s, and a driver unit test checks it against the constant.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
   self-check. The model expects one seeded record moved to another write, so
   `catalog: compaction preserves the acked multiset` must appear in

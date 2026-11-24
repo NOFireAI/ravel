@@ -1832,15 +1832,19 @@ impl Shared {
                 // published, and only while the rest of the race at its
                 // bounds still ends before the hour seals for the fold.
                 let fits = forced::tamper_fits(now_ns() / NS_PER_SECOND, record.hour);
-                let tampered = match &before {
-                    Ok(Some(bytes)) if tamper != Tamper::None && cli.is_finished() && fits => {
+                let plan = forced::tamper_plan(
+                    tamper,
+                    matches!(before, Ok(Some(_))),
+                    cli.is_finished(),
+                    fits,
+                    budget,
+                    record.hour,
+                );
+                let tampered = match (&before, plan) {
+                    (Ok(Some(bytes)), forced::TamperPlan::Run) => {
                         Some(self.tamper(tamper, &key, bytes))
                     }
-                    Ok(Some(_)) if tamper != Tamper::None && !fits => Some(Err(format!(
-                        "no tamper: the race would not end {} s before hour {}'s fold seal",
-                        forced::UNDO_ATTEMPT_S,
-                        record.hour
-                    ))),
+                    (_, forced::TamperPlan::Skip(why)) => Some(Err(why)),
                     _ => None,
                 };
                 let in_place = match &tampered {
@@ -1898,6 +1902,10 @@ impl Shared {
                 Some(Ok((undo, _))) => Some(undo),
                 _ => None,
             },
+            match &tampered {
+                Some(Ok((_, error))) => error.as_deref(),
+                _ => None,
+            },
         );
         // Undone whether or not the race reached its situation, once the
         // loser has had its GET, HEAD and GET of the record answered, and
@@ -1942,7 +1950,7 @@ impl Shared {
             "released_at_age_ms": released_at_age.map(|a| a.as_millis()),
             "held_status": held_status,
             "held_result": held_result.as_ref().map(|(k, s)| format!("{k} {s}")),
-            "record_bytes_changed_after_release": changed,
+            "record_bytes_changed_after_release": changed.detail(),
             "tamper": format!("{tamper:?}"),
             "tamper_key": tamper_key,
             "tamper_error": tamper_error,
