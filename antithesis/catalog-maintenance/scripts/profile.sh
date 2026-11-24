@@ -29,10 +29,6 @@ case "$WORKLOAD_PROFILE" in
         # It runs the whole catalog-maintenance workload as well, so it owns
         # the catalog area too.
         PROFILE_OWNED_TSV="catalog resharding maintenance"
-        # Reached only when a maintain worker warm-starts from a peer's memo
-        # snapshot, which the local loop does not force
-        # (antithesis/reshard-ownership/README.md, "The expected set").
-        PROFILE_PENDING="maintenance: a seeded memo entry is never fresher than its snapshot"
         ;;
     *)
         echo "refused: WORKLOAD_PROFILE is '$WORKLOAD_PROFILE', not catalog-maintenance or reshard-ownership" >&2
