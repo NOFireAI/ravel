@@ -1852,6 +1852,38 @@ values.
 - A metrics or spans load ignores the flag and prints a warning when it is
   set to `estimated`.
 
+### Withholding stamp sums with `--no-declared-stat-aggregates`
+
+Each logs commit record carries a declared-column stamp: for every declared
+`I64` or `BOOL` column, its min, max and null count over the object, the
+exact sum of an `I64` column, and the count of rows equal to 0 (or
+`false`). On an unfolded catalog, queries answer `SUM`, `AVG` and `<> 0`
+counts from these without reading the data objects.
+
+`--no-declared-stat-aggregates` withholds the sum and the zero count (stamp
+fields 6 to 8) from the commit records this logs load writes.
+
+- The min, max and null count are still written, so `MIN` and `MAX` still
+  answer from the stamps.
+- On an unfolded catalog, `SUM`, `AVG` and a `<> 0` count where 0 lies
+  inside a segment's min and max scan the data objects of those segments.
+  On a folded catalog the `.cstat` statistics can still answer them: the
+  flag does not touch `.cstat`, and a fold still writes its sums there.
+- The reason to set it: a sum is a subject value for erasure, and a sum
+  written to a commit record under an Object Lock stays until that record's
+  retain-until. The flag keeps new records free of
+  it; it does not remove fields already written, on a locked record or
+  any other.
+- It changes only the records this load writes. A later compaction of these
+  segments recomputes the fields from the rows, so a compactor that does
+  not withhold writes them into its output.
+- The summary's `stamp aggregates` line and the report JSON's
+  `declared_stat_aggregates` field say which the load wrote, for a logs
+  load only. A metrics or spans load writes no stamp, ignores the flag and
+  prints a warning when it is set.
+- `ravel-server` and `ravel-cli maintain` take no such flag yet: the
+  server's logs flush and every logs compaction write the fields.
+
 ### Clustering key and bloom scope
 
 A tenant's config record can carry a clustering key and a bloom scope

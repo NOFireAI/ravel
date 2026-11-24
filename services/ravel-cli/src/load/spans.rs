@@ -81,6 +81,7 @@ impl SpansLoadReport {
             decode_wait_ms: None,
             write_wait_ms: None,
             page_choice: None,
+            declared_stat_aggregates: None,
         }
     }
 }

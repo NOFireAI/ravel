@@ -127,6 +127,7 @@ pub async fn load_with_fold_after_load(
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
         None,
         true,
         Arc::new(TenantRules::none()),
@@ -180,6 +181,7 @@ pub async fn load_with_memory(
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
         Some(load_memory),
         false,
         Arc::new(TenantRules::none()),
@@ -272,6 +274,7 @@ pub(super) async fn load_instrumented(
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
         None,
         false,
         Arc::new(TenantRules::none()),
@@ -318,6 +321,7 @@ pub(super) async fn load_instrumented_at(
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
     page_choice: LoadPageChoice,
+    declared_stat_aggregates: DeclaredStatAggregates,
     load_memory: Option<LoadMemoryOptions>,
     fold_after_load: bool,
     rules: Arc<TenantRules>,
@@ -345,6 +349,7 @@ pub(super) async fn load_instrumented_at(
         group_target_blocks,
         chunk_order,
         page_choice,
+        declared_stat_aggregates,
         DRAIN_REFLUSH_PERIOD,
         load_memory,
         fold_after_load,
@@ -384,6 +389,7 @@ pub(super) async fn load_with_drain_reflush_period(
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
     page_choice: LoadPageChoice,
+    declared_stat_aggregates: DeclaredStatAggregates,
     drain_reflush_period: Duration,
     load_memory: Option<LoadMemoryOptions>,
     fold_after_load: bool,
@@ -510,6 +516,7 @@ pub(super) async fn load_with_drain_reflush_period(
                 group_target_blocks,
                 chunk_order,
                 page_choice,
+                declared_stat_aggregates,
             ),
             Arc::clone(&store),
             Arc::clone(&clock),
@@ -572,6 +579,7 @@ pub(super) async fn load_with_drain_reflush_period(
     let started = Instant::now();
     let mut report = LoadReport {
         page_choice,
+        declared_stat_aggregates,
         ..LoadReport::default()
     };
     if budget.is_some() {
@@ -2557,20 +2565,24 @@ fn shard_skew_warning(distinct_shards: usize, shards: u32) -> Option<String> {
 }
 
 /// The log loader's router config: `base` with the RLOG writer levers set,
-/// `page_choice` (`--page-choice`) among them. The router hands the config to
-/// every shard flush, so it reaches the row and the columnar path alike.
+/// `page_choice` (`--page-choice`) among them, and the stamp's sum and zero
+/// count withheld under `--no-declared-stat-aggregates`. The router hands the
+/// config to every shard flush, so it reaches the row and the columnar path
+/// alike.
 fn log_load_ingest_config(
     base: IngestConfig,
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
     page_choice: LoadPageChoice,
+    declared_stat_aggregates: DeclaredStatAggregates,
 ) -> IngestConfig {
     IngestConfig {
         rlog_zstd_level: zstd_level,
         rlog_group_target_blocks: group_target_blocks,
         rlog_chunk_order: chunk_order,
         rlog_page_choice: page_choice.page_choice(),
+        emit_declared_stat_aggregates: declared_stat_aggregates.emits(),
         ..base
     }
 }

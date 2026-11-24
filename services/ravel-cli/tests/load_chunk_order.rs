@@ -99,6 +99,7 @@ async fn field_dir_ids_at(
         RlogGroupTargetBlocks::DEFAULT,
         chunk_order,
         ravel_cli::load::LoadPageChoice::default(),
+        ravel_cli::load::DeclaredStatAggregates::default(),
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

@@ -295,6 +295,7 @@ async fn load_one(store: &Arc<dyn ObjectStoreBackend>, fx: &Fixture) -> bytes::B
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         ravel_cli::load::LoadPageChoice::default(),
+        ravel_cli::load::DeclaredStatAggregates::default(),
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

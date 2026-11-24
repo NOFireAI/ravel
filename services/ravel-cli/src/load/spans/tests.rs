@@ -433,6 +433,34 @@ fn metrics_and_spans_warn_on_a_non_default_page_choice_and_logs_does_not() {
     );
 }
 
+/// `--no-declared-stat-aggregates` on a metrics or spans load is named as
+/// ignored; emitting, or either value on a logs load, is not.
+#[test]
+fn metrics_and_spans_warn_on_the_stamp_aggregate_opt_out_and_logs_does_not() {
+    for value in [
+        DeclaredStatAggregates::Emit,
+        DeclaredStatAggregates::Withhold,
+    ] {
+        assert_eq!(
+            unused_declared_stat_aggregates_warning(value, SignalArg::Logs),
+            None
+        );
+    }
+    for (signal, noun) in [(SignalArg::Metrics, "metrics"), (SignalArg::Spans, "spans")] {
+        assert_eq!(
+            unused_declared_stat_aggregates_warning(DeclaredStatAggregates::Emit, signal),
+            None
+        );
+        assert_eq!(
+            unused_declared_stat_aggregates_warning(DeclaredStatAggregates::Withhold, signal),
+            Some(format!(
+                "warning: a {noun} load ignores --no-declared-stat-aggregates. Only the commit \
+                 records a logs load writes carry a declared-column stamp."
+            ))
+        );
+    }
+}
+
 /// The future-skew bound is kept and the past-lag bound is relaxed,
 /// both anchored on the span's END exactly as `checked_span_interval`
 /// anchors them.

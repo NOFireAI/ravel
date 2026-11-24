@@ -83,6 +83,7 @@ async fn row_groups_at(
         group_target_blocks,
         RlogChunkOrder::DEFAULT,
         ravel_cli::load::LoadPageChoice::default(),
+        ravel_cli::load::DeclaredStatAggregates::default(),
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
