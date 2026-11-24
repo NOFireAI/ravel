@@ -5,18 +5,24 @@
 //!
 //! Before the sealing jump the driver appends an increase from 4 to 6
 //! shards through `ravel-cli-ant` with the shortest lead, so the jump
-//! activates it. The eventually then forces, in order: writes until both new
+//! activates it. Once it has, the drawn rule `decrease_drawn` runs, rarely
+//! and at most once per timeline while faults may run, a decrease back to 4
+//! with a burst of writes in its last two seconds, whose stragglers it reads
+//! back with their tokens, then a read with a forged token for a record never
+//! written. The eventually then forces, in order: writes until both new
 //! shards acknowledged one; the stale-writer fence (refused reads of the
-//! provisioning record across a move past the writers' lead horizon); a
-//! decrease back to 4 with a burst of writes in its last two seconds, whose
-//! stragglers it reads back with their tokens; and a read with a forged token
-//! for a record never written.
+//! provisioning record across a move past the writers' lead horizon); the
+//! decrease, unless the drawn rule already read a straggler back; and the
+//! forged read.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use antithesis_sdk::{assert_always, assert_reachable, assert_sometimes};
+use hegel::TestCase;
+use hegel::generators as gs;
 use ravel_antithesis_driver::model::{self, Write};
 use ravel_antithesis_driver::ravel::{self, SqlFailure};
 use serde_json::json;
@@ -25,7 +31,7 @@ use crate::cli::AntCli;
 use crate::token::{self, Token};
 use crate::{
     CLI_TIMEOUT_S, NS_PER_HOUR, NS_PER_SECOND, READ_TIMEOUT, Shared, WINDOW_SLACK_NS, audit, clock,
-    lock, now_ns, seed, writes_query,
+    lock, now_ns, release_and_halt, seed, writes_query,
 };
 
 /// The count the increase reshards to; the decrease goes back to
@@ -56,8 +62,14 @@ const DECREASE_CYCLES: u32 = 2;
 const WIDE_WRITE: u32 = 32;
 /// Writes the eventually adds, at most, for both new shards to acknowledge.
 const ACTIVATION_WRITES: u32 = 24;
-/// Stragglers the eventually reads back, at most.
+/// Stragglers a decrease cycle reads back, at most.
 const STRAGGLER_READS: usize = 4;
+/// How often `decrease_drawn` runs once its preconditions hold, like the
+/// other forced races' rules.
+const DECREASE_DRAW: f64 = 0.02;
+/// The local loop only (`local/docker-compose.local.yaml`): `1` makes
+/// `decrease_drawn` skip its draw, so a local run takes the drawn path.
+const FORCE_DRAWN_DECREASE: &str = "WORKLOAD_FORCE_DRAWN_DECREASE";
 
 /// What the profile has done so far.
 #[derive(Debug, Default)]
@@ -69,6 +81,45 @@ pub struct State {
     /// The shards at or above [`seed::SHARDS`] some acknowledged write's
     /// token named.
     added_shards: Mutex<BTreeSet<u32>>,
+    /// Set once `decrease_drawn` started its cycle; the rule runs it once
+    /// per timeline.
+    drawn_started: AtomicBool,
+    /// Set once `decrease_drawn` found a straggler and read it back; the
+    /// eventually runs its own decrease cycles only while this is unset.
+    drawn_reached: AtomicBool,
+    /// `WORKLOAD_FORCE_DRAWN_DECREASE=1`.
+    force_drawn: bool,
+}
+
+impl State {
+    pub fn from_env() -> State {
+        State {
+            force_drawn: std::env::var(FORCE_DRAWN_DECREASE).is_ok_and(|v| v == "1"),
+            ..State::default()
+        }
+    }
+}
+
+/// Whether `decrease_drawn` may run: the eventually is on, the sealing jump
+/// reached the driver, the increase's activation hour has begun and the rule
+/// has not started before in this timeline.
+pub fn drawn_decrease_due(
+    eventually_on: bool,
+    jump_landed: bool,
+    increase_hour: Option<u32>,
+    now_ns: u64,
+    started: bool,
+) -> bool {
+    eventually_on
+        && jump_landed
+        && !started
+        && increase_hour.is_some_and(|h| now_ns >= u64::from(h) * NS_PER_HOUR)
+}
+
+/// Sets `flag`; true only for the call that found it unset.
+pub fn claim_once(flag: &AtomicBool) -> bool {
+    flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
 }
 
 /// The from, to and activation hour `provision reshard` printed:
@@ -262,6 +313,53 @@ pub fn check_new_shards(s: &Shared, prefix: &str, watermark_hour: u64, resolved:
     );
 }
 
+/// The rule `decrease_drawn`: rarely, once the sealing jump activated the
+/// increase, and at most once per timeline, one decrease cycle under the
+/// gate's write guard, its straggler reads under a read guard, then the
+/// forged token read with no guard, all while faults may run. The eventually
+/// keeps its own cycles for a timeline where this never read a straggler
+/// back.
+pub fn decrease_drawn(s: &Shared, tc: &TestCase) {
+    let due = drawn_decrease_due(
+        s.eventually_on,
+        lock(&s.jump).is_some_and(|j| j.reached_driver),
+        *lock(&s.reshard.increase),
+        now_ns(),
+        s.reshard.drawn_started.load(Ordering::SeqCst),
+    );
+    if !due {
+        return;
+    }
+    if !s.reshard.force_drawn && !tc.draw(gs::weighted_booleans(DECREASE_DRAW)) {
+        return;
+    }
+    let quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+    if s.stop.stopping() {
+        release_and_halt(quiet);
+    }
+    if !claim_once(&s.reshard.drawn_started) {
+        return;
+    }
+    println!(
+        "reshard: drawn decrease: starting (forced by {FORCE_DRAWN_DECREASE}: {})",
+        s.reshard.force_drawn
+    );
+    let stragglers = decrease_cycle(s, "drawn", 0);
+    drop(quiet);
+    {
+        let _g = s.enter();
+        read_stragglers(s, &stragglers);
+    }
+    if !stragglers.is_empty() {
+        s.reshard.drawn_reached.store(true, Ordering::SeqCst);
+    }
+    println!(
+        "reshard: drawn decrease: {} straggler(s) read back",
+        stragglers.len()
+    );
+    forged_read(s, "drawn");
+}
+
 /// The eventually's reshard situations, after the sealing jump. The caller
 /// holds the gate's write guard.
 pub fn eventually(s: &Shared) {
@@ -271,12 +369,18 @@ pub fn eventually(s: &Shared) {
     }
     activation_writes(s);
     fence(s);
-    for cycle in 0..DECREASE_CYCLES {
-        if decrease_cycle(s, cycle) {
-            break;
+    if s.reshard.drawn_reached.load(Ordering::SeqCst) {
+        println!("reshard: the drawn decrease read a straggler back; no decrease cycle here");
+    } else {
+        for cycle in 0..DECREASE_CYCLES {
+            let stragglers = decrease_cycle(s, "eventually", cycle);
+            read_stragglers(s, &stragglers);
+            if !stragglers.is_empty() {
+                break;
+            }
         }
     }
-    forged_read(s);
+    forged_read(s, "eventually");
 }
 
 fn active_now(s: &Shared) -> u32 {
@@ -445,10 +549,10 @@ fn fence(s: &Shared) -> bool {
 /// an earlier cycle left 4), append the decrease to 4, move every clock to
 /// just before its activation, and send a write every 50 ms in its last
 /// two seconds. A write routed at 6 that flushes in the activation hour is a
-/// straggler: a token at shard 4 or 5 in an hour that routes at 4. Each one
-/// is read back with its tokens on every node. Returns whether there was a
-/// straggler.
-fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
+/// straggler: a token at shard 4 or 5 in an hour that routes at 4. Returns
+/// the stragglers, for [`read_stragglers`]. `reason` is `drawn` or
+/// `eventually`, for the details. The caller holds the gate's write guard.
+fn decrease_cycle(s: &Shared, reason: &str, cycle: u32) -> Vec<Write> {
     if active_now(s) != INCREASED {
         match provision(s, INCREASED) {
             Ok(hour) => {
@@ -458,20 +562,20 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
                 });
             }
             Err(e) => {
-                println!("reshard: decrease cycle {cycle}: the increase: {e}");
-                return false;
+                println!("reshard: decrease cycle {cycle} ({reason}): the increase: {e}");
+                return Vec::new();
             }
         }
         if active_now(s) != INCREASED {
-            println!("reshard: decrease cycle {cycle}: 6 shards are not active");
-            return false;
+            println!("reshard: decrease cycle {cycle} ({reason}): 6 shards are not active");
+            return Vec::new();
         }
     }
     let a = match provision(s, seed::SHARDS) {
         Ok(hour) => hour,
         Err(e) => {
-            println!("reshard: decrease cycle {cycle}: {e}");
-            return false;
+            println!("reshard: decrease cycle {cycle} ({reason}): {e}");
+            return Vec::new();
         }
     };
     *lock(&s.reshard.decrease) = Some(a);
@@ -479,11 +583,11 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
     if !s.nudge("reshard: decrease burst", &|now_s| {
         target_s.saturating_sub(now_s)
     }) {
-        return false;
+        return Vec::new();
     }
     let Some(delays) = burst_delays(now_ns(), a, BURST_WINDOW, BURST_SPACING) else {
-        println!("reshard: decrease cycle {cycle}: past the burst's start already");
-        return false;
+        println!("reshard: decrease cycle {cycle} ({reason}): past the burst's start already");
+        return Vec::new();
     };
     let n = s.ravel.nodes.len().max(1);
     let started = std::time::Instant::now();
@@ -510,8 +614,9 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
             .filter_map(|(id, _)| id.and_then(|id| m.writes.get(&id).cloned()))
             .collect()
     };
-    let stragglers: Vec<&Write> = burst
-        .iter()
+    let acked = burst.len();
+    let stragglers: Vec<Write> = burst
+        .into_iter()
         .filter(|w| {
             w.acked_header()
                 .and_then(|h| token::decode_header(h).ok())
@@ -522,11 +627,12 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
         })
         .collect();
     let details = json!({
+        "reason": reason,
         "cycle": cycle,
         "activation_hour": a,
         "planned": delays.len(),
         "sent": ids.iter().filter(|(id, _)| id.is_some()).count(),
-        "acked": burst.len(),
+        "acked": acked,
         "stragglers": stragglers.iter().map(|w| w.id).collect::<Vec<_>>(),
         "straggler_tokens": stragglers.iter().take(3).map(|w| w.acked_header()).collect::<Vec<_>>(),
     });
@@ -548,18 +654,25 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
         .map(|node| (0..3).any(|_| write_to(s, 4, node).is_some()))
         .collect();
     if !anchored.iter().all(|&a| a) {
-        println!("reshard: decrease cycle {cycle}: not every node acknowledged at 4: {anchored:?}");
+        println!(
+            "reshard: decrease cycle {cycle} ({reason}): not every node acknowledged at 4: {anchored:?}"
+        );
     }
+    stragglers
+}
+
+/// Each straggler of a decrease cycle (up to [`STRAGGLER_READS`],
+/// single-attempt writes only) read back with its tokens on every node.
+fn read_stragglers(s: &Shared, stragglers: &[Write]) {
     for w in stragglers
         .iter()
         .filter(|w| w.max_copies() == 1)
         .take(STRAGGLER_READS)
     {
-        for node in 0..n {
+        for node in 0..s.ravel.nodes.len() {
             s.lifecycle_read(w, node, false, "reshard: straggler");
         }
     }
-    !stragglers.is_empty()
 }
 
 /// The forged token read (D4 part 1): an acknowledged write's token moved to
@@ -567,8 +680,8 @@ fn decrease_cycle(s: &Shared, cycle: u32) -> bool {
 /// writer reaches, so its record was never written. Every node must refuse
 /// it as unsatisfiable, and the SUT evaluates `resharding: a commit token
 /// whose record is durable resolves across a reshard` with the record
-/// absent.
-fn forged_read(s: &Shared) {
+/// absent. `reason` is `drawn` or `eventually`, for the details.
+fn forged_read(s: &Shared, reason: &str) {
     let picked: Option<(Write, Token, u32)> = {
         let history = lock(&s.history);
         let m = lock(&s.model);
@@ -627,6 +740,7 @@ fn forged_read(s: &Shared) {
             }
         }
         let details = json!({
+            "reason": reason,
             "node": s.ravel.nodes[node],
             "write": w.id,
             "from_token": format!("{t:?}"),
@@ -682,6 +796,30 @@ mod tests {
             burst_delays(boundary - NS_PER_SECOND, a, BURST_WINDOW, BURST_SPACING),
             None
         );
+    }
+
+    #[test]
+    fn the_drawn_decrease_waits_for_the_activated_increase_and_runs_once() {
+        let h = 498_724_u32;
+        let at = u64::from(h) * NS_PER_HOUR;
+        assert!(drawn_decrease_due(true, true, Some(h), at, false));
+        let later = at + NS_PER_HOUR;
+        assert!(drawn_decrease_due(true, true, Some(h), later, false));
+        // Each precondition missing on its own.
+        assert!(!drawn_decrease_due(false, true, Some(h), at, false));
+        assert!(!drawn_decrease_due(true, false, Some(h), at, false));
+        assert!(!drawn_decrease_due(true, true, None, at, false));
+        assert!(!drawn_decrease_due(true, true, Some(h), at - 1, false));
+        assert!(!drawn_decrease_due(true, true, Some(h), at, true));
+    }
+
+    #[test]
+    fn the_once_flag_is_claimed_by_the_first_caller_only() {
+        let flag = AtomicBool::new(false);
+        assert!(claim_once(&flag));
+        assert!(!claim_once(&flag));
+        assert!(!claim_once(&flag));
+        assert!(flag.load(Ordering::SeqCst));
     }
 
     #[test]

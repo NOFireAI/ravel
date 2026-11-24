@@ -3135,6 +3135,16 @@ impl Workload {
         s.unreadable_head_sweep("drawn");
     }
 
+    /// The reshard profile only: rarely, once the sealing jump activated the
+    /// increase, and at most once per timeline, a decrease cycle and the
+    /// forged token read while faults may run.
+    #[cfg(feature = "reshard")]
+    #[rule(groups = ["main"], weight = 1)]
+    fn decrease_drawn(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
+        reshard::decrease_drawn(&self.0, &tc);
+    }
+
     #[rule(groups = ["main"], weight = 1)]
     fn corrupt_head(&self, tc: TestCase) {
         self.0.halt_if_stopping();
@@ -3718,7 +3728,7 @@ fn main(tc: TestCase) {
         stop: Stop::default(),
         eventually_on,
         #[cfg(feature = "reshard")]
-        reshard: reshard::State::default(),
+        reshard: reshard::State::from_env(),
     });
 
     for node in 0..shared.ravel.nodes.len() {
