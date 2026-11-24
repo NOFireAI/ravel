@@ -304,7 +304,9 @@ and column, from exactly one carrier (ADR-4628 decision 5; the resolver is
    grants it (the rule in the bullets below).
 3. Otherwise nothing, and the whole statement scans.
 
-The two carriers are never added or compared for one segment. A stamp
+Figures from the two carriers are never added or mixed for one segment;
+the grant in step 2 still compares the stamp's `min`, `max` and NULL count
+with the entry's. A stamp
 without the field (written before ADR-4628, by an older fold or compactor,
 or a rewrite part, which carries an empty stamp) is no answer, never 0.
 `GROUP BY` counts keep the `.cstat` dictionary path. `f <> false` and
