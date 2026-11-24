@@ -713,14 +713,28 @@ async fn write_one_record_blocks(
         .put(key, bytes::Bytes::from(bytes), PutOptions::default())
         .await
         .expect("put");
-    SegmentRef {
-        data_object_key: key.to_string(),
-        object_size,
-        min_event_ts_ns: 1,
-        max_event_ts_ns: statuses.len() as i64,
-        sample_count: statuses.len() as u64,
-        ..seg_ref(1, statuses.len() as u64)
+    // The stamp a writer folds for these rows, so its extrema alone do not
+    // decide a not-equal count the test expects a scan for.
+    let mut dict: Vec<(i64, u64)> = Vec::new();
+    for v in statuses.iter().flatten() {
+        match dict.iter_mut().find(|(dv, _)| dv == v) {
+            Some(entry) => entry.1 += 1,
+            None => dict.push((*v, 1)),
+        }
     }
+    dict.sort_unstable();
+    let nulls = statuses.iter().filter(|s| s.is_none()).count() as u64;
+    stamped_like(
+        SegmentRef {
+            data_object_key: key.to_string(),
+            object_size,
+            min_event_ts_ns: 1,
+            max_event_ts_ns: statuses.len() as i64,
+            sample_count: statuses.len() as u64,
+            ..seg_ref(1, statuses.len() as u64)
+        },
+        &i64_stat("status", &dict, nulls),
+    )
 }
 
 /// The value of `name=N` on `line`, when the line carries one.
