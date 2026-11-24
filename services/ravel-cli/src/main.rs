@@ -6822,7 +6822,6 @@ mod tests {
                     zero_count: None,
                 },
             ],
-            ..Default::default()
         };
         let want: Vec<String> = [
             "format_version: 1",
