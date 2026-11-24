@@ -676,7 +676,7 @@ impl CombinerStream {
             "{DOMINANT_KEY_COMBINER_CONSUMER_PREFIX}{partition}]"
         ))
         .register(context.memory_pool());
-        let mut stream = CombinerStream {
+        Ok(CombinerStream {
             schema,
             input: Some(input),
             key_count: exec.key_count,
@@ -695,9 +695,7 @@ impl CombinerStream {
             output: VecDeque::new(),
             reservation,
             metrics: CombinerMetrics::new(&exec.metrics, partition),
-        };
-        stream.charge()?;
-        Ok(stream)
+        })
     }
 
     /// The bytes the reservation holds between batches.

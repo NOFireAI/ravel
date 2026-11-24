@@ -380,7 +380,10 @@ fn expected_top_k() -> Vec<(i64, i64)> {
 /// rather than silently moving the rule's target. The `CompactSlicesExec`
 /// between the projection and the final aggregate is the session's
 /// always-on `CompactSlices` rule (issue #2720), which decorates every
-/// aggregate feeding a sort and runs after this rule.
+/// aggregate feeding a sort and runs after this rule. The
+/// `DominantKeyCombinerExec` between the hash exchange and the partial
+/// aggregate is the session's default-on `dominant_key_combiner` rule (issue
+/// #4676), which also runs after this rule.
 #[tokio::test]
 async fn q33_shape_plans_to_a_sort_over_a_two_stage_aggregate() {
     let executor = executor(SMALL_KEYS, None).await;
@@ -408,6 +411,7 @@ async fn q33_shape_plans_to_a_sort_over_a_two_stage_aggregate() {
             "CompactSlicesExec",
             "AggregateExec",
             "RepartitionExec",
+            "DominantKeyCombinerExec",
             "AggregateExec",
             "RepartitionExec",
             "LogsScanExec",
