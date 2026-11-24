@@ -809,7 +809,12 @@ impl CombinerStream {
         }
         let key: Box<[u8]> = match encoded {
             Some(encoded) => encoded.row(row).as_ref().into(),
-            None => self.converter.convert_columns(&single)?.row(0).as_ref().into(),
+            None => self
+                .converter
+                .convert_columns(&single)?
+                .row(0)
+                .as_ref()
+                .into(),
         };
         self.table.key_bytes += key.len();
         self.table.counters[slot].held = Some(Held {
@@ -976,12 +981,13 @@ impl Stream for CombinerStream {
         let this = &mut *self;
         loop {
             if let Some(batch) = this.output.pop_front() {
-                this.metrics.baseline.record_output(batch.num_rows());
-                return Poll::Ready(Some(Ok(batch)));
+                return this
+                    .metrics
+                    .baseline
+                    .record_poll(Poll::Ready(Some(Ok(batch))));
             }
             let Some(input) = this.input.as_mut() else {
-                this.metrics.baseline.done();
-                return Poll::Ready(None);
+                return this.metrics.baseline.record_poll(Poll::Ready(None));
             };
             let step = match ready!(input.poll_next_unpin(cx)) {
                 Some(Ok(batch)) => {

@@ -40,6 +40,8 @@ mod deadline;
 mod declared_str_function_results;
 #[path = "distinct_on.rs"]
 mod distinct_on;
+#[path = "dominant_key_combiner.rs"]
+mod dominant_key_combiner;
 #[path = "erasure_dedup_positions.rs"]
 mod erasure_dedup_positions;
 #[path = "exact_typed_classification_q29.rs"]

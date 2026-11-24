@@ -193,6 +193,7 @@ async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
         max_query_bytes: 1024 * 1024,
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
+        dominant_key_combiner: true,
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
@@ -286,6 +287,7 @@ async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
         max_query_bytes: 16 * 1024 * 1024,
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
+        dominant_key_combiner: true,
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
@@ -391,6 +393,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         // asserts; only this test's operator-identity claim depends on the
         // aggregate being the one that runs out.
         skip_partial_aggregation: false,
+        dominant_key_combiner: true,
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
@@ -510,6 +513,7 @@ async fn a_large_order_by_over_budget_is_resources_exhausted() {
         max_query_bytes: 16 * 1024 * 1024,
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
+        dominant_key_combiner: true,
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,

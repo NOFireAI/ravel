@@ -67,12 +67,12 @@ mod cross_signal_tests;
 mod ddl;
 mod ddl_cost;
 mod declared;
-mod dominant_key;
 mod dedup;
 #[cfg(feature = "flight-sql")]
 pub mod distributed;
 #[cfg(feature = "flight-sql")]
 pub mod distributed_rlog;
+mod dominant_key;
 mod error;
 pub mod esql;
 mod exchange_floor;
@@ -160,10 +160,6 @@ pub use bucketed_final_aggregate::{
     BucketedFinalAggregateRule,
 };
 pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
-pub use dominant_key::{
-    COUNTER_BYTES, DOMINANT_KEY_COMBINER_CONSUMER_PREFIX, DOMINANT_KEY_COMBINER_RULE,
-    DominantKeyCombiner, DominantKeyCombinerExec, KeyHasher, counters_for,
-};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{
     BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_GROUPS_MAX_LIMIT,
@@ -193,6 +189,10 @@ pub use distributed_rlog::{
     ALERTS_ORDER_COLS, AUDIT_ORDER_COLS, DistributedSliceScanExec, LOGS_ORDER_COLS,
     distributed_alerts_plan, distributed_audit_plan, distributed_logs_plan, distributed_slice_plan,
     sort_slice_fragment,
+};
+pub use dominant_key::{
+    COUNTER_BYTES, DOMINANT_KEY_COMBINER_CONSUMER_PREFIX, DOMINANT_KEY_COMBINER_RULE,
+    DominantKeyCombiner, DominantKeyCombinerExec, KeyHasher, counters_for,
 };
 pub use error::{
     ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_SPILL_DISABLED_MARKER,
