@@ -1300,7 +1300,9 @@ fn cstat_figure(
 /// One segment's figure for one declared column from exactly one carrier
 /// (ADR-4628 decision 5): the stamp when it carries the figure, else the
 /// `.cstat` entry [`merged_view_entry`] grants, else `None`, which declines
-/// the whole statement. The two carriers are never added, compared or merged.
+/// the whole statement. Figures from the two carriers are never added or
+/// mixed for one segment; granting the entry still compares the stamp's min,
+/// max and NULL count with the entry's.
 ///
 /// Every exactness condition of the statement (pending erasure, filters, ts
 /// containment) is the caller's to check first
