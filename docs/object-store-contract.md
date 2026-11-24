@@ -1816,8 +1816,8 @@ adapter contract:
    compaction record or a snapshot entry holds the min and max of each
    declared `I64` and `BOOL` column over the rows it covers, and can hold
    its sum and zero count too (the sum for `I64` only; ADR-4628,
-   docs/catalog-and-mvcc.md). With the
-   min and max, a sum can recover an erased value: the pre-rewrite sum less
+   docs/catalog-and-mvcc.md). A sum can recover an erased value: the
+   pre-rewrite sum less
    the sum over the rows the rewrite kept is the sum of the erased rows,
    which for one erased row is its exact value. The erasure guarantee
    covers numeric values (ADR-4628, question 6a; ADR-0064, declared-column
@@ -1829,7 +1829,7 @@ adapter contract:
    `protection_horizon` age gate (`sweep_unreferenced_catalog_objects` in
    `crates/ravel-maintain/src/sweep.rs`), so the bound below holds for a
    locked `.csnap` part's stamp, with `T_w` that part's `last_modified`. A
-   locked commit record's stamp goes with the record, inside its
+   locked commit or compaction record's stamp goes with the record, inside its
    `max(bound + E_v, R)` bound.
 
    So for any tenant with a `STR` or `BYTES` typed attribute column, an

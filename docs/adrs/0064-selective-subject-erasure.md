@@ -1006,11 +1006,14 @@ ADR-0873 stamps the min, max and null count of each declared `I64` and
 `BOOL` column on logs commit records, compaction records and snapshot
 entries, and ADR-4628 adds the exact sum (`I64` only) and the zero count
 (`I64` and `BOOL`). The logs flush, `ravel-cli load` included, writes the
-sum and zero count from issue #4670 on, unless the ingest process opts out
-(`IngestConfig::emit_declared_stat_aggregates`). These are numeric values
-of the stamped rows. With the min and max, a sum can recover an erased
-value: the pre-rewrite sum less the sum over the rows the rewrite kept is
-the sum of the erased rows, which for one erased row is its exact value.
+sum and zero count from issue #4670 on. A producer process setting
+withholds them (`IngestConfig::emit_declared_stat_aggregates`, ADR-4628
+decision 8); as of this amendment no server or loader flag sets it, and
+issue #4672 tracks that surface. These are numeric values of the stamped
+rows. A sum can recover an erased value: the pre-rewrite sum less the sum
+over the rows the rewrite kept is the sum of the erased rows, which for
+one erased row is its exact value, and in an object with three non-null
+rows the sum less the min and the max is the third value.
 
 The stamp's numeric values count as subject values, as an `I64` `key8` in
 a `.kidx` leaf does (the kidx subject-values amendment). ADR-4628 question
@@ -1018,9 +1021,11 @@ a `.kidx` leaf does (the kidx subject-values amendment). ADR-4628 question
 erased record, numeric included, and any figure one can be recovered from;
 the matcher rule that a non-string value never matches (the attribute
 scope amendment) says which records a request selects, not which of their
-values the guarantee covers. The Context's catalog-contents bullet, the F3
-determination and §6's disjointness statement each say a snapshot entry
-holds no attribute value; that stops being true of its stamp.
+values the guarantee covers. The Context's catalog-contents bullet and the
+F3 determination each say a snapshot entry holds no label or attribute
+value, and §6 says `catalog/*` holds no subject attribute values; that
+stops being true of a snapshot entry's stamp, and so of the `.csnap` part
+that holds it.
 
 What follows for erasure:
 
@@ -1030,8 +1035,9 @@ What follows for erasure:
   horizon, the same rule as for `.cstat`. A commit record or compaction
   record the rewrite superseded is swept with its chain.
 - Under per-object compliance retention, a locked version keeps its stamp
-  until its retain-until. For a commit record that is inside the
-  `max(bound + E_v, R)` bound docs/deletion-and-gc.md states; for a
+  until its retain-until. For a commit record or a compaction record, both
+  under `t/*/*/c/*`, that is inside the `max(bound + E_v, R)` bound
+  docs/deletion-and-gc.md states for commit-record retention; for a
   `.csnap` part it is the catalog-keyspace bound
   docs/object-store-contract.md states for `.cstat`, and that modifier
   applies to a tenant with any declared `I64` or `BOOL` column.

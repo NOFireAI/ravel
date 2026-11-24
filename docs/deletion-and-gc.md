@@ -1351,7 +1351,7 @@ into them. An operator with erasure obligations must budget them deliberately.
     value, but it does hold numeric values. A retained stamp on a commit
     record, a compaction record or a snapshot entry holds the min and max of
     each declared `I64` and `BOOL` column over the rows it covers, and can
-    hold its sum and zero count too (the sum for `I64` only; ADR-4628). With the min and max, a sum
+    hold its sum and zero count too (the sum for `I64` only; ADR-4628). A sum
     can recover an erased value: the pre-rewrite sum less the sum over the
     rows the rewrite kept is the sum of the erased rows, which for one
     erased row is its exact value, and a zero count can tell whether that
@@ -1362,7 +1362,7 @@ into them. An operator with erasure obligations must budget them deliberately.
     bound it states for `.cstat`: the unreferenced-catalog sweep lists
     `snap/` beside `idx/`, keeps what HEAD names, and deletes the rest past
     the same `protection_horizon` age gate (`sweep_unreferenced_catalog_objects`
-    in ravel-maintain). A locked commit record's stamp goes with the record,
+    in ravel-maintain). A locked commit or compaction record's stamp goes with the record,
     inside the `max(bound + E_v, R)` bound the commit-record `R` modifier
     above states. The per-part `.cstat` column-statistics objects are the
     exception the catalog-keyspace `R` modifier above sets out: for a tenant with a `STR` or
