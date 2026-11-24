@@ -56,6 +56,20 @@ stored. Each plan counts the records it leaves out in
 `ravel_maintain_late_commit_records_total`. A later release disposes of late
 records.
 
+**Known issue: two dependency advisories are open on the versions this release
+locks.** 0.35.0 locks the same two versions.
+
+- RUSTSEC-2026-0592, `url` 2.5.8: `Url::origin()` overflows the stack on a
+  nested `blob:` URL. No call to `Url::origin()` was found in Ravel or in the
+  crates that depend on `url` directly (`datafusion`, `datafusion-datasource`,
+  `datafusion-execution`, `object_store`, `reqwest`, `tower-http`). Callers
+  deeper in the dependency graph were not traced. The update to 2.5.9 is
+  #4584.
+- RUSTSEC-2026-0595, `parquet` 59.3.0: when it writes an encrypted Parquet
+  file it writes bloom filters as plaintext. Ravel refuses encrypted Parquet
+  on read and configures no Parquet encryption. The update to 59.3.3 is
+  #4657.
+
 ### Added
 
 - **A failed `metricsbench_ingest --readback-only` keeps what answered.** When a
