@@ -993,6 +993,24 @@ enum Command {
         /// anything but exhaustive.
         #[arg(long, value_enum, value_name = "CHOICE", default_value_t)]
         page_choice: ravel_cli::load::LoadPageChoice,
+        /// Withhold the declared-column stamp's sum and zero count (fields 6
+        /// to 8, ADR-4628) from the commit records this logs load writes. The
+        /// min, max and null count are still written. On an unfolded catalog,
+        /// SUM, AVG and not-equal counts over those segments then scan; on a
+        /// folded one the `.cstat` statistics still answer them.
+        ///
+        /// Set it when the commit records sit under an Object Lock: a sum
+        /// written to a locked record stays until that record's retain-until
+        /// (ADR-4628 question 6b). It changes only the records this load
+        /// writes: a later compaction of these segments by a process that
+        /// does not withhold recomputes the fields from the rows.
+        ///
+        /// The summary's `stamp aggregates` line and the report JSON's
+        /// `declared_stat_aggregates` field say which the load wrote. A
+        /// metrics or spans load writes no stamp, ignores this flag and warns
+        /// when it is set.
+        #[arg(long = "no-declared-stat-aggregates", action = clap::ArgAction::SetFalse)]
+        emit_declared_stat_aggregates: bool,
         /// The bytes of built batches a logs load may hold at once (issue
         /// #2626). Every batch is charged before it is built, at an estimate
         /// from the previous batch's bytes per row (zero for the first batch),
@@ -4606,6 +4624,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             group_target_blocks,
             chunk_order,
             page_choice,
+            emit_declared_stat_aggregates,
             load_memory_bytes,
             fold_after_load,
             ipcrypt_config,
@@ -4648,6 +4667,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 group_target_blocks,
                 chunk_order.unwrap_or_default(),
                 page_choice,
+                ravel_cli::load::DeclaredStatAggregates::from_emit(emit_declared_stat_aggregates),
                 load_memory_bytes,
                 fold_after_load,
                 &ipcrypt,
@@ -6839,6 +6859,40 @@ mod tests {
         assert_eq!(commit_decode_lines(&record), want);
     }
 
+    /// `load` carries `--no-declared-stat-aggregates` as the emit switch:
+    /// absent means emit, the flag withholds, and it takes no value.
+    #[test]
+    fn load_carries_the_declared_stat_aggregates_opt_out() {
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "ravel",
+                    "load",
+                    "--parquet",
+                    "x.parquet",
+                    "--tenant",
+                    "acme",
+                    "--mapping",
+                    "m.toml",
+                ]
+                .iter()
+                .copied()
+                .chain(extra.iter().copied()),
+            )
+            .map(|cli| match cli.command {
+                Command::Load {
+                    emit_declared_stat_aggregates,
+                    ..
+                } => emit_declared_stat_aggregates,
+                _ => panic!("expected the load subcommand"),
+            })
+        };
+        assert!(parse(&[]).expect("no flag"), "absent means emit");
+        assert!(!parse(&["--no-declared-stat-aggregates"]).expect("the opt-out"));
+        let err = parse(&["--no-declared-stat-aggregates=true"]).expect_err("takes no value");
+        assert_eq!(err.kind(), clap::error::ErrorKind::TooManyValues, "{err}");
+    }
+
     /// `catalog inspect --entries` parses, and with `--json` clap refuses it:
     /// the JSON form reads HEAD alone and has no entries to list.
     #[test]
@@ -6974,6 +7028,7 @@ mod tests {
                 ravel_ingest::RlogGroupTargetBlocks::DEFAULT,
                 ravel_ingest::RlogChunkOrder::DEFAULT,
                 choice,
+                ravel_cli::load::DeclaredStatAggregates::default(),
                 None,
                 false,
                 &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

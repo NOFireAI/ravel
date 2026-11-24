@@ -230,6 +230,7 @@ pub async fn run(
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
     page_choice: LoadPageChoice,
+    declared_stat_aggregates: DeclaredStatAggregates,
     load_memory_bytes: Option<u64>,
     fold_after_load: bool,
     ipcrypt: &IpcryptPolicy,
@@ -257,6 +258,7 @@ pub async fn run(
         group_target_blocks,
         chunk_order,
         page_choice,
+        declared_stat_aggregates,
         LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
         fold_after_load,
         ipcrypt,
@@ -426,6 +428,7 @@ pub(crate) async fn run_fold_warning_to(
         group_target_blocks,
         chunk_order,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
         load_memory,
         fold_after_load,
         ipcrypt,
@@ -467,6 +470,7 @@ pub async fn run_load_reporting(
     group_target_blocks: RlogGroupTargetBlocks,
     chunk_order: RlogChunkOrder,
     page_choice: LoadPageChoice,
+    declared_stat_aggregates: DeclaredStatAggregates,
     load_memory: LoadMemoryRequest,
     fold_after_load: bool,
     ipcrypt: &IpcryptPolicy,
@@ -514,6 +518,10 @@ pub async fn run_load_reporting(
         let _ = writeln!(warnings, "{warning}");
     }
     if let Some(warning) = unused_page_choice_warning(page_choice, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    if let Some(warning) = unused_declared_stat_aggregates_warning(declared_stat_aggregates, signal)
+    {
         let _ = writeln!(warnings, "{warning}");
     }
     // Every signal's loader resolves the budget once it knows the read-cursor
@@ -685,6 +693,7 @@ pub async fn run_load_reporting(
             group_target_blocks,
             chunk_order,
             page_choice,
+            declared_stat_aggregates,
             Some(memory_options),
             fold_after_load,
             rules,
@@ -1171,6 +1180,26 @@ pub(super) fn unused_chunk_order_warning(
             "warning: a {noun} load ignores --chunk-order {}. The chunk order applies only \
              to the RLOG objects a logs load writes.",
             chunk_order.get().join(",")
+        )
+    })
+}
+
+/// The warning for a `--no-declared-stat-aggregates` a metrics or spans load
+/// cannot use, or `None` when the stamp fields are emitted or the load is a
+/// logs load. Only a logs flush writes a declared-column stamp.
+pub(super) fn unused_declared_stat_aggregates_warning(
+    declared_stat_aggregates: DeclaredStatAggregates,
+    signal: SignalArg,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    (!declared_stat_aggregates.emits()).then(|| {
+        format!(
+            "warning: a {noun} load ignores --no-declared-stat-aggregates. Only the commit \
+             records a logs load writes carry a declared-column stamp."
         )
     })
 }

@@ -141,6 +141,7 @@ async fn load_with(choice: LoadPageChoice, input: &Input) -> BTreeMap<i64, bytes
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         choice,
+        ravel_cli::load::DeclaredStatAggregates::default(),
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
