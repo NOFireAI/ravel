@@ -372,6 +372,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         max_query_bytes: 400_000,
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
+        dominant_key_combiner: true,
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,

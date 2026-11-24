@@ -3738,6 +3738,29 @@ async fn bucket_spill_retry_matches_unspilled_answer() {
     assert_eq!(bucket.rows, unlimited.rows);
 }
 
+/// Issue #4676: the bucket retry keeps its hash exchange, so its plan
+/// carries the dominant-key combiner under it, and the derivation still
+/// reads the plan's shape and plans the bucket retry (`spill_consumers`
+/// lists the exec as registering no spill-capable consumer).
+///
+/// Prove-the-test: drop `DominantKeyCombinerExec` from `registers_none` and
+/// the retry plans the sort-merge fallback instead.
+#[tokio::test]
+async fn bucket_retry_plans_the_dominant_key_combiner() {
+    let (unlimited, bucket, log) =
+        answered_retry(RETRY_TIES_SQL, bucket_refusal(RETRY_PARTITIONS)).await;
+    assert_bucket_spilled(&bucket, &log, RETRY_PARTITIONS);
+    let plan = bucket.plan.as_deref().expect("the retry's plan");
+    assert!(
+        plan.contains(&format!(
+            "DominantKeyCombinerExec: gby=[a], aggr=[count(Int64(1))], counters={}",
+            ravel_sql::counters_for(RETRY_PARTITIONS)
+        )),
+        "{plan}"
+    );
+    assert_eq!(bucket.rows, unlimited.rows);
+}
+
 /// The bucketed retry answers every group of the [`BIG_ROWS`] fixture as the
 /// unlimited first attempt does at 2, 4 and 16 final partitions, through
 /// bucketed execs that spilled at each count.

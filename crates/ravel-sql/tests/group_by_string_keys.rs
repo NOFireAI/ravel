@@ -51,7 +51,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, displayable,
 };
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
@@ -469,6 +469,99 @@ async fn group_by_str_limit_restores_above_the_topk() {
             ("https://example.test/c".to_string(), 1),
         ]
     );
+}
+
+/// Issue #4676, end to end through the real executor at the default
+/// configuration: a declared `Str` key, grouped on `Utf8View`, gets the
+/// dominant-key combiner between its partial aggregate and its hash
+/// exchange, for line 6's `COUNT(DISTINCT ..)` shape and a plain `GROUP BY`,
+/// and both answer as the executor with the combiner off does.
+#[tokio::test]
+async fn a_declared_str_key_is_combined_before_the_hash_exchange() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let records: Vec<LogRecord> = (0..3_000)
+        .map(|i| {
+            let url = if i % 10 == 0 {
+                format!("https://example.test/{i}")
+            } else {
+                "https://example.test/hot".to_string()
+            };
+            log_record(i + 1, &url)
+        })
+        .collect();
+    publish_logs(store.as_ref(), &tenant(), &records).await;
+    let declared = vec![DeclaredColumn::new(URL_KEY, DeclaredType::Str)];
+    let on = executor_over(Arc::clone(&store), declared.clone());
+    let off = SqlExecutor::new(
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog")),
+        SegmentFetcher::new(Arc::clone(&store)),
+        LogSegmentFetcher::new(Arc::clone(&store)),
+        SpanSegmentFetcher::new(Arc::clone(&store)),
+        SqlConfig {
+            dominant_key_combiner: false,
+            ..SqlConfig::default()
+        },
+        1 << 30,
+    )
+    .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared)));
+    for (sql, exec) in [
+        (
+            format!("SELECT count(DISTINCT {URL_KEY}) AS u FROM logs"),
+            "DominantKeyCombinerExec: gby=[alias1], aggr=[], counters=",
+        ),
+        (
+            format!("SELECT {URL_KEY}, count(*) AS hits FROM logs GROUP BY {URL_KEY}"),
+            "DominantKeyCombinerExec: gby=[url], aggr=[count(Int64(1))], counters=",
+        ),
+    ] {
+        let plan = executor_plan(&on, &sql).await;
+        let rendered = format!("{}", displayable(plan.as_ref()).indent(false));
+        let lines: Vec<&str> = rendered.lines().map(str::trim).collect();
+        let exchange = lines
+            .iter()
+            .position(|line| line.starts_with("RepartitionExec: partitioning=Hash"))
+            .unwrap_or_else(|| panic!("{sql}: no hash exchange:\n{rendered}"));
+        assert!(
+            lines
+                .get(exchange + 1)
+                .is_some_and(|line| line.starts_with(exec)),
+            "{sql}:\n{rendered}"
+        );
+        assert!(
+            lines
+                .get(exchange + 2)
+                .is_some_and(|line| line.starts_with("AggregateExec: mode=Partial")
+                    && line.contains("AS Utf8View")),
+            "{sql}: the partial groups on a view:\n{rendered}"
+        );
+        let got = sorted_answer(&on, &sql).await;
+        assert!(!got.is_empty(), "{sql}");
+        assert_eq!(got, sorted_answer(&off, &sql).await, "{sql}");
+    }
+}
+
+/// Every row `sql` returns, rendered column by column, sorted.
+async fn sorted_answer(executor: &SqlExecutor, sql: &str) -> Vec<String> {
+    let outcome = executor
+        .execute(tenant().hash(), &request(sql))
+        .await
+        .expect("query runs");
+    let mut rows = Vec::new();
+    for batch in outcome.output.batches() {
+        for row in 0..batch.num_rows() {
+            let cells: Vec<String> = batch
+                .columns()
+                .iter()
+                .map(|column| {
+                    datafusion::arrow::util::display::array_value_to_string(column, row)
+                        .expect("renders")
+                })
+                .collect();
+            rows.push(cells.join("|"));
+        }
+    }
+    rows.sort();
+    rows
 }
 
 /// q14's shape, `GROUP BY <declared Str>` over one `COUNT(DISTINCT ..)`,

@@ -102,9 +102,13 @@
 //! a memory and CPU decision, not a determinism one: the partial stage keeps
 //! one hash table per input partition, so a key whose distinct values appear
 //! in every partition costs `partitions x distinct` entries before the final
-//! stage ever merges them. Giving up early bounds that at `partitions x probe
-//! rows`, and on a key that barely reduces it saves hashing every row twice
-//! (issue #3231). It cannot change a result -- the final stage sees the same
+//! stage ever merges them. A partition that gives up early holds only the
+//! groups it found before it skipped; one whose probe never fires keeps every
+//! group it sees, so the bound covers the partitions that skip, not the stage
+//! (issue #4676 measured 137.6 K to 235.9 K groups in each unskipped partition
+//! of a 32-partition `COUNT(DISTINCT ..)`). On a key that barely reduces,
+//! giving up saves hashing every row twice (issue #3231). It cannot change a
+//! result -- the final stage sees the same
 //! rows and computes the same groups either way -- so it is orthogonal to the
 //! determinism rules above.
 //!
@@ -155,6 +159,7 @@ use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
 use crate::compact_slices::CompactSlices;
 use crate::config::{DEFAULT_SPILL_MERGE_FAN_IN, SqlConfig};
+use crate::dominant_key::DominantKeyCombiner;
 use crate::exchange_floor::FinalExchangeFloor;
 use crate::first_groups::FirstGroupsLimit;
 use crate::group_keys::DictionaryGroupKeysAsViews;
@@ -512,13 +517,20 @@ pub const SKIP_PARTIAL_AGGREGATION_PROBE_ROWS: usize = 8192;
 /// hashing and inserting each row in both the partial and the final stage
 /// costs more CPU than the partial stage saves on string and high-cardinality
 /// keys. Keys between 0.1 and 0.5 that still reduce (a phrase key with heavy
-/// repetition, for example) skip too, and pay a small cost in the repartition
-/// and the final stage, which then receive every row instead of one per
-/// group.
+/// repetition, for example) skip too, and the repartition and the final stage
+/// then receive every row instead of one per group. That cost is not small
+/// when the rows concentrate on one key: the one final partition that owns it
+/// receives them all (issue #4676: 64.1 of 75.6 M exchange rows to one of 32
+/// final partitions), which is why `crate::dominant_key` combines such a key
+/// before the exchange.
 ///
 /// A skipped partition emits the groups its probe accumulated and then holds
-/// no partial state, so the pre-final state stays near `partitions x probe
-/// rows` instead of `partitions x distinct`. Skipping never changes a result,
+/// no partial state. A partition whose probe never fires keeps its whole
+/// table, so the pre-final state is the skipped partitions' probe groups plus
+/// every unskipped partition's distinct keys, not `partitions x probe rows`
+/// (issue #4676 measured 137.6 K to 235.9 K groups in each unskipped
+/// partition, with the final partition that owned the dominant key 0.98 of
+/// the wall time). Skipping never changes a result,
 /// only where the state lives: the final stage sees the same rows and computes
 /// the same groups either way.
 pub const SKIP_PARTIAL_AGGREGATION_PROBE_RATIO: f64 = 0.1;
@@ -1073,6 +1085,18 @@ fn build_session_inner(
     // holds its own `k`-row heap.
     if let Some(max_limit) = config.partition_topk_max_limit {
         builder = builder.with_physical_optimizer_rule(Arc::new(LogsPartitionTopK::new(max_limit)));
+    }
+    // Issue #4676 (ADR-0102, amendment of 2026-11-24): combine a
+    // dominant group key's rows between a `Partial` aggregate and its hash
+    // exchange. After every rule above: each of them matches the
+    // partial/exchange/final shape `EnforceDistribution` chose or walks an
+    // allowlist that refuses a node it does not know (`DictionaryGroupKeysAsViews`,
+    // `BoundedTopKAggregate`), and the bucketed rule must see the exchange's
+    // final partition count. Before `CompactSlices`, which treats the exec as
+    // the hash exchange it feeds: neither charges a batch by capacity. See
+    // `crate::dominant_key`.
+    if config.dominant_key_combiner {
+        builder = builder.with_physical_optimizer_rule(Arc::new(DominantKeyCombiner));
     }
     // Issue #2720: give an aggregate's output slices buffers of their own
     // before a `RepartitionExec` or a sort charges each slice the whole
@@ -2520,6 +2544,67 @@ mod tests {
                 ][..]
             ),
             "{names:?}"
+        );
+    }
+
+    /// Issue #4676: the dominant-key combiner runs directly before
+    /// `CompactSlices`, after every rule that matches the partial, exchange
+    /// and final shape, and the aggregate profile rule stays last. With the
+    /// field off it is not installed at all.
+    #[test]
+    fn the_dominant_key_combiner_runs_directly_before_compact_slices() {
+        let ctx = samples_and_logs();
+        let state = ctx.state();
+        let names: Vec<&str> = state
+            .physical_optimizers()
+            .iter()
+            .map(|rule| rule.name())
+            .collect();
+        let at = |name: &str| {
+            names
+                .iter()
+                .position(|rule| *rule == name)
+                .unwrap_or_else(|| panic!("{name} not installed: {names:?}"))
+        };
+        let combiner = at(crate::dominant_key::DOMINANT_KEY_COMBINER_RULE);
+        assert_eq!(
+            names.get(combiner + 1),
+            Some(&crate::compact_slices::COMPACT_SLICES_RULE),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.last(),
+            Some(&crate::memory::AGGREGATE_PROFILE_RULE),
+            "{names:?}"
+        );
+        for earlier in [
+            crate::exchange_floor::FINAL_EXCHANGE_FLOOR_RULE,
+            crate::group_keys::DICTIONARY_GROUP_KEYS_RULE,
+            crate::bounded_topk::BOUNDED_TOPK_AGGREGATE_RULE,
+        ] {
+            assert!(at(earlier) < combiner, "{earlier}: {names:?}");
+        }
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let off = build_session_with_tables(
+            &SqlConfig {
+                dominant_key_combiner: false,
+                ..SqlConfig::default()
+            },
+            test_pool(),
+            vec![logs_table(&store)],
+            false,
+            SpillDecision::Disabled,
+            &no_capabilities(),
+        )
+        .expect("session builds");
+        let state = off.state();
+        assert!(
+            state
+                .physical_optimizers()
+                .iter()
+                .all(|rule| rule.name() != crate::dominant_key::DOMINANT_KEY_COMBINER_RULE),
+            "the field off installs no rule"
         );
     }
 

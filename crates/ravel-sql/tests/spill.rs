@@ -198,6 +198,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         max_query_bytes: query_bytes,
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
+        dominant_key_combiner: true,
         late_materialization_extra_columns: None,
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
@@ -868,6 +869,7 @@ fn parallel_config(spill: Option<SpillConfig>) -> SqlConfig {
         max_query_bytes: PLAN_SHAPE_QUERY_BYTES,
         parallel_final_aggregation: true,
         skip_partial_aggregation: true,
+        dominant_key_combiner: true,
         late_materialization_extra_columns: None,
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
@@ -1036,6 +1038,7 @@ async fn spill_off_reproduces_todays_refusal() {
         max_query_bytes: TIGHT_QUERY_BYTES,
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
+        dominant_key_combiner: true,
         late_materialization_extra_columns: None,
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
