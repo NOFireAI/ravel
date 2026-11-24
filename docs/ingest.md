@@ -1325,18 +1325,18 @@ non-null values (`I64` only; field 6 when it fits i64, else the 16-byte
 `sum_wide`) and its zero count, the non-null rows equal to 0 or false. An
 `I64` column with no non-null row stamps a sum of 0, and any column with no
 non-null row stamps a zero count of 0; a `BOOL` column never carries a sum.
-The
-row and columnar write paths fold the same figures, and `ravel-cli load`
+The row and columnar write paths fold the same figures, and `ravel-cli load`
 writes through the same flush. The running figures are folded as each
 write merges into the shard buffer, so their cost falls in the `merge`
 stage of the `stage-timing` feature (`LogStage::Merge`), not in a flush
-phase; building the stamp falls in `commit_build`. Setting `IngestConfig::emit_declared_stat_aggregates` to
-false (default true) withholds the sum and zero count and leaves the min,
-max and null count as before, so a reader treats those segments as
-written before ADR-4628. It is a process setting, not persisted, and
-neither `ravel-server` nor `ravel-cli load` sets it from a flag yet. These
-figures are subject values for erasure (docs/deletion-and-gc.md, "Three
-index object kinds hold no string value").
+phase; building the stamp falls in `commit_build`. Setting
+`IngestConfig::emit_declared_stat_aggregates` to false (default true)
+withholds the sum and zero count and leaves the min, max and null count as
+before, so a reader treats those segments as written before ADR-4628. It
+is a process setting, not persisted, and neither `ravel-server` nor
+`ravel-cli load` sets it from a flag yet. These figures are subject values
+for erasure (docs/deletion-and-gc.md, "Three index object kinds hold no
+string value").
 
 The log flush writes each object with the tenant's clustering key and bloom
 scope (ADR-2135 decisions 1 and 5). Both come from config record fields 13
