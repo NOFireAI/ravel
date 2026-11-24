@@ -847,28 +847,100 @@ pub fn serve_control(
     }
 }
 
+/// The longest one [`control`] command takes: a single deadline for its
+/// address resolution, connect, write and read together.
+pub const CONTROL_DEADLINE: Duration = Duration::from_secs(7);
+/// The connect's own cap, inside [`CONTROL_DEADLINE`].
+const CONTROL_CONNECT: Duration = Duration::from_secs(2);
+/// The longest control reply read; a reply is one short line.
+const MAX_CONTROL_REPLY: usize = 4096;
+
+/// What is left of `deadline` at `now`; `Err` naming `what` once nothing
+/// is, so no step starts with a zero timeout.
+pub fn left(deadline: Instant, now: Instant, what: &str) -> Result<Duration, String> {
+    match deadline.checked_duration_since(now) {
+        Some(rest) if !rest.is_zero() => Ok(rest),
+        _ => Err(format!(
+            "{what}: past the {} s control deadline",
+            CONTROL_DEADLINE.as_secs()
+        )),
+    }
+}
+
+/// `addr` as a socket address by `deadline`: parsed when it is one, else
+/// resolved on a thread of its own, which is left behind if the resolver
+/// has not answered in time.
+fn resolve_by(addr: &str, deadline: Instant) -> Result<std::net::SocketAddr, String> {
+    if let Ok(sock) = addr.parse() {
+        return Ok(sock);
+    }
+    let wait = left(deadline, Instant::now(), &format!("{addr}: resolving"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let name = addr.to_string();
+    spawn("s3-proxy-resolve", move || {
+        let _ = tx.send(name.to_socket_addrs().map(|mut socks| socks.next()));
+    })
+    .map_err(|e| format!("{addr}: no thread to resolve it: {e}"))?;
+    match rx.recv_timeout(wait) {
+        Ok(Ok(Some(sock))) => Ok(sock),
+        Ok(Ok(None)) => Err(format!("{addr} resolves to nothing")),
+        Ok(Err(e)) => Err(format!("{addr}: {e}")),
+        Err(_) => Err(format!(
+            "{addr}: not resolved within the {} s control deadline",
+            CONTROL_DEADLINE.as_secs()
+        )),
+    }
+}
+
 /// Send one command to the proxy's control port at `addr` and return its
 /// reply; an error when the proxy does not answer, which a killed proxy
-/// does not.
+/// does not. Returns within [`CONTROL_DEADLINE`]: every step's timeout is
+/// what is left of it.
 pub fn control(addr: &str, command: &str) -> Result<String, String> {
-    let sock = addr
-        .to_socket_addrs()
-        .map_err(|e| format!("{addr}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{addr} resolves to nothing"))?;
-    let mut stream = TcpStream::connect_timeout(&sock, Duration::from_secs(2))
-        .map_err(|e| format!("{addr}: {e}"))?;
-    let timeout = Some(Duration::from_secs(5));
-    stream
-        .set_read_timeout(timeout)
-        .and_then(|()| stream.set_write_timeout(timeout))
-        .map_err(|e| format!("{addr}: {e}"))?;
-    writeln!(stream, "{command}").map_err(|e| format!("{addr}: {e}"))?;
-    let mut reply = String::new();
-    BufReader::new(stream)
-        .read_line(&mut reply)
-        .map_err(|e| format!("{addr}: {e}"))?;
-    let reply = reply.trim().to_string();
+    let deadline = Instant::now() + CONTROL_DEADLINE;
+    let io = |e: io::Error| format!("{addr}: {command}: {e}");
+    let sock = resolve_by(addr, deadline)?;
+    let connect = left(deadline, Instant::now(), addr)?.min(CONTROL_CONNECT);
+    let mut stream = TcpStream::connect_timeout(&sock, connect).map_err(io)?;
+    let line = format!("{command}\n");
+    let mut sent = 0;
+    while sent < line.len() {
+        stream
+            .set_write_timeout(Some(left(deadline, Instant::now(), addr)?))
+            .map_err(io)?;
+        match stream.write(&line.as_bytes()[sent..]) {
+            Ok(0) => return Err(format!("{addr}: {command}: the connection closed")),
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io(e)),
+        }
+    }
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        stream
+            .set_read_timeout(Some(left(deadline, Instant::now(), addr)?))
+            .map_err(io)?;
+        let n = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(io(e)),
+        };
+        if n == 0 {
+            break;
+        }
+        reply.extend_from_slice(&buf[..n]);
+        if let Some(end) = reply.iter().position(|&b| b == b'\n') {
+            reply.truncate(end);
+            break;
+        }
+        if reply.len() > MAX_CONTROL_REPLY {
+            return Err(format!(
+                "{addr}: {command}: a reply longer than {MAX_CONTROL_REPLY} bytes"
+            ));
+        }
+    }
+    let reply = String::from_utf8_lossy(&reply).trim().to_string();
     if reply.is_empty() || reply.starts_with("error") {
         return Err(format!("{addr}: {command}: {reply:?}"));
     }
@@ -1461,6 +1533,44 @@ mod tests {
         drop(idle);
         assert!(live_reaches(&slots, 0), "live {}", slots.live());
         assert_eq!(control(&addr, "held"), Ok("none".to_string()));
+    }
+
+    #[test]
+    fn each_control_step_gets_only_what_is_left_of_the_deadline() {
+        let start = Instant::now();
+        let deadline = start + CONTROL_DEADLINE;
+        assert_eq!(left(deadline, start, "x"), Ok(CONTROL_DEADLINE));
+        let late = start + Duration::from_secs(5);
+        assert_eq!(left(deadline, late, "x"), Ok(Duration::from_secs(2)));
+        assert!(left(deadline, deadline, "x").is_err());
+        assert!(left(deadline, deadline + Duration::from_secs(1), "x").is_err());
+    }
+
+    #[test]
+    fn a_control_reply_trickled_past_the_deadline_is_an_error_at_the_deadline() {
+        // One byte every 300 ms and never a newline: each read returns well
+        // inside any per-read timeout, so only the whole command's deadline
+        // stops it.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("an address").to_string();
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().expect("accepts");
+            let mut line = String::new();
+            BufReader::new(conn.try_clone().expect("clones"))
+                .read_line(&mut line)
+                .expect("reads the command");
+            for _ in 0..50 {
+                if conn.write_all(b"n").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        let started = Instant::now();
+        let reply = control(&addr, "held");
+        let took = started.elapsed();
+        assert!(reply.is_err(), "{reply:?}");
+        assert!(took < CONTROL_DEADLINE + Duration::from_secs(3), "{took:?}");
     }
 
     #[test]

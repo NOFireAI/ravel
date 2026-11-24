@@ -98,16 +98,28 @@ fi
 # this bound and launch.sh's --setup-timeout add room for the containers to
 # start around it.
 SETUP_LIMIT=900
+# One divergent-record or missing-part race with every wait, request and
+# undo retry at its bound: forced::TAMPER_RACE_S in driver/src/forced.rs,
+# which counts the 200 s wait before the undo that applies while faults may
+# run (60 s once they stopped). A driver unit test holds this line equal to
+# it, so the two cannot drift apart.
+TAMPER_RACE_S=842
 # The eventually waits up to 300 s for recovery, then jumps the clocks, runs
 # up to six fold races, five record races, one unfolded-record sweep and one
 # unreadable-HEAD sweep (README.md, "The forced races"; about 2200 s between
 # them at their waits' bounds), up to three divergent-record and three
-# missing-part races (250 s each at their bounds: the 45 s wait for a held
-# PUT, the 10 s compaction budget, the 10 s wait for the held result, 2 s,
-# the 60 s before the tamper is undone with faults stopped, and 60 s of
-# undo retries plus one 60 s attempt), folds, compacts and audits, takes the
-# two sweep jumps (each with its reread and serving waits), sweeps, folds,
-# audits again and reads; 4800 s and the 6 * 250 s bound all of it.
+# missing-part races (TAMPER_RACE_S each), folds, compacts and audits, takes
+# the two sweep jumps (each with its reread and serving waits), sweeps,
+# folds, audits again and reads; 4800 s and 6 * TAMPER_RACE_S bound all of
+# it.
+# The eventually takes the driver's gate first, and every forced rule holds
+# that gate, so a drawn race or sweep still running when the eventually is
+# due ends before the eventually starts. That is at most one rule: a
+# tampering race and its nudge (TAMPER_RACE_S + 60), or one of the forced
+# races the 2200 s above counts at their bounds together, with up to three
+# clock moves of its own (the unfolded-record sweep's), whichever is longer.
+DRAWN_IN_FLIGHT=$((2200 + 3 * 60))
+[ $((TAMPER_RACE_S + 60)) -gt "$DRAWN_IN_FLIGHT" ] && DRAWN_IN_FLIGHT=$((TAMPER_RACE_S + 60))
 # The fresh compaction read
 # (README.md, "The fresh compaction read") adds 900 s: its compact-bucket
 # timeout (300 s), the 120 s wait for the record, six token reads at their
@@ -119,7 +131,7 @@ SETUP_LIMIT=900
 # one reread (README.md, "HEAD holds still before every move"): 60 s each.
 # After the window jump the driver waits up to 150 s more for a server sweep
 # to delete an input.
-END_LIMIT=$((SECS + 4800 + 6 * 250 + 900 + 25 * 60 + 150))
+END_LIMIT=$((SECS + DRAWN_IN_FLIGHT + 4800 + 6 * TAMPER_RACE_S + 900 + 25 * 60 + 150))
 # The reshard profile's situations run first in the eventually: the
 # activation writes, the fence (a 75 s stale-view wait, one move, writes
 # that may each wait out a store timeout, and up to 300 s of recovery), and
