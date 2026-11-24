@@ -8,6 +8,54 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.36.0] - 2026-11-24
 
+**0.35.0 can answer a logs aggregate over a `LIMIT` subquery from the
+statistics of every row (#4680).** In a statement that loads column
+statistics, a `SUM`, `AVG`, `COUNT(*) WHERE col <> lit` or `GROUP BY col`
+count over a `LIMIT` subquery on one logs object was answered from every row
+instead of the rows the limit keeps, with no error. 0.36.0 scans the limited
+rows. Releases before 0.35.0 carry the same rule and were not tested. See the
+entry under Fixed.
+
+**Upgrade: a maintain process with a non-default `--gc-max-flush-lifetime`
+and the late-commit fence on now fails at startup (#4579).** Remove the flag,
+or pass `--late-commit-fence off` on every maintainer of the store. Other
+modes are not affected.
+
+**Upgrade: a metrics range query over many small series reaches its memory
+budget sooner (#4530).** The sample fold now charges what it holds, so a query
+that fit in 0.35.0 can be refused with the same 422. A query can also be
+refused after every object was fetched, and an allocation the allocator
+refuses now fails the query with its own error, also a 422. No default budget
+changes.
+
+**MCP clients: `ravel_analyze_timeseries` and `ravel_describe_data` report a
+memory refusal as `budget_exceeded`, not `unavailable` (#4632).** These tools
+no longer tell a client to retry a query that needs more memory than the
+server gives it.
+
+**A metrics hour with one series over a part's reader bound now stays at L0
+(#4645).** Compaction refuses such a bucket instead of publishing a part that
+fails every catalog decode, and the maintenance scan counts it in
+`held_reader_bound`. The format-migration walk still stops with an error on
+such a bucket. Parts 0.35.0 already wrote over a bound stay unreadable; 0.36.0
+does not repair them.
+
+**The commit and catalog protos gain three stamp fields that nothing writes
+yet (ADR-4628).** 0.36.0 decodes and carries the declared-column sum and zero
+count but writes neither, so it writes the same objects 0.35.0 writes and a
+rollback to 0.35.0 reads them unchanged. The 0.36.0 fold copies the fields
+when a record carries them; 0.36.0 compaction does not. The release that
+first writes them gives the upgrade order in its notes. The record cache
+charges each stamped entry more; see the fold entry under Added.
+
+**Known issue, unchanged from 0.35.0: a commit record that lands after its
+hour sealed is never compacted (#4561).** Such a late record is still served
+and kept. An erasure request whose window overlaps it does not complete and
+raises the erasure deadline alarm, and a format floor stays down while it is
+stored. Each plan counts the records it leaves out in
+`ravel_maintain_late_commit_records_total`. A later release disposes of late
+records.
+
 ### Added
 
 - **A failed `metricsbench_ingest --readback-only` keeps what answered.** When a
@@ -41,23 +89,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fields.** `DeclaredColumnMinMax` adds `sum` (field 6), `sum_wide` (field 7)
   and `zero_count` (field 8) in both the commit and catalog protos (ADR-4628),
   and decoders validate them and drop a defective entry under the existing
-  carrier-labelled drop counter. No producer writes them and no reader uses
-  them yet; metrics and spans records carry no stamp.
+  carrier-labelled drop counter. A snapshot entry's drop is still counted
+  under the commit-record label, as before (#4672). No producer writes them
+  and no reader uses them yet; metrics and spans records carry no stamp.
 - **The fold carries a stamp's write-time sum and zero count onto sealed
   snapshot entries.** When a commit record or compaction part carries the
   ADR-4628 sum and zero count (fields 6 to 8 of its declared-column stamp), the
   fold copies them, as the source predicate validated them, onto the
   `SnapshotEntry` and off it onto the resolved `SegmentRef`, so a sealed segment
   carries the statistics wherever its source stamp did. The record cache charges
-  each entry for the wider stamp. No producer writes the fields and no reader
-  uses them yet; both land in later ADR-4628 tasks. No format version changes.
+  every stamped entry for the wider stamp, whether or not it carries the new
+  fields: a commit record that declares 200 typed attribute columns now
+  charges about 29 KB when admitted instead of about 20 KB, so the same commit
+  cache budget holds fewer such records. No producer writes the fields and no
+  reader uses them yet; both land in later ADR-4628 tasks. No format version
+  changes.
 
 ### Fixed
 
 - **ravel-server listens for SIGTERM before it reports ready.** The SIGTERM
   and SIGINT handlers are now installed before `/readyz` turns 200, so a signal
   delivered the instant a pod becomes ready drains gracefully instead of taking
-  the signal's default disposition and killing the process with exit 143.
+  the signal's default disposition and killing the process with exit 143. A
+  signal that arrives while the server is still starting is now held until
+  startup finishes, and the server then drains; against a slow store that
+  wait can outlast an orchestrator's grace period.
 - **A metrics range query charges its query memory budget for what its
   sample fold holds.** The fold under-charged many small series by about a
   quarter of their bytes, over-charged a few long series by about an
@@ -97,8 +153,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   present in an hour retention had retired, and nothing else made it list
   that hour, it added the write's level-0 object, while a plain read of the
   same hour served nothing from it. The read now checks the hour's
-  retention marker, at most one request per shard and hour per read, and
-  answers a retired hour with nothing.
+  retention marker, at most one request per shard and hour each time it
+  resolves, and answers a retired hour with nothing. A store error on that
+  check fails the read.
 - **`ravel-server --mode maintain` refuses a non-default
   `--gc-max-flush-lifetime` while the late-commit fence is on.** The fence
   derives each hour's late-commit cutoff from this value, and `ravel-cli
@@ -112,9 +169,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not affected.
 - **`ravel_analyze_timeseries` and `ravel_describe_data` report a memory
   refusal as `budget_exceeded`, not the retryable `unavailable`.** A fetch or
-  catalog decode the memory budget refused, and an allocation the allocator
-  refused after the budget admitted it, already answered HTTP 422 (ADR-2633
-  decision 5), but the query service classed all three as `unavailable` on
+  catalog decode the memory budget refused already answered HTTP 422 (ADR-2633
+  decision 5), and so does the allocation refusal this release adds (see the
+  query memory budget entry above), but the query service classed all three
+  as `unavailable` on
   the analytics and describe paths, so an MCP client was told to retry a
   query that needed more memory than the server would give it. The PromQL,
   label and SQL-backed tools are unchanged: they report the same refusal as
@@ -126,12 +184,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   most the reader decodes under its default limits. Before, parts closed on
   the stored-size target alone, so a part with heavily merged series could be
   published and then fail every catalog decode with
-  `ProvenanceLiveBudgetExceeded`. A bucket with one series over either bound
-  on its own is now refused with a typed error, writes and publishes nothing,
-  and keeps its L0 inputs. Parts already written over a bound stay unreadable.
-  The maintenance scan holds such a bucket, counts it in `held_reader_bound`
-  and logs the series, quantity, count and bound, and later hours of the shard
-  still compact.
+  `ProvenanceLiveBudgetExceeded` or `RunTotalLiveBudgetExceeded`. A bucket
+  with one series over either bound on its own is now refused with
+  `SeriesOverPartReaderBound`, writes and publishes nothing, and keeps its L0
+  inputs. Parts already written over a bound stay unreadable. The maintenance
+  scan holds such a bucket, counts it in `held_reader_bound` and logs the
+  series, quantity, count and bound, and later hours of the shard still
+  compact. The format-migration walk still stops with an error on such a
+  bucket, and `ravel-cli maintain compact-tenant` reports it as failed while
+  it compacts the others.
 - **A spill retry grouping by a string key no longer recopies its chunks as
   they fill.** Once a byte-budgeted chunk's buffers could no longer double
   inside the chunk budget, every growth reallocated the buffer to its exact
