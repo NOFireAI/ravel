@@ -357,13 +357,18 @@ grep -q "^$MAINT_RESTART_NODE restarted at " "$OUT/node-restart.txt" \
 # the restart. Recorded, not gated: the assertion gates below decide.
 if [ -n "$maint_restarted_at" ]; then
     seeded_by=""
-    while [ -z "$seeded_by" ] && [ $(($(date +%s) - maint_restarted_at)) -le "$MAINT_SEED_WAIT" ]; do
+    # Reads the logs at least once, even when the driver ended after the
+    # whole wait had passed.
+    while :; do
         for svc in maint1 maint2; do
-            docker logs --since "$maint_restarted_at" "$svc" > "$OUT/maint-poll.log" 2>&1 \
-                && grep -q "maintenance: warm-started memo from durable snapshots" "$OUT/maint-poll.log" \
+            docker logs --since "$maint_restarted_at" "$svc" > "$OUT/maint-poll-$svc.log" 2>&1 \
+                && grep -q "maintenance: warm-started memo from durable snapshots" "$OUT/maint-poll-$svc.log" \
                 && seeded_by="$seeded_by$svc "
         done
-        [ -n "$seeded_by" ] || sleep 5
+        if [ -n "$seeded_by" ] || [ $(($(date +%s) - maint_restarted_at)) -gt "$MAINT_SEED_WAIT" ]; then
+            break
+        fi
+        sleep 5
     done
     if [ -n "$seeded_by" ]; then
         echo "memo warm start after the $MAINT_RESTART_NODE restart: ${seeded_by}$(($(date +%s) - maint_restarted_at))s after it" \
