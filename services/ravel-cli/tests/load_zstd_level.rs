@@ -124,6 +124,7 @@ async fn load_at(level: i32, parquet: &Path, mapping: &Path, now_ns: i64) -> Loa
         // The page counts below were measured under the exhaustive choice,
         // where the level can also change which encoding a page keeps.
         ravel_cli::load::LoadPageChoice::Exhaustive,
+        ravel_cli::load::DeclaredStatAggregates::default(),
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

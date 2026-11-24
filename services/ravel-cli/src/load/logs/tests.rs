@@ -1846,6 +1846,7 @@ async fn load_with_default_geometry_on(
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
         Some(LoadMemoryOptions::new(load_memory)),
         false,
         Arc::new(TenantRules::none()),
@@ -2108,6 +2109,7 @@ async fn an_explicit_target_runs_the_depth_flush() {
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
         Some(LoadMemoryOptions::new(LoadMemoryRequest::Derived {
             host_total_bytes: Some(GEOMETRY_HOST_BYTES),
         })),
@@ -2211,6 +2213,7 @@ async fn load_with_a_held_age_flush(
             RlogGroupTargetBlocks::DEFAULT,
             RlogChunkOrder::DEFAULT,
             LoadPageChoice::default(),
+            DeclaredStatAggregates::default(),
             Some(memory),
             false,
             Arc::new(TenantRules::none()),
@@ -2314,6 +2317,7 @@ async fn a_zero_ack_margin_is_refused_by_the_logs_loader() {
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
         Some(memory),
         false,
         Arc::new(TenantRules::none()),
@@ -2364,6 +2368,7 @@ async fn a_zero_decode_workers_is_refused_by_the_logs_loader() {
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
         Some(memory),
         false,
         Arc::new(TenantRules::none()),
@@ -2553,6 +2558,7 @@ async fn an_explicit_target_closes_a_sparse_shard_at_the_window() {
             RlogGroupTargetBlocks::DEFAULT,
             RlogChunkOrder::DEFAULT,
             LoadPageChoice::default(),
+            DeclaredStatAggregates::default(),
             None,
             false,
             Arc::new(TenantRules::none()),
@@ -3537,6 +3543,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         RlogGroupTargetBlocks::DEFAULT,
         RlogChunkOrder::DEFAULT,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
         UNREACHED_REFLUSH_PERIOD,
         None,
         false,
@@ -5298,6 +5305,7 @@ async fn the_page_choice_reaches_the_row_path() {
                 RlogGroupTargetBlocks::DEFAULT,
                 RlogChunkOrder::DEFAULT,
                 choice,
+                DeclaredStatAggregates::default(),
                 None,
                 false,
                 Arc::new(TenantRules::none()),
@@ -5355,6 +5363,36 @@ async fn the_page_choice_reaches_the_row_path() {
     );
 }
 
+/// ADR-4628 decision 8: the loader's router config carries
+/// `--no-declared-stat-aggregates` to the shard flush whichever value it is,
+/// over a base whose own setting differs from it, while the config shared
+/// with the metrics and spans loaders emits.
+#[test]
+fn the_loader_config_carries_the_stamp_aggregate_opt_out() {
+    let shared = build_ingest_config(2, 1, 4, None);
+    assert!(shared.emit_declared_stat_aggregates);
+    for value in [
+        DeclaredStatAggregates::Emit,
+        DeclaredStatAggregates::Withhold,
+    ] {
+        let mut base = shared;
+        base.emit_declared_stat_aggregates = !value.emits();
+        let config = log_load_ingest_config(
+            base,
+            RlogZstdLevel::DEFAULT,
+            RlogGroupTargetBlocks::DEFAULT,
+            RlogChunkOrder::DEFAULT,
+            LoadPageChoice::default(),
+            value,
+        );
+        assert_eq!(
+            config.emit_declared_stat_aggregates,
+            value.emits(),
+            "{value:?}"
+        );
+    }
+}
+
 /// Issue #4212: the loader's router config carries `--page-choice` to the
 /// shard flush's RLOG writer whichever value it is, over a base whose own
 /// choice differs from it. The other writer levers carry through.
@@ -5382,6 +5420,7 @@ fn the_loader_config_builds_the_flush_writer_the_page_choice_names() {
             group_target_blocks,
             RlogChunkOrder::DEFAULT,
             choice,
+            DeclaredStatAggregates::default(),
         );
         assert_eq!(config.rlog_page_choice, writer, "{choice:?}");
     }
@@ -5391,6 +5430,7 @@ fn the_loader_config_builds_the_flush_writer_the_page_choice_names() {
         group_target_blocks,
         RlogChunkOrder::DEFAULT,
         LoadPageChoice::default(),
+        DeclaredStatAggregates::default(),
     );
     assert_eq!(config.rlog_zstd_level, zstd_level);
     assert_eq!(config.rlog_group_target_blocks, group_target_blocks);

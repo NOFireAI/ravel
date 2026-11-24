@@ -1230,12 +1230,179 @@ fn field_counts(counts: &std::collections::BTreeMap<String, u64>) -> String {
         .join(",")
 }
 
+/// The word for a stamp entry's `declared_type` tag (ADR-0090's
+/// `TypedAttrColumnType` numbers), `UNKNOWN` for a number it does not define.
+fn declared_type_word(tag: u32) -> &'static str {
+    use ravel_types::declared_stats::{
+        TYPED_ATTR_COLUMN_TYPE_BOOL, TYPED_ATTR_COLUMN_TYPE_BYTES, TYPED_ATTR_COLUMN_TYPE_F64,
+        TYPED_ATTR_COLUMN_TYPE_I64, TYPED_ATTR_COLUMN_TYPE_STR, TYPED_ATTR_COLUMN_TYPE_UNSPECIFIED,
+    };
+    match tag {
+        TYPED_ATTR_COLUMN_TYPE_UNSPECIFIED => "UNSPECIFIED",
+        TYPED_ATTR_COLUMN_TYPE_STR => "STR",
+        TYPED_ATTR_COLUMN_TYPE_I64 => "I64",
+        TYPED_ATTR_COLUMN_TYPE_BOOL => "BOOL",
+        TYPED_ATTR_COLUMN_TYPE_BYTES => "BYTES",
+        TYPED_ATTR_COLUMN_TYPE_F64 => "F64",
+        _ => "UNKNOWN",
+    }
+}
+
+fn stamp_value_text(value: Option<&ravel_proto::commit::v1::DeclaredColumnStatValue>) -> String {
+    use ravel_proto::commit::v1::declared_column_stat_value::Kind;
+    match value.map(|v| v.kind.as_ref()) {
+        None => "ABSENT".to_string(),
+        Some(None) => "EMPTY".to_string(),
+        Some(Some(Kind::I64(v))) => v.to_string(),
+        Some(Some(Kind::B(b))) => b.to_string(),
+    }
+}
+
+/// Field 7 as the inspectors print it: the exact decimal of a 16-byte
+/// little-endian two's complement value, `INVALID(<n> bytes)` for any other
+/// nonzero length, `ABSENT` when empty.
+fn sum_wide_text(sum_wide: &[u8]) -> String {
+    match <[u8; 16]>::try_from(sum_wide) {
+        Ok(bytes) => i128::from_le_bytes(bytes).to_string(),
+        Err(_) if sum_wide.is_empty() => "ABSENT".to_string(),
+        Err(_) => format!("INVALID({} bytes)", sum_wide.len()),
+    }
+}
+
+/// One declared-column stamp entry (ADR-0873, with ADR-4628's fields 6 to 8)
+/// as it sits on the wire, not as a reader validates it: an entry a reader
+/// drops still prints, and each absent field prints `ABSENT`, never `0`.
+pub fn declared_stamp_entry_text(entry: &ravel_proto::commit::v1::DeclaredColumnMinMax) -> String {
+    format!(
+        "name={:?} declared_type={} ({}) min={} max={} null_count={} sum={} sum_wide={} \
+         zero_count={}",
+        entry.name,
+        entry.declared_type,
+        declared_type_word(entry.declared_type),
+        stamp_value_text(entry.min.as_ref()),
+        stamp_value_text(entry.max.as_ref()),
+        entry.null_count,
+        entry
+            .sum
+            .map_or_else(|| "ABSENT".to_string(), |s| s.to_string()),
+        sum_wide_text(&entry.sum_wide),
+        entry
+            .zero_count
+            .map_or_else(|| "ABSENT".to_string(), |z| z.to_string()),
+    )
+}
+
+/// A carrier's stamp lines, each prefixed with `indent`: one `stamp[i]:` line
+/// per wire entry, then `stamp: entries=<wire count> kept=<kept>`, where
+/// `kept` is what the carrier's reader keeps (`covered().len()` of
+/// `read_commit_record`, `read_compaction_part` or `read_snapshot_entry`).
+pub fn declared_stamp_lines(
+    entries: &[ravel_proto::commit::v1::DeclaredColumnMinMax],
+    kept: usize,
+    indent: &str,
+) -> Vec<String> {
+    let mut lines: Vec<String> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| format!("{indent}stamp[{i}]: {}", declared_stamp_entry_text(entry)))
+        .collect();
+    lines.push(format!(
+        "{indent}stamp: entries={} kept={kept}",
+        entries.len()
+    ));
+    lines
+}
+
+/// The catalog-side mirror of a stamp entry as its commit-side twin, field
+/// for field, so one formatter prints both.
+pub fn catalog_stamp_entry_to_commit(
+    entry: &ravel_proto::catalog::v1::DeclaredColumnMinMax,
+) -> ravel_proto::commit::v1::DeclaredColumnMinMax {
+    use ravel_proto::catalog::v1::declared_column_stat_value::Kind as CatalogKind;
+    use ravel_proto::commit::v1::DeclaredColumnStatValue;
+    use ravel_proto::commit::v1::declared_column_stat_value::Kind;
+    let value = |v: &ravel_proto::catalog::v1::DeclaredColumnStatValue| DeclaredColumnStatValue {
+        kind: v.kind.as_ref().map(|k| match k {
+            CatalogKind::I64(v) => Kind::I64(*v),
+            CatalogKind::B(b) => Kind::B(*b),
+        }),
+    };
+    ravel_proto::commit::v1::DeclaredColumnMinMax {
+        name: entry.name.clone(),
+        declared_type: entry.declared_type,
+        min: entry.min.as_ref().map(value),
+        max: entry.max.as_ref().map(value),
+        null_count: entry.null_count,
+        sum: entry.sum,
+        sum_wide: entry.sum_wide.clone(),
+        zero_count: entry.zero_count,
+    }
+}
+
+/// A snapshot entry's stamp lines: [`declared_stamp_lines`] over its field 15,
+/// with `kept` from `ravel_catalog::read_snapshot_entry`.
+pub fn snapshot_entry_stamp_lines(
+    entry: &ravel_proto::catalog::v1::SnapshotEntry,
+    indent: &str,
+) -> Vec<String> {
+    let wire: Vec<_> = entry
+        .declared_column_stats
+        .iter()
+        .map(catalog_stamp_entry_to_commit)
+        .collect();
+    let kept = ravel_catalog::read_snapshot_entry(entry).covered().len();
+    declared_stamp_lines(&wire, kept, indent)
+}
+
+/// The per-part census `catalog inspect` prints under `entries (decoded):`.
+/// `stamped` counts entries with at least one stamp entry; each `with_`
+/// figure counts entries having at least one stamp entry that carries that
+/// field on the wire.
+pub fn snapshot_stamp_census_line(entries: &[ravel_proto::catalog::v1::SnapshotEntry]) -> String {
+    let count = |pred: &dyn Fn(&ravel_proto::catalog::v1::DeclaredColumnMinMax) -> bool| {
+        entries
+            .iter()
+            .filter(|e| e.declared_column_stats.iter().any(pred))
+            .count()
+    };
+    format!(
+        "    stamps: entries={} stamped={} with_sum={} with_sum_wide={} with_zero_count={}",
+        entries.len(),
+        count(&|_| true),
+        count(&|s| s.sum.is_some()),
+        count(&|s| !s.sum_wide.is_empty()),
+        count(&|s| s.zero_count.is_some()),
+    )
+}
+
+/// One snapshot entry under `catalog inspect --entries`: its identity, then
+/// its stamp lines. ravel-catalog exposes no public derivation of an entry's
+/// data object key, so the identity is printed instead of the key.
+fn snapshot_entry_lines(
+    index: usize,
+    entry: &ravel_proto::catalog::v1::SnapshotEntry,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "      entry[{index}] level={} shard={} ingest_hour_bucket={} writer_id={} \
+         writer_epoch={} writer_seq={}",
+        entry.level,
+        entry.shard,
+        entry.ingest_hour_bucket,
+        hex::encode(&entry.writer_id),
+        entry.writer_epoch,
+        entry.writer_seq,
+    )];
+    lines.extend(snapshot_entry_stamp_lines(entry, "        "));
+    lines
+}
+
 pub async fn inspect(
     store: Arc<dyn ObjectStoreBackend>,
     selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
     json: bool,
+    entries: bool,
 ) -> anyhow::Result<()> {
     if json {
         let value = render_inspect_json(store, selection, tenant, signal).await?;
@@ -1245,7 +1412,8 @@ pub async fn inspect(
         return Ok(());
     }
     let mut out = String::new();
-    let result = render_inspect(store, selection, tenant, signal, &mut out).await;
+    let result =
+        render_inspect_with_entries(store, selection, tenant, signal, entries, &mut out).await;
     // Print whatever was rendered even on error: a part fetch/decode failure
     // partway through must not discard the HEAD fields and every earlier
     // part's ref this call already rendered -- an operator inspecting a
@@ -1277,6 +1445,19 @@ pub async fn render_inspect(
     selection: StoreSelection,
     tenant: &str,
     signal: SignalArg,
+    out: &mut String,
+) -> anyhow::Result<()> {
+    render_inspect_with_entries(store, selection, tenant, signal, false, out).await
+}
+
+/// [`render_inspect`], and with `entries` (`catalog inspect --entries`) each
+/// decoded entry's identity and stamp lines under its part's census line.
+pub async fn render_inspect_with_entries(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    entries: bool,
     out: &mut String,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
@@ -1383,6 +1564,16 @@ pub async fn render_inspect(
             "    entries (decoded): {}\n",
             decoded.entries.len()
         ));
+        out.push_str(&snapshot_stamp_census_line(&decoded.entries));
+        out.push('\n');
+        if entries {
+            for (i, entry) in decoded.entries.iter().enumerate() {
+                for line in snapshot_entry_lines(i, entry) {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1828,6 +2019,152 @@ pub async fn verify(
     }
     println!("catalog verify: snapshot matches the sealed commit history");
     Ok(())
+}
+
+/// Stamp entries shared by the inspector rendering tests: one per field
+/// shape, over a carrier of [`stamp_fixture::ROWS`] rows.
+#[cfg(test)]
+pub(crate) mod stamp_fixture {
+    use ravel_proto::commit::v1::declared_column_stat_value::Kind;
+    use ravel_proto::commit::v1::{DeclaredColumnMinMax, DeclaredColumnStatValue};
+
+    pub(crate) const ROWS: u64 = 10;
+    /// Ten rows of 2^62: the sum leaves i64, so it sits in field 7.
+    pub(crate) const WIDE_SUM: i128 = 10 * (1i128 << 62);
+
+    fn i64v(v: i64) -> Option<DeclaredColumnStatValue> {
+        Some(DeclaredColumnStatValue {
+            kind: Some(Kind::I64(v)),
+        })
+    }
+
+    fn boolv(b: bool) -> Option<DeclaredColumnStatValue> {
+        Some(DeclaredColumnStatValue {
+            kind: Some(Kind::B(b)),
+        })
+    }
+
+    /// Valid: field 6 and field 8.
+    pub(crate) fn narrow() -> DeclaredColumnMinMax {
+        DeclaredColumnMinMax {
+            name: "AdvEngineID".to_string(),
+            declared_type: 2,
+            min: i64v(0),
+            max: i64v(3),
+            null_count: 0,
+            sum: Some(12),
+            sum_wide: Vec::new(),
+            zero_count: Some(4),
+        }
+    }
+
+    /// Valid: field 7 past i64::MAX and a zero count of 0.
+    pub(crate) fn wide() -> DeclaredColumnMinMax {
+        DeclaredColumnMinMax {
+            name: "UserID".to_string(),
+            declared_type: 2,
+            min: i64v(1 << 62),
+            max: i64v(1 << 62),
+            null_count: 0,
+            sum: None,
+            sum_wide: WIDE_SUM.to_le_bytes().to_vec(),
+            zero_count: Some(0),
+        }
+    }
+
+    /// Valid: a BOOL column, which carries no sum.
+    pub(crate) fn boolean() -> DeclaredColumnMinMax {
+        DeclaredColumnMinMax {
+            name: "IsMobile".to_string(),
+            declared_type: 3,
+            min: boolv(false),
+            max: boolv(true),
+            null_count: 2,
+            sum: None,
+            sum_wide: Vec::new(),
+            zero_count: Some(3),
+        }
+    }
+
+    /// A stamp written before ADR-4628: none of fields 6 to 8.
+    pub(crate) fn pre_adr() -> DeclaredColumnMinMax {
+        DeclaredColumnMinMax {
+            name: "ResolutionWidth".to_string(),
+            declared_type: 2,
+            min: i64v(800),
+            max: i64v(1920),
+            null_count: 1,
+            sum: None,
+            sum_wide: Vec::new(),
+            zero_count: None,
+        }
+    }
+
+    /// Breaks decision 2's first clause: fields 6 and 7 both present.
+    pub(crate) fn both_sums() -> DeclaredColumnMinMax {
+        DeclaredColumnMinMax {
+            name: "Both".to_string(),
+            declared_type: 2,
+            min: i64v(1 << 62),
+            max: i64v(1 << 62),
+            null_count: 0,
+            sum: Some(5),
+            sum_wide: WIDE_SUM.to_le_bytes().to_vec(),
+            zero_count: None,
+        }
+    }
+
+    /// The five entries every rendering test carries, in order.
+    pub(crate) fn entries() -> Vec<DeclaredColumnMinMax> {
+        vec![narrow(), wide(), boolean(), pre_adr(), both_sums()]
+    }
+
+    /// The stamp lines of [`entries`] at `indent`: five wire entries, four
+    /// kept (the both-sums entry is dropped).
+    pub(crate) fn lines(indent: &str) -> Vec<String> {
+        [
+            "stamp[0]: name=\"AdvEngineID\" declared_type=2 (I64) min=0 max=3 null_count=0 \
+             sum=12 sum_wide=ABSENT zero_count=4",
+            "stamp[1]: name=\"UserID\" declared_type=2 (I64) min=4611686018427387904 \
+             max=4611686018427387904 null_count=0 sum=ABSENT sum_wide=46116860184273879040 \
+             zero_count=0",
+            "stamp[2]: name=\"IsMobile\" declared_type=3 (BOOL) min=false max=true \
+             null_count=2 sum=ABSENT sum_wide=ABSENT zero_count=3",
+            "stamp[3]: name=\"ResolutionWidth\" declared_type=2 (I64) min=800 max=1920 \
+             null_count=1 sum=ABSENT sum_wide=ABSENT zero_count=ABSENT",
+            "stamp[4]: name=\"Both\" declared_type=2 (I64) min=4611686018427387904 \
+             max=4611686018427387904 null_count=0 sum=5 sum_wide=46116860184273879040 \
+             zero_count=ABSENT",
+            "stamp: entries=5 kept=4",
+        ]
+        .iter()
+        .map(|l| format!("{indent}{l}"))
+        .collect()
+    }
+
+    /// The commit-side entry as its catalog-side mirror.
+    pub(crate) fn to_catalog(
+        entry: &DeclaredColumnMinMax,
+    ) -> ravel_proto::catalog::v1::DeclaredColumnMinMax {
+        use ravel_proto::catalog::v1::declared_column_stat_value::Kind as CatalogKind;
+        let value =
+            |v: &DeclaredColumnStatValue| ravel_proto::catalog::v1::DeclaredColumnStatValue {
+                kind: v.kind.as_ref().map(|k| match k {
+                    Kind::I64(v) => CatalogKind::I64(*v),
+                    Kind::B(b) => CatalogKind::B(*b),
+                }),
+            };
+        ravel_proto::catalog::v1::DeclaredColumnMinMax {
+            name: entry.name.clone(),
+            declared_type: entry.declared_type,
+            min: entry.min.as_ref().map(value),
+            max: entry.max.as_ref().map(value),
+            null_count: entry.null_count,
+            sum: entry.sum,
+            sum_wide: entry.sum_wide.clone(),
+            zero_count: entry.zero_count,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2611,5 +2948,242 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn stamped_snapshot_entry(
+        writer: u8,
+        stats: &[ravel_proto::commit::v1::DeclaredColumnMinMax],
+    ) -> ravel_proto::catalog::v1::SnapshotEntry {
+        ravel_proto::catalog::v1::SnapshotEntry {
+            level: 0,
+            shard: 0,
+            ingest_hour_bucket: 10,
+            writer_id: vec![writer; 16],
+            writer_epoch: 1,
+            writer_seq: u64::from(writer),
+            content_hash: vec![0xBB; 32],
+            object_size: 4_096,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 100,
+            sample_count: super::stamp_fixture::ROWS,
+            series_count: 1,
+            segment_format_version: 4,
+            created_unix_ns: 1_000,
+            declared_column_stats: stats.iter().map(super::stamp_fixture::to_catalog).collect(),
+        }
+    }
+
+    /// Each field prints its own presence: ABSENT for a missing field, never
+    /// 0, and fields 6 and 7 apart.
+    #[test]
+    fn a_stamp_entry_prints_every_field_present_and_absent() {
+        use super::stamp_fixture::*;
+        let mut entry = narrow();
+        assert_eq!(
+            declared_stamp_entry_text(&entry),
+            "name=\"AdvEngineID\" declared_type=2 (I64) min=0 max=3 null_count=0 sum=12 \
+             sum_wide=ABSENT zero_count=4"
+        );
+        entry.sum = None;
+        entry.zero_count = None;
+        entry.min = None;
+        entry.max = Some(ravel_proto::commit::v1::DeclaredColumnStatValue { kind: None });
+        assert_eq!(
+            declared_stamp_entry_text(&entry),
+            "name=\"AdvEngineID\" declared_type=2 (I64) min=ABSENT max=EMPTY null_count=0 \
+             sum=ABSENT sum_wide=ABSENT zero_count=ABSENT"
+        );
+        entry.sum = Some(0);
+        entry.zero_count = Some(0);
+        entry.declared_type = 9;
+        assert_eq!(
+            declared_stamp_entry_text(&entry),
+            "name=\"AdvEngineID\" declared_type=9 (UNKNOWN) min=ABSENT max=EMPTY null_count=0 \
+             sum=0 sum_wide=ABSENT zero_count=0"
+        );
+    }
+
+    /// Field 7 prints as the exact i128 decimal at 16 bytes, past i64 in
+    /// both directions, and as INVALID with its length otherwise.
+    #[test]
+    fn sum_wide_prints_the_exact_decimal_or_invalid() {
+        let mut entry = super::stamp_fixture::wide();
+        let text = |e: &ravel_proto::commit::v1::DeclaredColumnMinMax| {
+            let line = declared_stamp_entry_text(e);
+            let start = line.find(" sum_wide=").expect("a sum_wide field") + 1;
+            let end = line.find(" zero_count=").expect("a zero_count field");
+            line[start..end].to_string()
+        };
+        assert_eq!(text(&entry), "sum_wide=46116860184273879040");
+        entry.sum_wide = (i128::from(i64::MIN) - 1).to_le_bytes().to_vec();
+        assert_eq!(text(&entry), "sum_wide=-9223372036854775809");
+        entry.sum_wide = vec![0xFF; 15];
+        assert_eq!(text(&entry), "sum_wide=INVALID(15 bytes)");
+        entry.sum_wide = vec![1; 17];
+        assert_eq!(text(&entry), "sum_wide=INVALID(17 bytes)");
+    }
+
+    /// The lines print the wire entries, the both-sums entry included, while
+    /// kept counts what the reader keeps: an entry that breaks a decision 2
+    /// clause shows as kept below entries.
+    #[test]
+    fn the_stamp_lines_show_the_wire_and_kept_shows_the_drop() {
+        use super::stamp_fixture::*;
+        let record = ravel_proto::commit::v1::CommitRecord {
+            sample_count: ROWS,
+            declared_column_stats: entries(),
+            ..Default::default()
+        };
+        let kept = ravel_commit::declared_stats::read_commit_record(&record)
+            .covered()
+            .len();
+        assert_eq!(kept, 4);
+        assert_eq!(
+            declared_stamp_lines(&record.declared_column_stats, kept, "  "),
+            lines("  ")
+        );
+        // A zero count above the non-null count breaks a decision 2 clause.
+        let mut bad = narrow();
+        bad.zero_count = Some(ROWS + 1);
+        let record = ravel_proto::commit::v1::CommitRecord {
+            sample_count: ROWS,
+            declared_column_stats: vec![bad, pre_adr()],
+            ..Default::default()
+        };
+        let kept = ravel_commit::declared_stats::read_commit_record(&record)
+            .covered()
+            .len();
+        assert_eq!(
+            declared_stamp_lines(&record.declared_column_stats, kept, "")
+                .last()
+                .map(String::as_str),
+            Some("stamp: entries=2 kept=1")
+        );
+        let entry = stamped_snapshot_entry(1, &record.declared_column_stats);
+        assert_eq!(
+            snapshot_entry_stamp_lines(&entry, "")
+                .last()
+                .map(String::as_str),
+            Some("stamp: entries=2 kept=1")
+        );
+    }
+
+    /// `catalog inspect` over a `.csnap` part carrying the fields: the census
+    /// line under `entries (decoded):`, and with `--entries` each entry's
+    /// identity and stamp lines, compared line for line.
+    #[tokio::test]
+    async fn inspect_prints_the_stamp_census_and_each_entry_stamp() {
+        use super::stamp_fixture;
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-inspect-stamps";
+        let tenant_hash = TenantId::new(tenant).hash();
+        let entries = vec![
+            stamped_snapshot_entry(1, &stamp_fixture::entries()),
+            stamped_snapshot_entry(2, &[stamp_fixture::pre_adr()]),
+            stamped_snapshot_entry(3, &[]),
+        ];
+        let part_bytes =
+            ravel_catalog::encode_part(tenant_hash.0, 0, 1, 20, &entries).expect("encode part");
+        let key = format!("t/{}/catalog/m/snap/part0.rcs", tenant_hash.to_hex());
+        store
+            .put(
+                &key,
+                part_bytes.clone().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put part");
+        let head = SnapshotHead {
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION_1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour: 20,
+            parts: vec![SnapshotPartRef {
+                key,
+                blake3: vec![0; 32],
+                size: part_bytes.len() as u64,
+                entry_count: 3,
+                watermark_hour: 20,
+                min_hour: 0,
+                column_stats: None,
+                key_index: Vec::new(),
+                retired_hours: Vec::new(),
+            }],
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        store
+            .put(
+                &head_key(&tenant_hash, Signal::Metrics),
+                ravel_catalog::encode_head(&head)
+                    .expect("encode head")
+                    .into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let render = |entries: bool| {
+            let store = store.clone();
+            async move {
+                let mut report = String::new();
+                render_inspect_with_entries(
+                    store,
+                    StoreSelection::explicit(crate::store::StoreKind::Memory),
+                    tenant,
+                    SignalArg::Metrics,
+                    entries,
+                    &mut report,
+                )
+                .await
+                .expect("inspect renders");
+                report
+            }
+        };
+        let after_count = |report: &str| -> Vec<String> {
+            let lines: Vec<String> = report.lines().map(str::to_string).collect();
+            let at = lines
+                .iter()
+                .position(|l| l == "    entries (decoded): 3")
+                .unwrap_or_else(|| panic!("no entries line in:\n{report}"));
+            lines[at + 1..].to_vec()
+        };
+        let census = "    stamps: entries=3 stamped=2 with_sum=1 with_sum_wide=1 with_zero_count=1"
+            .to_string();
+
+        let plain = render(false).await;
+        assert_eq!(after_count(&plain), vec![census.clone()], "{plain}");
+
+        let listed = render(true).await;
+        let mut want = vec![
+            census,
+            format!(
+                "      entry[0] level=0 shard=0 ingest_hour_bucket=10 writer_id={} \
+                 writer_epoch=1 writer_seq=1",
+                "01".repeat(16)
+            ),
+        ];
+        want.extend(stamp_fixture::lines("        "));
+        want.push(format!(
+            "      entry[1] level=0 shard=0 ingest_hour_bucket=10 writer_id={} \
+             writer_epoch=1 writer_seq=2",
+            "02".repeat(16)
+        ));
+        want.push(
+            "        stamp[0]: name=\"ResolutionWidth\" declared_type=2 (I64) min=800 max=1920 \
+             null_count=1 sum=ABSENT sum_wide=ABSENT zero_count=ABSENT"
+                .to_string(),
+        );
+        want.push("        stamp: entries=1 kept=1".to_string());
+        want.push(format!(
+            "      entry[2] level=0 shard=0 ingest_hour_bucket=10 writer_id={} \
+             writer_epoch=1 writer_seq=3",
+            "03".repeat(16)
+        ));
+        want.push("        stamp: entries=0 kept=0".to_string());
+        assert_eq!(after_count(&listed), want, "{listed}");
     }
 }

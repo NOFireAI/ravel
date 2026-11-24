@@ -1239,6 +1239,7 @@ async fn the_entry_point_warns_that_metrics_and_spans_ignore_the_page_choice() {
                 RlogGroupTargetBlocks::DEFAULT,
                 RlogChunkOrder::DEFAULT,
                 choice,
+                DeclaredStatAggregates::default(),
                 LoadMemoryRequest::Derived {
                     host_total_bytes: Some(64 << 30),
                 },

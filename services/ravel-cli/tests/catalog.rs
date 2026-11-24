@@ -108,6 +108,7 @@ async fn fold_then_inspect_then_verify_round_trips_cleanly() {
         tenant,
         SignalArg::Metrics,
         false,
+        false,
     )
     .await
     .expect("inspect succeeds against a freshly folded HEAD");
@@ -165,9 +166,16 @@ async fn inspect_and_verify_report_cleanly_with_no_head_yet() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = "acme";
 
-    catalog::inspect(store.clone(), MEMORY, tenant, SignalArg::Metrics, false)
-        .await
-        .expect("inspect on an absent HEAD reports rather than errors");
+    catalog::inspect(
+        store.clone(),
+        MEMORY,
+        tenant,
+        SignalArg::Metrics,
+        false,
+        false,
+    )
+    .await
+    .expect("inspect on an absent HEAD reports rather than errors");
     let json = catalog::render_inspect_json(store.clone(), MEMORY, tenant, SignalArg::Metrics)
         .await
         .expect("inspect --json on an absent HEAD reports rather than errors");
@@ -250,6 +258,7 @@ async fn inspect_rejects_a_corrupt_head() {
         MEMORY,
         "acme",
         SignalArg::Metrics,
+        false,
         false,
     )
     .await
