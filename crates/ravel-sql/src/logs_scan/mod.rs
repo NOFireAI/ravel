@@ -5300,7 +5300,11 @@ mod figure_resolver_tests {
             let plan = stamped_scan(std::slice::from_ref(&filter));
             let scan = as_scan(&plan);
             assert!(
-                !scan.prune.is_empty() && !prune_is_rewrite_neutral(&scan.prune),
+                !scan.prune.is_empty()
+                    && scan
+                        .prune
+                        .iter()
+                        .all(|p| !matches!(p, Predicate::NumNotEq { .. })),
                 "{filter}: a prune arm other than NumNotEq: {:?}",
                 scan.prune
             );
