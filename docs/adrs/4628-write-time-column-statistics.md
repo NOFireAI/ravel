@@ -1085,6 +1085,12 @@ In the readers and the resolver:
   type, with value kinds that match.
 - A segment with no figure from either carrier declines the whole
   statement (`resolve_segment_figure`).
+- A stamp whose zero count is 0 while its min or max is the type's zero,
+  over a segment with non-null rows, cannot describe its object, so
+  `stamp_equal_count` gives no stamp answer for that segment. The segment
+  falls to the granted `.cstat` entry, or the statement scans. Decode does
+  not yet refuse such a stamp (issue #4672), and this check does not
+  replace that clause.
 
 At the result type, `sum_array`, `avg_array`, `sum_count_array` and
 `count_to_i64` decline a total the result type cannot hold, so the scan
