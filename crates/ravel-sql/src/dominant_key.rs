@@ -89,7 +89,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::row::{RowConverter, Rows, SortField};
 use datafusion::common::Result as DFResult;
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::hash_utils::{RandomState, create_hashes};
+use datafusion::common::hash_utils::create_hashes;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -105,7 +105,7 @@ use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricsSet,
 };
-use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::repartition::{REPARTITION_RANDOM_STATE, RepartitionExec};
 use datafusion::physical_plan::{
     ChildStats, ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
     ExecutionPlanProperties, InputOrderMode, PlanProperties, ReplaceChildrenOptions,
@@ -121,10 +121,6 @@ pub const DOMINANT_KEY_COMBINER_RULE: &str = "dominant_key_combiner";
 /// The name prefix of the exec's per-partition memory consumer:
 /// `"DominantKeyCombiner[{partition}]"`.
 pub const DOMINANT_KEY_COMBINER_CONSUMER_PREFIX: &str = "DominantKeyCombiner[";
-
-/// The seed of the key hash: the hash exchange's own (`create_hashes` over
-/// the key columns at seed 0, as `RepartitionExec` hashes them).
-const KEY_HASH_SEED: u64 = 0;
 
 /// Bytes one counter of the table takes: its hash, its count, and the
 /// optional held group (a group index and the boxed encoded key).
@@ -652,7 +648,6 @@ struct CombinerStream {
     converter: RowConverter,
     table: CounterTable,
     hasher: Option<KeyHasher>,
-    random_state: RandomState,
     hashes: Vec<u64>,
     group_indices: Vec<usize>,
     pending_rows: Vec<u32>,
@@ -692,7 +687,6 @@ impl CombinerStream {
             key_schema,
             table: CounterTable::new(exec.counters),
             hasher: exec.hasher.clone(),
-            random_state: RandomState::with_seed(KEY_HASH_SEED),
             hashes: Vec::new(),
             group_indices: Vec::new(),
             pending_rows: Vec::new(),
@@ -726,7 +720,12 @@ impl CombinerStream {
         self.hashes.resize(rows, 0);
         match &self.hasher {
             Some(hasher) => hasher(keys, &mut self.hashes),
-            None => create_hashes(keys, &self.random_state, &mut self.hashes).map(|_| ()),
+            None => create_hashes(
+                keys,
+                REPARTITION_RANDOM_STATE.random_state(),
+                &mut self.hashes,
+            )
+            .map(|_| ()),
         }
     }
 

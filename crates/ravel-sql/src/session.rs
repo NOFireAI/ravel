@@ -102,9 +102,13 @@
 //! a memory and CPU decision, not a determinism one: the partial stage keeps
 //! one hash table per input partition, so a key whose distinct values appear
 //! in every partition costs `partitions x distinct` entries before the final
-//! stage ever merges them. Giving up early bounds that at `partitions x probe
-//! rows`, and on a key that barely reduces it saves hashing every row twice
-//! (issue #3231). It cannot change a result -- the final stage sees the same
+//! stage ever merges them. A partition that gives up early holds only the
+//! groups it found before it skipped; one whose probe never fires keeps every
+//! group it sees, so the bound covers the partitions that skip, not the stage
+//! (issue #4676 measured 137.6 K to 235.9 K groups in each unskipped partition
+//! of a 32-partition `COUNT(DISTINCT ..)`). On a key that barely reduces,
+//! giving up saves hashing every row twice (issue #3231). It cannot change a
+//! result -- the final stage sees the same
 //! rows and computes the same groups either way -- so it is orthogonal to the
 //! determinism rules above.
 //!
@@ -513,13 +517,20 @@ pub const SKIP_PARTIAL_AGGREGATION_PROBE_ROWS: usize = 8192;
 /// hashing and inserting each row in both the partial and the final stage
 /// costs more CPU than the partial stage saves on string and high-cardinality
 /// keys. Keys between 0.1 and 0.5 that still reduce (a phrase key with heavy
-/// repetition, for example) skip too, and pay a small cost in the repartition
-/// and the final stage, which then receive every row instead of one per
-/// group.
+/// repetition, for example) skip too, and the repartition and the final stage
+/// then receive every row instead of one per group. That cost is not small
+/// when the rows concentrate on one key: the one final partition that owns it
+/// receives them all (issue #4676: 64.1 of 75.6 M exchange rows to one of 32
+/// final partitions), which is why `crate::dominant_key` combines such a key
+/// before the exchange.
 ///
 /// A skipped partition emits the groups its probe accumulated and then holds
-/// no partial state, so the pre-final state stays near `partitions x probe
-/// rows` instead of `partitions x distinct`. Skipping never changes a result,
+/// no partial state. A partition whose probe never fires keeps its whole
+/// table, so the pre-final state is the skipped partitions' probe groups plus
+/// every unskipped partition's distinct keys, not `partitions x probe rows`
+/// (issue #4676 measured 137.6 K to 235.9 K groups in each unskipped
+/// partition, with the final partition that owned the dominant key 0.98 of
+/// the wall time). Skipping never changes a result,
 /// only where the state lives: the final stage sees the same rows and computes
 /// the same groups either way.
 pub const SKIP_PARTIAL_AGGREGATION_PROBE_RATIO: f64 = 0.1;

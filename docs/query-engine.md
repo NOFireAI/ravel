@@ -2314,7 +2314,9 @@ applies to a legacy aggregate whose memory consumer DataFusion marks as
 unable to spill: a final or single-stage aggregate on a statement that runs
 without spill, or one whose input is fully sorted on the group key. A
 partial aggregate is never held, because it emits early into the exchange
-that feeds the final aggregate and that exchange reserves what it buffers. A
+that feeds the final aggregate, or into the dominant-key combiner in front of
+that exchange, which passes forwarded rows on and charges the states it holds,
+and that exchange reserves what it buffers. A
 final aggregate that can spill is not held either, because its shrink can
 follow a spill to disk, which frees the memory. So on a deployment that runs
 with `--sql-spill-dir`, a legacy final aggregate over an unordered group key
@@ -6864,6 +6866,51 @@ before its output is cut, and the evaluated bucket batch and its sort indices
 are held uncharged for the duration of the cut, at most one bucket's evaluated
 output per partition; sizing a ceiling from the one-to-one charging sentence
 above leaves that transient out.
+
+#### Dominant-key combining before the hash exchange (ADR-0102)
+
+A partial aggregate partition that skips aggregation forwards one state row
+per input row, so a key holding most of a scan's rows sends most of them to
+the one final partition that owns it. `SqlConfig::dominant_key_combiner` (on
+by default, no ravel-server flag) puts a `DominantKeyCombinerExec` between a
+`Partial` aggregate and the hash `RepartitionExec` directly above it. It keeps
+a table of `2P - 1` counters per input partition, `P` being the exchange's
+output partitions, keyed by the group key hash. A row whose hash holds a
+counter increments it; the second row of that hash creates the key's state,
+and later rows with the same encoded key merge into it, while a row whose key
+only collides with the hash is forwarded. A row with no counter takes a free
+one and is forwarded, or, with none free, triggers a pass that decrements
+every counter, frees those at zero and emits the state each of them held; the
+row is forwarded. At end of input each held state is emitted once. The
+exchange and the final aggregate above are unchanged, and the final merges
+the same states either way, so answers are the stock plan's.
+
+A pass consumes `k + 1` rows of a partition's `n` for `k` counters, so a key
+is forwarded at most `n / (k + 1) + 1` times per input partition,
+`n / (2P) + 1` at `k = 2P - 1`, and the exec holds at most `2P - 1` groups
+per input partition. A key whose hash collides with a held key's is outside
+that bound and is always forwarded.
+
+The rule admits a `Partial` aggregate with one grouping set and no limit,
+input ordering or dynamic filter, whose aggregates all have a groups
+accumulator, no `ORDER BY`, and state that is fixed width and not float, and
+whose keys are not float. Zero aggregates qualify (the `GROUP BY` a
+`COUNT(DISTINCT x)` plans), as do `count`, `sum`, `min`, `max` and `avg` over
+an integer column. It runs after every other rule that matches the partial,
+exchange and final shape and directly before the compact-slices rule. A
+repartition-free spill session has no hash exchange and gets no exec; the
+bucketed refusal retry keeps its exchange and gets one. Memory is charged one
+to one to a non-spillable `DominantKeyCombiner[p]` consumer per partition: the
+group table, the accumulators, the counter table and the stored encoded keys.
+`EXPLAIN` shows `counters=<k>` on the exec's line, and `EXPLAIN ANALYZE`
+reports `merged_rows`, `forwarded_rows`, `emitted_states`, `held_groups_peak`
+and `decrement_passes`.
+
+Per input row the exec hashes every key column and probes its table once; a
+row that meets a held key's hash also compares encoded key bytes, after the
+batch's keys are row-encoded once. The exchange then hashes the forwarded rows'
+keys again with the same function and seed: reusing the exec's hashes would need
+the exchange to accept precomputed hashes, a DataFusion change.
 
 #### The decoded column-block cache (ADR-3326)
 

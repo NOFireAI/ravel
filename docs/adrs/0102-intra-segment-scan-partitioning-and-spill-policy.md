@@ -271,7 +271,8 @@ aggregation-attributable peak divided by `D` is 65.4 bytes at `D = 50,000` and
 63.5 bytes at `D = 200,000`, for a 13-byte string key. At ClickBench's roughly
 17M distinct `UserID` that puts the final aggregation state near 1.1 GiB, the
 partial stage at 32 x 8,192 x 64 B (about 17 MiB, against about 205 MiB under
-DataFusion's stock 100,000-row probe), and the scan at about 1.5 MiB per
+DataFusion's stock 100,000-row probe; a figure for partitions that skip, see
+the dominant-key amendment (#4676) below), and the scan at about 1.5 MiB per
 partition. Allowing a factor of two for a hash table resident across a doubling
 resize, `COUNT(DISTINCT UserID)` needs on the order of 2.2 GiB, so an 8 GiB pool
 holds it with room; that it failed at 1 GiB and passed at 8 GiB matches this
@@ -1105,16 +1106,104 @@ high-cardinality `GROUP BY` statements q13-q19, q34 and q35 spent 0.976 of the
 server CPU they spent at 0.5, and the whole sweep 0.985, with every answer
 unchanged.
 
-The cost falls on keys between 0.1 and 0.5 that still reduce, such as a
-phrase key with heavy repetition: they skip too, and the repartition and the
-final stage then receive every row instead of one per group. In the same
-measurement the `SearchPhrase`-keyed q13-q15 spent about 1.01 of their former
-CPU for that reason, and no statement spent more than 1.035.
+The cost falls on keys between 0.1 and 0.5 that still reduce (corrected by
+the dominant-key amendment (#4676) below), such as a phrase key with heavy
+repetition: they skip too, and the repartition and the final stage then
+receive every row instead of one per group. In the same measurement the
+`SearchPhrase`-keyed q13-q15 spent about 1.01 of their former CPU for that
+reason (a CPU figure, not a wall-time one; see the dominant-key amendment
+(#4676) below), and no statement spent more than 1.035.
 
-The memory argument of the #680 amendment still holds and is stronger: a
+The memory argument of the #680 amendment still holds and is stronger
+(corrected by the dominant-key amendment (#4676) below): a
 skipped partition emits the groups its probe accumulated and then holds no
 partial state, and more partitions now skip. Skipping still cannot change a
 result. The #680 pin (`tests/skip_partial_aggregation.rs`) reads a ratio of
 1.0 on the tightened side and is unaffected; the same file's
 `probe_ratio_threshold_is_one_new_group_in_ten_rows` pins the new value from
 both sides, with 820 groups in the 8,192 probe rows skipping and 819 not.
+
+## Amendment (2026-11-24, #4676): a dominant key is combined before the hash exchange
+
+<!-- amendment-applies: sections="Amendment, 2026-08-26: aggregation state scales with partition count (issue #680)|Amendment (2026-10-26, #3231): the skip-partial probe ratio is 0.1" pointer="dominant-key amendment (#4676)" -->
+<!-- amendment-supersedes: phrase="The cost falls on keys between 0.1 and 0.5" pointer="dominant-key amendment (#4676)" -->
+<!-- amendment-supersedes: phrase="still holds and is stronger" pointer="dominant-key amendment (#4676)" -->
+
+A partial partition that skips aggregation forwards one state row per input
+row to the hash exchange, so a key that holds most of a scan's rows sends most
+of them to the one final partition that owns it. Measured on v0.34.0 on a
+c6a.8xlarge at 32 partitions (#4676 design comment 7116548191, sections 3 and
+5; evidence comment 7102913046), line 6, a `COUNT(DISTINCT ..)` that plans as
+a `GROUP BY` with no aggregates, took 0.763 s hot; 25 of its 32 partial
+partitions skipped, one of its 32 final partitions received 64.1 M of the
+75.6 M rows the exchange carried, and the answer came 0.23 s after the last
+scan stream ended. The 7 partitions that did not skip held 137.6 K to
+235.9 K groups each, and the final partition that owned the dominant key took
+0.98 of the wall time.
+
+Decision. `SqlConfig::dominant_key_combiner` (default on, no server flag)
+installs the `dominant_key_combiner` physical rule, which puts a
+`DominantKeyCombinerExec` between a `Partial` aggregate and the hash
+`RepartitionExec` directly above it (`crates/ravel-sql/src/dominant_key.rs`).
+Per input partition it keeps `k = 2P - 1` counters, `P` the exchange's output
+partitions, keyed by the group key hash. A row whose hash holds a counter
+increments it; the second row of a hash creates the key's state, and later
+rows whose encoded key equals the stored one merge into it, while a row whose
+key only collides with the hash is forwarded. A row with no counter takes a
+free one and is forwarded, or, with none free, triggers one decrement pass:
+every counter loses 1, a counter at 0 is freed and the state it held is
+emitted as one row, and the row is forwarded. At end of input each held state
+is emitted once. The rule admits a `Partial` aggregate with one grouping set,
+no limit, linear input order and no dynamic filter, whose aggregates all have
+a groups accumulator, no `ORDER BY`, and fixed-width non-float state, and
+whose keys are not float; zero aggregates qualify. Every input row is either
+forwarded or merged into one held state, every held state is emitted once,
+and the final aggregate merges states whatever subsets they cover, so answers
+are unchanged, as the skip decision leaves them unchanged. No approximation
+is involved and none can be turned on.
+
+The bound. A decrement pass consumes `k + 1` of a partition's `n` rows, so
+there are at most `n / (k + 1)` passes. A key forwards the rows that trigger
+passes while it holds no counter, plus its admissions, and each admission after
+the first follows a pass that freed its counter, which it did not trigger: at
+most `n / (k + 1) + 1` forwarded rows, `n / (2P) + 1` at `k = 2P - 1`. State
+is held only for keys holding a counter, at most `2P - 1` groups per input
+partition, each one key and one fixed-width state; a key whose hash collides
+with a held key's is outside this bound and is always forwarded. The memory is
+charged one to one to a non-spillable `DominantKeyCombiner[<partition>]`
+consumer: the group table, every accumulator, the counter table and the stored
+encoded keys, released at end of input, on an error and on drop.
+
+What this corrects, each from the measurement above:
+
+- The probe ratio amendment (#3231) says the cost of skipping "falls on keys
+  between 0.1 and 0.5 that still reduce" and is a small one in the
+  repartition and the final stage. It falls on any skipping partition whose
+  rows concentrate on few keys, whatever its probe ratio, and it is not small:
+  the final partition that owns the key receives all of them and sets the
+  wall time (64.1 of 75.6 M rows, 0.98 of the wall). With the combiner a key
+  whose hash no other key shares in the table reaches the exchange from each
+  input partition at most `n / (2P) + 1` times as a forwarded row, plus the
+  states it emits.
+- The same amendment says the memory argument of the #680 amendment "still
+  holds and is stronger". It holds for the partitions that skip, which hold
+  no partial state after their probe. A partition whose probe never fires
+  keeps its whole table (137.6 K to 235.9 K groups each in the measurement),
+  so the pre-final state is not bounded by `partitions x probe rows`, and
+  more partitions skipping lowers that state only by the partitions that do.
+  The combiner adds at most `2P - 1` groups per input partition.
+
+What this qualifies, without disputing it:
+
+- The #680 amendment's partial-stage figure, 32 x 8,192 x 64 B, is the state
+  of 32 partitions that all skip after one probe batch. A partition that does
+  not skip holds its distinct keys instead.
+- The probe ratio amendment's "about 1.01" for q13-q15 is server CPU summed
+  over partitions. It says nothing about wall time on a statement whose rows
+  concentrate on one key, where one final partition is the critical path.
+
+Pinned by `crates/ravel-sql/tests/dominant_key_combiner.rs`: the answers
+against the rule off at 1, 4 and 32 partitions, the forwarded counts at the
+bound (`n / (2P)` for the worst case, once for a key on one row in `P`), the
+held-group peak at `2P - 1`, the memory charge at named checkpoints, and the
+five `EXPLAIN ANALYZE` counters. The skip thresholds are unchanged.
