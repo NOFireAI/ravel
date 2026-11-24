@@ -258,7 +258,8 @@ object bound to the covered part set) and loaded once per query by
 `Catalog::load_column_stats`; the query-side rewrite is `MetadataOnlyAggregate`
 (crates/ravel-sql/src/metadata_agg.rs), which replaces the aggregate subtree
 with a `MetadataOnlyExec` leaf whose line in a `ravel-cli sql explain` plan
-reads `MetadataOnlyExec: metadata_only=true, rows=<n>`. The shapes are:
+reads `MetadataOnlyExec: metadata_only=true, rows=<n>, stamp_segments=<s>,
+cstat_segments=<c>` (the two counts are described below). The shapes are:
 
 - **q02**: `SELECT COUNT(*) FROM logs WHERE <typed attribute column> <>
   <literal>`, one residual filter over the scan and no `GROUP BY`. Answered as
@@ -315,10 +316,48 @@ or a rewrite part, which carries an empty stamp) is no answer, never 0.
 
 A stamp answer needs no `.cstat`, so the executor's statistics load guards
 nothing for it: every refusal below is a check in the rule or in
-`LogsScanExec::metadata_rewrite_stats_are_exact`. The load itself still runs
-for an admitted shape, and on an unfolded catalog it costs one plan-phase GET
-of the absent catalog HEAD; skipping it when the stamps answer is
-ADR-4628 task T5.
+`LogsScanExec::metadata_rewrite_stats_are_exact`. The load is skipped when
+the stamps answer the whole statement (ADR-4628 decision 5).
+`SqlExecutor::logs_column_stats_eligible` checks this last, after every
+refusal it already makes (a pending erasure, no admitted aggregate, a
+content predicate or a prune arm other than `NumNotEq`, a ts bound that
+clips a touched segment). It skips the load only when all of these hold:
+
+- the statement names one table and its analyzed plan holds one table scan;
+- every admitted aggregate states the figures its answer reads
+  (`AdmittedAggregate::stamp_figures` in `metadata_agg.rs`): one sum per
+  distinct column for the sum shapes (`COUNT(*)` beside them reads none),
+  or the one `<>` count of q02, whose literal must already be a constant of
+  the column's own type (`Int64` for `I64`, `Boolean` for `BOOL`). A q08
+  count, an aggregate with a residual conjunct the gate cannot read, and a
+  literal that is still an expression (`a <> 100 + 100`) or of another type
+  state none, and keep the load;
+- every segment the analyzed plan's ts bound touches answers every figure
+  through `resolve_segment_figure` with no column statistics, that is, from
+  its stamp. A stamp carrying field 8 can still give no figure (the
+  zero-count guard), and a stamp without fields 6 to 8 still answers a
+  literal its extrema decide.
+
+The analyzed plan reads no bound written as `TIMESTAMP '...'` (it is still a
+cast there), so such a bound makes the walk cover every segment. The walk does
+no I/O. The skip decides only whether the load is paid: with nothing loaded, a
+segment whose stamp gives no figure declines the rewrite and the statement
+scans, so a wrong skip costs a scan, never a wrong answer. On an unfolded
+catalog a kept load is one plan-phase GET of the absent catalog HEAD, and on a
+folded one the HEAD and the `.cstat` object.
+
+Each `MetadataOnlyExec` reports which carrier answered each touched segment,
+counting each segment once: as `cstat` when any figure read for it came from
+`.cstat`, otherwise as `stamp`, so the two add up to the touched segments. A
+q08 count reads only `.cstat`, so all its segments count as `cstat`. The
+counts appear on the `EXPLAIN` line as `stamp_segments` and `cstat_segments`,
+as the node's metrics `segments_answered_from_stamp` and
+`segments_answered_from_cstat`, and in `stats.pruning` as
+`segmentsAnsweredFromStamp` and `segmentsAnsweredFromCstat`. A statement the
+rule does not answer (a scan, or one DataFusion's `AggregateStatistics`
+answers, such as a bare `COUNT(*)` or `MIN`) reports 0 and 0. A falling stamp
+count on a tenant whose writers emit the fields is how a fold or compactor
+that drops them shows up (ADR-4628 decision 8, "Order").
 
 All are additive to DataFusion's built-in `AggregateStatistics` rule (which
 handles the predicate-free `COUNT(*)` above and never fires for any shape
@@ -503,8 +542,15 @@ as a defect check. The entry describes record-level cells and the stamp the
 merged value, so they differ wherever a row takes its value from the resource
 or scope, and no figure they carry tells that difference apart from a defect.
 
-A per-query coverage figure (segments stamped over segments touched, per
-carrier, under phase accounting) is not built.
+A statement whose `.cstat` load is skipped because the stamps answer it reads
+no `.cstat` entry, so its stamp-covered segments add nothing to the `cstat`
+label; with the load kept, a stamp-answered segment's entry is still read
+once for the tally.
+
+The per-query coverage figure is the carrier split above: each statement the
+rule answers reports `segmentsAnsweredFromStamp` and
+`segmentsAnsweredFromCstat` in `stats.pruning`. It is a segment count, not a
+phase-accounted cost; the load's GETs are under the plan phase.
 
 ## Predicate-free full-window logs scan: request count
 
@@ -4436,6 +4482,12 @@ and block-level reported independently:
 - `segmentsPrunedByStats`: segments a logs scan skipped before any fetch
   because a typed attribute column's stamped statistics excluded a
   pushed-down predicate (ADR-2121 D1).
+- `segmentsAnsweredFromStamp` and `segmentsAnsweredFromCstat`: the touched
+  segments a metadata-only aggregate answered from their stamps alone, and
+  those with at least one figure read from `.cstat` (ADR-4628 decision 5;
+  see "Logs aggregates from exact per-object column statistics"). Summed over
+  every `MetadataOnlyExec` in the plan; 0 for a statement the rule does not
+  answer.
 - `segmentsPrunedByKeyIndex`: segments a spans `trace_id =` lookup or a logs
   exact-key equality read no blocks of because their KEY_IDX section proved
   the key absent, or, for several logs keys joined by `AND`, named no block
@@ -4513,7 +4565,8 @@ and block-level reported independently:
   (ADR-0099 decision 2).
 
 The two key-index counts are 0 for a statement with no spans
-`trace_id =` lookup and are sums over every spans scan in the plan. The
+`trace_id =` lookup and are sums over every spans scan in the plan. The two
+carrier counts are 0 for a statement with no metadata-only answer. The
 other twelve counts after `segments` are 0 for a statement with no logs scan.
 They are sums over every logs scan in the plan (`stats.timings.scans`),
 while `segments` counts every segment of every resolved snapshot. With one

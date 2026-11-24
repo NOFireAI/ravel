@@ -85,7 +85,7 @@ impl Row {
     }
 }
 
-fn log_record(r: &Row) -> LogRecord {
+pub(crate) fn log_record(r: &Row) -> LogRecord {
     let resource: Vec<(String, AttrValue)> = vec![(
         "service.name".to_string(),
         AttrValue::Str("api".to_string()),
@@ -807,9 +807,9 @@ async fn one_segment_without_the_fields_scans() {
 // Executor-level harness: commit records through a real Catalog
 // ---------------------------------------------------------------------------
 
-const NS_PER_SEC: i64 = 1_000_000_000;
-const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
-const BASE_HOUR: u32 = 500_000;
+pub(crate) const NS_PER_SEC: i64 = 1_000_000_000;
+pub(crate) const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
+pub(crate) const BASE_HOUR: u32 = 500_000;
 
 /// GETs by key kind, counted below every cache.
 #[derive(Default)]
@@ -822,11 +822,11 @@ pub(crate) struct KeyCountingStore {
 }
 
 impl KeyCountingStore {
-    fn data_gets(&self) -> u64 {
+    pub(crate) fn data_gets(&self) -> u64 {
         self.data_gets.load(Ordering::Acquire)
     }
 
-    fn take_keys(&self) -> Vec<String> {
+    pub(crate) fn take_keys(&self) -> Vec<String> {
         std::mem::take(&mut *self.get_keys.lock().expect("keys"))
     }
 }
@@ -889,12 +889,12 @@ impl ObjectStoreBackend for KeyCountingStore {
     }
 }
 
-fn tenant() -> TenantId {
+pub(crate) fn tenant() -> TenantId {
     TenantId::new("stamp-readers-4684".to_string())
 }
 
 /// The ClickBench columns of test 1.
-fn clickbench_cols() -> Vec<DeclaredColumn> {
+pub(crate) fn clickbench_cols() -> Vec<DeclaredColumn> {
     vec![
         DeclaredColumn::new("AdvEngineID", DeclaredType::I64),
         DeclaredColumn::new("ResolutionWidth", DeclaredType::I64),
@@ -902,7 +902,7 @@ fn clickbench_cols() -> Vec<DeclaredColumn> {
     ]
 }
 
-fn cb_row(ts: i64, adv: Option<i64>, width: Option<i64>, user: Option<i64>) -> Row {
+pub(crate) fn cb_row(ts: i64, adv: Option<i64>, width: Option<i64>, user: Option<i64>) -> Row {
     let mut attrs = Vec::new();
     if let Some(v) = adv {
         attrs.push(("AdvEngineID", AttrValue::I64(v)));
@@ -917,7 +917,7 @@ fn cb_row(ts: i64, adv: Option<i64>, width: Option<i64>, user: Option<i64>) -> R
 }
 
 /// Three objects; the first one's `UserID` sum leaves `i64` (field 7).
-fn clickbench_parts() -> Vec<Vec<Row>> {
+pub(crate) fn clickbench_parts() -> Vec<Vec<Row>> {
     let h = i64::from(BASE_HOUR) * NS_PER_HOUR;
     let big = i64::MAX - 10;
     vec![
@@ -942,7 +942,7 @@ fn clickbench_parts() -> Vec<Vec<Row>> {
 }
 
 /// Write `rows` as a real RLOG object and return its bytes.
-fn rlog_bytes(tenant: &TenantId, seq: u64, rows: &[Row]) -> Vec<u8> {
+pub(crate) fn rlog_bytes(tenant: &TenantId, seq: u64, rows: &[Row]) -> Vec<u8> {
     let mut w = RlogWriter::new(
         RlogConfig::default(),
         ObjectIdentity {
@@ -959,15 +959,14 @@ fn rlog_bytes(tenant: &TenantId, seq: u64, rows: &[Row]) -> Vec<u8> {
     w.finish().expect("finish")
 }
 
-/// The commit record of object `seq` holding `rows`, stamped for `cols`.
-fn stamped_record(
+/// The commit record of object `seq` holding `rows`, carrying `stamps`.
+fn record_with_stamps(
     tenant: &TenantId,
     seq: u64,
     hour: u32,
     rows: &[Row],
     bytes: &[u8],
-    cols: &[DeclaredColumn],
-    fields: Fields,
+    stamps: &[DeclaredColumnStat],
 ) -> CommitRecord {
     let min = rows.iter().map(|r| r.ts).min().expect("nonempty");
     let max = rows.iter().map(|r| r.ts).max().expect("nonempty");
@@ -991,12 +990,12 @@ fn stamped_record(
         ingest_hour_bucket: hour,
     })
     .expect("valid logs commit record");
-    ravel_commit::declared_stats::stamp_commit_record(&mut rec, &stamps_of(cols, rows, fields));
+    ravel_commit::declared_stats::stamp_commit_record(&mut rec, stamps);
     rec
 }
 
 /// Write object `seq` and publish its stamped commit record, as a flush does.
-async fn publish_object(
+pub(crate) async fn publish_object(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
     seq: u64,
@@ -1005,8 +1004,28 @@ async fn publish_object(
     cols: &[DeclaredColumn],
     fields: Fields,
 ) -> CommitRecord {
+    publish_with_stamps(
+        store,
+        tenant,
+        seq,
+        hour,
+        rows,
+        &stamps_of(cols, rows, fields),
+    )
+    .await
+}
+
+/// [`publish_object`] with the stamps given per column.
+pub(crate) async fn publish_with_stamps(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    seq: u64,
+    hour: u32,
+    rows: &[Row],
+    stamps: &[DeclaredColumnStat],
+) -> CommitRecord {
     let bytes = rlog_bytes(tenant, seq, rows);
-    let rec = stamped_record(tenant, seq, hour, rows, &bytes, cols, fields);
+    let rec = record_with_stamps(tenant, seq, hour, rows, &bytes, stamps);
     let data_key = keys::reconstruct_data_key(&rec).expect("logs data key");
     store
         .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
@@ -1018,20 +1037,20 @@ async fn publish_object(
     rec
 }
 
-fn sql_config() -> SqlConfig {
+pub(crate) fn sql_config() -> SqlConfig {
     let mut config = SqlConfig::default();
     config.engine.max_segments = 1_000_000;
     config
 }
 
-fn executor(store: &Arc<KeyCountingStore>, cols: Vec<DeclaredColumn>) -> SqlExecutor {
+pub(crate) fn executor(store: &Arc<KeyCountingStore>, cols: Vec<DeclaredColumn>) -> SqlExecutor {
     let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(store) as Arc<dyn ObjectStoreBackend>;
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog"));
     executor_on(catalog, &backend, cols)
 }
 
-fn executor_on(
+pub(crate) fn executor_on(
     catalog: Arc<Catalog>,
     backend: &Arc<dyn ObjectStoreBackend>,
     cols: Vec<DeclaredColumn>,
@@ -1049,7 +1068,7 @@ fn executor_on(
 
 /// A request over `BASE_HOUR`, at an instant inside the next hour (so the
 /// hour is not sealed and no fold is assumed).
-fn request(sql: &str, tokens: Vec<CommitToken>) -> SqlRequest {
+pub(crate) fn request(sql: &str, tokens: Vec<CommitToken>) -> SqlRequest {
     let start = i64::from(BASE_HOUR) * NS_PER_HOUR;
     let now = start + NS_PER_HOUR + 60 * NS_PER_SEC;
     SqlRequest {
@@ -1072,16 +1091,16 @@ fn request(sql: &str, tokens: Vec<CommitToken>) -> SqlRequest {
 
 /// Per-phase GETs and wire bytes of one statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Phases {
-    resolve: (u64, u64),
-    plan: (u64, u64),
-    probe: (u64, u64),
-    scan: (u64, u64),
-    key_index: (u64, u64),
-    fetch: (u64, u64),
+pub(crate) struct Phases {
+    pub(crate) resolve: (u64, u64),
+    pub(crate) plan: (u64, u64),
+    pub(crate) probe: (u64, u64),
+    pub(crate) scan: (u64, u64),
+    pub(crate) key_index: (u64, u64),
+    pub(crate) fetch: (u64, u64),
 }
 
-fn phases(outcome: &SqlOutcome) -> Phases {
+pub(crate) fn phases(outcome: &SqlOutcome) -> Phases {
     let pa = &outcome.phase_accounting;
     let of = |s: &ravel_types::accounting::QueryAccountingSnapshot| {
         (
@@ -1100,34 +1119,50 @@ fn phases(outcome: &SqlOutcome) -> Phases {
 }
 
 /// One statement through the executor.
-struct ExecRun {
-    plan: String,
-    answer: Run,
-    phases: Phases,
-    data_gets: u64,
-    get_keys: Vec<String>,
+pub(crate) struct ExecRun {
+    pub(crate) plan: String,
+    pub(crate) answer: Run,
+    pub(crate) phases: Phases,
+    pub(crate) data_gets: u64,
+    pub(crate) get_keys: Vec<String>,
+    /// The executed statement's stats; `None` when it failed.
+    pub(crate) stats: Option<ravel_sql::SqlStats>,
 }
 
-async fn exec(
+pub(crate) async fn exec(
     store: &Arc<KeyCountingStore>,
     executor: &SqlExecutor,
     sql: &str,
     tokens: Vec<CommitToken>,
 ) -> ExecRun {
-    let req = request(sql, tokens);
-    let th = tenant().hash();
+    exec_request(store, executor, &tenant(), request(sql, tokens)).await
+}
+
+/// [`exec`] for `req` against `tenant`.
+pub(crate) async fn exec_request(
+    store: &Arc<KeyCountingStore>,
+    executor: &SqlExecutor,
+    tenant: &TenantId,
+    req: SqlRequest,
+) -> ExecRun {
+    let th = tenant.hash();
     store.take_keys();
     let before = store.data_gets();
     let outcome = executor.execute(th, &req).await;
     let data_gets = store.data_gets() - before;
     let get_keys = store.take_keys();
-    let (answer, phases_of) = match outcome {
+    let (answer, phases_of, stats) = match outcome {
         Ok(outcome) => {
             let p = phases(&outcome);
-            (Ok(outcome.output.batches().to_vec()), Some(p))
+            (
+                Ok(outcome.output.batches().to_vec()),
+                Some(p),
+                Some(outcome.stats.clone()),
+            )
         }
         Err(e) => (
             Err(datafusion::error::DataFusionError::Execution(e.to_string())),
+            None,
             None,
         ),
     };
@@ -1154,11 +1189,12 @@ async fn exec(
         }),
         data_gets,
         get_keys,
+        stats,
     }
 }
 
 /// A store holding `parts` published at `BASE_HOUR`, stamped with `fields`.
-async fn clickbench_store(fields: Fields) -> Arc<KeyCountingStore> {
+pub(crate) async fn clickbench_store(fields: Fields) -> Arc<KeyCountingStore> {
     let store = Arc::new(KeyCountingStore::default());
     for (i, rows) in clickbench_parts().iter().enumerate() {
         publish_object(
@@ -1188,7 +1224,7 @@ fn clickbench_q29() -> String {
     format!("SELECT {} FROM logs", terms.join(", "))
 }
 
-const Q1: &str = "SELECT COUNT(*) FROM logs WHERE \"AdvEngineID\" <> 0";
+pub(crate) const Q1: &str = "SELECT COUNT(*) FROM logs WHERE \"AdvEngineID\" <> 0";
 const Q2: &str = "SELECT SUM(\"AdvEngineID\"), COUNT(*), AVG(\"ResolutionWidth\") FROM logs";
 const Q3: &str = "SELECT AVG(\"UserID\") FROM logs";
 
@@ -1217,20 +1253,20 @@ async fn assert_clickbench_statement(sql: &str) -> (Phases, Phases) {
         (0, 0, 0, 0),
         "{sql}: probe, scan, key_index and fetch GETs: {p:?}"
     );
-    // The statistics load still runs (T5b removes it) and reads the catalog
-    // HEAD, absent on an unfolded catalog: the one plan-phase GET.
-    // The resolve reads it once too; every other GET is a commit record.
+    // Every segment's stamp answers every figure, so the statistics load is
+    // skipped (T5b): no plan-phase GET. The resolve reads the absent catalog
+    // HEAD once; every other GET is a commit record.
     let head = format!("t/{}/catalog/l/HEAD", tenant().hash().to_hex());
     let non_record: Vec<&String> = run
         .get_keys
         .iter()
         .filter(|k| !k.ends_with(".cmt"))
         .collect();
-    assert_eq!(p.plan.0, 1, "{sql}: one plan-phase GET: {p:?}");
+    assert_eq!(p.plan.0, 0, "{sql}: no plan-phase GET: {p:?}");
     assert_eq!(
         non_record,
-        vec![&head, &head],
-        "{sql}: the resolve's and the plan's HEAD reads"
+        vec![&head],
+        "{sql}: the resolve's HEAD read only"
     );
     assert_eq!(
         p.resolve.0,
@@ -1244,6 +1280,11 @@ async fn assert_clickbench_statement(sql: &str) -> (Phases, Phases) {
         scan.plan
     );
     assert!(scan.data_gets > 0, "{sql}: the forced scan reads objects");
+    assert_eq!(
+        scan.phases.plan.0, 1,
+        "{sql}: the stripped stamps keep the load, the absent HEAD: {:?}",
+        scan.phases
+    );
     assert_eq!(
         p.resolve.0, scan.phases.resolve.0,
         "{sql}: resolve GETs equal the forced scan's"
@@ -1538,7 +1579,7 @@ fn sealed_request(sql: &str, tokens: Vec<CommitToken>) -> SqlRequest {
 
 /// One world of test 6: input A stamped with `fields`, warmed into the query
 /// node's commit-record cache by a token read, then rewritten.
-struct ErasureWorld {
+pub(crate) struct ErasureWorld {
     store: Arc<KeyCountingStore>,
     executor: SqlExecutor,
     token: CommitToken,
@@ -1580,7 +1621,7 @@ async fn erasure_world(fields: Fields) -> ErasureWorld {
     }
 }
 
-async fn erasure_exec(world: &ErasureWorld, req: &SqlRequest) -> ExecRun {
+pub(crate) async fn erasure_exec(world: &ErasureWorld, req: &SqlRequest) -> ExecRun {
     let th = erasure_tenant().hash();
     let before = world.store.data_gets();
     let outcome = world.executor.execute(th, req).await.expect("executes");
@@ -1601,6 +1642,7 @@ async fn erasure_exec(world: &ErasureWorld, req: &SqlRequest) -> ExecRun {
         },
         data_gets,
         get_keys: Vec::new(),
+        stats: Some(outcome.stats.clone()),
     }
 }
 
@@ -1688,7 +1730,7 @@ async fn a_rewrite_part_and_a_completed_erasure_scan() {
 
 /// Input A alone, stamped with `fields`, unfolded, with no rewrite record;
 /// the request on A's erased row is pending when `pending` is set.
-async fn pre_rewrite_world(fields: Fields, pending: bool) -> ErasureWorld {
+pub(crate) async fn pre_rewrite_world(fields: Fields, pending: bool) -> ErasureWorld {
     let t = erasure_tenant();
     let store = Arc::new(KeyCountingStore::default());
     let a = publish_object(

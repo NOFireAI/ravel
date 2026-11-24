@@ -132,6 +132,8 @@ pub fn pruning_json(stats: &SqlStats) -> Json {
     json!({
         "segments": stats.segments,
         "segmentsPrunedByStats": stats.segments_pruned_by_stats,
+        "segmentsAnsweredFromStamp": stats.segments_answered_from_stamp,
+        "segmentsAnsweredFromCstat": stats.segments_answered_from_cstat,
         "segmentsPrunedByKeyIndex": stats.segments_pruned_by_key_index,
         "blocksPrunedByKeyIndex": stats.blocks_pruned_by_key_index,
         "blocksTotal": stats.blocks_total,
@@ -668,6 +670,8 @@ mod tests {
             attempts: 2,
             segments: 7,
             segments_pruned_by_stats: 3,
+            segments_answered_from_stamp: 47,
+            segments_answered_from_cstat: 53,
             segments_pruned_by_key_index: 23,
             blocks_pruned_by_key_index: 29,
             blocks_total: 40,
@@ -777,7 +781,7 @@ mod tests {
         }
     }
 
-    /// `pruning_json`'s key set is exactly the fifteen counters below, each
+    /// `pruning_json`'s key set is exactly the seventeen counters below, each
     /// carrying its own `SqlStats` field.
     #[test]
     fn pruning_json_names_every_field_exactly_once() {
@@ -785,6 +789,8 @@ mod tests {
         let expected: std::collections::BTreeSet<&str> = [
             "segments",
             "segmentsPrunedByStats",
+            "segmentsAnsweredFromStamp",
+            "segmentsAnsweredFromCstat",
             "segmentsPrunedByKeyIndex",
             "blocksPrunedByKeyIndex",
             "blocksTotal",
@@ -805,6 +811,8 @@ mod tests {
         for (key, value) in [
             ("segments", 7),
             ("segmentsPrunedByStats", 3),
+            ("segmentsAnsweredFromStamp", 47),
+            ("segmentsAnsweredFromCstat", 53),
             ("segmentsPrunedByKeyIndex", 23),
             ("blocksPrunedByKeyIndex", 29),
             ("blocksTotal", 40),

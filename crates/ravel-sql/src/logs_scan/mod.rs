@@ -1371,6 +1371,8 @@ fn declared_null_scalar(ty: DeclaredType) -> ScalarValue {
 pub(crate) struct DeclaredGroupCounts {
     pub(crate) counts: Vec<(ScalarValue, u64)>,
     pub(crate) null_count: u64,
+    /// The touched segments, every one answered from its `.cstat` entry.
+    pub(crate) segments: usize,
 }
 
 /// Exact aggregate inputs for the `SUM(col + k)` and `AVG(col)` decompositions
@@ -1384,6 +1386,17 @@ pub(crate) struct DeclaredGroupCounts {
 pub(crate) struct DeclaredColumnSum {
     pub(crate) sum: i128,
     pub(crate) non_null_count: u64,
+    /// The carrier [`resolve_segment_figure`] answered each touched segment
+    /// from, in touched-segment order.
+    pub(crate) carriers: Vec<FigureCarrier>,
+}
+
+/// The exact `COUNT(*) WHERE col <> lit` from
+/// [`LogsScanExec::declared_not_equal_count`], with the carrier each touched
+/// segment's count came from, in touched-segment order.
+pub(crate) struct DeclaredNotEqualCount {
+    pub(crate) count: u64,
+    pub(crate) carriers: Vec<FigureCarrier>,
 }
 
 /// Log segment scan producing block-at-a-time batches over a projection of the
@@ -2963,7 +2976,11 @@ impl LogsScanExec {
     /// and summing to its non-null count; one segment with neither declines
     /// the statement. A `Str` column and a literal of another scalar type
     /// decline.
-    pub(crate) fn declared_not_equal_count(&self, k: usize, literal: &ScalarValue) -> Option<u64> {
+    pub(crate) fn declared_not_equal_count(
+        &self,
+        k: usize,
+        literal: &ScalarValue,
+    ) -> Option<DeclaredNotEqualCount> {
         if !self.metadata_rewrite_stats_are_exact() {
             return None;
         }
@@ -2972,8 +2989,9 @@ impl LogsScanExec {
             return None;
         }
         let mut total: u64 = 0;
+        let mut carriers = Vec::with_capacity(self.segments.len());
         for seg in self.segments.iter() {
-            let (_, SegmentFigure::NotEqual(not_equal)) = resolve_segment_figure(
+            let (carrier, SegmentFigure::NotEqual(not_equal)) = resolve_segment_figure(
                 declared,
                 seg,
                 self.column_stats.as_deref(),
@@ -2983,8 +3001,12 @@ impl LogsScanExec {
                 return None;
             };
             total = total.checked_add(not_equal)?;
+            carriers.push(carrier);
         }
-        Some(total)
+        Some(DeclaredNotEqualCount {
+            count: total,
+            carriers,
+        })
     }
 
     /// The declared-column index (into `self.declared`) that this scan's
@@ -3052,6 +3074,7 @@ impl LogsScanExec {
         Some(DeclaredGroupCounts {
             counts: merged.into_iter().collect(),
             null_count,
+            segments: self.segments.len(),
         })
     }
 
@@ -3078,9 +3101,10 @@ impl LogsScanExec {
         }
         let mut sum: i128 = 0;
         let mut non_null_count: u64 = 0;
+        let mut carriers = Vec::with_capacity(self.segments.len());
         for seg in self.segments.iter() {
             let (
-                _,
+                carrier,
                 SegmentFigure::Sum {
                     sum: seg_sum,
                     non_null_count: seg_non_null,
@@ -3096,10 +3120,12 @@ impl LogsScanExec {
             };
             sum = sum.checked_add(seg_sum)?;
             non_null_count = non_null_count.checked_add(seg_non_null)?;
+            carriers.push(carrier);
         }
         Some(DeclaredColumnSum {
             sum,
             non_null_count,
+            carriers,
         })
     }
 
@@ -4461,6 +4487,7 @@ mod cstat_reconcile_tests {
 
     fn not_equal_404(scan: &LogsScanExec) -> Option<u64> {
         scan.declared_not_equal_count(0, &ScalarValue::Int64(Some(404)))
+            .map(|c| c.count)
     }
 
     /// q02 (`declared_not_equal_count`): an entry accounting for four of the
@@ -4503,6 +4530,7 @@ mod cstat_reconcile_tests {
     fn a_stamp_answer_still_counts_an_unreconciled_entry_once() {
         let (answered, delta) = one_read(SAMPLE_COUNT, vec![status_stat(0)], |scan| {
             scan.declared_not_equal_count(0, &ScalarValue::Int64(Some(0)))
+                .map(|c| c.count)
         });
         assert_eq!(
             answered,
@@ -5309,7 +5337,10 @@ mod figure_resolver_tests {
             "{:?}",
             control.prune
         );
-        assert_eq!(control.declared_not_equal_count(0, &zero), Some(4));
+        assert_eq!(
+            control.declared_not_equal_count(0, &zero).map(|c| c.count),
+            Some(4)
+        );
         let sum = control.declared_column_sum(0).expect("the stamp's sum");
         assert_eq!((sum.sum, sum.non_null_count), (1004, 4));
 
@@ -5339,7 +5370,10 @@ mod figure_resolver_tests {
                     && (scan.ts_min, scan.ts_max) == (i64::MIN, i64::MAX),
                 "{filter}: the prune arm is the only refusal"
             );
-            assert_eq!(scan.declared_not_equal_count(0, &zero), None, "{filter}");
+            assert!(
+                scan.declared_not_equal_count(0, &zero).is_none(),
+                "{filter}"
+            );
             assert!(scan.declared_column_sum(0).is_none(), "{filter}");
         }
     }

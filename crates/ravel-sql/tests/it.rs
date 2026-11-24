@@ -124,6 +124,8 @@ mod logs_scan_fetch_pushdown;
 mod logs_selective_scan_amplification;
 #[path = "logs_stamp_guards.rs"]
 mod logs_stamp_guards;
+#[path = "logs_stamp_load_gate.rs"]
+mod logs_stamp_load_gate;
 #[path = "logs_stamp_readers.rs"]
 mod logs_stamp_readers;
 #[path = "logs_stats_load.rs"]
