@@ -6,6 +6,192 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-11-24
+
+### Added
+
+- **A failed `metricsbench_ingest --readback-only` keeps what answered.** When a
+  later query fails after the series listing answered, the output carries
+  `readback_partial` with the failed query, the attempt, the series count and
+  the listing's time, windows, stats and cost, including the new
+  `process_store_get_bytes_delta`. The bin still exits 1. The Ravel-only
+  MetricsBench run stamps `series_store_get_calls` and
+  `series_store_get_bytes`: the change in ravel-server's process-wide
+  `ravel_store_calls_total` and `ravel_store_bytes_total` with `op="get"`
+  between the scrapes right before and right after the series listing. The
+  bytes are object bytes returned by successful GETs, a ranged read counted as
+  its range, not HTTP wire bytes or decompressed bytes. Either figure null on
+  a read-back that has it to give is a miss and fails the step. A read-back
+  that carries `readback_partial` is stamped `error` and fails its step, and a
+  422 grades `refused (budget)` only when the error names the series query,
+  so a 422 from a samples query now fails the step. Each catalog state stamps
+  its fold report's `postings_built`, which `ravel_only.differences` now
+  checks.
+- **A metrics part left without a series index says why, field by field.** The
+  fold report's new `metrics_series_index_over_cap_parts` and the key-index
+  repair report's new `series_index_over_cap_parts` list each part over the
+  series-index byte cap or the leaf body ceiling: its cap, the pairs of
+  `series_label`, `series_class` and `class_objects`, and its class and series
+  counts. A part over the byte cap also gives its leaf bytes and each field's
+  leaf bytes; a part with a key over the body ceiling gives null `leaf_bytes`
+  and `field_bytes` and sets `body_bytes` and `body_ceiling` instead. The warn
+  line and the text form of both reports carry the same figures. Which parts
+  get a series index is unchanged.
+- **The declared-column stamp on logs commit records gains sum and zero-count
+  fields.** `DeclaredColumnMinMax` adds `sum` (field 6), `sum_wide` (field 7)
+  and `zero_count` (field 8) in both the commit and catalog protos (ADR-4628),
+  and decoders validate them and drop a defective entry under the existing
+  carrier-labelled drop counter. No producer writes them and no reader uses
+  them yet; metrics and spans records carry no stamp.
+- **The fold carries a stamp's write-time sum and zero count onto sealed
+  snapshot entries.** When a commit record or compaction part carries the
+  ADR-4628 sum and zero count (fields 6 to 8 of its declared-column stamp), the
+  fold copies them, as the source predicate validated them, onto the
+  `SnapshotEntry` and off it onto the resolved `SegmentRef`, so a sealed segment
+  carries the statistics wherever its source stamp did. The record cache charges
+  each entry for the wider stamp. No producer writes the fields and no reader
+  uses them yet; both land in later ADR-4628 tasks. No format version changes.
+
+### Fixed
+
+- **ravel-server listens for SIGTERM before it reports ready.** The SIGTERM
+  and SIGINT handlers are now installed before `/readyz` turns 200, so a signal
+  delivered the instant a pod becomes ready drains gracefully instead of taking
+  the signal's default disposition and killing the process with exit 143.
+- **A metrics range query charges its query memory budget for what its
+  sample fold holds.** The fold under-charged many small series by about a
+  quarter of their bytes, over-charged a few long series by about an
+  eighth, and reserved room for the largest merge any series in a call
+  could build, whether or not one would merge, never shrinking it until
+  the query ended. It now charges each container by its capacity before it
+  grows, releases a refused or failed growth's charge once and never twice,
+  keeps merge room
+  only for a series that will merge, and shrinks its reservation after each
+  call when the budget has room for the smaller reservation beside the
+  larger one. An allocation the allocator refuses, or whose size overflows,
+  fails the query with its own error rather than a budget refusal, and
+  answers the same 422. Before building its result the fold now also
+  reserves the result's series list, 48 bytes per series, so a query can be
+  refused after every object was fetched, which earlier releases never did:
+  a query whose fold fit but whose budget has less than that free, including
+  one whose budget concurrent queries filled between its last fetch and that
+  reservation, is refused with `FetchMemoryExhausted` (422). **Operators:
+  a query over many small series now reaches the memory budget sooner.** On
+  a fold of 20,000 series with 4 samples each, measured on x86_64 (other
+  targets differ by a few bytes), the charge rises from
+  6,088,986 to 8,219,070 bytes, about 35%, plus the 48 bytes per series
+  above, so such a query that fit earlier can now be refused with the same
+  422. A fold of a few long series is charged about 11% less (43,201,640 to
+  38,402,940 bytes for 8 series of 200,000 samples). No default budget
+  changes. Every query
+  that is served returns the same series and samples, bit for bit, as
+  before.
+- **A token read no longer adds a write retention is deleting, on a tenant
+  with a completed erasure.** On such a tenant a read with a commit token
+  lists the token's bucket. When that list showed a retention tombstone,
+  the read still added the write's level-0 object, which retention was
+  deleting, while a read whose commit record was already gone answered the
+  same bucket with nothing. Both now answer with nothing.
+- **A token read no longer adds a write retention is deleting, on any
+  tenant.** When a read with a commit token found the token's write still
+  present in an hour retention had retired, and nothing else made it list
+  that hour, it added the write's level-0 object, while a plain read of the
+  same hour served nothing from it. The read now checks the hour's
+  retention marker, at most one request per shard and hour per read, and
+  answers a retired hour with nothing.
+- **`ravel-server --mode maintain` refuses a non-default
+  `--gc-max-flush-lifetime` while the late-commit fence is on.** The fence
+  derives each hour's late-commit cutoff from this value, and `ravel-cli
+  maintain compact-bucket` and `compact-tenant` already refuse any value but
+  the default under the fence. A maintain process with another value drew a
+  different cutoff for the same bucket than a CLI run did, so a compaction
+  and an erasure rewrite of that bucket could cover different inputs. Upgrade:
+  a maintain process started with a `--gc-max-flush-lifetime` other than the
+  default (1h) and the fence on now fails at startup. Remove the flag, or pass
+  `--late-commit-fence off` on every maintainer of the store. Other modes are
+  not affected.
+- **`ravel_analyze_timeseries` and `ravel_describe_data` report a memory
+  refusal as `budget_exceeded`, not the retryable `unavailable`.** A fetch or
+  catalog decode the memory budget refused, and an allocation the allocator
+  refused after the budget admitted it, already answered HTTP 422 (ADR-2633
+  decision 5), but the query service classed all three as `unavailable` on
+  the analytics and describe paths, so an MCP client was told to retry a
+  query that needed more memory than the server would give it. The PromQL,
+  label and SQL-backed tools are unchanged: they report the same refusal as
+  `unsupported`.
+- **Metrics L1 compaction no longer writes a part whose provenance columns or
+  run total its own reader refuses.** A
+  part closes before the series that would take its flagged per-sample
+  provenance samples past 16,777,216, or its run total past 4,473,924, the
+  most the reader decodes under its default limits. Before, parts closed on
+  the stored-size target alone, so a part with heavily merged series could be
+  published and then fail every catalog decode with
+  `ProvenanceLiveBudgetExceeded`. A bucket with one series over either bound
+  on its own is now refused with a typed error, writes and publishes nothing,
+  and keeps its L0 inputs. Parts already written over a bound stay unreadable.
+  The maintenance scan holds such a bucket, counts it in `held_reader_bound`
+  and logs the series, quantity, count and bound, and later hours of the shard
+  still compact.
+- **A spill retry grouping by a string key no longer recopies its chunks as
+  they fill.** Once a byte-budgeted chunk's buffers could no longer double
+  inside the chunk budget, every growth reallocated the buffer to its exact
+  new length and copied it whole: on ClickBench line 34 that copy passed at
+  least 1.49 TB through memmove to write 2.87 GB of spill. A chunk that
+  cannot double a buffer within its budget now seals and starts the next
+  one, so the bytes growth copies are less than twice the bytes written into
+  the chunks. Chunks can hold fewer rows than before, and each is still
+  charged its full budget, so a retry can start spilling on fewer rows. The
+  retry's INFO line
+  gains `bucket_route_resize_bytes` and `bucket_route_chunks_sealed`.
+- **A logs aggregate over a `LIMIT` subquery no longer answers from column
+  statistics of every row.** When a statement loaded column statistics and
+  also aggregated a `LIMIT` subquery over one logs object, such as
+  `SELECT (SELECT SUM(status) FROM logs), (SELECT SUM(status) FROM (SELECT
+  status FROM logs LIMIT 2))`, the limited `SUM`, `AVG`,
+  `COUNT(*) WHERE col <> lit` or `GROUP BY col` count was answered from the
+  statistics of every row instead of the rows the limit keeps: 1408 instead
+  of 400 in that example. This was shown on code whose rule and statistics
+  load are unchanged since v0.35.0; earlier releases carry the same rule and
+  were not tested. Such an aggregate now scans the limited rows (#4680).
+
+### Changed
+
+- **Release images and binaries are built with Rust 1.100.0.** The pinned
+  toolchain and the release image's builder move from Rust 1.97.1 to 1.100.0.
+  The minimum supported Rust version stays 1.97.
+- **Re-checking a cached commit record reads one byte.** Since 0.35.0 a read
+  with a commit token re-checks, with one GET, that a commit record the node
+  had cached is still present. That GET transferred the whole record and
+  threw it away. It now reads one byte of it, at the same request count.
+- **The SQL resolve time is split into its parts.** `stats.timings` now carries
+  `resolveGenerationsMs`, `resolveListWaveMs`, `resolveRecordsMs` and
+  `resolveOtherMs` beside `resolveMs`, on SQL and ES|QL responses. They sum to
+  `resolveMs` and show whether a slow resolve waited on the provisioning reads,
+  the catalog LISTs or the commit records. The resolve itself is unchanged.
+- **A logs statement with several sums, averages and `COUNT(*)` is answered
+  from column statistics.** An ungrouped, unfiltered statement whose every
+  aggregate is `SUM`, `SUM(col + k)`, `AVG` or `COUNT(*)` over typed integer
+  columns, in any mix, now reads no data object when every touched object
+  carries exact statistics for every column it names (ClickBench lines 3 and
+  30). Each column's statistics are read once per statement. One aggregate
+  the statistics cannot answer, or one object without a stored sum for one
+  column, makes the whole statement scan as before (#4651).
+- **A comparison with the empty string reads lengths, not bytes.** `x = ''`
+  and `x <> ''` over a string or binary `x`, in either operand order, in a SQL
+  filter or the `logs` scan's row filter, are now decided from each value's
+  length (offsets, view length, or once per dictionary value) instead of
+  arrow's byte comparison. Answers are unchanged. EXPLAIN shows the
+  comparison as `empty_eq(x)` or `empty_ne(x)`, so a declared `str` column's
+  `<> ''` reads `row_filters=[empty_ne(x)]` on the scan line.
+
+### Security
+
+- **url moves from 2.5.8 to 2.5.9 for RUSTSEC-2026-0592**, a stack overflow
+  in `Url::origin()` on a nested `blob:` URL. `form_urlencoded` moves from
+  1.2.2 to 1.2.3 with it. No call to `Url::origin()` was found in Ravel or in
+  the crates that depend on `url` directly. The change is a lockfile patch
+  bump.
+
 ## [0.35.0] - 2026-11-22
 
 **Upgrade: scripts that run the preview `ravel-cli compat` commands must
