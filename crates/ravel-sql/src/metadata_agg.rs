@@ -55,7 +55,11 @@
 //! every refusal is a check in this rule (the walk, the aggregate
 //! classification, the column resolution) or in
 //! `LogsScanExec::metadata_rewrite_stats_are_exact` (pending erasure,
-//! content, row filters, key predicates, prune arms, ts containment).
+//! content, row filters, key predicates, prune arms, ts containment). The
+//! gate skips the load when every touched segment's stamp answers every
+//! figure an admitted aggregate reads ([`AdmittedAggregate::stamp_figures`]);
+//! a wrong skip leaves a segment with no figure, which declines here, so it
+//! costs a scan, never an answer.
 //!
 //! Every shape delegates the actual statistics read to `LogsScanExec` (the
 //! crate's established split: `logs_scan.rs` owns every statistics read,
@@ -73,12 +77,17 @@
 //! has one partition.
 //!
 //! [`MetadataOnlyExec`] is the observable marker (issue #850 deliverable 3):
-//! a purpose-named leaf `ExecutionPlan` whose `EXPLAIN` line always reads
+//! a purpose-named leaf `ExecutionPlan` whose `EXPLAIN` line always begins
 //! `MetadataOnlyExec: metadata_only=true, rows=<n>`, distinct from the
 //! generic `PlaceholderRowExec`/`ProjectionExec` pair DataFusion's own
 //! built-in rule (and any future one) produces, so a test can assert this
 //! specific optimization fired by matching that exact string rather than a
-//! node type multiple rules could have produced.
+//! node type multiple rules could have produced. The line goes on with
+//! `, stamp_segments=<s>, cstat_segments=<c>` (ADR-4628 decision 5,
+//! "Marker"): each touched segment counted once, as `cstat` when any figure
+//! read for it came from `.cstat` (every segment of a q08 count), else as
+//! `stamp`. The same two figures are the node's
+//! `segments_answered_from_stamp` and `segments_answered_from_cstat` metrics.
 
 use std::fmt;
 use std::sync::Arc;

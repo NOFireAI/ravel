@@ -13,9 +13,10 @@
 //! Own integration binary, all tests synchronous, all tests holding one lock:
 //! the tally is process-wide and monotonic, so an exact-delta assertion means
 //! something only when the test knows every other reader in the process.
-//! Nothing here reads an object -- the statistics path is pure plan-time work
-//! over the resolved snapshot -- so the segments are fabricated and no store is
-//! needed.
+//! No test here reads a data object -- the statistics path is pure plan-time
+//! work over the resolved snapshot -- so the segments are fabricated. The
+//! `SqlExecutor` tests at the end read a catalog HEAD and a `.cstat` object
+//! from a `MemoryStore`, since whether that load runs is what they measure.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -491,5 +492,290 @@ fn a_reconciled_entry_is_not_counted() {
         (mine, others),
         (0, 0),
         "3 non-null + 1 null == 4 == sample_count, so the entry is not a defect"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Through `SqlExecutor`: a skipped load reads no `.cstat` entry (ADR-4628
+// decision 5, issue #4685)
+// ---------------------------------------------------------------------------
+
+/// Segment `seq` carrying `stamp`; `seq` also keys its content hash, which
+/// the v3 `.cstat` joins on.
+fn stamped_seg(seq: u64, stamp: ravel_types::declared_stats::DeclaredColumnStat) -> SegmentRef {
+    let mut record = ravel_proto::commit::v1::CommitRecord {
+        sample_count: SAMPLE_COUNT,
+        ..Default::default()
+    };
+    ravel_commit::declared_stats::stamp_commit_record(&mut record, std::slice::from_ref(&stamp));
+    let read = ravel_commit::declared_stats::read_commit_record(&record);
+    assert_eq!(read.covered().len(), 1, "a valid stamp");
+    SegmentRef {
+        content_hash: [u8::try_from(seq).expect("small"); 32],
+        declared_column_stats: DeclaredColumnStats::from_validated(&read),
+        ..seg_ref(seq)
+    }
+}
+
+/// A `.cstat` object holding `segments` and a folded HEAD naming it, written
+/// with the public codecs as `logs_stats_load.rs` writes them; no snapshot
+/// part or data object is needed for a statement answered from statistics.
+async fn install_head_and_stats(store: &dyn ObjectStoreBackend, segments: &[ColumnStatsSegment]) {
+    use ravel_catalog::{
+        DEFAULT_MAX_COLUMN_STATS_BYTES, HEAD_FORMAT_VERSION_1, encode_column_stats_v3,
+    };
+    use ravel_object_store::PutOptions;
+    use ravel_proto::catalog::v1::{SnapshotColumnStatsPartRef, SnapshotHead, SnapshotPartRef};
+
+    let signal_num = ravel_commit::signal::to_proto(ravel_types::Signal::Logs) as u32;
+    let part_hash = *blake3::hash(b"part-0").as_bytes();
+    let stats_bytes = encode_column_stats_v3(
+        TENANT.0,
+        signal_num,
+        part_hash,
+        segments,
+        DEFAULT_MAX_COLUMN_STATS_BYTES,
+    )
+    .expect("encode column stats");
+    let stats_key = format!("t/{}/catalog/l/cstat/one.cstat", TENANT.to_hex());
+    store
+        .put(
+            &stats_key,
+            bytes::Bytes::from(stats_bytes.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put stats");
+    let head = SnapshotHead {
+        format_version: HEAD_FORMAT_VERSION_1,
+        tenant_hash: TENANT.0.to_vec(),
+        signal: signal_num,
+        shard_count: 1,
+        watermark_hour: 10,
+        parts: vec![SnapshotPartRef {
+            key: format!("t/{}/catalog/l/snap/part.csnap", TENANT.to_hex()),
+            blake3: part_hash.to_vec(),
+            size: 1,
+            entry_count: 0,
+            watermark_hour: 10,
+            min_hour: 0,
+            column_stats: Some(SnapshotColumnStatsPartRef {
+                key: stats_key,
+                blake3: blake3::hash(&stats_bytes).as_bytes().to_vec(),
+                size: stats_bytes.len() as u64,
+                segment_count: segments.len() as u32,
+                part_blake3: vec![part_hash.to_vec()],
+            }),
+            key_index: Vec::new(),
+            retired_hours: Vec::new(),
+        }],
+        folder_id: Uuid::new_v4().into_bytes().to_vec(),
+        created_unix_ns: 0,
+        postings: None,
+        shard_generation_count: 1,
+    };
+    store
+        .put(
+            &format!("t/{}/catalog/l/HEAD", TENANT.to_hex()),
+            bytes::Bytes::from(ravel_catalog::encode_head(&head).expect("encode head")),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put head");
+}
+
+/// The `cstat`-labelled drop delta, the summed delta of every other label,
+/// the plan and the one `Int64` answered, across planning and running `sql`
+/// through `SqlExecutor::plan_pinned` over `segments` on a folded tenant
+/// whose `.cstat` carries `entries`.
+fn executor_statement(
+    sql: &str,
+    segments: Vec<SegmentRef>,
+    entries: Vec<ColumnStatsSegment>,
+) -> (u64, u64, String, i64) {
+    use futures::StreamExt;
+
+    let guard = drops_lock();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    runtime.block_on(install_head_and_stats(store.as_ref(), &entries));
+    let catalog = Arc::new(
+        ravel_catalog::Catalog::new(Arc::clone(&store), ravel_catalog::CatalogConfig::default())
+            .expect("catalog"),
+    );
+    let executor = ravel_sql::SqlExecutor::new(
+        catalog,
+        ravel_query::SegmentFetcher::new(Arc::clone(&store)),
+        LogSegmentFetcher::new(Arc::clone(&store)),
+        ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
+        ravel_sql::SqlConfig::default(),
+        1 << 30,
+    );
+    let declared = vec![DeclaredColumn::new(COL, DeclaredType::I64)];
+    // The load runs in `plan_pinned` and `execute` optimizes the plan once, so
+    // the delta spans one rewrite. The plan shown is a second planning of the
+    // same statement, outside the delta.
+    let (before, after, plan, batches) = runtime.block_on(async {
+        let accounting = ravel_types::accounting::QueryAccounting::new();
+        let snapshot = || Snapshot {
+            segments: segments.clone(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let before = observed_all();
+        let pinned = executor
+            .plan_pinned(TENANT, snapshot(), sql, &accounting, &declared)
+            .await
+            .expect("plan");
+        let mut stream = pinned.execute().await.expect("execute");
+        let mut batches = Vec::new();
+        while let Some(next) = stream.next().await {
+            batches.push(next.expect("batch"));
+        }
+        let after = observed_all();
+        let shown = executor
+            .plan_pinned(TENANT, snapshot(), sql, &accounting, &declared)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let shown = datafusion::physical_plan::displayable(shown.as_ref())
+            .indent(true)
+            .to_string();
+        (before, after, shown, batches)
+    });
+    drop(guard);
+    let mut mine = 0;
+    let mut others = 0;
+    for ((label, b), a) in StatCarrier::ALL.iter().zip(before.iter()).zip(after.iter()) {
+        if *label == StatCarrier::Cstat {
+            mine = a - b;
+        } else {
+            others += a - b;
+        }
+    }
+    let value = batches
+        .iter()
+        .find(|b| b.num_rows() == 1)
+        .expect("one row")
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("Int64")
+        .value(0);
+    (mine, others, plan, value)
+}
+
+/// A dictionary-carrying `.cstat` entry for values `{0: 2, 3: 1, 7: 1}`, the
+/// four rows of segment 2, which reconciles with its stamp.
+fn segment_2_entry() -> ColumnStat {
+    ColumnStat {
+        dictionary_present: true,
+        dictionary: [(0, 2), (3, 1), (7, 1)]
+            .into_iter()
+            .map(|(v, count)| ravel_proto::catalog::v1::DictEntry {
+                value: Some(i64_value(v)),
+                count,
+            })
+            .collect(),
+        sum: Some(10),
+        ..cstat(COL, 0, 7, 0)
+    }
+}
+
+/// A skipped load reads no `.cstat` entry, so a defective one beside a
+/// stamp-covered segment adds nothing to the `cstat` drop tally; once one
+/// segment lacks the figure the load runs and the same statement adds
+/// exactly the one observation a read of one defective entry carries
+/// (`a_stamp_answer_still_counts_a_defective_entry`).
+///
+/// Segment 1's stamp is `[200, 500]` with sum 900 and zero count 0, beside
+/// the defective entry (2 + 1 rows of 4). Segment 2 holds `{0, 0, 3, 7}`; its
+/// full stamp's zero count answers `<> 0`, its stripped stamp cannot (0 lies
+/// inside `[0, 7]`), and then its reconciled entry answers. The answer is
+/// 3 + 2 either way.
+///
+/// Prove-the-test: drop the skip (`(!stamps_answer).then_some(request)` made
+/// `Some(request)`) and the first delta reads 1.
+#[test]
+fn a_skipped_load_adds_nothing_to_the_cstat_drop_tally() {
+    use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, DeclaredStatValue};
+    let sql = format!("SELECT COUNT(*) FROM logs WHERE \"{COL}\" <> 0");
+    let stamp = |min: i64, max: i64, null_count: u64| {
+        DeclaredColumnStat::new(
+            COL,
+            DeclaredStatType::I64,
+            Some(DeclaredStatValue::I64(min)),
+            Some(DeclaredStatValue::I64(max)),
+            null_count,
+        )
+        .expect("valid stamp")
+    };
+    let seg_1 = stamped_seg(
+        21,
+        stamp(200, 500, 1)
+            .with_sum(900)
+            .expect("sum")
+            .with_zero_count(0)
+            .expect("zero count"),
+    );
+    let seg_2_full = stamped_seg(
+        22,
+        stamp(0, 7, 0)
+            .with_sum(10)
+            .expect("sum")
+            .with_zero_count(2)
+            .expect("zero count"),
+    );
+    let seg_2_stripped = stamped_seg(22, stamp(0, 7, 0));
+    let entries = |seg_2: &SegmentRef| {
+        let entry = |seg: &SegmentRef, columns| ColumnStatsSegment {
+            ingest_hour_bucket: seg.ingest_hour_bucket,
+            shard: seg.shard,
+            writer_id: seg.content_hash.to_vec(),
+            writer_epoch: seg.writer_epoch,
+            writer_seq: seg.writer_seq,
+            columns,
+        };
+        vec![
+            entry(&seg_1, vec![raw_stat(2, 1, Some(200), Some(500))]),
+            entry(seg_2, vec![segment_2_entry()]),
+        ]
+    };
+
+    let (mine, others, plan, value) = executor_statement(
+        &sql,
+        vec![seg_1.clone(), seg_2_full.clone()],
+        entries(&seg_2_full),
+    );
+    assert!(
+        plan.contains("stamp_segments=2, cstat_segments=0") && !plan.contains("LogsScanExec"),
+        "every segment answers from its stamp; plan was:\n{plan}"
+    );
+    assert_eq!(value, 5, "3 + 2 from the stamps");
+    assert_eq!(
+        (mine, others),
+        (0, 0),
+        "a skipped load reads no entry, so the defective one is not observed"
+    );
+
+    let (mine, others, plan, value) = executor_statement(
+        &sql,
+        vec![seg_1.clone(), seg_2_stripped.clone()],
+        entries(&seg_2_stripped),
+    );
+    assert!(
+        plan.contains("stamp_segments=1, cstat_segments=1") && !plan.contains("LogsScanExec"),
+        "segment 2 answers from its entry; plan was:\n{plan}"
+    );
+    assert_eq!(value, 5, "3 from the stamp, 2 from the entry");
+    assert_eq!(
+        (mine, others),
+        (1, 0),
+        "the kept load reads the defective entry once, under cstat only"
     );
 }

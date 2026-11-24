@@ -2595,6 +2595,8 @@ const RESOLVE_PART_KEYS: [&str; 4] = [
 const PRUNING_KEYS: &[&str] = &[
     "segments",
     "segmentsPrunedByStats",
+    "segmentsAnsweredFromStamp",
+    "segmentsAnsweredFromCstat",
     "segmentsPrunedByKeyIndex",
     "blocksPrunedByKeyIndex",
     "blocksTotal",
@@ -2668,6 +2670,8 @@ async fn sql_response_carries_timings_and_pruning_stats() {
         "strCellsValidated",
         "rowpathBatches",
         "columnarBatches",
+        "segmentsAnsweredFromStamp",
+        "segmentsAnsweredFromCstat",
     ] {
         assert_eq!(pruning[key], 0, "{key} with no logs scan: {value}");
     }
