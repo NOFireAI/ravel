@@ -331,6 +331,152 @@ fn a_stale_all_null_entry_grants_nothing_and_is_counted() {
     assert_eq!(others, 0, "and under the cstat label only");
 }
 
+/// The `cstat`-labelled drop delta across planning and running `sql` over one
+/// segment stamped with `stamp` plus its `.cstat` entries, the summed delta of
+/// every other label, the physical plan, and the one `Int64` value answered.
+fn statement(
+    sql: &str,
+    stamp: ravel_types::declared_stats::DeclaredColumnStat,
+    columns: Vec<ColumnStat>,
+) -> (u64, u64, String, i64) {
+    let guard = drops_lock();
+    let mut record = ravel_proto::commit::v1::CommitRecord {
+        sample_count: SAMPLE_COUNT,
+        ..Default::default()
+    };
+    ravel_commit::declared_stats::stamp_commit_record(&mut record, std::slice::from_ref(&stamp));
+    let read = ravel_commit::declared_stats::read_commit_record(&record);
+    assert_eq!(read.covered().len(), 1, "a valid stamp");
+    let seg = SegmentRef {
+        declared_column_stats: DeclaredColumnStats::from_validated(&read),
+        ..seg_ref(10)
+    };
+    let stats = loaded(&seg, columns);
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let provider = LogsTableProvider::new(
+        Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        },
+        TENANT,
+        LogSegmentFetcher::new(backend),
+        PhaseAccounting::new(),
+    )
+    .with_declared_columns(vec![DeclaredColumn::new(COL, DeclaredType::I64)])
+    .with_column_stats(Some(stats));
+    let config = ravel_sql::SqlConfig::default();
+    let (pool, _breach) = config.query_pool(
+        ravel_sql::TenantMemoryAccountant::new(1 << 30),
+        ravel_types::accounting::QueryAccounting::new(),
+    );
+    let ctx = ravel_sql::build_session(
+        &config,
+        pool,
+        ravel_sql::SessionTable::Logs(Arc::new(provider)),
+        false,
+        ravel_sql::SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(TenantHash([0u8; 16])),
+    )
+    .expect("session");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let before = observed_all();
+    let (plan, batches) = runtime.block_on(async {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let shown = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("answer");
+        (shown, batches)
+    });
+    let after = observed_all();
+    drop(guard);
+    let mut mine = 0;
+    let mut others = 0;
+    for ((label, b), a) in StatCarrier::ALL.iter().zip(before.iter()).zip(after.iter()) {
+        if *label == StatCarrier::Cstat {
+            mine = a - b;
+        } else {
+            others += a - b;
+        }
+    }
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let value = batches
+        .iter()
+        .find(|b| b.num_rows() == 1)
+        .expect("one row")
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("Int64")
+        .value(0);
+    (mine, others, plan, value)
+}
+
+/// A stamp answer still reads the segment's loaded `.cstat` entry for the
+/// drop tally. The stamp `[200, 500]`, NULL count 1, sum 900, zero count 0
+/// answers `<> 0` (0 is outside the range) and `SUM` (field 6) with its own
+/// figures; the entry beside it accounts for three of the segment's four rows.
+/// The rewrite's read of the entry adds exactly one observation, the count
+/// one read of one defective entry carries in every test above. The `SUM`
+/// statement's planning also resolves the scan's statistics four times, each
+/// reading the entry through `cstat_coverage`; the q02 statement's does not
+/// reach them.
+///
+/// Prove-the-test: remove the `merged_view_entry` call on the stamp branch of
+/// `resolve_segment_figure` and the deltas read 0 and 4.
+#[test]
+fn a_stamp_answer_still_counts_a_defective_entry() {
+    let stamp = ravel_types::declared_stats::DeclaredColumnStat::new(
+        COL,
+        ravel_types::declared_stats::DeclaredStatType::I64,
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(200)),
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(500)),
+        1,
+    )
+    .expect("valid stamp")
+    .with_sum(900)
+    .expect("sum")
+    .with_zero_count(0)
+    .expect("zero count");
+    for (sql, expected, statistics_reads) in [
+        (
+            format!("SELECT COUNT(*) FROM logs WHERE \"{COL}\" <> 0"),
+            3,
+            0,
+        ),
+        (format!("SELECT SUM(\"{COL}\") FROM logs"), 900, 4),
+    ] {
+        let (mine, others, plan, value) = statement(
+            &sql,
+            stamp.clone(),
+            vec![raw_stat(2, 1, Some(200), Some(500))],
+        );
+        assert!(
+            plan.contains("MetadataOnlyExec") && !plan.contains("LogsScanExec"),
+            "{sql}: answered from the stamp; plan was:\n{plan}"
+        );
+        assert_eq!(value, expected, "{sql}: the stamp's figure");
+        assert_eq!(
+            mine,
+            statistics_reads + 1,
+            "{sql}: the rewrite's one read of the defective entry is counted"
+        );
+        assert_eq!(others, 0, "{sql}: under the cstat label only");
+    }
+}
+
 /// A reconciled, consistent entry is not counted: the [`cstat`] helper balances
 /// `non_null_count + null_count` to `SAMPLE_COUNT`, so the reconciliation is a
 /// no-op. The column stays `Absent` because the entry describes record-level
