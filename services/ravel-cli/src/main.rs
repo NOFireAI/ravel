@@ -996,8 +996,9 @@ enum Command {
         /// Withhold the declared-column stamp's sum and zero count (fields 6
         /// to 8, ADR-4628) from the commit records this logs load writes. The
         /// min, max and null count are still written. On an unfolded catalog,
-        /// SUM, AVG and not-equal counts over those segments then scan; on a
-        /// folded one the `.cstat` statistics still answer them.
+        /// SUM, AVG and a `<> 0` count where 0 lies inside a segment's min
+        /// and max then scan those segments; on a folded one the `.cstat`
+        /// statistics can still answer them.
         ///
         /// Set it when the commit records sit under an Object Lock: a sum
         /// written to a locked record stays until that record's retain-until

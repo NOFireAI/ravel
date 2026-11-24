@@ -1333,8 +1333,8 @@ phase; building the stamp falls in `commit_build`. Setting
 `IngestConfig::emit_declared_stat_aggregates` to false (default true)
 withholds the sum and zero count and leaves the min, max and null count as
 before, so a reader treats those segments as written before ADR-4628. It
-is a process setting, not persisted, and neither `ravel-server` nor
-`ravel-cli load` sets it from a flag yet. These figures are subject values
+is a process setting, not persisted; `ravel-cli load` sets it with
+`--no-declared-stat-aggregates`, and `ravel-server` does not yet. These figures are subject values
 for erasure (docs/deletion-and-gc.md, "Three index object kinds hold no
 string value").
 
