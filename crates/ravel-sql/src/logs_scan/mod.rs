@@ -1127,6 +1127,207 @@ fn merged_view_entry<'a>(
         .then_some(stat)
 }
 
+/// Which carrier answered one segment's figure for one declared column
+/// (ADR-4628 decision 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FigureCarrier {
+    /// The segment's own stamp (`SegmentRef::declared_column_stats`).
+    Stamp,
+    /// The loaded `.cstat` entry [`merged_view_entry`] grants.
+    Cstat,
+}
+
+/// The figure a statistics reader asks [`resolve_segment_figure`] for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FigureRequest<'a> {
+    /// The exact sum and non-null count of an `I64` column.
+    Sum,
+    /// The count of non-null rows not equal to the literal, which is already
+    /// the column's own scalar type ([`literal_stat_value`]).
+    NotEqual(&'a ScalarValue),
+}
+
+/// One segment's figure for one declared column, from one carrier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SegmentFigure {
+    Sum { sum: i128, non_null_count: u64 },
+    NotEqual(u64),
+}
+
+/// `literal` as a stamp value of `declared`'s own type, or `None` when its
+/// scalar type is not the column's (`Int64` for `I64`, `Boolean` for `Bool`)
+/// or it is NULL.
+fn literal_stat_value(
+    declared: &DeclaredColumn,
+    literal: &ScalarValue,
+) -> Option<DeclaredStatValue> {
+    match (declared.ty, literal) {
+        (DeclaredType::I64, ScalarValue::Int64(Some(v))) => Some(DeclaredStatValue::I64(*v)),
+        (DeclaredType::Bool, ScalarValue::Boolean(Some(b))) => Some(DeclaredStatValue::Bool(*b)),
+        _ => None,
+    }
+}
+
+/// The stamp entry for `declared` together with its coverage, under the same
+/// checks [`stamp_coverage`] applies (eligible type, the entry's declared type
+/// equal to the column's, value kinds matching).
+fn stamp_entry<'a>(
+    declared: &DeclaredColumn,
+    stamps: &'a DeclaredColumnStats,
+) -> Option<(
+    &'a ravel_types::declared_stats::DeclaredColumnStat,
+    SegmentCoverage,
+)> {
+    let coverage = stamp_coverage(declared, stamps)?;
+    Some((stamps.column(&declared.key)?, coverage))
+}
+
+/// The stamp's answer to `request` for one segment, or `None` when the stamp
+/// does not carry it: no usable entry, an absent field, or a not-equal
+/// literal that none of ADR-4628 decision 5's three cases covers.
+fn stamp_figure(
+    declared: &DeclaredColumn,
+    seg: &SegmentRef,
+    request: FigureRequest<'_>,
+) -> Option<SegmentFigure> {
+    let (stat, coverage) = stamp_entry(declared, &seg.declared_column_stats)?;
+    let non_null_count = seg.sample_count.checked_sub(coverage.null_count)?;
+    match request {
+        FigureRequest::Sum => {
+            if stat.declared_type() != DeclaredStatType::I64 {
+                return None;
+            }
+            Some(SegmentFigure::Sum {
+                sum: stat.sum()?,
+                non_null_count,
+            })
+        }
+        FigureRequest::NotEqual(literal) => {
+            let lit = literal_stat_value(declared, literal)?;
+            let equal = stamp_equal_count(stat, lit, non_null_count)?;
+            Some(SegmentFigure::NotEqual(non_null_count.checked_sub(equal)?))
+        }
+    }
+}
+
+/// Rows of one stamped segment whose value equals `lit`, which has the
+/// stamp's type: the zero count when `lit` is the type's zero and the stamp
+/// carries one; 0 when `lit` lies outside `[min, max]` or no non-null row
+/// exists; every non-null row when `min == max == lit`; otherwise `None`.
+fn stamp_equal_count(
+    stat: &ravel_types::declared_stats::DeclaredColumnStat,
+    lit: DeclaredStatValue,
+    non_null_count: u64,
+) -> Option<u64> {
+    let is_zero = matches!(
+        lit,
+        DeclaredStatValue::I64(0) | DeclaredStatValue::Bool(false)
+    );
+    if is_zero && let Some(zero_count) = stat.zero_count() {
+        return Some(zero_count);
+    }
+    let (Some(min), Some(max)) = (stat.min(), stat.max()) else {
+        // Absent extrema state that no row is non-null.
+        return (non_null_count == 0).then_some(0);
+    };
+    let same_type = |v: DeclaredStatValue| v.stat_type() == lit.stat_type();
+    if !same_type(min) || !same_type(max) {
+        return None;
+    }
+    let rank = |v: DeclaredStatValue| match v {
+        DeclaredStatValue::I64(v) => i128::from(v),
+        DeclaredStatValue::Bool(b) => i128::from(b),
+    };
+    let (lo, hi, l) = (rank(min), rank(max), rank(lit));
+    if l < lo || l > hi {
+        return Some(0);
+    }
+    if lo == l && hi == l {
+        return Some(non_null_count);
+    }
+    None
+}
+
+/// The granted `.cstat` entry's answer to `request` for one segment, or
+/// `None`: no statistics loaded, no entry for the segment, an entry
+/// [`merged_view_entry`] refuses, no stored sum, or (not-equal) a dictionary
+/// not loaded, omitted, or not summing to the entry's non-null count.
+fn cstat_figure(
+    declared: &DeclaredColumn,
+    seg: &SegmentRef,
+    column_stats: Option<&LoadedColumnStats>,
+    request: FigureRequest<'_>,
+) -> Option<SegmentFigure> {
+    let stats = column_stats?;
+    if let FigureRequest::NotEqual(_) = request
+        && !stats.dictionary_loaded(&declared.key)
+    {
+        return None;
+    }
+    let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
+    let stat = merged_view_entry(declared, seg, seg_stats)?;
+    match request {
+        FigureRequest::Sum => Some(SegmentFigure::Sum {
+            sum: i128::from(stat.sum?),
+            non_null_count: stat.non_null_count,
+        }),
+        FigureRequest::NotEqual(literal) => {
+            if !stat.dictionary_present {
+                return None;
+            }
+            let mut matching: u64 = 0;
+            let mut dict_total: u64 = 0;
+            for entry in &stat.dictionary {
+                let value = entry.value.as_ref()?;
+                let v = declared_scalar(declared.ty, value)?;
+                if v == *literal {
+                    matching = matching.checked_add(entry.count)?;
+                }
+                dict_total = dict_total.checked_add(entry.count)?;
+            }
+            // An entry whose dictionary does not account for its non-null
+            // count is rejected at load; decline here too.
+            if dict_total != stat.non_null_count {
+                return None;
+            }
+            Some(SegmentFigure::NotEqual(
+                stat.non_null_count.checked_sub(matching)?,
+            ))
+        }
+    }
+}
+
+/// One segment's figure for one declared column from exactly one carrier
+/// (ADR-4628 decision 5): the stamp when it carries the figure, else the
+/// `.cstat` entry [`merged_view_entry`] grants, else `None`, which declines
+/// the whole statement. The two carriers are never added, compared or merged.
+///
+/// Every exactness condition of the statement (pending erasure, filters, ts
+/// containment) is the caller's to check first
+/// ([`LogsScanExec::metadata_rewrite_stats_are_exact`]); this answers only
+/// for the segment's whole row set.
+pub(crate) fn resolve_segment_figure(
+    declared: &DeclaredColumn,
+    seg: &SegmentRef,
+    column_stats: Option<&LoadedColumnStats>,
+    request: FigureRequest<'_>,
+) -> Option<(FigureCarrier, SegmentFigure)> {
+    match request {
+        FigureRequest::Sum => {
+            if declared.ty != DeclaredType::I64 {
+                return None;
+            }
+        }
+        FigureRequest::NotEqual(literal) => {
+            literal_stat_value(declared, literal)?;
+        }
+    }
+    if let Some(figure) = stamp_figure(declared, seg, request) {
+        return Some((FigureCarrier::Stamp, figure));
+    }
+    cstat_figure(declared, seg, column_stats, request).map(|figure| (FigureCarrier::Cstat, figure))
+}
+
 /// The `None`-valued Arrow scalar `ty` projects to, for a declared column
 /// whose exact MIN/MAX is `NULL` (every covered segment's column entirely
 /// null, or zero segments). `Str` is unreachable, matching [`declared_scalar`].
@@ -2739,35 +2940,19 @@ impl LogsScanExec {
         if matches!(declared.ty, DeclaredType::Str) {
             return None;
         }
-        let stats = self.column_stats.as_ref()?;
-        if !stats.dictionary_loaded(&declared.key) {
-            return None;
-        }
+        self.column_stats.as_ref()?;
         let mut total: u64 = 0;
         for seg in self.segments.iter() {
-            let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
-            let stat = merged_view_entry(declared, seg, seg_stats)?;
-            if !stat.dictionary_present {
+            let (_, SegmentFigure::NotEqual(not_equal)) = resolve_segment_figure(
+                declared,
+                seg,
+                self.column_stats.as_deref(),
+                FigureRequest::NotEqual(literal),
+            )?
+            else {
                 return None;
-            }
-            let mut matching: u64 = 0;
-            let mut dict_total: u64 = 0;
-            for entry in &stat.dictionary {
-                let value = entry.value.as_ref()?;
-                let v = declared_scalar(declared.ty, value)?;
-                if v == *literal {
-                    matching += entry.count;
-                }
-                dict_total = dict_total.checked_add(entry.count)?;
-            }
-            // Fail closed: an internally-inconsistent record (dictionary
-            // counts that do not sum to `non_null_count`) is rejected at load
-            // by `decode_column_stats`, but decline here too rather than
-            // subtract from a count this dictionary cannot account for.
-            if dict_total != stat.non_null_count {
-                return None;
-            }
-            total += stat.non_null_count.checked_sub(matching)?;
+            };
+            total = total.checked_add(not_equal)?;
         }
         Some(total)
     }
@@ -2873,15 +3058,27 @@ impl LogsScanExec {
         if !matches!(declared.ty, DeclaredType::I64) {
             return None;
         }
-        let stats = self.column_stats.as_ref()?;
+        self.column_stats.as_ref()?;
         let mut sum: i128 = 0;
         let mut non_null_count: u64 = 0;
         for seg in self.segments.iter() {
-            let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
-            let stat = merged_view_entry(declared, seg, seg_stats)?;
-            let seg_sum = stat.sum?;
-            sum = sum.checked_add(i128::from(seg_sum))?;
-            non_null_count = non_null_count.checked_add(stat.non_null_count)?;
+            let (
+                _,
+                SegmentFigure::Sum {
+                    sum: seg_sum,
+                    non_null_count: seg_non_null,
+                },
+            ) = resolve_segment_figure(
+                declared,
+                seg,
+                self.column_stats.as_deref(),
+                FigureRequest::Sum,
+            )?
+            else {
+                return None;
+            };
+            sum = sum.checked_add(seg_sum)?;
+            non_null_count = non_null_count.checked_add(seg_non_null)?;
         }
         Some(DeclaredColumnSum {
             sum,
