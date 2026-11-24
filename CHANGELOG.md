@@ -56,6 +56,16 @@ stored. Each plan counts the records it leaves out in
 `ravel_maintain_late_commit_records_total`. A later release disposes of late
 records.
 
+**Known issue: RUSTSEC-2026-0595 is open on `parquet` 59.3.0, which this
+release locks.** When `parquet` writes an encrypted Parquet file it writes
+bloom filters as plaintext. Ravel refuses encrypted Parquet on read and
+configures no Parquet encryption. 0.35.0 locks the same version. The update to
+59.3.3 (#4657) is not in this release: it moves the parquet decoder that
+ravel-parquet's footer check was written against, and six arrow crates with
+it, including a change to the bytes the Arrow IPC writer produces, and both
+need checking first (#4695). RUSTSEC-2026-0592 on `url` is fixed; see the
+entry under Security.
+
 ### Added
 
 - **A failed `metricsbench_ingest --readback-only` keeps what answered.** When a
