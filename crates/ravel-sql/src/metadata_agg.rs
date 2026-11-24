@@ -48,9 +48,9 @@
 //! The sum-backed shapes decompose only for an integer column, and only when
 //! every touched segment has an exact sum for every column read. The q02 and
 //! sum-backed shapes read each segment's figure from one carrier (ADR-4628
-//! decision 5): the segment's declared-column stamp (fields 6 to 8, written
-//! at flush and compaction, so an unfolded catalog has them), else a `.cstat`
-//! entry the stamp grants, else none and the statement scans. A stamp answer
+//! decision 5): the segment's declared-column stamp (ADR-4628 fields 6 to 8,
+//! carried on the commit record, so they reach an unfolded catalog), else a
+//! `.cstat` entry the stamp grants, else none and the statement scans. A stamp answer
 //! needs no `.cstat` load, so the executor's load gate guards nothing for it:
 //! every refusal is a check in this rule (the walk, the aggregate
 //! classification, the column resolution) or in

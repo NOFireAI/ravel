@@ -288,8 +288,8 @@ A stamp answer needs no `.cstat`, so the executor's statistics load guards
 nothing for it: every refusal below is a check in the rule or in
 `LogsScanExec::metadata_rewrite_stats_are_exact`. The load itself still runs
 for an admitted shape, and on an unfolded catalog it costs one plan-phase GET
-of the absent catalog HEAD; skipping it when the stamps answer is issue
-#4685.
+of the absent catalog HEAD; skipping it when the stamps answer is
+ADR-4628 task T5.
 
 All are additive to DataFusion's built-in `AggregateStatistics` rule (which
 handles the predicate-free `COUNT(*)` above and never fires for any shape
