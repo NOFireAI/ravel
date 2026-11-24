@@ -643,8 +643,8 @@ fn plain_session(batch: RecordBatch, partitions: usize) -> SessionContext {
     ctx
 }
 
-/// A float sum and a `List` state are refused even where the plan has a
-/// hash exchange; a count over the same key is admitted.
+/// A float sum, a `List` state and a float key are refused even where the
+/// plan has a hash exchange; a count over an integer key is admitted.
 #[tokio::test]
 async fn a_float_sum_and_a_list_state_are_refused() {
     let schema = Arc::new(Schema::new(vec![
@@ -669,6 +669,7 @@ async fn a_float_sum_and_a_list_state_are_refused() {
         ("SELECT k, count(*) FROM t GROUP BY k", true),
         ("SELECT k, sum(f) FROM t GROUP BY k", false),
         ("SELECT k, array_agg(v) FROM t GROUP BY k", false),
+        ("SELECT f, count(*) FROM t GROUP BY f", false),
     ] {
         let plan = ctx
             .sql(sql)
@@ -1091,14 +1092,17 @@ async fn held_groups_peak_at_the_table_size() {
         let keys: Vec<i64> = (0..n)
             .map(|i| ((i / 2) % (4 * partitions)) as i64)
             .collect();
-        for counters in [counters_for(partitions), partitions] {
+        for (counters, peak) in [
+            (counters_for(partitions), 2 * partitions - 1),
+            (partitions, partitions),
+        ] {
             let exec = key_exec(&keys, counters);
             let out = run_partition(&exec, 0, task_ctx(Arc::new(GreedyMemoryPool::new(1 << 30))))
                 .await
                 .expect("runs");
             assert_eq!(
                 metric(&exec, "held_groups_peak"),
-                counters,
+                peak,
                 "{counters} counters at P = {partitions}"
             );
             let mut got = key_values(&out);
