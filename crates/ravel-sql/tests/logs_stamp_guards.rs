@@ -342,7 +342,7 @@ async fn row16_a_stamp_of_another_type_scans() {
             attrs: vec![("a", AttrValue::Bool(false))],
         },
     ];
-    let corpus = Corpus::build(&[rows.clone()]).await;
+    let corpus = Corpus::build(std::slice::from_ref(&rows)).await;
     let bool_stamp = stamp_of("a", DeclaredType::Bool, &rows, Fields::With).expect("stamp");
     assert_eq!(bool_stamp.zero_count(), Some(2));
     for sql in [

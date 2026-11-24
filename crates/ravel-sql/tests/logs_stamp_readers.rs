@@ -704,7 +704,7 @@ async fn totals_outside_the_result_type_scan_and_field_7_answers_avg() {
     for sql in ["SELECT SUM(a) FROM logs", "SELECT SUM(w + 1) FROM logs"] {
         let run = over.stamped(sql).await;
         let scan = over.forced(sql).await;
-        let err = run.answer.as_ref().err().expect("the total overflows");
+        let err = run.answer.as_ref().expect_err("the total overflows");
         assert!(
             err.to_string().contains("overflow"),
             "{sql}: an overflow error, got {err}"
