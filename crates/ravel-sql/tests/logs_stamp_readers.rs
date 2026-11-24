@@ -1685,3 +1685,123 @@ async fn a_rewrite_part_and_a_completed_erasure_scan() {
         pretty(&run.answer)
     );
 }
+
+/// Input A alone, stamped with `fields`, unfolded, with no rewrite record;
+/// the request on A's erased row is pending when `pending` is set.
+async fn pre_rewrite_world(fields: Fields, pending: bool) -> ErasureWorld {
+    let t = erasure_tenant();
+    let store = Arc::new(KeyCountingStore::default());
+    let a = publish_object(
+        store.as_ref(),
+        &t,
+        1,
+        BASE_HOUR,
+        &input_rows(),
+        &erasure_cols(),
+        fields,
+    )
+    .await;
+    if pending {
+        put_dreq(store.as_ref()).await;
+    }
+    let executor = executor(&store, erasure_cols());
+    ErasureWorld {
+        store,
+        executor,
+        token: record::token_for(&a).expect("token"),
+    }
+}
+
+const PRE_REWRITE_SHAPES: [&str; 3] = [
+    "SELECT SUM(a) FROM logs",
+    "SELECT AVG(a) FROM logs",
+    "SELECT COUNT(*) FROM logs WHERE a <> 0",
+];
+
+/// A pre-rewrite input named while its erasure request is pending: no rewrite
+/// record exists, so the snapshot names input A itself, whose stamp carries
+/// the fields and counts the erased row. Listed and through A's token, every
+/// shape scans, reads data objects and equals the forced scan of the same
+/// world, and `SUM(a)` leaves the erased row's 40 out.
+///
+/// Prove-the-test: drop `self.erasure.is_empty()` from
+/// `metadata_rewrite_stats_are_exact`; each shape then answers from A's
+/// stamp, failing the plan assertion, and `SUM(a)` reads 45.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pre_rewrite_input_with_its_request_pending_scans() {
+    let stamped = pre_rewrite_world(Fields::With, true).await;
+    let forced = pre_rewrite_world(Fields::Without, true).await;
+    for tokens in [false, true] {
+        let pick = |w: &ErasureWorld| {
+            if tokens {
+                vec![w.token.clone()]
+            } else {
+                Vec::new()
+            }
+        };
+        for sql in PRE_REWRITE_SHAPES {
+            let run = erasure_exec(&stamped, &request(sql, pick(&stamped))).await;
+            let scan = erasure_exec(&forced, &request(sql, pick(&forced))).await;
+            assert!(
+                run.plan.contains("LogsScanExec") && !run.plan.contains("MetadataOnlyExec"),
+                "{sql} (token {tokens}): the pending request scans; plan was:\n{}",
+                run.plan
+            );
+            assert!(run.data_gets > 0, "{sql} (token {tokens})");
+            assert_same_answer(&run.answer, &scan.answer, sql);
+        }
+        let run = erasure_exec(
+            &stamped,
+            &request("SELECT SUM(a) FROM logs", pick(&stamped)),
+        )
+        .await;
+        assert!(
+            pretty(&run.answer).contains("| 5 "),
+            "0 + 5, the erased 40 left out (token {tokens}): {}",
+            pretty(&run.answer)
+        );
+    }
+}
+
+/// The same world with no request at all: the statement answers from A's
+/// stamp, with no data-object GET, and equals the scan, both counting every
+/// row A holds (`SUM(a)` is 0 + 40 + 5). A stamp answer over a pre-rewrite
+/// input rests on its request staying pending while that input is held
+/// (docs/deletion-and-gc.md, the sweep's hold rule), which this test does
+/// not exercise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pre_rewrite_input_with_no_request_pending_answers_as_the_scan_reads_it() {
+    let stamped = pre_rewrite_world(Fields::With, false).await;
+    let forced = pre_rewrite_world(Fields::Without, false).await;
+    for tokens in [false, true] {
+        let pick = |w: &ErasureWorld| {
+            if tokens {
+                vec![w.token.clone()]
+            } else {
+                Vec::new()
+            }
+        };
+        for sql in PRE_REWRITE_SHAPES {
+            let run = erasure_exec(&stamped, &request(sql, pick(&stamped))).await;
+            let scan = erasure_exec(&forced, &request(sql, pick(&forced))).await;
+            assert!(
+                run.plan.contains("MetadataOnlyExec") && !run.plan.contains("LogsScanExec"),
+                "{sql} (token {tokens}): answered from A's stamp; plan was:\n{}",
+                run.plan
+            );
+            assert_eq!(run.data_gets, 0, "{sql} (token {tokens})");
+            assert!(scan.data_gets > 0, "{sql} (token {tokens})");
+            assert_same_answer(&run.answer, &scan.answer, sql);
+        }
+        let run = erasure_exec(
+            &stamped,
+            &request("SELECT SUM(a) FROM logs", pick(&stamped)),
+        )
+        .await;
+        assert!(
+            pretty(&run.answer).contains("| 45 "),
+            "every row of A (token {tokens}): {}",
+            pretty(&run.answer)
+        );
+    }
+}

@@ -1214,6 +1214,11 @@ fn stamp_figure(
 /// stamp's type: the zero count when `lit` is the type's zero and the stamp
 /// carries one; 0 when `lit` lies outside `[min, max]` or no non-null row
 /// exists; every non-null row when `min == max == lit`; otherwise `None`.
+///
+/// A zero count of 0 beside a `min` or `max` that is the zero, over a
+/// segment with non-null rows, contradicts itself (an extremum is a value
+/// some row holds), so the stamp answers nothing for that segment and the
+/// resolver falls to the `.cstat` entry or declines.
 fn stamp_equal_count(
     stat: &ravel_types::declared_stats::DeclaredColumnStat,
     lit: DeclaredStatValue,
@@ -1224,6 +1229,12 @@ fn stamp_equal_count(
         DeclaredStatValue::I64(0) | DeclaredStatValue::Bool(false)
     );
     if is_zero && let Some(zero_count) = stat.zero_count() {
+        if zero_count == 0
+            && non_null_count > 0
+            && (stat.min() == Some(lit) || stat.max() == Some(lit))
+        {
+            return None;
+        }
         return Some(zero_count);
     }
     let (Some(min), Some(max)) = (stat.min(), stat.max()) else {
@@ -1308,6 +1319,13 @@ fn cstat_figure(
 /// containment) is the caller's to check first
 /// ([`LogsScanExec::metadata_rewrite_stats_are_exact`]); this answers only
 /// for the segment's whole row set.
+///
+/// When the stamp answers, the segment's `.cstat` entry is still read through
+/// [`merged_view_entry`] for the [`StatCarrier::Cstat`] drop tally, and the
+/// result is discarded: the figure and carrier returned do not change. That
+/// read runs only when a `.cstat` object is already loaded and names the
+/// segment; it reads the loaded statistics in memory, issues no I/O, and
+/// triggers no load.
 pub(crate) fn resolve_segment_figure(
     declared: &DeclaredColumn,
     seg: &SegmentRef,
@@ -1325,6 +1343,8 @@ pub(crate) fn resolve_segment_figure(
         }
     }
     if let Some(figure) = stamp_figure(declared, seg, request) {
+        let _ =
+            segment_column_stats(column_stats, seg).map(|s| merged_view_entry(declared, seg, s));
         return Some((FigureCarrier::Stamp, figure));
     }
     cstat_figure(declared, seg, column_stats, request).map(|figure| (FigureCarrier::Cstat, figure))
@@ -4450,6 +4470,26 @@ mod cstat_reconcile_tests {
         assert_eq!(delta, 0, "a reconciled entry is not a defect");
     }
 
+    /// A stamp answer still reads the segment's loaded `.cstat` entry for the
+    /// drop tally: `<> 0` lies outside the stamp's `[200, 404]`, so the stamp
+    /// answers all four non-null rows, and the unreconciled entry beside it
+    /// is counted once, as one read of it is everywhere else.
+    ///
+    /// Prove-the-test: remove the `merged_view_entry` call on the stamp
+    /// branch of `resolve_segment_figure` and the delta reads 0.
+    #[test]
+    fn a_stamp_answer_still_counts_an_unreconciled_entry_once() {
+        let (answered, delta) = one_read(SAMPLE_COUNT, vec![status_stat(0)], |scan| {
+            scan.declared_not_equal_count(0, &ScalarValue::Int64(Some(0)))
+        });
+        assert_eq!(
+            answered,
+            Some(4),
+            "the stamp's figure: 0 is outside [200, 404]"
+        );
+        assert_eq!(delta, 1, "one read of the unreconciled entry, counted once");
+    }
+
     /// The metadata rewrite counts a prune list of only `NumNotEq` arms as
     /// empty: the `status <> 404` arm its own q02 filter pushes leaves the
     /// answer at 3. A `NumRange` arm beside it refuses the rewrite, and the
@@ -5022,5 +5062,263 @@ mod figure_resolver_tests {
             ),
             Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(0)))
         );
+    }
+
+    /// An I64 stamp `[min, max]` with NULL count 1 and zero count 0, over the
+    /// five-row segment, so four rows are non-null.
+    fn zero_count_zero_stamp(min: i64, max: i64) -> DeclaredColumnStat {
+        DeclaredColumnStat::new(
+            COL,
+            DeclaredStatType::I64,
+            Some(DeclaredStatValue::I64(min)),
+            Some(DeclaredStatValue::I64(max)),
+            1,
+        )
+        .expect("valid stamp")
+        .with_zero_count(0)
+        .expect("the stamp the decode gap admits")
+    }
+
+    /// A reconciled entry agreeing with [`zero_count_zero_stamp`]`(min, max)`:
+    /// four non-null rows `{min, min, max, max}` and one NULL.
+    fn agreeing_entry(seg: &SegmentRef, min: i64, max: i64) -> LoadedColumnStats {
+        let stat = ColumnStat {
+            name: COL.to_string(),
+            declared_type: 2,
+            non_null_count: 4,
+            null_count: 1,
+            min: Some(i64_value(min)),
+            max: Some(i64_value(max)),
+            dictionary_present: true,
+            dictionary: vec![
+                ravel_proto::catalog::v1::DictEntry {
+                    value: Some(i64_value(min)),
+                    count: 2,
+                },
+                ravel_proto::catalog::v1::DictEntry {
+                    value: Some(i64_value(max)),
+                    count: 2,
+                },
+            ],
+            sum: Some(2 * min + 2 * max),
+        };
+        let mut segments = HashMap::new();
+        segments.insert(
+            segment_identity(seg),
+            ColumnStatsSegment {
+                ingest_hour_bucket: seg.ingest_hour_bucket,
+                shard: seg.shard,
+                writer_id: seg.writer_id.as_bytes().to_vec(),
+                writer_epoch: seg.writer_epoch,
+                writer_seq: seg.writer_seq,
+                columns: vec![stat],
+            },
+        );
+        LoadedColumnStats::from_maps(segments, HashMap::new())
+    }
+
+    /// A zero count of 0 beside an extremum that is 0, over non-null rows,
+    /// cannot describe its object: the stamp gives no not-equal answer for
+    /// `<> 0`, with the minimum or the maximum at 0. With no `.cstat` the
+    /// figure is `None`; with a granted entry it is the entry's.
+    ///
+    /// Prove-the-test: remove the zero-count check in `stamp_equal_count` and
+    /// each read answers `(Stamp, NotEqual(4))`.
+    #[test]
+    fn a_zero_count_of_zero_beside_a_zero_extremum_gives_no_stamp_answer() {
+        let zero = ScalarValue::Int64(Some(0));
+        for (min, max) in [(0, 5), (-5, 0)] {
+            let seg = seg(&[zero_count_zero_stamp(min, max)]);
+            assert_eq!(
+                resolve_segment_figure(&i64_col(), &seg, None, FigureRequest::NotEqual(&zero)),
+                None,
+                "[{min}, {max}] with no .cstat"
+            );
+            let stats = agreeing_entry(&seg, min, max);
+            assert_eq!(
+                resolve_segment_figure(
+                    &i64_col(),
+                    &seg,
+                    Some(&stats),
+                    FigureRequest::NotEqual(&zero)
+                ),
+                Some((FigureCarrier::Cstat, SegmentFigure::NotEqual(2))),
+                "[{min}, {max}] falls to the granted entry: two rows hold the non-zero end"
+            );
+        }
+    }
+
+    /// The BOOL side of the same guard: `min false, max true` with zero count
+    /// 0 gives no stamp answer for `<> false`.
+    ///
+    /// Prove-the-test: remove the zero-count check in `stamp_equal_count` and
+    /// this reads `(Stamp, NotEqual(4))`.
+    #[test]
+    fn a_bool_zero_count_of_zero_beside_a_false_extremum_gives_no_stamp_answer() {
+        let stamp = DeclaredColumnStat::new(
+            COL,
+            DeclaredStatType::Bool,
+            Some(DeclaredStatValue::Bool(false)),
+            Some(DeclaredStatValue::Bool(true)),
+            1,
+        )
+        .expect("valid stamp")
+        .with_zero_count(0)
+        .expect("the stamp the decode gap admits");
+        let seg = seg(&[stamp]);
+        assert_eq!(
+            resolve_segment_figure(
+                &DeclaredColumn::new(COL, DeclaredType::Bool),
+                &seg,
+                None,
+                FigureRequest::NotEqual(&ScalarValue::Boolean(Some(false)))
+            ),
+            None
+        );
+    }
+
+    /// The control: `[1, 5]` with zero count 0 is consistent, and 0 lies
+    /// outside the range, so the stamp still answers every non-null row.
+    #[test]
+    fn a_zero_count_of_zero_with_zero_outside_the_range_still_answers() {
+        let seg = seg(&[zero_count_zero_stamp(1, 5)]);
+        assert_eq!(
+            resolve_segment_figure(
+                &i64_col(),
+                &seg,
+                None,
+                FigureRequest::NotEqual(&ScalarValue::Int64(Some(0)))
+            ),
+            Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(4)))
+        );
+    }
+
+    /// A not-equal literal whose scalar type is not `Int64` gives no figure
+    /// for an I64 column, even where a lossy cast to `i64` would land on a
+    /// value a stamp case covers. The stamp is `[0, 5]` with two zeros among
+    /// four non-null rows, so `<> 0.5` holds for all four rows, while 0.5
+    /// cast to 0 would read the zero count and answer 2.
+    ///
+    /// Prove-the-test: let `literal_stat_value` take a `Float64`, `UInt64` or
+    /// `Decimal128` literal for an I64 column by casting it to `i64`; the
+    /// `0.5` read then answers `(Stamp, NotEqual(2))`.
+    #[test]
+    fn a_literal_of_another_numeric_type_gives_none() {
+        let stamp = DeclaredColumnStat::new(
+            COL,
+            DeclaredStatType::I64,
+            Some(DeclaredStatValue::I64(0)),
+            Some(DeclaredStatValue::I64(5)),
+            1,
+        )
+        .expect("valid stamp")
+        .with_sum(8)
+        .expect("sum")
+        .with_zero_count(2)
+        .expect("zero count");
+        let seg = seg(&[stamp]);
+        for literal in [
+            ScalarValue::Float64(Some(0.5)),
+            ScalarValue::Float64(Some(0.0)),
+            ScalarValue::UInt64(Some(1 << 63)),
+            ScalarValue::Decimal128(Some(0), 20, 0),
+        ] {
+            assert_eq!(
+                resolve_segment_figure(&i64_col(), &seg, None, FigureRequest::NotEqual(&literal)),
+                None,
+                "{literal:?}"
+            );
+        }
+        assert_eq!(
+            resolve_segment_figure(
+                &i64_col(),
+                &seg,
+                None,
+                FigureRequest::NotEqual(&ScalarValue::Int64(Some(0)))
+            ),
+            Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(2))),
+            "the Int64 zero reads the zero count"
+        );
+    }
+
+    /// The scan [`LogsTableProvider::plan_filters`] builds over one segment
+    /// stamped with the fields (`[200, 404]`, sum 1004, zero count 0), with no
+    /// `.cstat`, so only the stamp could answer.
+    fn stamped_scan(filters: &[datafusion::prelude::Expr]) -> Arc<dyn ExecutionPlan> {
+        let backend: Arc<dyn ravel_object_store::ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let provider = crate::LogsTableProvider::new(
+            Snapshot {
+                segments: vec![seg(&[i64_stamp(true)])],
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(backend),
+            PhaseAccounting::new(),
+        )
+        .with_declared_columns(vec![i64_col()]);
+        provider.plan_filters(1, filters).expect("plan_filters")
+    }
+
+    fn as_scan(plan: &Arc<dyn ExecutionPlan>) -> &LogsScanExec {
+        plan.downcast_ref::<LogsScanExec>().expect("a logs scan")
+    }
+
+    /// The prune-arm refusal of `metadata_rewrite_stats_are_exact`, alone. No
+    /// SQL statement reaches the rule with a prune arm other than `NumNotEq`
+    /// and nothing else refusing (`logs_stamp_guards.rs`,
+    /// `every_prune_arm_statement_carries_another_refusal`), so the scan is
+    /// built from filters directly: each filter leaves one prune arm, no
+    /// content arm, no key, no row filter, no erasure and no ts bound, and the
+    /// stamp's sum and not-equal count are refused. A `<> 0` filter, whose arm
+    /// is `NumNotEq`, answers.
+    ///
+    /// Prove-the-test: make `prune_is_rewrite_neutral` return `true` and each
+    /// refused read answers `Some`.
+    #[test]
+    fn a_prune_arm_other_than_not_equal_refuses_the_stamp_answer() {
+        use datafusion::prelude::{col, lit};
+        let zero = ScalarValue::Int64(Some(0));
+        let control_plan = stamped_scan(&[col(COL).not_eq(lit(0i64))]);
+        let control = as_scan(&control_plan);
+        assert!(
+            matches!(control.prune.as_slice(), [Predicate::NumNotEq { .. }]),
+            "{:?}",
+            control.prune
+        );
+        assert_eq!(control.declared_not_equal_count(0, &zero), Some(4));
+        let sum = control.declared_column_sum(0).expect("the stamp's sum");
+        assert_eq!((sum.sum, sum.non_null_count), (1004, 4));
+
+        for filter in [
+            col(COL).gt(lit(1i64)),
+            col(COL).eq(lit(200i64)),
+            col(COL).between(lit(0i64), lit(1000i64)),
+            col(COL).in_list(vec![lit(200i64), lit(404i64)], false),
+        ] {
+            let plan = stamped_scan(std::slice::from_ref(&filter));
+            let scan = as_scan(&plan);
+            assert!(
+                !scan.prune.is_empty()
+                    && scan
+                        .prune
+                        .iter()
+                        .all(|p| !matches!(p, Predicate::NumNotEq { .. })),
+                "{filter}: a prune arm other than NumNotEq: {:?}",
+                scan.prune
+            );
+            assert!(
+                scan.content.is_empty()
+                    && scan.key_equals.is_empty()
+                    && scan.key_in.is_none()
+                    && scan.row_filters.is_empty()
+                    && scan.erasure.is_empty()
+                    && (scan.ts_min, scan.ts_max) == (i64::MIN, i64::MAX),
+                "{filter}: the prune arm is the only refusal"
+            );
+            assert_eq!(scan.declared_not_equal_count(0, &zero), None, "{filter}");
+            assert!(scan.declared_column_sum(0).is_none(), "{filter}");
+        }
     }
 }

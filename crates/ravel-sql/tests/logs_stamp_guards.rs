@@ -9,9 +9,10 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::array::{Float64Array, Int64Array};
 use ravel_logseg::AttrValue;
 use ravel_sql::{DeclaredType, KeyIndexDeclaration};
+use ravel_types::declared_stats::DeclaredStatValue;
 
 use crate::logs_stamp_readers::{
     Corpus, Fields, Row, assert_answered, assert_same_answer, assert_scanned, columns, pretty, row,
@@ -393,4 +394,209 @@ async fn bool_not_equal_shapes_match_the_scan() {
         .stamped("SELECT COUNT(*) FROM logs WHERE f <> false")
         .await;
     assert!(pretty(&run).contains("| 3 "), "{}", pretty(&run));
+}
+
+/// The one value of a one-row, one-column `Int64` answer.
+fn int64(run: &crate::logs_stamp_readers::Run) -> i64 {
+    columns(run)[0]
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64")
+        .value(0)
+}
+
+/// The one value of a one-row, one-column `Float64` answer, as bits.
+fn float64_bits(run: &crate::logs_stamp_readers::Run) -> u64 {
+    columns(run)[0]
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Float64")
+        .value(0)
+        .to_bits()
+}
+
+/// Row 3's prune-arm refusal has no statement of its own: every pushed
+/// predicate that adds a prune arm other than `NumNotEq` also leaves a
+/// residual `FilterExec` above the scan (the arm is block-only, so the
+/// provider reports the filter `Inexact`), or, for a declared I64 equality,
+/// a row filter on the scan. Each candidate below scans and equals the forced
+/// scan; the arm alone is pinned in `logs_scan`'s `figure_resolver_tests`
+/// (`a_prune_arm_other_than_not_equal_refuses_the_stamp_answer`).
+#[tokio::test]
+async fn every_prune_arm_statement_carries_another_refusal() {
+    let parts: Vec<Vec<Row>> = two_parts()
+        .into_iter()
+        .map(|rows| {
+            rows.into_iter()
+                .enumerate()
+                .map(|(i, r)| r.with("s", AttrValue::Str(format!("v{}", i % 2))))
+                .collect()
+        })
+        .collect();
+    let corpus = Corpus::build(&parts).await;
+    for sql in [
+        "SELECT SUM(a) FROM logs WHERE attrs['user'] = 'subject-s'",
+        "SELECT COUNT(*) FROM logs WHERE a <> 0 AND attrs['user'] = 'subject-s'",
+        "SELECT SUM(a) FROM logs WHERE w = 7",
+        "SELECT COUNT(*) FROM logs WHERE a <> 0 AND w = 7",
+        "SELECT SUM(a) FROM logs WHERE w BETWEEN 1 AND 1000",
+        "SELECT SUM(a) FROM logs WHERE w > 1",
+        "SELECT COUNT(*) FROM logs WHERE a <> 0 AND w > 1",
+        "SELECT SUM(a) FROM logs WHERE w IN (7, 800)",
+        "SELECT SUM(a) FROM logs WHERE s = 'v0'",
+        "SELECT COUNT(*) FROM logs WHERE a <> 0 AND s = 'v0'",
+    ] {
+        let run = corpus.stamped(sql).await;
+        assert!(
+            run.plan.contains("FilterExec") || run.plan.contains("row_filters=["),
+            "{sql}: a residual filter or a row filter beside the prune arm; plan was:\n{}",
+            run.plan
+        );
+        assert_scanned(&run, sql);
+        assert_same_answer(&run, &corpus.forced(sql).await, sql);
+    }
+}
+
+/// Two objects with disjoint ts spans (0 to 40 and 100 to 130); `ts >= 50`
+/// excludes the first entirely and contains the second, so the resolved scan
+/// holds only the second, which the bound does not clip: the statement
+/// answers from its stamp, with no data-object GET, and equals the scan of
+/// unstamped objects. The figures differ from the unbounded statement's, so
+/// counting the excluded object would change them. Written once as a
+/// `TIMESTAMP` literal and once plain.
+///
+/// Prove-the-test: make `LogsTableProvider::pruned_segments` keep every
+/// segment; the first object then fails the containment check and the
+/// statement scans, failing `assert_answered`.
+#[tokio::test]
+async fn a_ts_bound_excluding_one_object_and_containing_the_other_answers() {
+    let corpus = Corpus::build(&two_parts()).await;
+    for bound in [
+        "ts >= TIMESTAMP '1970-01-01 00:00:00.000000050'",
+        "ts >= '1970-01-01 00:00:00.000000050'",
+    ] {
+        let sum = format!("SELECT SUM(a) FROM logs WHERE {bound}");
+        let avg = format!("SELECT AVG(a) FROM logs WHERE {bound}");
+        let ne = format!("SELECT COUNT(*) FROM logs WHERE a <> 0 AND {bound}");
+        for sql in [&sum, &avg, &ne] {
+            let run = corpus.stamped(sql).await;
+            assert_answered(&run, sql);
+            let truth = corpus.truth(sql).await;
+            assert_scanned(&truth, sql);
+            assert_same_answer(&run, &truth, sql);
+        }
+        // The second object's a: 3, NULL, 0, 7.
+        assert_eq!(int64(&corpus.stamped(&sum).await), 10, "{sum}");
+        assert_eq!(
+            float64_bits(&corpus.stamped(&avg).await),
+            (10.0f64 / 3.0).to_bits(),
+            "{avg}"
+        );
+        assert_eq!(int64(&corpus.stamped(&ne).await), 2, "{ne}");
+    }
+    // Unbounded, the first object's 0, 2, 0, 5 count too.
+    assert_eq!(int64(&corpus.stamped("SELECT SUM(a) FROM logs").await), 17);
+    assert_eq!(
+        float64_bits(&corpus.stamped("SELECT AVG(a) FROM logs").await),
+        (17.0f64 / 7.0).to_bits()
+    );
+    assert_eq!(
+        int64(
+            &corpus
+                .stamped("SELECT COUNT(*) FROM logs WHERE a <> 0")
+                .await
+        ),
+        4
+    );
+}
+
+/// Literals the not-equal reader must not take: past `i64`, fractional, a
+/// float equal to an integer, and the column cast to `DOUBLE`. DataFusion
+/// casts the column to the literal's type (`CAST(a@0 AS Decimal128(20, 0))`,
+/// `CAST(a@0 AS Float64)`), so none reaches the rule as a bare column against
+/// an `Int64` literal; each scans and equals the scan of unstamped objects.
+/// `CAST(a AS BIGINT)` and `-0` reach it as `a <> 0`: the optimizer removes
+/// the no-op cast and folds `-0` to 0, and both answer from the stamps with
+/// the scan's count.
+#[tokio::test]
+async fn not_equal_literals_of_another_type_scan() {
+    let corpus = Corpus::build(&two_parts()).await;
+    for (sql, filter, count) in [
+        (
+            "SELECT COUNT(*) FROM logs WHERE a <> 9223372036854775808",
+            "FilterExec: CAST(a@0 AS Decimal128(20, 0)) != 9223372036854775808",
+            7,
+        ),
+        (
+            "SELECT COUNT(*) FROM logs WHERE a <> 0.5",
+            "FilterExec: CAST(a@0 AS Float64) != 0.5",
+            7,
+        ),
+        (
+            "SELECT COUNT(*) FROM logs WHERE a <> 100.0",
+            "FilterExec: CAST(a@0 AS Float64) != 100,",
+            7,
+        ),
+        (
+            "SELECT COUNT(*) FROM logs WHERE CAST(a AS DOUBLE) <> 0",
+            "FilterExec: CAST(a@0 AS Float64) != 0,",
+            4,
+        ),
+    ] {
+        let run = corpus.stamped(sql).await;
+        assert!(run.plan.contains(filter), "{sql}: plan was:\n{}", run.plan);
+        assert_scanned(&run, sql);
+        assert_same_answer(&run, &corpus.truth(sql).await, sql);
+        assert_eq!(int64(&run), count, "{sql}");
+    }
+    for sql in [
+        "SELECT COUNT(*) FROM logs WHERE CAST(a AS BIGINT) <> 0",
+        "SELECT COUNT(*) FROM logs WHERE a <> -0",
+    ] {
+        let run = corpus.stamped(sql).await;
+        assert_answered(&run, sql);
+        let truth = corpus.truth(sql).await;
+        assert_scanned(&truth, sql);
+        assert_same_answer(&run, &truth, sql);
+        assert_eq!(int64(&run), 4, "{sql}: a is 2, 5, 3, 7 on four rows");
+    }
+}
+
+/// A stamp with a zero count of 0 over an object whose minimum `a` is 0, the
+/// stamp the decode gap admits (#4672): it cannot describe its object, so
+/// `COUNT(*) WHERE a <> 0` scans and equals the forced scan, which counts
+/// the two non-zero rows, not the three non-null ones.
+///
+/// Prove-the-test: remove the zero-count check in `stamp_equal_count`; the
+/// statement then answers 3 from the stamp, failing `assert_scanned` (and
+/// the value).
+#[tokio::test]
+async fn a_zero_count_of_zero_beside_a_zero_minimum_scans() {
+    let rows = vec![
+        row(0, Some(0), None),
+        row(10, Some(3), None),
+        row(20, None, None),
+        row(30, Some(5), None),
+    ];
+    let corpus = Corpus::build(std::slice::from_ref(&rows)).await;
+    let true_stamp = stamp_of("a", DeclaredType::I64, &rows, Fields::Without).expect("stamp");
+    assert_eq!(
+        (true_stamp.min(), true_stamp.max(), true_stamp.null_count()),
+        (
+            Some(DeclaredStatValue::I64(0)),
+            Some(DeclaredStatValue::I64(5)),
+            1
+        )
+    );
+    let lying = true_stamp
+        .with_zero_count(0)
+        .expect("the decode gap admits it");
+    let sql = "SELECT COUNT(*) FROM logs WHERE a <> 0";
+    let mut setup = corpus.setup(Fields::With);
+    setup.segs = vec![corpus.seg_with(0, std::slice::from_ref(&lying))];
+    let run = corpus.run(sql, setup).await;
+    assert_scanned(&run, sql);
+    let forced = corpus.forced(sql).await;
+    assert_same_answer(&run, &forced, sql);
+    assert_eq!(int64(&run), 2, "3 and 5");
 }
