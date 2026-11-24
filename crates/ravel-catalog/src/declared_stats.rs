@@ -110,8 +110,9 @@ fn value_to_commit(value: &DeclaredColumnStatValue) -> commit_pb::DeclaredColumn
 /// two messages are field-for-field identical by construction (ADR-0873
 /// decision 1, ADR-4628 decision 1), including the value kinds, a
 /// present-but-empty value message, and the ADR-4628 sum and zero count (fields
-/// 6 to 8), all of which a defect the reader must still see rather than one
-/// this conversion may quietly normalise away. The sum's two fields are copied
+/// 6 to 8). Each is copied as it stands, so a defect in any of them is one the
+/// reader must still see rather than one this conversion may quietly normalise
+/// away. The sum's two fields are copied
 /// byte for byte and not chosen between: a defective entry carrying both field
 /// 6 and field 7, or a field 7 of the wrong length, has to reach the
 /// `decode`-side predicate unchanged so it is dropped there, exactly as a

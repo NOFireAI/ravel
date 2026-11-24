@@ -2880,7 +2880,8 @@ per stamped column for the min, max and null count, and ADR-4628 adds up to 29
 more for an I64 column (field 6 or the 18-byte field 7 for the sum, plus up to
 11 for field 8's zero count) and up to 11 for a BOOL column (field 8 alone), so
 a part's `entries_uncompressed_len` and the resolve path's per-record cache
-sizing note below grow by that order for a tenant with typed attribute columns. `verify_seal_divergence`
+sizing note below grow by that order for a tenant with typed attribute
+columns. `verify_seal_divergence`
 (`crates/ravel-catalog/src/seal_divergence.rs`) therefore compares only the
 level-0 entries against the L0 commit history, and mirrors the fold's
 supersession exclusion on the ground-truth side: an L0 commit record named in a
