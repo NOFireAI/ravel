@@ -111,17 +111,19 @@ races ("The forced races" in `../catalog-maintenance/README.md`). Then:
    the attribution of each burst write to the count it was routed at need
    writes no other rule interleaves.
 2. The write gate is released. Under a read gate, like the other read
-   rules, each straggler is read back with its tokens on both nodes. If the
-   cycle found a straggler and the reads ran, the eventually skips its own
-   decrease cycles.
+   rules, each straggler is read back with its tokens on both nodes (up to
+   4, single-attempt writes only, as in step 4). If at least one straggler
+   was read back, the eventually skips its own decrease cycles. A straggler
+   acknowledged only after a retry is not read, so a cycle whose stragglers
+   were all retried leaves the eventually's cycles to run.
 3. With no gate, the forged token read of step 5, with its three attempts
    per node.
 
 The cycle and the forged read are the same code the eventually runs, with
 `reason` `drawn` in their details (`reshard: decrease burst` and `reshard:
 forged token read` in the driver log), and the rule prints `reshard: drawn
-decrease: starting` and `reshard: drawn decrease: <n> straggler(s) read
-back`. No assertion literal is new. If the drawn decrease ran, the eventually
+decrease: starting` and `reshard: drawn decrease: <n> straggler(s) found,
+<m> read back`. No assertion literal is new. If the drawn decrease ran, the eventually
 first appends an increase back to 6 (its usual step 1 check), so its
 activation writes and fence run at 6 shards, as they do without it.
 
@@ -139,11 +141,13 @@ The local loop draws the rule or not, like any drawn rule. To force it, set
 `WORKLOAD_FORCE_DRAWN_DECREASE=1` (`../catalog-maintenance/local/docker-compose.local.yaml`
 passes it to the driver): the rule then skips its draw and runs once its
 preconditions hold. Unset, the local run is unchanged, and no Antithesis
-config sets it.
+config sets it. The rule still waits for a drawn sealing jump, which the
+default 240 s of workload time often does not reach before the forced races
+take it up, so give the run more:
 
 ```sh
 WORKLOAD_FORCE_DRAWN_DECREASE=1 WORKLOAD_PROFILE=reshard-ownership \
-  antithesis/catalog-maintenance/scripts/local-run.sh out/reshard-drawn
+  antithesis/catalog-maintenance/scripts/local-run.sh out/reshard-drawn 1500
 ```
 
 ## Properties

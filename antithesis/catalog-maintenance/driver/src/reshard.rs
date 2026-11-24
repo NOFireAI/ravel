@@ -346,15 +346,15 @@ pub fn decrease_drawn(s: &Shared, tc: &TestCase) {
     );
     let stragglers = decrease_cycle(s, "drawn", 0);
     drop(quiet);
-    {
+    let read = {
         let _g = s.enter();
-        read_stragglers(s, &stragglers);
-    }
-    if !stragglers.is_empty() {
+        read_stragglers(s, &stragglers)
+    };
+    if read > 0 {
         s.reshard.drawn_reached.store(true, Ordering::SeqCst);
     }
     println!(
-        "reshard: drawn decrease: {} straggler(s) read back",
+        "reshard: drawn decrease: {} straggler(s) found, {read} read back",
         stragglers.len()
     );
     forged_read(s, "drawn");
@@ -663,7 +663,9 @@ fn decrease_cycle(s: &Shared, reason: &str, cycle: u32) -> Vec<Write> {
 
 /// Each straggler of a decrease cycle (up to [`STRAGGLER_READS`],
 /// single-attempt writes only) read back with its tokens on every node.
-fn read_stragglers(s: &Shared, stragglers: &[Write]) {
+/// Returns how many stragglers were read.
+fn read_stragglers(s: &Shared, stragglers: &[Write]) -> usize {
+    let mut read = 0;
     for w in stragglers
         .iter()
         .filter(|w| w.max_copies() == 1)
@@ -672,7 +674,9 @@ fn read_stragglers(s: &Shared, stragglers: &[Write]) {
         for node in 0..s.ravel.nodes.len() {
             s.lifecycle_read(w, node, false, "reshard: straggler");
         }
+        read += 1;
     }
+    read
 }
 
 /// The forged token read (D4 part 1): an acknowledged write's token moved to
