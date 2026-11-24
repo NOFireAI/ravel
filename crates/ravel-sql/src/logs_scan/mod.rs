@@ -5193,6 +5193,54 @@ mod figure_resolver_tests {
         );
     }
 
+    /// A not-equal literal whose scalar type is not `Int64` gives no figure
+    /// for an I64 column, even where a lossy cast to `i64` would land on a
+    /// value a stamp case covers. The stamp is `[0, 5]` with two zeros among
+    /// four non-null rows, so `<> 0.5` holds for all four rows, while 0.5
+    /// cast to 0 would read the zero count and answer 2.
+    ///
+    /// Prove-the-test: let `literal_stat_value` take a `Float64`, `UInt64` or
+    /// `Decimal128` literal for an I64 column by casting it to `i64`; the
+    /// `0.5` read then answers `(Stamp, NotEqual(2))`.
+    #[test]
+    fn a_literal_of_another_numeric_type_gives_none() {
+        let stamp = DeclaredColumnStat::new(
+            COL,
+            DeclaredStatType::I64,
+            Some(DeclaredStatValue::I64(0)),
+            Some(DeclaredStatValue::I64(5)),
+            1,
+        )
+        .expect("valid stamp")
+        .with_sum(8)
+        .expect("sum")
+        .with_zero_count(2)
+        .expect("zero count");
+        let seg = seg(&[stamp]);
+        for literal in [
+            ScalarValue::Float64(Some(0.5)),
+            ScalarValue::Float64(Some(0.0)),
+            ScalarValue::UInt64(Some(1 << 63)),
+            ScalarValue::Decimal128(Some(0), 20, 0),
+        ] {
+            assert_eq!(
+                resolve_segment_figure(&i64_col(), &seg, None, FigureRequest::NotEqual(&literal)),
+                None,
+                "{literal:?}"
+            );
+        }
+        assert_eq!(
+            resolve_segment_figure(
+                &i64_col(),
+                &seg,
+                None,
+                FigureRequest::NotEqual(&ScalarValue::Int64(Some(0)))
+            ),
+            Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(2))),
+            "the Int64 zero reads the zero count"
+        );
+    }
+
     /// The scan [`LogsTableProvider::plan_filters`] builds over one segment
     /// stamped with the fields (`[200, 404]`, sum 1004, zero count 0), with no
     /// `.cstat`, so only the stamp could answer.
