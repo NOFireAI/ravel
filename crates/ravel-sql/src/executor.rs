@@ -949,6 +949,20 @@ pub struct SqlStats {
     /// prunes the same snapshot again, so the sum can exceed it. Zero for a
     /// metrics query and for a logs plan with no scan node.
     pub segments_pruned_by_stats: u64,
+    /// Touched segments a metadata-only aggregate answered from their stamps
+    /// alone (ADR-4628 decision 5), read off the `MetadataOnlyExec`
+    /// `segments_answered_from_stamp` counter and summed over every such node
+    /// in the plan. A segment with any figure read from `.cstat` is counted in
+    /// [`Self::segments_answered_from_cstat`] instead, so with one node the
+    /// two add up to its touched segments. Zero for a statement the rewrite
+    /// does not answer.
+    pub segments_answered_from_stamp: u64,
+    /// Touched segments a metadata-only aggregate read at least one figure
+    /// for from `.cstat`, every segment of a `GROUP BY` count included, read
+    /// off the `MetadataOnlyExec` `segments_answered_from_cstat` counter and
+    /// summed over every such node in the plan. Zero for a statement the
+    /// rewrite does not answer.
+    pub segments_answered_from_cstat: u64,
     /// Segments an exact-key lookup read no block of because a key index
     /// proves the key absent: on spans, a `trace_id` equality's segments the
     /// tier-2 router dropped before the scan because their part's key-index
@@ -1425,6 +1439,8 @@ struct BlockCounts {
     scanned: u64,
     pruned_by_postings: u64,
     segments_pruned_by_stats: u64,
+    segments_answered_from_stamp: u64,
+    segments_answered_from_cstat: u64,
     segments_pruned_by_key_index: u64,
     blocks_pruned_by_key_index: u64,
     blocks_skipped_by_threshold: u64,
@@ -1468,7 +1484,9 @@ struct BlockCounts {
 /// nested it, and a plan carrying neither scan contributes nothing. The
 /// `segments_pruned_by_key_index` and `blocks_pruned_by_key_index` sums come
 /// from both `SpansScanExec` (crate::spans_scan) and `LogsScanExec` the same
-/// way. Reads the counters the scans already
+/// way, and the `segments_answered_from_stamp` and
+/// `segments_answered_from_cstat` sums from `MetadataOnlyExec`
+/// (crate::metadata_agg) alone. Reads the counters the nodes already
 /// maintain rather than counting a second time.
 fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCounts) {
     // One walk, one `metrics()` call per node: that call clones the node's
@@ -1486,6 +1504,10 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.scanned += sum("blocks_scanned");
         counts.pruned_by_postings += sum("blocks_pruned_by_postings");
         counts.segments_pruned_by_stats += sum("segments_pruned_by_stats");
+        counts.segments_answered_from_stamp +=
+            sum(crate::metadata_agg::SEGMENTS_ANSWERED_FROM_STAMP);
+        counts.segments_answered_from_cstat +=
+            sum(crate::metadata_agg::SEGMENTS_ANSWERED_FROM_CSTAT);
         counts.segments_pruned_by_key_index += sum("segments_pruned_by_key_index");
         counts.blocks_pruned_by_key_index += sum("blocks_pruned_by_key_index");
         counts.blocks_skipped_by_threshold += sum("blocks_skipped_by_threshold");
@@ -3039,6 +3061,8 @@ impl SqlExecutor {
                     stats.blocks_scanned = blocks.scanned;
                     stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
                     stats.segments_pruned_by_stats = blocks.segments_pruned_by_stats;
+                    stats.segments_answered_from_stamp = blocks.segments_answered_from_stamp;
+                    stats.segments_answered_from_cstat = blocks.segments_answered_from_cstat;
                     stats.segments_pruned_by_key_index = blocks.segments_pruned_by_key_index;
                     stats.blocks_pruned_by_key_index = blocks.blocks_pruned_by_key_index;
                     stats.key_index = blocks.key_index;
@@ -5553,6 +5577,19 @@ impl SqlExecutor {
     /// the column, a dictionary over the cardinality ceiling) is left to
     /// decline downstream, so such a plan loads and then scans.
     ///
+    /// Last, after every refusal above has passed, the load is skipped when
+    /// the stamps answer the statement on their own (ADR-4628 decision 5):
+    /// the statement names one table and holds one table scan, every
+    /// admitted aggregate states the figures it reads
+    /// ([`crate::metadata_agg::AdmittedAggregate::stamp_figures`]: one sum
+    /// per distinct column, or the q02 literal's not-equal count; never the
+    /// q08 counts, an unknown residual conjunct, or a literal that is not a
+    /// constant of the column's own type), and every segment the analyzed ts
+    /// bound touches answers every one of them through
+    /// [`Self::stamps_answer_every_figure`]. The skip decides only whether
+    /// the load is paid: with no `.cstat` loaded, a segment the stamp does
+    /// not answer declines the rewrite and the statement scans.
+    ///
     /// `several_tables` is whether the statement names more than one table,
     /// two signal tables or a signal table beside a Parquet table; the
     /// pushdown checks then read only the `logs` scans' own conjuncts.
@@ -5586,7 +5623,7 @@ impl SqlExecutor {
         let Some(plan) = analyzed else {
             return Some(ColumnStatsRequest::summary_only());
         };
-        let request = plan_stats_answerable_request(plan, declared)?;
+        let (request, figures) = plan_stats_answerable_request(plan, declared)?;
         if several_tables {
             return Self::some_logs_scan_may_use_column_stats(snapshot, plan, declared)
                 .then_some(request);
@@ -5609,7 +5646,18 @@ impl SqlExecutor {
         // resolves (`pruned_segments`); a segment fully outside the bound is
         // pruned away and never reaches the containment check, so it must not
         // count as a clip here either.
-        (!Self::ts_bound_clips(snapshot, pushdown.ts_min(), pushdown.ts_max())).then_some(request)
+        let (ts_min, ts_max) = (pushdown.ts_min(), pushdown.ts_max());
+        if Self::ts_bound_clips(snapshot, ts_min, ts_max) {
+            return None;
+        }
+        // ADR-4628 decision 5: no load when every touched segment's stamp
+        // answers every figure. Two scans of `logs` pool their conjuncts
+        // above, so one of them could read a figure judged for neither.
+        let stamps_answer = count_table_scans(plan) == 1
+            && figures.is_some_and(|figures| {
+                Self::stamps_answer_every_figure(snapshot, ts_min, ts_max, &figures)
+            });
+        (!stamps_answer).then_some(request)
     }
 
     /// Whether `[ts_min, ts_max]` clips a segment of `snapshot` it touches.
@@ -5619,6 +5667,36 @@ impl SqlExecutor {
             .iter()
             .filter(|s| LogSegmentFetcher::ts_range_relevant(s, ts_min, ts_max))
             .any(|s| !(ts_min <= s.min_event_ts_ns && s.max_event_ts_ns <= ts_max))
+    }
+
+    /// Whether every segment of `snapshot` that `[ts_min, ts_max]` touches
+    /// answers every one of `figures` from its stamp alone: the same
+    /// [`resolve_segment_figure`](crate::logs_scan::resolve_segment_figure)
+    /// the readers call, with no column statistics, so the stamp is the only
+    /// carrier it can return. No I/O.
+    fn stamps_answer_every_figure(
+        snapshot: &Snapshot,
+        ts_min: i64,
+        ts_max: i64,
+        figures: &[crate::metadata_agg::StampFigure<'_>],
+    ) -> bool {
+        use crate::logs_scan::{FigureRequest, resolve_segment_figure};
+        use crate::metadata_agg::StampFigure;
+        snapshot
+            .segments
+            .iter()
+            .filter(|s| LogSegmentFetcher::ts_range_relevant(s, ts_min, ts_max))
+            .all(|seg| {
+                figures.iter().all(|figure| {
+                    let (declared, request) = match figure {
+                        StampFigure::Sum(declared) => (*declared, FigureRequest::Sum),
+                        StampFigure::NotEqual(declared, literal) => {
+                            (*declared, FigureRequest::NotEqual(literal))
+                        }
+                    };
+                    resolve_segment_figure(declared, seg, None, request).is_some()
+                })
+            })
     }
 
     /// [`Self::logs_column_stats_eligible`]'s pushdown checks for a plan that
@@ -8665,10 +8743,18 @@ fn is_exact_integer(ty: &datafusion::arrow::datatypes::DataType) -> bool {
 /// reach (inputs plus embedded subquery plans), so `SELECT (SELECT SUM(status)
 /// FROM logs)` is judged on the nested aggregate. The plan's `logs` scans share
 /// one load, so it carries every dictionary any accepted aggregate reads.
-fn plan_stats_answerable_request(
+///
+/// Beside the request, the figures every accepted aggregate reads per touched
+/// segment ([`crate::metadata_agg::AdmittedAggregate::stamp_figures`]), or
+/// `None` when any one accepted aggregate's figures cannot be decided from
+/// stamps.
+fn plan_stats_answerable_request<'a>(
     plan: &LogicalPlan,
-    declared: &[DeclaredColumn],
-) -> Option<ColumnStatsRequest> {
+    declared: &'a [DeclaredColumn],
+) -> Option<(
+    ColumnStatsRequest,
+    Option<Vec<crate::metadata_agg::StampFigure<'a>>>,
+)> {
     let mut aggregates = Vec::new();
     let mut distincts = Vec::new();
     collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
@@ -8677,9 +8763,14 @@ fn plan_stats_answerable_request(
         .filter_map(|aggregate| {
             crate::metadata_agg::logical_aggregate_answerable(aggregate, declared)
         })
-        .reduce(|mut union, request| {
+        .map(|admitted| (admitted.request, admitted.stamp_figures))
+        .reduce(|(mut union, figures), (request, more)| {
             union.extend(&request);
-            union
+            let figures = figures.zip(more).map(|(mut figures, more)| {
+                figures.extend(more);
+                figures
+            });
+            (union, figures)
         })
 }
 
@@ -11473,7 +11564,7 @@ pub(crate) mod tests {
                     .sql_classification_plan(t, sql, declared, None)
                     .await
                     .expect("the statement plans");
-                plan_stats_answerable_request(&plan, declared)
+                plan_stats_answerable_request(&plan, declared).map(|(request, _)| request)
             }
         };
         let names = |request: Option<ColumnStatsRequest>| {
@@ -11558,6 +11649,108 @@ pub(crate) mod tests {
             Vec::<&str>::new()
         );
         assert!(request.is_summary_only());
+    }
+
+    /// ADR-4628 decision 5, skip test (s2): the stamp walk covers only the
+    /// segments the analyzed ts bound touches. Segment 1 (ts 0 to 10) carries
+    /// `a`'s zero count; segment 2 (ts 100 to 110) does not, and 0 lies inside
+    /// its `[0, 6]`, so its stamp has no figure for `a <> 0`. Under `ts <= 50`
+    /// segment 2 is not touched and the load is skipped; under `ts <= 200`
+    /// both are touched and contained, and the load is kept.
+    ///
+    /// The bound is a typed timestamp literal here: SQL text reaches this
+    /// gate with `TIMESTAMP '...'` still a cast, which reads no bound, so the
+    /// executor-level form of this case keeps the load
+    /// (`logs_stamp_load_gate::s2_a_timestamp_text_bound_keeps_the_load`).
+    #[tokio::test]
+    async fn the_stamp_skip_judges_only_the_segments_the_ts_bound_touches() {
+        use datafusion::functions_aggregate::expr_fn::count;
+        use datafusion::logical_expr::logical_plan::builder::table_scan_with_filters;
+        use datafusion::prelude::{col, lit};
+        use ravel_catalog::{DeclaredColumnStats, SegmentLevel, SegmentRef};
+        use ravel_types::declared_stats::{
+            DeclaredColumnStat, DeclaredStatType, DeclaredStatValue,
+        };
+
+        let exec = eviction_test_executor();
+        let declared = [DeclaredColumn::new("a", DeclaredType::I64)];
+        let segment = |seq: u64, ts: i64, stamp: DeclaredColumnStat| {
+            let mut record = ravel_proto::commit::v1::CommitRecord {
+                sample_count: 3,
+                ..Default::default()
+            };
+            ravel_commit::declared_stats::stamp_commit_record(&mut record, &[stamp]);
+            let read = ravel_commit::declared_stats::read_commit_record(&record);
+            assert_eq!(read.covered().len(), 1, "a valid stamp");
+            SegmentRef {
+                data_object_key: format!("logs/{seq}.rlog"),
+                object_size: 1,
+                min_event_ts_ns: ts,
+                max_event_ts_ns: ts + 10,
+                ingest_hour_bucket: 0,
+                sample_count: 3,
+                series_count: 1,
+                shard: 0,
+                content_hash: [u8::try_from(seq).expect("small"); 32],
+                writer_id: Uuid::from_u128(1),
+                writer_epoch: 1,
+                writer_seq: seq,
+                created_unix_ns: 0,
+                level: SegmentLevel::L0,
+                segment_format_version: 0,
+                declared_column_stats: DeclaredColumnStats::from_validated(&read),
+            }
+        };
+        let a_stamp = |max: i64| {
+            DeclaredColumnStat::new(
+                "a",
+                DeclaredStatType::I64,
+                Some(DeclaredStatValue::I64(0)),
+                Some(DeclaredStatValue::I64(max)),
+                0,
+            )
+            .expect("valid stamp")
+        };
+        let snapshot = Snapshot {
+            segments: vec![
+                segment(
+                    1,
+                    0,
+                    a_stamp(4)
+                        .with_sum(4)
+                        .expect("sum")
+                        .with_zero_count(2)
+                        .expect("zero count"),
+                ),
+                segment(2, 100, a_stamp(6)),
+            ],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let schema = crate::logs_schema::logs_schema_with_declared(&declared);
+        let plan_under =
+            |bound: i64| {
+                table_scan_with_filters(Some(LOGS_TABLE), &schema, None, Vec::new())
+                    .expect("scan")
+                    .filter(col("a").not_eq(lit(0i64)).and(
+                        col("ts").lt_eq(lit(ScalarValue::TimestampNanosecond(Some(bound), None))),
+                    ))
+                    .expect("filter")
+                    .aggregate(Vec::<Expr>::new(), vec![count(lit(1i64))])
+                    .expect("aggregate")
+                    .build()
+                    .expect("plan")
+            };
+        assert!(
+            exec.logs_column_stats_eligible(&snapshot, Some(&plan_under(50)), &declared, false)
+                .is_none(),
+            "ts <= 50: only segment 1 is touched, and its stamp answers"
+        );
+        assert!(
+            exec.logs_column_stats_eligible(&snapshot, Some(&plan_under(200)), &declared, false)
+                .is_some(),
+            "ts <= 200: segment 2 is touched and its stamp does not answer"
+        );
     }
 
     /// ADR-0094 decision 1: the classifier admits exactly the exact-typed
