@@ -142,23 +142,23 @@ always-assertion is listed, not gated (`../catalog-maintenance/README.md`,
 "The expected set"). Every `catalog: ` always-assertion was hit in each of
 three local runs of this profile, so owning the area adds no pending entry.
 
-Two owned always-assertions have no forced situation here yet.
-`scripts/profile.sh` names both in `PROFILE_PENDING`, and `local-run.sh`
-lists them as pending, never as a gate failure, until a situation reaches
-each and its entry is removed:
+One owned always-assertion has no forced situation here yet.
+`scripts/profile.sh` names it in `PROFILE_PENDING`, and `local-run.sh` lists
+it as pending, never as a gate failure, until a situation reaches it and its
+entry is removed: `maintenance: a seeded memo entry is never fresher than its
+snapshot` is evaluated only when a maintain worker warm-starts from a peer's
+memo snapshot (`crates/ravel-maintain/src/scan.rs`), which happens when the
+two workers' starts and membership changes stagger against each other's
+snapshot writes: a race, not a situation the driver forces. It held in two
+of three local runs of this profile and was never hit in the third. A forced
+maintain restart in the local loop, as `ravel2`'s, would reach it.
 
-- `maintenance: a loser observing a divergent input-set hash fails closed and
-  never overwrites the record` is evaluated only when a compaction loser sees
-  a divergent input set, which the record race never produces (it races two
-  compactions over the same inputs). The forced situation that reaches it is
-  D5 item 7 of the step 5 decision, not built yet.
-- `maintenance: a seeded memo entry is never fresher than its snapshot` is
-  evaluated only when a maintain worker warm-starts from a peer's memo
-  snapshot (`crates/ravel-maintain/src/scan.rs`), which happens when the two
-  workers' starts and membership changes stagger against each other's
-  snapshot writes: a race, not a situation the driver forces. It held in two
-  of three local runs of this profile and was never hit in the third. A
-  forced maintain restart in the local loop, as `ravel2`'s, would reach it.
+`maintenance: a loser observing a divergent input-set hash fails closed and
+never overwrites the record` is evaluated only when a compaction loser sees a
+divergent input set. The divergent-record race reaches it (D5 item 7 of the
+step 5 decision; `../catalog-maintenance/README.md`, "The divergent-record
+and missing-part races"), and `local-run.sh` requires it in every plain run,
+so it is gated like any other owned always-assertion.
 
 ## Mutants
 
