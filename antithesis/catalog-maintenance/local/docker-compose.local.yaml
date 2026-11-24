@@ -19,6 +19,9 @@ services:
       ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
       WORKLOAD_INJECT_SWAPPED_RECORD: ${WORKLOAD_INJECT_SWAPPED_RECORD:-}
       WORKLOAD_INJECT_STALE_TOKEN_RESULT: ${WORKLOAD_INJECT_STALE_TOKEN_RESULT:-}
+      # 1: driver-reshard's decrease_drawn rule skips its draw
+      # (../../reshard-ownership/README.md); the plain driver ignores it.
+      WORKLOAD_FORCE_DRAWN_DECREASE: ${WORKLOAD_FORCE_DRAWN_DECREASE:-}
       # Before its token reads after the sweep, the eventually asks
       # scripts/local-run.sh to restart this node and waits for it: the
       # local loop's stand-in for a restart fault.

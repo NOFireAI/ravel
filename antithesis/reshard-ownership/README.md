@@ -72,7 +72,13 @@ record (D3).
    `u64::MAX`, so its commit record was never written (`forge`). Each node
    must refuse it as unsatisfiable, which makes the SUT evaluate `resharding:
    a commit token whose record is durable resolves across a reshard` with the
-   record absent.
+   record absent. Each node's read is tried up to three times while it
+   answers 503 or nothing.
+
+Steps 4 and 5 also run as a drawn rule, before the eventually, while faults
+may run ("Drawn under faults" below). Steps 2 to 5 run in the eventually,
+except that step 4 is skipped there when the drawn rule already read a
+straggler back.
 
 Then the eventually runs catalog-maintenance's own sequence (fold and record
 races, the unfolded and unreadable-HEAD sweeps, fold, compaction, audits,
@@ -89,6 +95,57 @@ token reads needs: a reshard rebuilds a router's shard set under a new writer
 identity with no restart (`../catalog-maintenance/README.md`, "Token reads
 across the lifecycle").
 
+## Drawn under faults
+
+`driver-reshard` has one rule the plain driver lacks, `decrease_drawn`
+(weight 1), so the decrease and the forged read also run while faults are
+on. It runs when the eventually is on, the sealing jump reached the driver,
+the increase's activation hour has begun, and the rule has not run before in
+this timeline. It then draws with probability 0.02, like the other forced
+races ("The forced races" in `../catalog-maintenance/README.md`). Then:
+
+1. Under the driver's write gate, for the whole cycle: the decrease cycle of
+   step 4 above (an increase back to 6 first, if 6 shards are not active;
+   the decrease; the move to 30 s before its activation; the 50 ms burst; the
+   wait for the activation hour; the anchor write per node). Clock moves and
+   the attribution of each burst write to the count it was routed at need
+   writes no other rule interleaves.
+2. The write gate is released. Under a read gate, like the other read
+   rules, each straggler is read back with its tokens on both nodes. If the
+   cycle found a straggler and the reads ran, the eventually skips its own
+   decrease cycles.
+3. With no gate, the forged token read of step 5, with its three attempts
+   per node.
+
+The cycle and the forged read are the same code the eventually runs, with
+`reason` `drawn` in their details (`reshard: decrease burst` and `reshard:
+forged token read` in the driver log), and the rule prints `reshard: drawn
+decrease: starting` and `reshard: drawn decrease: <n> straggler(s) read
+back`. No assertion literal is new. If the drawn decrease ran, the eventually
+first appends an increase back to 6 (its usual step 1 check), so its
+activation writes and fence run at 6 shards, as they do without it.
+
+The fence stays in the eventually only. It asserts `catalog: the system
+recovers once faults stop` after `thaw-read`, which holds only once faults
+have stopped: a partition that kept a node from serving for 300 s would make
+it a false counterexample. Its SUT assertion in grace routing is judged from
+the router's own clock and last refresh, so it is already evaluated under
+faults whenever a fault refuses a record read, and the drawn 9000 s sealing
+jump crosses the lead horizon. Forcing the refusal while faults run would add
+determinism, not coverage, and would mix the driver's refusal with the
+proxy faults.
+
+The local loop draws the rule or not, like any drawn rule. To force it, set
+`WORKLOAD_FORCE_DRAWN_DECREASE=1` (`../catalog-maintenance/local/docker-compose.local.yaml`
+passes it to the driver): the rule then skips its draw and runs once its
+preconditions hold. Unset, the local run is unchanged, and no Antithesis
+config sets it.
+
+```sh
+WORKLOAD_FORCE_DRAWN_DECREASE=1 WORKLOAD_PROFILE=reshard-ownership \
+  antithesis/catalog-maintenance/scripts/local-run.sh out/reshard-drawn
+```
+
 ## Properties
 
 The driver's own literals start with `reshard: ` (besides the
@@ -101,8 +158,8 @@ catalog-maintenance driver's `catalog: ` and `clock: `).
 | `reshard: a write routed after the decrease activated was acknowledged` | reachable | every acknowledged write | The always above held for a write sent at or after the decrease's activation and routed at 4. |
 | `reshard: the clocks passed the writers' lead horizon while the provisioning record's reads were refused` | sometimes | the fence | The refusal was set, the move landed and the clock is past the horizon. The details carry each node's grace and fenced write. |
 | `catalog: the system recovers once faults stop` | always | the fence, after `thaw-read` (details `after: thaw-read`), and the eventually | Every node serves within 300 s. |
-| `reshard: a write routed before a decrease landed at a retired shard in its activation hour` | sometimes | each decrease cycle | A burst write's token is at shard 4 or 5 in the decrease's activation hour. |
-| `reshard: a forged token for a record never written was refused as unsatisfiable` | sometimes | the forged read, per node | The read answered 503 with the unsatisfiable-token message. |
+| `reshard: a write routed before a decrease landed at a retired shard in its activation hour` | sometimes | each decrease cycle, drawn or in the eventually | A burst write's token is at shard 4 or 5 in the decrease's activation hour. |
+| `reshard: a forged token for a record never written was refused as unsatisfiable` | sometimes | the forged read, drawn or in the eventually, per node | The read answered 503 with the unsatisfiable-token message. |
 | `reshard: HEAD's footprint named data of a folded post-activation hour at every shard the increase added` | sometimes | every audit with a stable HEAD | For acknowledged tokens at shards 4 and 5 in hours that route at 6 and that HEAD has folded, `rlog footprint` resolved a data object of each shard: the token's level-0 object or an output part of its bucket (`audit::new_shard_keys`). |
 
 The SUT's `resharding: ` assertions this profile reaches are in
@@ -204,9 +261,9 @@ The `weekly` file opts the profile into the weekly run (ADR-4326 decision 4).
 
 - ADR-4326 decision 4 lists a third maintain worker for this profile; the
   step 5 decision's build list does not, and the compose runs two.
-- The reshard situations run in the eventually (and the increase at the
-  sealing jump, drawn or forced), not as drawn rules of their own, so under
-  Antithesis the fence, the decrease and the forged read run after faults
-  stop.
+- The fence has no drawn rule of its own: under Antithesis it runs only after
+  faults stop, because its recovery assertion assumes they have ("Drawn
+  under faults"). The decrease and the forged read are drawn under faults,
+  and the activation writes run in the eventually only.
 - No property of its own checks `EveryAdmittedWriteInScanSet`; neither the
   step 5 decision nor its plan names one for this profile.
