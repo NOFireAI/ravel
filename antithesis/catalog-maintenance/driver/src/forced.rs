@@ -1,6 +1,8 @@
-//! The record race and the unfolded-record sweep (README.md, "The forced
+//! The record races and the unfolded-record sweep (README.md, "The forced
 //! races"): which bucket each one works on, when a held server PUT is fresh
-//! enough to race, and which of a compaction record's inputs the store holds.
+//! enough to race, what a record race changes in the store before the
+//! release and how it undoes that, and which of a compaction record's inputs
+//! the store holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -16,6 +18,401 @@ use crate::token::Token;
 /// cap, so the release, not the cap, decides when the PUT is sent.
 pub const RELEASE_BY: Duration = Duration::from_secs(14);
 const _: () = assert!(RELEASE_BY.as_secs() + 2 < HOLD_CAP.as_secs());
+
+/// In a record race that tampers, the `ravel-cli` compaction must have
+/// finished by the time the held PUT is this old, or the race tampers with
+/// nothing. The tamper's raw S3 requests and the release then have the rest
+/// of the hold cap, so the release, not the cap, still sends the PUT.
+pub const TAMPER_BY: Duration = Duration::from_secs(10);
+const _: () = assert!(TAMPER_BY.as_secs() + 8 <= HOLD_CAP.as_secs());
+
+/// How long after the store answered the released PUT the driver waits
+/// before it undoes its tamper once faults stopped: three of the servers'
+/// 20 s store request timeouts, so the loser's GET, HEAD and second GET of
+/// the record have been answered before the record's version changes again.
+pub const RESTORE_AFTER: Duration = Duration::from_secs(3 * crate::clock::STORE_REQUEST_TIMEOUT_S);
+
+/// The same wait while faults may run: the servers' store client retries one
+/// operation for up to 180 s plus one 20 s request (`retry_timeout +
+/// request_timeout` in crates/ravel-object-store/src/s3.rs), so one of the
+/// loser's requests retried to that bound is still answered before the
+/// undo. Three retried to it would not be; README.md, "The forced races",
+/// names that residual.
+pub const RESTORE_AFTER_FAULTS: Duration = Duration::from_secs(200);
+
+/// How long the driver keeps starting undo attempts the store refused
+/// before it leaves the undo pending for the next clock move or the
+/// eventually.
+pub const UNDO_FOR: Duration = Duration::from_secs(60);
+
+/// How long a tampering race waits for a server's held record PUT after
+/// the nudge; the plain record race waits 120 s. Servers send one within a
+/// second of the nudge in practice.
+pub const TAMPER_HELD_WAIT: Duration = Duration::from_secs(45);
+
+/// One raw S3 request at its bound: curl's `--max-time` (`s3::MAX_TIME_S`).
+const S3_S: u64 = crate::s3::MAX_TIME_S;
+/// One proxy control command at its bound: the 2 s connect and 5 s read
+/// timeouts of `proxy::control`.
+const PROXY_CMD_S: u64 = 7;
+/// `clock::reach_wait_s`: one reread interval plus a second. Also the most
+/// two processes' faked clocks differ by.
+const REACH_WAIT_S: u64 = crate::clock::FAKETIME_CACHE_DURATION_S + 1;
+/// One round of `Shared::all_nodes_serve` at its bound, which the settle's
+/// wait can start just before its 120 s are up: two ravel nodes' readiness
+/// (2 s each) and SQL (`READ_TIMEOUT`, 30 s, each), two maintenance nodes'
+/// readiness (2 s each), and the 2 s pause between rounds.
+const SERVE_ROUND_S: u64 = 2 * (2 + crate::READ_TIMEOUT.as_secs()) + 2 * 2 + 2;
+
+/// From the nudge's write of the clock offset to the tamper, every term at
+/// its bound.
+pub const BEFORE_TAMPER_S: u64 =
+    // shift_clock: wait for the move to reach the driver, one reread plus 30 s.
+    (crate::clock::FAKETIME_CACHE_DURATION_S + 30)
+    // shift_clock: its reach wait.
+    + REACH_WAIT_S
+    // shift_clock: the GET of HEAD after the move (`head_read`).
+    + S3_S
+    // settle: its reach wait.
+    + REACH_WAIT_S
+    // settle: the 120 s `wait_serving`, and one serving round past it.
+    + 120 + SERVE_ROUND_S
+    // `hold-record`.
+    + PROXY_CMD_S
+    // The held wait, and one poll round past it: `held`, `release`, the
+    // 0.5 s pause, `hold-record`, the 0.25 s pause.
+    + TAMPER_HELD_WAIT.as_secs() + 3 * PROXY_CMD_S + 1
+    // The compaction's budget, measured from the held PUT's age.
+    + TAMPER_BY.as_secs()
+    // The GET of the CLI's record before the tamper.
+    + S3_S;
+
+/// From the tamper's start to the first undo attempt, every term at its
+/// bound.
+pub const TAMPER_TAIL_S: u64 =
+    // The tamper: the part's GET and DELETE (a forged record is one PUT).
+    2 * S3_S
+    // The GET that checks the tamper is in place.
+    + S3_S
+    // `release`.
+    + PROXY_CMD_S
+    // `held_result_of`: `HELD_RESULT_WAIT`, one command past it, the 0.1 s
+    // pause.
+    + crate::HELD_RESULT_WAIT.as_secs() + PROXY_CMD_S + 1
+    // The 2 s for the server's handling of the store's answer.
+    + 2
+    // The GET of the record after the release.
+    + S3_S
+    // The wait before the undo while faults may run.
+    + RESTORE_AFTER_FAULTS.as_secs();
+
+/// One undo attempt at its bound: the GET of the key and the PUT back.
+pub const UNDO_ATTEMPT_S: u64 = 2 * S3_S;
+
+/// Seconds from the nudge until the bucket's hour seals for the fold: the
+/// nudge lands the clocks `SEAL_SLACK_S` past the compaction seal, which is
+/// `FOLD_SAFETY_MARGIN_S` before the fold seal.
+pub const FOLD_SEAL_AFTER_NUDGE_S: u64 =
+    crate::clock::FOLD_SAFETY_MARGIN_S - crate::clock::SEAL_SLACK_S;
+
+/// The whole tampering race, every term at its bound.
+pub const TAMPER_RACE_S: u64 =
+    // From the nudge to the tamper.
+    BEFORE_TAMPER_S
+    // From the tamper to the first undo attempt.
+    + TAMPER_TAIL_S
+    // The undo's retries: attempts start for `UNDO_FOR`, and the last one
+    // started can take a whole attempt past it.
+    + UNDO_FOR.as_secs() + UNDO_ATTEMPT_S
+    // A server's faked clock can run this far ahead of the driver's.
+    + REACH_WAIT_S;
+const _: () = assert!(TAMPER_RACE_S <= FOLD_SEAL_AFTER_NUDGE_S);
+
+/// The unix second the bucket hour `hour` seals for the fold
+/// (`clock::seal_margin_s` after its end).
+pub fn fold_seal_s(hour: u64) -> u64 {
+    (hour + 1) * 3600 + crate::clock::seal_margin_s()
+}
+
+/// The last second of the driver's clock at which an undo attempt on a
+/// tamper in `hour` may start and still finish before any server's clock
+/// reaches the hour's fold seal.
+pub fn undo_by_s(hour: u64) -> u64 {
+    fold_seal_s(hour).saturating_sub(UNDO_ATTEMPT_S + REACH_WAIT_S)
+}
+
+/// Whether a race may tamper with a record of `hour` at `now_s`: the rest
+/// of the race at its bounds still ends before [`undo_by_s`]. The race runs
+/// no tamper otherwise, so a slow run up to the tamper never carries one
+/// past the fold seal.
+pub fn tamper_fits(now_s: u64, hour: u64) -> bool {
+    now_s + TAMPER_TAIL_S <= undo_by_s(hour)
+}
+
+/// The wait before the undo: [`restore_after`], cut short so the first
+/// undo attempt still starts by [`undo_by_s`].
+pub fn restore_wait(now_s: u64, hour: u64, faults_may_run: bool) -> Duration {
+    restore_after(faults_may_run).min(Duration::from_secs(undo_by_s(hour).saturating_sub(now_s)))
+}
+
+/// What the undo of a tamper in bucket hour `hour` does next, at `now_s`,
+/// after `attempts` refused attempts that started `tried` ago.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UndoStep {
+    /// Start an attempt. `overran` when it starts past [`undo_by_s`], so it
+    /// may finish after the fold seal: the cap fires, and the undo still
+    /// runs, since giving it up would leave the tamper in the store.
+    Attempt { overran: bool },
+    /// Stop retrying: at least one attempt ran, and [`UNDO_FOR`] is up.
+    GiveUp,
+}
+
+/// See [`UndoStep`]. The first attempt always starts.
+pub fn undo_step(now_s: u64, hour: u64, tried: Duration, attempts: u32) -> UndoStep {
+    if attempts > 0 && tried >= UNDO_FOR {
+        return UndoStep::GiveUp;
+    }
+    UndoStep::Attempt {
+        overran: now_s > undo_by_s(hour),
+    }
+}
+
+/// Seconds of the driver's clock from the nudge to `now_s`, against the
+/// [`FOLD_SEAL_AFTER_NUDGE_S`] budget: the nudge puts the clocks that long
+/// before the fold seal of `hour`.
+pub fn race_elapsed_s(now_s: u64, hour: u64) -> i64 {
+    now_s as i64 - (fold_seal_s(hour) - FOLD_SEAL_AFTER_NUDGE_S) as i64
+}
+
+/// Whether the record a loser met changed after the release: `after`, read
+/// 2 s after it, against what was in place at the release, the forged
+/// record in a divergent-record race and the CLI's record otherwise.
+/// `None` when either read failed or found nothing.
+pub fn record_changed(
+    before: Option<&[u8]>,
+    after: Option<&[u8]>,
+    undo: Option<&Undo>,
+) -> Option<bool> {
+    let at_release = match undo {
+        Some(Undo::Record { forged, .. }) => Some(forged.as_slice()),
+        _ => before,
+    };
+    Some(after? != at_release?)
+}
+
+/// The wait before the undo: [`RESTORE_AFTER_FAULTS`] while faults may run,
+/// [`RESTORE_AFTER`] once they stopped.
+pub fn restore_after(faults_may_run: bool) -> Duration {
+    if faults_may_run {
+        RESTORE_AFTER_FAULTS
+    } else {
+        RESTORE_AFTER
+    }
+}
+
+/// What a record race does to the store after the `ravel-cli` compaction
+/// published and before the driver releases the held server PUT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tamper {
+    /// Nothing: the plain record race.
+    None,
+    /// Rewrite the record with its input-set hash changed after the 8
+    /// bytes its key carries ([`diverge`]).
+    Diverge,
+    /// Delete one part the record names ([`part_to_delete`]).
+    DeletePart,
+}
+
+impl Tamper {
+    /// The race's name in log lines.
+    pub fn race(self) -> &'static str {
+        match self {
+            Tamper::None => "record race",
+            Tamper::Diverge => "divergent-record race",
+            Tamper::DeletePart => "missing-part race",
+        }
+    }
+}
+
+/// The fields of `CompactionRecord` (proto/ravel/commit.proto) a tamper
+/// reads; prost skips the rest.
+#[derive(Clone, PartialEq, prost::Message)]
+struct CompactionRecord {
+    #[prost(bytes = "vec", tag = "8")]
+    input_set_hash: Vec<u8>,
+    #[prost(message, repeated, tag = "9")]
+    parts: Vec<CompactionPart>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct CompactionPart {
+    #[prost(uint32, tag = "1")]
+    part_index: u32,
+    #[prost(bytes = "vec", tag = "4")]
+    content_hash: Vec<u8>,
+}
+
+/// `input_set_hash` (field 8, wire type 2) framed as protobuf writes a
+/// 32-byte value: its key byte and its length.
+const HASH_FRAME: [u8; 2] = [(8 << 3) | 2, 32];
+
+/// The record at `record_key` decoded, with the 16 hex digits its key names
+/// checked against the first 8 bytes of its 32-byte input-set hash.
+fn decode_record(record_key: &str, record: &[u8]) -> Result<CompactionRecord, String> {
+    use prost::Message;
+    keys::parse_record_key(record_key)
+        .ok_or_else(|| format!("{record_key} is not a compaction record key"))?;
+    let hash16 = record_key
+        .rsplit_once("/l1.")
+        .and_then(|(_, name)| name.strip_suffix(".cmt"))
+        .ok_or_else(|| format!("{record_key} names no input-set hash"))?;
+    let decoded = CompactionRecord::decode(record)
+        .map_err(|e| format!("{record_key} does not decode: {e}"))?;
+    if decoded.input_set_hash.len() != 32 {
+        return Err(format!(
+            "{record_key}: the input-set hash is {} bytes, not 32",
+            decoded.input_set_hash.len()
+        ));
+    }
+    if !hex(&decoded.input_set_hash[..8]).eq_ignore_ascii_case(hash16) {
+        return Err(format!(
+            "{record_key}: the input-set hash does not start with the key's {hash16}"
+        ));
+    }
+    Ok(decoded)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The keys of the parts the compaction record `record` at `record_key`
+/// names, by part index: `<tenant>/<signal>/l1/<shard:04>/<hour>/
+/// <input_set_hash16>.<part:04>.<content_hash16>.rseg`, as `l1_part_key`
+/// in crates/ravel-commit/src/keys.rs builds them. `Err` when the key is not
+/// a compaction record key, the bytes do not decode, the hash does not match
+/// the key, or a part's content hash is not 32 bytes.
+pub fn winner_parts(record_key: &str, record: &[u8]) -> Result<Vec<String>, String> {
+    let decoded = decode_record(record_key, record)?;
+    let rk = keys::parse_record_key(record_key)
+        .ok_or_else(|| format!("{record_key} is not a compaction record key"))?;
+    let dir = format!(
+        "{}{}/l1/{:04}/{}/",
+        rk.tenant_prefix,
+        rk.signal,
+        rk.shard,
+        keys::hour_string(rk.hour)
+    );
+    let input16 = hex(&decoded.input_set_hash[..8]);
+    let mut parts = decoded.parts;
+    parts.sort_by_key(|p| p.part_index);
+    parts
+        .iter()
+        .map(|p| {
+            if p.part_index > 9999 {
+                return Err(format!(
+                    "{record_key}: part index {} does not fit the key's 4 digits",
+                    p.part_index
+                ));
+            }
+            if p.content_hash.len() != 32 {
+                return Err(format!(
+                    "{record_key}: part {} has a {}-byte content hash",
+                    p.part_index,
+                    p.content_hash.len()
+                ));
+            }
+            Ok(format!(
+                "{dir}{input16}.{:04}.{}.rseg",
+                p.part_index,
+                hex(&p.content_hash[..8])
+            ))
+        })
+        .collect()
+}
+
+/// The part a missing-part race deletes: the record's first part.
+pub fn part_to_delete(record_key: &str, record: &[u8]) -> Result<String, String> {
+    winner_parts(record_key, record)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("{record_key} names no part"))
+}
+
+/// The record's bytes with the last byte of its input-set hash flipped, and
+/// nothing else changed, so no field it does not know is lost to a
+/// re-encode. The first 8 bytes of the hash, which the key carries, stay, so
+/// the record still verifies against its key, and a compaction of the same
+/// inputs now finds a winner whose hash differs from its own. `Err` unless
+/// the record decodes, its hash matches the key, and the framed hash occurs
+/// exactly once in the bytes.
+pub fn diverge(record_key: &str, record: &[u8]) -> Result<Vec<u8>, String> {
+    let decoded = decode_record(record_key, record)?;
+    let mut framed = HASH_FRAME.to_vec();
+    framed.extend_from_slice(&decoded.input_set_hash);
+    let at: Vec<usize> = record
+        .windows(framed.len())
+        .enumerate()
+        .filter(|(_, w)| *w == framed.as_slice())
+        .map(|(i, _)| i)
+        .collect();
+    let [start] = at.as_slice() else {
+        return Err(format!(
+            "{record_key}: the framed input-set hash occurs {} times, not once",
+            at.len()
+        ));
+    };
+    let mut forged = record.to_vec();
+    forged[start + framed.len() - 1] ^= 0xff;
+    Ok(forged)
+}
+
+/// What a tamper changed, so the driver can tell whether it was in place at
+/// the release and undo it once the loser resolved.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Undo {
+    /// The record at `key` was overwritten with `forged`; `original` is the
+    /// `ravel-cli` compaction's.
+    Record {
+        key: String,
+        original: Vec<u8>,
+        forged: Vec<u8>,
+    },
+    /// The part at `key` was deleted; `bytes` are its content.
+    Part { key: String, bytes: Vec<u8> },
+}
+
+impl Undo {
+    /// The key the tamper changed.
+    pub fn key(&self) -> &str {
+        match self {
+            Undo::Record { key, .. } | Undo::Part { key, .. } => key,
+        }
+    }
+
+    /// Whether the key holds what the tamper left (`current`, `None` when
+    /// the key is absent): the forged record, or no part.
+    pub fn in_place(&self, current: Option<&[u8]>) -> bool {
+        match self {
+            Undo::Record { forged, .. } => current == Some(forged.as_slice()),
+            Undo::Part { .. } => current.is_none(),
+        }
+    }
+
+    /// The bytes to put back at [`Undo::key`] when it holds `current`; `None`
+    /// when the tamper is no longer in place. A record a loser overwrote
+    /// stays: the `mo-diverge-overwrites-record` mutant PUT its own record,
+    /// whose parts that loser had PUT before it.
+    pub fn restore(&self, current: Option<&[u8]>) -> Option<&[u8]> {
+        if !self.in_place(current) {
+            return None;
+        }
+        Some(match self {
+            Undo::Record { original, .. } => original,
+            Undo::Part { bytes, .. } => bytes,
+        })
+    }
+}
 
 /// A held PUT older than this when the driver first sees it leaves too
 /// little of [`RELEASE_BY`] for the compaction; the driver releases it and
@@ -125,10 +522,28 @@ pub fn record_lost(
         && matches!(held_status, Some(412) | Some(409))
 }
 
+/// Whether a record race that tampers reached its situation: the server's
+/// PUT lost as [`record_lost`] judges it, and a read just before the release
+/// found the tamper in place ([`Undo::in_place`]), so the loser that the
+/// store's refusal sends to the winner record finds the forged record, or
+/// the record without one of its parts.
+pub fn tampered_lost(
+    published_before_release: bool,
+    released_at_age: Option<Duration>,
+    held_status: Option<u16>,
+    tamper_in_place: bool,
+) -> bool {
+    tamper_in_place && record_lost(published_before_release, released_at_age, held_status)
+}
+
 /// How long the `ravel-cli` compaction may run before a PUT held for `age`
-/// is released.
-pub fn cli_budget(age: Duration) -> Duration {
-    RELEASE_BY.saturating_sub(age)
+/// is released, or, in a race that tampers, before the tamper.
+pub fn cli_budget(age: Duration, tamper: Tamper) -> Duration {
+    match tamper {
+        Tamper::None => RELEASE_BY,
+        Tamper::Diverge | Tamper::DeletePart => TAMPER_BY,
+    }
+    .saturating_sub(age)
 }
 
 /// The keys of `inputs` that `listed` holds: each input's commit record and
@@ -371,15 +786,366 @@ mod tests {
 
     #[test]
     fn the_compaction_gets_what_is_left_before_the_release() {
-        assert_eq!(cli_budget(Duration::ZERO), RELEASE_BY);
-        assert_eq!(cli_budget(MAX_HELD_AGE), RELEASE_BY - MAX_HELD_AGE);
+        let none = Tamper::None;
+        assert_eq!(cli_budget(Duration::ZERO, none), RELEASE_BY);
+        assert_eq!(cli_budget(MAX_HELD_AGE, none), RELEASE_BY - MAX_HELD_AGE);
         assert_eq!(
-            cli_budget(RELEASE_BY + Duration::from_secs(1)),
+            cli_budget(RELEASE_BY + Duration::from_secs(1), none),
             Duration::ZERO
         );
         // The freshest PUT the race takes still leaves the compaction most
         // of the window.
-        assert!(cli_budget(MAX_HELD_AGE) >= Duration::from_secs(8));
+        assert!(cli_budget(MAX_HELD_AGE, none) >= Duration::from_secs(8));
+        // A race that tampers stops waiting for the compaction earlier, so
+        // the tamper and the release land well inside the hold cap; the
+        // compaction, which takes about 0.1 s, still gets seconds.
+        for tamper in [Tamper::Diverge, Tamper::DeletePart] {
+            assert_eq!(cli_budget(Duration::ZERO, tamper), TAMPER_BY);
+            assert!(cli_budget(MAX_HELD_AGE, tamper) >= Duration::from_secs(4));
+            assert!(TAMPER_BY + Duration::from_secs(8) <= HOLD_CAP);
+        }
+    }
+
+    /// The `CompactionRecord` fields a test record carries, one of them
+    /// (`created_unix_ns`) unknown to the driver's own decode.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FullRecord {
+        #[prost(uint32, tag = "1")]
+        format_version: u32,
+        #[prost(bytes = "vec", tag = "2")]
+        tenant_hash: Vec<u8>,
+        #[prost(uint32, tag = "4")]
+        shard: u32,
+        #[prost(bytes = "vec", tag = "8")]
+        input_set_hash: Vec<u8>,
+        #[prost(message, repeated, tag = "9")]
+        parts: Vec<FullPart>,
+        #[prost(sfixed64, tag = "10")]
+        created_unix_ns: i64,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct FullPart {
+        #[prost(uint32, tag = "1")]
+        part_index: u32,
+        #[prost(bytes = "vec", tag = "4")]
+        content_hash: Vec<u8>,
+        #[prost(uint64, tag = "5")]
+        object_size: u64,
+    }
+
+    fn input_hash() -> Vec<u8> {
+        (0u8..32)
+            .map(|i| i.wrapping_mul(7).wrapping_add(1))
+            .collect()
+    }
+
+    fn record_bytes(hash: &[u8], parts: &[(u32, u8)]) -> Vec<u8> {
+        use prost::Message;
+        FullRecord {
+            format_version: 1,
+            tenant_hash: vec![0x0a; 16],
+            shard: 3,
+            input_set_hash: hash.to_vec(),
+            parts: parts
+                .iter()
+                .map(|&(part_index, fill)| FullPart {
+                    part_index,
+                    content_hash: vec![fill; 32],
+                    object_size: 4096,
+                })
+                .collect(),
+            created_unix_ns: 1_794_931_200_123_456_789,
+        }
+        .encode_to_vec()
+    }
+
+    fn record_key_for(hash: &[u8]) -> String {
+        key(3, HOUR, &format!("l1.{}.cmt", hex(&hash[..8])))
+    }
+
+    #[test]
+    fn the_part_to_delete_is_the_records_first_part_at_its_l1_key() {
+        let hash = input_hash();
+        let record_key = record_key_for(&hash);
+        // Parts in the record out of index order.
+        let record = record_bytes(&hash, &[(1, 0xbb), (0, 0xaa)]);
+        let dir = format!("{PREFIX}l/l1/0003/{}/", keys::hour_string(HOUR));
+        let h16 = hex(&hash[..8]);
+        assert_eq!(
+            winner_parts(&record_key, &record),
+            Ok(vec![
+                format!("{dir}{h16}.0000.aaaaaaaaaaaaaaaa.rseg"),
+                format!("{dir}{h16}.0001.bbbbbbbbbbbbbbbb.rseg"),
+            ])
+        );
+        assert_eq!(
+            part_to_delete(&record_key, &record),
+            Ok(format!("{dir}{h16}.0000.aaaaaaaaaaaaaaaa.rseg"))
+        );
+        // A record with no part has none to delete.
+        assert!(part_to_delete(&record_key, &record_bytes(&hash, &[])).is_err());
+        // The key must name the record's own hash.
+        let mut other = hash.clone();
+        other[0] ^= 1;
+        assert!(winner_parts(&record_key_for(&other), &record).is_err());
+        // Not a compaction record key, or not a record.
+        assert!(winner_parts(&key(3, HOUR, "w1.1.00000000000000000001.cmt"), &record).is_err());
+        assert!(winner_parts(&record_key, b"\xff\xff\xff").is_err());
+        // A part whose content hash is not 32 bytes names no key.
+        let mut short = {
+            use prost::Message;
+            FullRecord::decode(record.as_slice()).expect("decode")
+        };
+        short.parts[0].content_hash.truncate(8);
+        let short = {
+            use prost::Message;
+            short.encode_to_vec()
+        };
+        assert!(winner_parts(&record_key, &short).is_err());
+        // A part index past the key's 4 digits names no key either, and says
+        // so.
+        let wide = record_bytes(&hash, &[(10_000, 0xaa)]);
+        let err = winner_parts(&record_key, &wide).expect_err("index too wide");
+        assert!(err.contains("part index 10000"), "{err}");
+    }
+
+    #[test]
+    fn diverge_flips_only_the_hash_byte_past_the_keys_eight() {
+        use prost::Message;
+        let hash = input_hash();
+        let record_key = record_key_for(&hash);
+        let record = record_bytes(&hash, &[(0, 0xaa), (1, 0xbb)]);
+        let forged = diverge(&record_key, &record).expect("diverges");
+        assert_eq!(forged.len(), record.len());
+        let changed: Vec<usize> = (0..record.len())
+            .filter(|&i| record[i] != forged[i])
+            .collect();
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        let was = FullRecord::decode(record.as_slice()).expect("decode");
+        let now = FullRecord::decode(forged.as_slice()).expect("decode forged");
+        // The hash differs in its last byte only, so the key still names it
+        // and every other field, the unknown one included, is the same.
+        assert_eq!(now.input_set_hash[..31], was.input_set_hash[..31]);
+        assert_ne!(now.input_set_hash[31], was.input_set_hash[31]);
+        assert_eq!(
+            FullRecord {
+                input_set_hash: was.input_set_hash.clone(),
+                ..now.clone()
+            },
+            was
+        );
+        assert!(winner_parts(&record_key, &forged).is_ok());
+        // A hash framed twice in the bytes (a repeated field, the last of
+        // which protobuf keeps) is refused rather than half patched.
+        let mut twice = record.clone();
+        twice.extend_from_slice(&HASH_FRAME);
+        twice.extend_from_slice(&hash);
+        assert_eq!(
+            FullRecord::decode(twice.as_slice())
+                .expect("decode")
+                .input_set_hash,
+            hash
+        );
+        assert!(diverge(&record_key, &twice).is_err());
+        // A key that does not name the record's hash.
+        let mut other = hash.clone();
+        other[7] ^= 1;
+        assert!(diverge(&record_key_for(&other), &record).is_err());
+    }
+
+    #[test]
+    fn the_tampering_race_at_every_bound_ends_before_the_fold_seal() {
+        // The nudge lands 30 s past the compaction seal, 900 s before the
+        // fold seal.
+        assert_eq!(FOLD_SEAL_AFTER_NUDGE_S, 870);
+        // Every term, each from the constant it stands for, so dropping one
+        // from a sum fails here.
+        let reread = crate::clock::FAKETIME_CACHE_DURATION_S;
+        let reach = crate::clock::reach_wait_s(reread);
+        let s3 = crate::s3::MAX_TIME_S;
+        let serve_round = 2 * (2 + crate::READ_TIMEOUT.as_secs()) + 2 * 2 + 2;
+        let before_tamper = (reread + 30) // shift_clock: the move reaching the driver
+            + reach // shift_clock: its reach wait
+            + s3 // shift_clock: the GET of HEAD
+            + reach // settle: its reach wait
+            + 120 + serve_round // settle: wait_serving and one round past it
+            + PROXY_CMD_S // hold-record
+            + TAMPER_HELD_WAIT.as_secs() + 3 * PROXY_CMD_S + 1 // held wait, one poll round
+            + TAMPER_BY.as_secs() // the compaction
+            + s3; // the GET of the CLI's record
+        assert_eq!(BEFORE_TAMPER_S, before_tamper);
+        let tail = 2 * s3 // the tamper: two raw S3 requests
+            + s3 // the in-place GET
+            + PROXY_CMD_S // release
+            + crate::HELD_RESULT_WAIT.as_secs() + PROXY_CMD_S + 1 // the held result
+            + 2
+            + s3 // the GET after the release
+            + RESTORE_AFTER_FAULTS.as_secs();
+        assert_eq!(TAMPER_TAIL_S, tail);
+        assert_eq!(UNDO_ATTEMPT_S, 2 * s3);
+        assert_eq!(
+            TAMPER_RACE_S,
+            before_tamper + tail + UNDO_FOR.as_secs() + 2 * s3 + reach
+        );
+        // The figures: 372 + 347 + 60 + 60 + 3 = 842.
+        assert_eq!(BEFORE_TAMPER_S, 372);
+        assert_eq!(TAMPER_TAIL_S, 347);
+        assert_eq!(TAMPER_RACE_S, 842);
+    }
+
+    #[test]
+    fn a_tamper_happens_and_is_undone_only_before_the_fold_seal() {
+        let seal = (HOUR + 1) * 3600 + 4800;
+        assert_eq!(fold_seal_s(HOUR), seal);
+        // The last undo attempt starts one attempt and one clock skew
+        // before the seal.
+        assert_eq!(undo_by_s(HOUR), seal - 60 - 3);
+        // Right after the nudge every wait fits.
+        let nudged = (HOUR + 1) * 3600 + 3900 + 30;
+        assert!(tamper_fits(nudged + BEFORE_TAMPER_S, HOUR));
+        let last = undo_by_s(HOUR) - TAMPER_TAIL_S;
+        assert!(tamper_fits(last, HOUR));
+        assert!(!tamper_fits(last + 1, HOUR));
+        // An earlier hour, already past its seal, is never tampered.
+        assert!(!tamper_fits(nudged, HOUR - 1));
+        // The wait before the undo is cut so the first attempt starts by
+        // the deadline, and is zero past it.
+        assert_eq!(restore_wait(nudged, HOUR, true), RESTORE_AFTER_FAULTS);
+        assert_eq!(restore_wait(nudged, HOUR, false), RESTORE_AFTER);
+        assert_eq!(
+            restore_wait(undo_by_s(HOUR) - 50, HOUR, true),
+            Duration::from_secs(50)
+        );
+        assert_eq!(
+            restore_wait(undo_by_s(HOUR) + 5, HOUR, true),
+            Duration::ZERO
+        );
+        // The elapsed time printed for the race counts from the nudge.
+        assert_eq!(race_elapsed_s(nudged, HOUR), 0);
+        assert_eq!(race_elapsed_s(nudged + 842, HOUR), 842);
+    }
+
+    #[test]
+    fn a_late_undo_fires_the_cap_and_still_runs() {
+        let by = undo_by_s(HOUR);
+        // In time: an attempt, no cap.
+        assert_eq!(
+            undo_step(by, HOUR, Duration::ZERO, 0),
+            UndoStep::Attempt { overran: false }
+        );
+        // Past the deadline the cap fires, and the undo still runs: the
+        // first attempt, and every retry while UNDO_FOR lasts.
+        assert_eq!(
+            undo_step(by + 1, HOUR, Duration::ZERO, 0),
+            UndoStep::Attempt { overran: true }
+        );
+        assert_eq!(
+            undo_step(by + 300, HOUR, UNDO_FOR - Duration::from_millis(1), 3),
+            UndoStep::Attempt { overran: true }
+        );
+        // Even with UNDO_FOR spent before the first attempt, one runs.
+        assert_eq!(
+            undo_step(by + 300, HOUR, UNDO_FOR, 0),
+            UndoStep::Attempt { overran: true }
+        );
+        // After refused attempts for all of UNDO_FOR it gives up, and the
+        // undo is left pending.
+        assert_eq!(undo_step(by, HOUR, UNDO_FOR, 1), UndoStep::GiveUp);
+        assert_eq!(undo_step(by + 300, HOUR, UNDO_FOR, 4), UndoStep::GiveUp);
+    }
+
+    #[test]
+    fn a_record_change_after_the_release_is_judged_against_what_the_loser_met() {
+        let forged = Undo::Record {
+            key: "r".to_string(),
+            original: b"cli".to_vec(),
+            forged: b"forged".to_vec(),
+        };
+        // Divergent-record race: the forged record still there is no
+        // change, though it differs from the CLI's; a loser's own record is.
+        assert_eq!(
+            record_changed(Some(b"cli"), Some(b"forged"), Some(&forged)),
+            Some(false)
+        );
+        assert_eq!(
+            record_changed(Some(b"cli"), Some(b"loser"), Some(&forged)),
+            Some(true)
+        );
+        // Otherwise the CLI's record is what the loser met.
+        let part = Undo::Part {
+            key: "p".to_string(),
+            bytes: b"part".to_vec(),
+        };
+        assert_eq!(
+            record_changed(Some(b"cli"), Some(b"cli"), Some(&part)),
+            Some(false)
+        );
+        assert_eq!(
+            record_changed(Some(b"cli"), Some(b"loser"), None),
+            Some(true)
+        );
+        assert_eq!(record_changed(Some(b"cli"), None, None), None);
+        assert_eq!(record_changed(None, Some(b"cli"), None), None);
+    }
+
+    #[test]
+    fn the_undo_waits_out_a_retried_request_while_faults_may_run() {
+        assert_eq!(restore_after(false), RESTORE_AFTER);
+        assert_eq!(restore_after(true), RESTORE_AFTER_FAULTS);
+        // One store operation retried to its bound: 180 s of retries plus
+        // one 20 s request.
+        assert!(
+            RESTORE_AFTER_FAULTS
+                >= Duration::from_secs(180 + crate::clock::STORE_REQUEST_TIMEOUT_S)
+        );
+        assert!(RESTORE_AFTER >= Duration::from_secs(3 * crate::clock::STORE_REQUEST_TIMEOUT_S));
+    }
+
+    #[test]
+    fn a_tamper_is_undone_only_while_it_is_in_place() {
+        let record = Undo::Record {
+            key: "r".to_string(),
+            original: b"cli".to_vec(),
+            forged: b"forged".to_vec(),
+        };
+        assert!(record.in_place(Some(b"forged")));
+        assert_eq!(record.restore(Some(b"forged")), Some(&b"cli"[..]));
+        // A loser overwrote the forged record (the mutant): its record stays.
+        assert!(!record.in_place(Some(b"loser")));
+        assert_eq!(record.restore(Some(b"loser")), None);
+        // The forged PUT never landed, or a sweep removed the record.
+        assert_eq!(record.restore(Some(b"cli")), None);
+        assert_eq!(record.restore(None), None);
+        let part = Undo::Part {
+            key: "p".to_string(),
+            bytes: b"part".to_vec(),
+        };
+        assert_eq!(part.key(), "p");
+        assert!(part.in_place(None));
+        assert_eq!(part.restore(None), Some(&b"part"[..]));
+        // The DELETE never landed, or the part is back already.
+        assert!(!part.in_place(Some(b"part")));
+        assert_eq!(part.restore(Some(b"part")), None);
+    }
+
+    #[test]
+    fn a_tampered_race_counts_only_with_the_tamper_in_place_at_the_release() {
+        let fresh = Some(Duration::from_secs(10));
+        assert!(tampered_lost(true, fresh, Some(412), true));
+        // The store refused the held PUT, but a read just before the release
+        // did not find the tamper: the loser met the plain winner.
+        assert!(!tampered_lost(true, fresh, Some(412), false));
+        // The tamper was in place, but the race was not lost as
+        // record_lost judges it.
+        assert!(!tampered_lost(true, fresh, Some(200), true));
+        assert!(!tampered_lost(false, fresh, Some(412), true));
+        assert!(!tampered_lost(
+            true,
+            Some(HOLD_CAP + Duration::from_millis(1)),
+            Some(412),
+            true
+        ));
     }
 
     #[test]
