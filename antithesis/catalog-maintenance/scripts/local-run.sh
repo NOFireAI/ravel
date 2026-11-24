@@ -294,6 +294,22 @@ docker compose exec -T driver /opt/antithesis/test/v1/main/first_start_workload 
 # takes the token fallback (README.md, "Token reads across the lifecycle").
 # In Antithesis the faults restart nodes; here nothing else does. The SDK
 # output file is appended to, so the restart loses none of it.
+#
+# At the same point, restart MAINT_RESTART_NODE first. A maintain worker
+# seeds its memo from the memo snapshots under sys/maintain/memo/ when it
+# starts and when the live worker set changes, and only then evaluates
+# `maintenance: a seeded memo entry is never fresher than its snapshot`.
+# Here every forced race and clock move is done, so both workers' snapshots
+# are fresh, and the restart starts a new process id: the new process
+# seeds at startup, the peer seeds when the new heartbeat joins its live
+# set, and both seed again when the old process's heartbeat expires
+# (3 * 60 s). The driver waits for every maintain node to serve again
+# before it reads.
+MAINT_RESTART_NODE=maint1
+# After the driver ends, how long past the maint restart to wait for a warm
+# start: the old heartbeat's expiry (180 s), the peer's next heartbeat read
+# (60 s), and a discovery cycle (20 s, jittered) with room for its reads.
+MAINT_SEED_WAIT=330
 RESTART_NODE=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' driver \
     | sed -n 's/^WORKLOAD_LOCAL_RESTART_NODE=//p')
 case "$RESTART_NODE" in
@@ -301,6 +317,7 @@ case "$RESTART_NODE" in
     *) abort "WORKLOAD_LOCAL_RESTART_NODE in the driver container is '$RESTART_NODE', not ravel1 or ravel2" ;;
 esac
 restarted=""
+maint_restarted_at=""
 : > "$OUT/node-restart.txt"
 start=$(date +%s)
 while read -r _ st code <<< "$(container_state driver)" && [ "${st:-}" = running ]; do
@@ -314,6 +331,13 @@ while read -r _ st code <<< "$(container_state driver)" && [ "${st:-}" = running
         && docker compose logs --no-color driver > "$OUT/driver-poll.log" 2>/dev/null \
         && grep -q "eventually: local loop: restart http://$RESTART_NODE:[0-9]* now" "$OUT/driver-poll.log"; then
         restarted=1
+        if docker restart -t 30 "$MAINT_RESTART_NODE" > /dev/null; then
+            maint_restarted_at=$(date +%s)
+            echo "$MAINT_RESTART_NODE restarted at $maint_restarted_at, before $RESTART_NODE" \
+                | tee -a "$OUT/node-restart.txt"
+        else
+            echo "restarting $MAINT_RESTART_NODE failed" | tee -a "$OUT/node-restart.txt"
+        fi
         if docker restart -t 30 "$RESTART_NODE" > /dev/null \
             && docker compose exec -T driver touch /tmp/local-restart-done; then
             echo "$RESTART_NODE restarted at $(date +%s), when the eventually asked" \
@@ -326,6 +350,29 @@ while read -r _ st code <<< "$(container_state driver)" && [ "${st:-}" = running
 done
 grep -q "^$RESTART_NODE restarted at " "$OUT/node-restart.txt" \
     || fail "$RESTART_NODE was not restarted when the eventually asked (see node-restart.txt)"
+grep -q "^$MAINT_RESTART_NODE restarted at " "$OUT/node-restart.txt" \
+    || fail "$MAINT_RESTART_NODE was not restarted when the eventually asked (see node-restart.txt)"
+# The evidence that the restart, not an earlier race, reached the warm
+# start: a maintain worker's log line for a seed that loaded entries, after
+# the restart. Recorded, not gated: the assertion gates below decide.
+if [ -n "$maint_restarted_at" ]; then
+    seeded_by=""
+    while [ -z "$seeded_by" ] && [ $(($(date +%s) - maint_restarted_at)) -le "$MAINT_SEED_WAIT" ]; do
+        for svc in maint1 maint2; do
+            docker logs --since "$maint_restarted_at" "$svc" > "$OUT/maint-poll.log" 2>&1 \
+                && grep -q "maintenance: warm-started memo from durable snapshots" "$OUT/maint-poll.log" \
+                && seeded_by="$seeded_by$svc "
+        done
+        [ -n "$seeded_by" ] || sleep 5
+    done
+    if [ -n "$seeded_by" ]; then
+        echo "memo warm start after the $MAINT_RESTART_NODE restart: ${seeded_by}$(($(date +%s) - maint_restarted_at))s after it" \
+            | tee -a "$OUT/node-restart.txt"
+    else
+        echo "no memo warm start within ${MAINT_SEED_WAIT}s of the $MAINT_RESTART_NODE restart" \
+            | tee -a "$OUT/node-restart.txt"
+    fi
+fi
 read -r _ st code <<< "$(container_state driver)"
 # Read whatever the driver's state: the clock probe below adds up the moves
 # its log reports.

@@ -229,14 +229,16 @@ run that leaves any of them unhit. Two are worth naming:
   in every plain run.
 - `maintenance: a seeded memo entry is never fresher than its snapshot` is
   evaluated only when a maintain worker warm-starts from a peer's memo
-  snapshot (`crates/ravel-maintain/src/scan.rs`), which happens when the two
-  workers' starts and membership changes stagger against each other's
-  snapshot writes: a race, not a situation the driver forces. It was hit
-  once in each of three plain local runs of this profile in a row (#4340),
-  so it is gated too. One earlier run missed it. A run that misses it
-  again fails on that assertion alone. The fix is a forced situation, such
-  as a maintain restart in the local loop like `ravel2`'s, not a pending
-  entry.
+  snapshot (`crates/ravel-maintain/src/scan.rs`): at a worker's start, and
+  when its live worker set changes. Without help that is a race between the
+  two workers' starts, membership changes and snapshot writes, and plain
+  local runs missed it about two times in ten (#4340). So the local loop
+  forces it: when the eventually asks `local-run.sh` to restart `ravel2`,
+  the script restarts `maint1` first, and the new process and `maint2` both
+  seed from the snapshots already written
+  (`../catalog-maintenance/README.md`, the `local-run.sh` gates). In
+  Antithesis only faults restart the maintain workers, so there it stays
+  a race across timelines.
 
 ## Mutants
 
