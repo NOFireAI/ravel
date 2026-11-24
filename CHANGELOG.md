@@ -121,9 +121,10 @@ entry under Security.
   and SIGINT handlers are now installed before `/readyz` turns 200, so a signal
   delivered the instant a pod becomes ready drains gracefully instead of taking
   the signal's default disposition and killing the process with exit 143. A
-  signal that arrives while the server is still starting is now held until
-  startup finishes, and the server then drains; against a slow store that
-  wait can outlast an orchestrator's grace period.
+  signal that arrives while `start` is running is now held until `start`
+  returns, and the server then drains; against a slow store that wait can
+  outlast an orchestrator's grace period. A signal during the startup store
+  checks, before `start`, still takes its default action.
 - **A metrics range query charges its query memory budget for what its
   sample fold holds.** The fold under-charged many small series by about a
   quarter of their bytes, over-charged a few long series by about an
@@ -163,7 +164,7 @@ entry under Security.
   present in an hour retention had retired, and nothing else made it list
   that hour, it added the write's level-0 object, while a plain read of the
   same hour served nothing from it. The read now checks the hour's
-  retention marker, at most one request per shard and hour each time it
+  retention tombstone, at most one request per shard and hour each time it
   resolves, and answers a retired hour with nothing. A store error on that
   check fails the read.
 - **`ravel-server --mode maintain` refuses a non-default
