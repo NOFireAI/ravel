@@ -122,6 +122,10 @@ mod logs_request_cost_knob_routing;
 mod logs_scan_fetch_pushdown;
 #[path = "logs_selective_scan_amplification.rs"]
 mod logs_selective_scan_amplification;
+#[path = "logs_stamp_guards.rs"]
+mod logs_stamp_guards;
+#[path = "logs_stamp_readers.rs"]
+mod logs_stamp_readers;
 #[path = "logs_stats_load.rs"]
 mod logs_stats_load;
 #[path = "logs_str_dict_charge.rs"]
