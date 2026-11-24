@@ -4152,6 +4152,8 @@ async fn merge_in_unit(
         block_target_records: config.rlog_run_block_target_records,
         write_version: output.writer.write_version,
     });
+    // Intermediate runs are never stamped: with no declared columns the
+    // aggregates flag is inert, so it is not read from the config here.
     let run_declared = Arc::new(DeclaredSchema::build(&[], &BTreeMap::new(), false));
     let group_len = usize::try_from(layout.group_size).unwrap_or(usize::MAX);
     let runs_count = inputs.div_ceil(group_len);

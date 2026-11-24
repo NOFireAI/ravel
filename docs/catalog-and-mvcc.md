@@ -3358,9 +3358,10 @@ value equals the type's zero (0 for I64, false for BOOL). A sum is written
 only for an I64 column. Each is absent when its producer did not compute it,
 which reads as unknown. The logs flush writes them on every commit record it
 stamps, `ravel-cli load` included, unless the ingest process sets
-`IngestConfig::emit_declared_stat_aggregates` to false (docs/ingest.md); no
-other producer writes them yet. A decoder drops and
-counts an entry whose aggregates break ADR-4628 decision 2: both sum fields
+`IngestConfig::emit_declared_stat_aggregates` to false (docs/ingest.md), and
+the logs compaction recompute writes them on the parts it builds
+(`CompactionPart.declared_column_stats`, below). A decoder drops and counts
+an entry whose aggregates break ADR-4628 decision 2: both sum fields
 present, a `sum_wide` of any length other than 16 or holding a value that
 fits i64, a sum on a non-I64 column or outside `[non_null * min, non_null *
 max]`, a nonzero sum over no non-null rows, a `zero_count` above the
