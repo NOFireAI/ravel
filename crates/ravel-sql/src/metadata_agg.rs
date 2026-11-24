@@ -40,28 +40,31 @@
 //!   beside them is [`LogsScanExec::declared_row_count`], the summed
 //!   `sample_count` of every touched segment, never a column's non-null count.
 //!   One aggregate outside the list (`DISTINCT`, a per-aggregate `FILTER`, a
-//!   cast column, `MIN`/`MAX`) or one column without a stored sum on one
+//!   cast column, `MIN`/`MAX`) or one column without a sum on one
 //!   segment declines the whole statement; no part of it is answered from
 //!   statistics. A grouped statement with anything but a lone `COUNT(*)`
 //!   declines too.
 //!
 //! The sum-backed shapes decompose only for an integer column, and only when
-//! every touched segment carries an exact sum for every column read: a would-be float column, or a
-//! per-object sum that overflowed `i64` at fold time, has no stored sum and
-//! the statement scans (the ADR-0850 safety lemma).
+//! every touched segment has an exact sum for every column read. The q02 and
+//! sum-backed shapes read each segment's figure from one carrier (ADR-4628
+//! decision 5): the segment's declared-column stamp (fields 6 to 8, written
+//! at flush and compaction, so an unfolded catalog has them), else a `.cstat`
+//! entry the stamp grants, else none and the statement scans. A stamp answer
+//! needs no `.cstat` load, so the executor's load gate guards nothing for it:
+//! every refusal is a check in this rule (the walk, the aggregate
+//! classification, the column resolution) or in
+//! `LogsScanExec::metadata_rewrite_stats_are_exact` (pending erasure,
+//! content, row filters, key predicates, prune arms, ts containment).
 //!
-//! Every shape delegates the actual statistics read to `LogsScanExec` (the crate's
-//! established split: `logs_scan.rs` owns every column-stats read,
+//! Every shape delegates the actual statistics read to `LogsScanExec` (the
+//! crate's established split: `logs_scan.rs` owns every statistics read,
 //! sibling optimizer-rule modules only match plan shape and splice in a
 //! replacement, the same way [`crate::late_materialization`] calls
 //! `scan.late_materialization_candidate()` rather than reaching into
-//! `LogsScanExec`'s fields). A `None` from any of those methods means the ADR-0850
-//! safety lemma requires falling back to scanning (no loaded column-stats
-//! object, an unsupported declared type, a segment outside the loaded stats,
-//! a pending selective erasure, or -- specific to this path -- a segment
-//! whose dictionary was omitted for exceeding the cardinality ceiling): this
-//! rule simply declines the rewrite and the unmodified plan runs, scanning
-//! exactly as it would have without ADR-0850.
+//! `LogsScanExec`'s fields). A `None` from any of those methods declines the
+//! rewrite and the unmodified plan runs, scanning exactly as it would have
+//! without statistics.
 //!
 //! A pushed fetch on any node between the raw aggregate and the scan, the
 //! scan included, declines every shape: the aggregate then sees only the

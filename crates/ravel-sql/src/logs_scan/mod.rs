@@ -2904,34 +2904,21 @@ impl LogsScanExec {
     /// Exact count of rows whose declared column at schema index
     /// `FIRST_DECLARED_COL + k` is non-null and not equal to `literal`
     /// (ADR-0850's q02 shape: `COUNT(*) WHERE <declared column> <> <literal>`,
-    /// which per SQL three-valued logic excludes NULL rows the same way the
-    /// scan path's per-row `<>` evaluation would). `None` means fall back to
-    /// scanning, for every reason [`Self::declared_min_max_all`] does at its call
-    /// site ([`Self::metadata_rewrite_stats_are_exact`]: no pending erasure,
-    /// no content predicate, no prune arm other than `NumNotEq`, and a ts
-    /// bound that clips no touched segment) plus no
-    /// `Str` support, the column's dictionary loaded on every part
-    /// (`LoadedColumnStats::dictionary_loaded`: a load that did not request it
-    /// holds the summary only), a loaded column-stats object covering every touched
-    /// segment whose entry [`merged_view_entry`] grants (an entry whose row
-    /// accounting disagrees with the joined `SegmentRef::sample_count`
-    /// describes rows this object does not have, and an entry the segment's
-    /// stamp does not match may omit rows whose value comes from the resource
-    /// or scope, so neither one's dictionary counts can be summed), and one
-    /// reason specific to this path: any
-    /// covered segment whose dictionary is absent because its distinct-value
-    /// count exceeded the fold's cardinality ceiling (ADR-0850 decision 3) has
-    /// no exact per-value count to subtract, so a count derived from it could
-    /// be wrong outright, not merely unavailable.
+    /// which per SQL three-valued logic excludes NULL rows as the scan's
+    /// per-row `<>` does). `None` means fall back to scanning.
     ///
-    /// The [`Self::metadata_rewrite_stats_are_exact`] gate is what makes a clipping ts bound
-    /// safe. Segments are resolved on OVERLAP, and a pure `ts` bound is
-    /// reported `Exact` by `LogsTableProvider::supports_filters_pushdown`, so
-    /// the `FilterExec` that carried it is deleted and the bound survives only
-    /// as `self.ts_min`/`self.ts_max`. A per-segment dictionary carries no
-    /// intra-segment time distribution, so a clipped segment's contribution
-    /// cannot be derived from it at all; summing its whole-segment counts
-    /// would answer a different query than the one asked.
+    /// [`Self::metadata_rewrite_stats_are_exact`] runs first: no pending
+    /// erasure, no content predicate, row filter or key predicate, no prune
+    /// arm other than `NumNotEq`, and a ts bound that clips no touched
+    /// segment. A clipped segment's contribution cannot be derived from any
+    /// whole-segment figure, so that check is what makes a clipping bound
+    /// safe. Then each touched segment's count comes from one carrier
+    /// ([`resolve_segment_figure`], ADR-4628 decision 5): the stamp when one
+    /// of its three cases covers `literal`, else a `.cstat` entry
+    /// [`merged_view_entry`] grants, with its dictionary loaded and present
+    /// and summing to its non-null count; one segment with neither declines
+    /// the statement. A `Str` column and a literal of another scalar type
+    /// decline.
     pub(crate) fn declared_not_equal_count(&self, k: usize, literal: &ScalarValue) -> Option<u64> {
         if !self.metadata_rewrite_stats_are_exact() {
             return None;
@@ -3024,31 +3011,19 @@ impl LogsScanExec {
         })
     }
 
-    /// Exact sum and non-null count for the declared column at schema index
-    /// `FIRST_DECLARED_COL + k` (ADR-0850's q03/q04/q30 shapes, #861), summed
-    /// across every touched segment's exact per-object statistics. `None` means
-    /// fall back to scanning, for the same reasons
-    /// [`Self::declared_not_equal_count`] does (the
-    /// [`Self::metadata_rewrite_stats_are_exact`] gate: no pending erasure, no
-    /// content predicate, no prune arm other than `NumNotEq`, a ts bound that
-    /// clips no touched segment; and the [`merged_view_entry`] gate, which
-    /// refuses a segment's whole entry, its stored sum included, when the
-    /// entry's row accounting disagrees with the joined
-    /// `SegmentRef::sample_count` or the segment's stamp does not match it),
-    /// plus two specific to this path:
+    /// Exact sum and non-null count for the declared `I64` column at schema
+    /// index `FIRST_DECLARED_COL + k` (ADR-0850's q03/q04/q30 shapes, #861),
+    /// summed in `i128` over every touched segment. `None` means fall back to
+    /// scanning: [`Self::metadata_rewrite_stats_are_exact`] refuses (checked
+    /// first), the column is not `I64`, a segment has no figure from either
+    /// carrier, or a total leaves `i128` or `u64`.
     ///
-    /// - the column is not integer-typed. A sum is stored for `I64` columns
-    ///   only (#861): a float fold would be order-dependent, so a non-`I64`
-    ///   column carries no sum and its `SUM`/`AVG` scans;
-    /// - a touched segment's stat omits its sum. That happens for a would-be
-    ///   float column, for an exact per-object sum that overflowed `i64` at fold
-    ///   time, or for a segment never covered by the loaded stats. In every case
-    ///   there is no exact sum to add, so the whole answer declines rather than
-    ///   undercounting.
-    ///
-    /// Unlike the q02/q08 dictionary paths this needs no `dictionary_present`:
-    /// the sum is exact independently of whether the value dictionary was kept,
-    /// so a high-cardinality integer column still decomposes.
+    /// Each segment's figure comes from exactly one carrier
+    /// ([`resolve_segment_figure`], ADR-4628 decision 5): the stamp's sum
+    /// (field 6 or 7) with `sample_count - null_count` as the non-null count,
+    /// else the `int64` sum of a `.cstat` entry [`merged_view_entry`] grants.
+    /// An absent sum on both is no answer, never 0. The result type's own
+    /// range is the callers' to check (`sum_array`, `sum_count_array`).
     pub(crate) fn declared_column_sum(&self, k: usize) -> Option<DeclaredColumnSum> {
         if !self.metadata_rewrite_stats_are_exact() {
             return None;
