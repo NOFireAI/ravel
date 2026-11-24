@@ -4761,3 +4761,289 @@ mod pool_leaf_budget_tests {
         assert_eq!(pool.reserved(), 0);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod figure_resolver_tests {
+    //! [`resolve_segment_figure`], carrier asserted (ADR-4628 decision 5).
+
+    use super::*;
+    use ravel_types::declared_stats::DeclaredColumnStat;
+
+    const COL: &str = "status";
+    /// Rows `{200, 200, 200, 404, NULL}`: four non-null, sum 1004.
+    const SAMPLE_COUNT: u64 = 5;
+
+    fn i64_col() -> DeclaredColumn {
+        DeclaredColumn::new(COL, DeclaredType::I64)
+    }
+
+    fn i64_stamp(fields: bool) -> DeclaredColumnStat {
+        let stat = DeclaredColumnStat::new(
+            COL,
+            DeclaredStatType::I64,
+            Some(DeclaredStatValue::I64(200)),
+            Some(DeclaredStatValue::I64(404)),
+            1,
+        )
+        .expect("valid stamp");
+        if fields {
+            stat.with_sum(1004)
+                .expect("sum")
+                .with_zero_count(0)
+                .expect("zero count")
+        } else {
+            stat
+        }
+    }
+
+    fn seg(stamps: &[DeclaredColumnStat]) -> SegmentRef {
+        let mut record = ravel_proto::commit::v1::CommitRecord {
+            sample_count: SAMPLE_COUNT,
+            ..Default::default()
+        };
+        ravel_commit::declared_stats::stamp_commit_record(&mut record, stamps);
+        let validated = ravel_commit::declared_stats::read_commit_record(&record);
+        assert_eq!(validated.covered().len(), stamps.len(), "valid stamps");
+        SegmentRef {
+            data_object_key: "logs/seg-1.rlog".to_string(),
+            object_size: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 1_000,
+            ingest_hour_bucket: 0,
+            sample_count: SAMPLE_COUNT,
+            series_count: 0,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: uuid::Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: DeclaredColumnStats::from_validated(&validated),
+        }
+    }
+
+    fn i64_value(v: i64) -> ColumnValue {
+        ColumnValue {
+            kind: Some(ColumnValueKind::I64(v)),
+        }
+    }
+
+    /// A reconciled entry agreeing with [`i64_stamp`]'s extrema and NULL
+    /// count, whose sum (999) and dictionary (`{200: 2, 404: 2}`) differ from
+    /// the stamp's rows, so an answer names the carrier it came from.
+    fn loaded_entry(seg: &SegmentRef) -> LoadedColumnStats {
+        let stat = ColumnStat {
+            name: COL.to_string(),
+            declared_type: 2,
+            non_null_count: 4,
+            null_count: 1,
+            min: Some(i64_value(200)),
+            max: Some(i64_value(404)),
+            dictionary_present: true,
+            dictionary: vec![
+                ravel_proto::catalog::v1::DictEntry {
+                    value: Some(i64_value(200)),
+                    count: 2,
+                },
+                ravel_proto::catalog::v1::DictEntry {
+                    value: Some(i64_value(404)),
+                    count: 2,
+                },
+            ],
+            sum: Some(999),
+        };
+        let mut segments = HashMap::new();
+        segments.insert(
+            segment_identity(seg),
+            ColumnStatsSegment {
+                ingest_hour_bucket: seg.ingest_hour_bucket,
+                shard: seg.shard,
+                writer_id: seg.writer_id.as_bytes().to_vec(),
+                writer_epoch: seg.writer_epoch,
+                writer_seq: seg.writer_seq,
+                columns: vec![stat],
+            },
+        );
+        LoadedColumnStats::from_maps(segments, HashMap::new())
+    }
+
+    #[test]
+    fn a_stamp_with_the_field_beats_a_granted_entry() {
+        let seg = seg(&[i64_stamp(true)]);
+        let stats = loaded_entry(&seg);
+        assert_eq!(
+            resolve_segment_figure(&i64_col(), &seg, Some(&stats), FigureRequest::Sum),
+            Some((
+                FigureCarrier::Stamp,
+                SegmentFigure::Sum {
+                    sum: 1004,
+                    non_null_count: 4
+                }
+            ))
+        );
+        assert_eq!(
+            resolve_segment_figure(
+                &i64_col(),
+                &seg,
+                Some(&stats),
+                FigureRequest::NotEqual(&ScalarValue::Int64(Some(0)))
+            ),
+            Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(4)))
+        );
+    }
+
+    #[test]
+    fn a_stamp_without_the_field_gives_the_granted_entry() {
+        let seg = seg(&[i64_stamp(false)]);
+        let stats = loaded_entry(&seg);
+        assert_eq!(
+            resolve_segment_figure(&i64_col(), &seg, Some(&stats), FigureRequest::Sum),
+            Some((
+                FigureCarrier::Cstat,
+                SegmentFigure::Sum {
+                    sum: 999,
+                    non_null_count: 4
+                }
+            ))
+        );
+        // 0 is outside [200, 404]: the extrema alone answer, from the stamp.
+        assert_eq!(
+            resolve_segment_figure(
+                &i64_col(),
+                &seg,
+                Some(&stats),
+                FigureRequest::NotEqual(&ScalarValue::Int64(Some(0)))
+            ),
+            Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(4)))
+        );
+        // 200 is the min of a wider range: no stamp case covers it.
+        assert_eq!(
+            resolve_segment_figure(
+                &i64_col(),
+                &seg,
+                Some(&stats),
+                FigureRequest::NotEqual(&ScalarValue::Int64(Some(200)))
+            ),
+            Some((FigureCarrier::Cstat, SegmentFigure::NotEqual(2)))
+        );
+    }
+
+    #[test]
+    fn neither_carrier_gives_none() {
+        let seg = seg(&[i64_stamp(false)]);
+        assert_eq!(
+            resolve_segment_figure(&i64_col(), &seg, None, FigureRequest::Sum),
+            None
+        );
+        assert_eq!(
+            resolve_segment_figure(
+                &i64_col(),
+                &seg,
+                None,
+                FigureRequest::NotEqual(&ScalarValue::Int64(Some(200)))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_bool_stamp_under_an_i64_declaration_gives_none() {
+        let stamp = DeclaredColumnStat::new(
+            COL,
+            DeclaredStatType::Bool,
+            Some(DeclaredStatValue::Bool(false)),
+            Some(DeclaredStatValue::Bool(true)),
+            1,
+        )
+        .expect("valid stamp")
+        .with_zero_count(3)
+        .expect("zero count");
+        let seg = seg(&[stamp]);
+        for request in [
+            FigureRequest::Sum,
+            FigureRequest::NotEqual(&ScalarValue::Int64(Some(0))),
+        ] {
+            assert_eq!(
+                resolve_segment_figure(&i64_col(), &seg, None, request),
+                None,
+                "{request:?}"
+            );
+        }
+        // And an I64 stamp carrying a sum under a BOOL declaration.
+        let seg = seg_i64_under_bool();
+        assert_eq!(
+            resolve_segment_figure(
+                &DeclaredColumn::new(COL, DeclaredType::Bool),
+                &seg,
+                None,
+                FigureRequest::Sum
+            ),
+            None
+        );
+    }
+
+    fn seg_i64_under_bool() -> SegmentRef {
+        seg(&[i64_stamp(true)])
+    }
+
+    #[test]
+    fn not_equal_cases_from_the_stamp() {
+        let one_valued = DeclaredColumnStat::new(
+            COL,
+            DeclaredStatType::I64,
+            Some(DeclaredStatValue::I64(7)),
+            Some(DeclaredStatValue::I64(7)),
+            1,
+        )
+        .expect("valid stamp");
+        let one_seg = seg(&[one_valued]);
+        let ne = |v: i64| {
+            resolve_segment_figure(
+                &i64_col(),
+                &one_seg,
+                None,
+                FigureRequest::NotEqual(&ScalarValue::Int64(Some(v))),
+            )
+        };
+        // (c) min == max == lit: every non-null row is equal.
+        assert_eq!(
+            ne(7),
+            Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(0)))
+        );
+        // (b) outside the range, the zero included when field 8 is absent.
+        assert_eq!(
+            ne(0),
+            Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(4)))
+        );
+        assert_eq!(
+            ne(8),
+            Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(4)))
+        );
+        // A literal of another scalar type answers nothing.
+        assert_eq!(
+            resolve_segment_figure(
+                &i64_col(),
+                &one_seg,
+                None,
+                FigureRequest::NotEqual(&ScalarValue::Int32(Some(7)))
+            ),
+            None
+        );
+        // All NULL: no non-null row, so nothing equals anything.
+        let all_null = DeclaredColumnStat::new(COL, DeclaredStatType::I64, None, None, 5)
+            .expect("valid stamp");
+        let null_seg = seg(&[all_null]);
+        assert_eq!(
+            resolve_segment_figure(
+                &i64_col(),
+                &null_seg,
+                None,
+                FigureRequest::NotEqual(&ScalarValue::Int64(Some(3)))
+            ),
+            Some((FigureCarrier::Stamp, SegmentFigure::NotEqual(0)))
+        );
+    }
+}

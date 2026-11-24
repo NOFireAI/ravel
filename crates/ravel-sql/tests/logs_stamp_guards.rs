@@ -357,9 +357,9 @@ async fn row16_a_stamp_of_another_type_scans() {
     }
 }
 
-/// The BOOL not-equal shapes. `f <> false` and `f <> true` equal the forced
-/// scan whichever way they are planned; the plan of each is printed for the
-/// report.
+/// The BOOL not-equal shapes reach the rule as no not-equal at all:
+/// DataFusion simplifies `f <> false` to the filter `f` and `f <> true` to
+/// `NOT f`, so both scan and equal the scan of unstamped objects.
 #[tokio::test]
 async fn bool_not_equal_shapes_match_the_scan() {
     let parts = vec![
@@ -374,14 +374,23 @@ async fn bool_not_equal_shapes_match_the_scan() {
         ],
     ];
     let corpus = Corpus::build(&parts).await;
-    for sql in [
-        "SELECT COUNT(*) FROM logs WHERE f <> false",
-        "SELECT COUNT(*) FROM logs WHERE f <> true",
+    for (sql, filter) in [
+        (
+            "SELECT COUNT(*) FROM logs WHERE f <> false",
+            "FilterExec: f@0, projection=[]",
+        ),
+        (
+            "SELECT COUNT(*) FROM logs WHERE f <> true",
+            "FilterExec: NOT f@0, projection=[]",
+        ),
     ] {
         let run = corpus.stamped(sql).await;
-        println!("BOOL plan of {sql}:\n{}", run.plan);
-        let forced = corpus.forced(sql).await;
-        assert_same_answer(&run, &forced, sql);
-        println!("BOOL answer of {sql}:\n{}", pretty(&run));
+        assert!(run.plan.contains(filter), "{sql}: plan was:\n{}", run.plan);
+        assert_scanned(&run, sql);
+        assert_same_answer(&run, &corpus.truth(sql).await, sql);
     }
+    let run = corpus
+        .stamped("SELECT COUNT(*) FROM logs WHERE f <> false")
+        .await;
+    assert!(pretty(&run).contains("| 3 "), "{}", pretty(&run));
 }
