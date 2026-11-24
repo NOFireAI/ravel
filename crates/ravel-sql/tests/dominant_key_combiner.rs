@@ -446,10 +446,7 @@ async fn check_answers(rows: &[Row], what: &str, merges: bool) {
 /// per key is the input's.
 async fn check_direct(rows: &[Row], what: &str, partitions: usize) {
     let keys: Vec<Option<String>> = rows.iter().map(|row| row.s.clone()).collect();
-    let batches: Vec<RecordBatch> = keys
-        .chunks(1_000)
-        .map(string_count_batch)
-        .collect();
+    let batches: Vec<RecordBatch> = keys.chunks(1_000).map(string_count_batch).collect();
     let exec = string_count_exec(
         vec![batches.into_iter().map(Ok).collect()],
         counters_for(partitions),
