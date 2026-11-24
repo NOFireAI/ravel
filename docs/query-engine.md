@@ -355,8 +355,8 @@ cannot be proven. The full set of decline conditions:
   column that is not declared, or a segment with no figure from either
   carrier above.
 - A segment with no `SegmentRef` stamp for the column (see the next section),
-  or whose stamp does not state the same `min`, `max` and NULL count as its
-  `.cstat` entry. The fold builds the entry from the record-level cells only,
+  or, for a segment answered from its `.cstat` entry, one whose stamp does not
+  state the same `min`, `max` and NULL count as that entry. The fold builds the entry from the record-level cells only,
   while SQL returns the merged value: the record's own attribute, or the
   resource or scope attribute of the same name when the record does not set
   it. A row whose value comes from the resource or scope reads NULL to the
@@ -365,8 +365,8 @@ cannot be proven. The full set of decline conditions:
   the record, which is the value SQL reads for that row; equal NULL counts
   therefore mean no row took its value from the resource or scope. A `Bytes`
   column has no stamp, so these shapes always scan it.
-- A segment whose per-value dictionary the fold omitted for exceeding the
-  cardinality ceiling (ADR-0850 decision 3) -- an omitted dictionary carries no
+- For a segment answered from its `.cstat` entry, a per-value dictionary the
+  fold omitted for exceeding the cardinality ceiling (ADR-0850 decision 3) -- an omitted dictionary carries no
   exact per-value counts, so a derived count could be wrong outright, not
   merely unavailable.
 - For the sums and averages: a segment with no sum from either carrier for
@@ -383,7 +383,8 @@ cannot be proven. The full set of decline conditions:
   scan's own fetch when the scan has one partition, and the aggregate then
   sees only the rows the fetch lets through, while the statistics count every
   row.
-- A segment carrying an internally-inconsistent `ColumnStat` (its dictionary
+- For a segment answered from its `.cstat` entry (every segment, for the
+  `GROUP BY` counts), an internally-inconsistent `ColumnStat` (its dictionary
   counts do not sum to `non_null_count`). Such a record is rejected at load by
   `decode_column_stats`, but `declared_not_equal_count`/`declared_group_counts`
   decline on it too, failing closed rather than computing from it.
