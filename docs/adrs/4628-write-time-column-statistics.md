@@ -578,7 +578,8 @@ Not established here, and needed by a reader of the conditions:
   (`max(max(T_f, T_w + protection_horizon) + S + E_v, R)`,
   `docs/object-store-contract.md`, "A lock on the catalog family"). The
   sweep code for `.csnap` parts was not read for this; the task that
-  writes the documents does.
+  writes the documents does (the sweep rule is now stated in the
+  stamp-path guards amendment below).
 
 **Measured 2026-11-23.** Q3 could not have been answered from the `int64`
 sum of `.cstat`: no folded object of the entry tenant carries a `UserID`
@@ -1051,7 +1052,14 @@ functions. The load gate still guards every `.cstat` figure, and the
 **3. Decision 6 has no row for the rewrite's own refusals, and a stamp
 answer depends on them.** The checks below are the only guard on a stamp
 answer. They all run while the plan is built. Nothing checks a stamp
-answer again at execution.
+answer again at execution. A stamp answer over a pre-rewrite input rests
+on the erasure request staying pending for as long as a snapshot can
+resolve that input (`docs/deletion-and-gc.md`, the held-input rule). Test
+6 does not run the sweep, and the sweep's rule is pinned by a test for
+metrics only (`crates/ravel-maintain/tests/superseded_head_gate.rs`). With
+no request pending, the stamp answer and the scan read the same
+pre-rewrite rows, so the stamp path adds no exposure the scan does not
+have.
 
 In `LogsScanExec::metadata_rewrite_stats_are_exact`
 (`crates/ravel-sql/src/logs_scan/mod.rs`), which both readers,
@@ -1090,11 +1098,14 @@ In the readers and the resolver:
   `stamp_equal_count` gives no stamp answer for that segment. The segment
   falls to the granted `.cstat` entry, or the statement scans. Decode does
   not yet refuse such a stamp (issue #4672), and this check does not
-  replace that clause.
+  replace that clause. The mirror case is refused neither here nor at
+  decode: a zero count equal to the non-null count beside a min or max
+  that is not the zero. Issue #4672 tracks it with the decode clause.
 
-At the result type, `sum_array`, `avg_array`, `sum_count_array` and
-`count_to_i64` decline a total the result type cannot hold, so the scan
-raises its own error.
+At the result type, `sum_array`, `sum_count_array` and `count_to_i64`
+decline a total the result type cannot hold, so the scan raises its own
+error. `avg_array` declines only an output type other than `Float64`: it
+divides in `f64` and has no range to leave.
 
 **4. Renamed functions.** `sum_scalar`, `avg_scalar` and `sum_count_batch`
 are now `sum_array`, `avg_array` and `sum_count_array` in
@@ -1103,6 +1114,12 @@ are now `sum_array`, `avg_array` and `sum_count_array` in
 `IntegerSumOverflow`. `sum_count_array` declines a sum outside
 `Decimal128(38, 0)` or a count outside `i64`, and the projection raises
 the same error on both paths.
+
+**Decision 6, "Not established here": the sweep rule for a `.csnap`
+part.** `sweep_unreferenced_catalog_objects`
+(`crates/ravel-maintain/src/sweep.rs`) lists `snap/` beside `idx/`, keeps
+what HEAD names and applies one `protection_horizon` age gate, so a
+replaced `.csnap` part is swept by the same rule as a `.cstat`.
 
 **Behaviour change on existing stores.** Before T5a, `COUNT(*) WHERE col <>
 lit` on a declared I64 column needed, for every touched segment, a loaded
