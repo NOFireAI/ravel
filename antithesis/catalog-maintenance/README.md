@@ -1049,6 +1049,19 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     hour was unsealed, so without a restart no read GETs a swept record and
     the token fallback never runs. In Antithesis the variable is unset and
     the faults restart nodes;
+  - `maint1` was restarted once at the same point, before `ravel2`
+    (`node-restart.txt`). A maintain worker seeds its memo from the memo
+    snapshots under `sys/maintain/memo/` when it starts and when its live
+    worker set changes, and only then evaluates `maintenance: a seeded memo
+    entry is never fresher than its snapshot`. The restart starts a new
+    process id, so the new process seeds at startup, `maint2` seeds when the
+    new heartbeat joins its live set, and both seed again when the old
+    heartbeat expires. After the driver ends, `local-run.sh` waits up to
+    330 s from the restart for a maintain worker to log `maintenance:
+    warm-started memo from durable snapshots`, and records in
+    `node-restart.txt` which worker did and when. That line is evidence, not
+    a gate; the assertion gates below decide. In Antithesis only faults
+    restart the maintain workers;
   - the driver was still running after setup, then exited 0 having logged
     `eventually: ending the timeline`;
   - every other container (`s3proxy` included) is running or exited 0;
