@@ -256,6 +256,41 @@ reads `MetadataOnlyExec: metadata_only=true, rows=<n>`. The shapes are:
   column's non-null count. A `SUM(<col> + k)` that passes the 64-bit range
   fails with the same overflow error the scan raises.
 
+### Carrier order for sums and not-equal counts (ADR-4628)
+
+The q02 shape and the sums and averages read one figure per touched segment
+and column, from exactly one carrier (ADR-4628 decision 5; the resolver is
+`resolve_segment_figure` in `crates/ravel-sql/src/logs_scan/mod.rs`):
+
+1. The segment's declared-column stamp, when it carries the figure. The
+   stamp rides the commit record the resolve already reads, so it answers on
+   an unfolded catalog, for the live tail and for token-resolved segments. Its
+   sum is field 6, or field 7 when the object's sum leaves `i64`; its non-null
+   count is `sample_count - null_count`. For `<> lit`, the rows equal to `lit`
+   are the zero count (field 8) when `lit` is the type's zero (`0`, or
+   `false`) and the stamp carries one; 0 when `lit` lies outside the stamp's
+   `[min, max]` or the column has no non-null row; and every non-null row when
+   `min == max == lit`. These last two cases need only the extrema, so they
+   answer from stamps written before ADR-4628 too. Any other literal has no
+   stamp answer for that segment.
+2. Otherwise the segment's `.cstat` entry, when one is loaded and the stamp
+   grants it (the rule in the bullets below).
+3. Otherwise nothing, and the whole statement scans.
+
+The two carriers are never added or compared for one segment. A stamp
+without the field (written before ADR-4628, by an older fold or compactor,
+or a rewrite part, which carries an empty stamp) is no answer, never 0.
+`GROUP BY` counts keep the `.cstat` dictionary path. `f <> false` and
+`f <> true` on a `BOOL` column reach the rule as the filters `f` and
+`NOT f`, which it does not answer, so both scan.
+
+A stamp answer needs no `.cstat`, so the executor's statistics load guards
+nothing for it: every refusal below is a check in the rule or in
+`LogsScanExec::metadata_rewrite_stats_are_exact`. The load itself still runs
+for an admitted shape, and on an unfolded catalog it costs one plan-phase GET
+of the absent catalog HEAD; skipping it when the stamps answer is
+ADR-4628 task T5.
+
 All are additive to DataFusion's built-in `AggregateStatistics` rule (which
 handles the predicate-free `COUNT(*)` above and never fires for any shape
 here: it answers only `COUNT`, `MIN` and `MAX`, replaces all of a
@@ -288,7 +323,8 @@ cannot be proven. The full set of decline conditions:
   the whole-segment dictionary counts. A pushed `LIKE '%literal%'` contains arm
   stays `Inexact` (its `FilterExec` remains) and declines all the same.
 - A `Str`-typed typed attribute column, a predicate or group key over a
-  column that is not declared, or a segment with no loaded statistics.
+  column that is not declared, or a segment with no figure from either
+  carrier above.
 - A segment with no `SegmentRef` stamp for the column (see the next section),
   or whose stamp does not state the same `min`, `max` and NULL count as its
   `.cstat` entry. The fold builds the entry from the record-level cells only,
@@ -304,9 +340,9 @@ cannot be proven. The full set of decline conditions:
   cardinality ceiling (ADR-0850 decision 3) -- an omitted dictionary carries no
   exact per-value counts, so a derived count could be wrong outright, not
   merely unavailable.
-- For the sums and averages: a segment whose entry has no stored sum for any
-  one column the statement reads (a per-object sum that passed 64 bits at fold
-  time stores none), any one aggregate outside the list above (`DISTINCT`, a
+- For the sums and averages: a segment with no sum from either carrier for
+  any one column the statement reads (a `.cstat` sum that passed 64 bits at
+  fold time is not stored), any one aggregate outside the list above (`DISTINCT`, a
   per-aggregate `FILTER`, a cast column, `MIN`/`MAX`, a non-`I64` column), a
   group key, or a residual filter. The statement is answered as a whole or
   not at all: no part of it is answered from statistics beside a scan of the
