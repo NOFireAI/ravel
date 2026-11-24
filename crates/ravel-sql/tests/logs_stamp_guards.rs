@@ -27,12 +27,15 @@ async fn assert_each_scans(corpus: &Corpus, sqls: &[&str]) {
     }
 }
 
-/// Each statement answers from the stamps and equals the forced scan.
+/// Each statement answers from the stamps and equals a scan of the same
+/// objects with no stamp at all.
 async fn assert_each_answers(corpus: &Corpus, sqls: &[&str]) {
     for sql in sqls {
         let run = corpus.stamped(sql).await;
         assert_answered(&run, sql);
-        assert_same_answer(&run, &corpus.forced(sql).await, sql);
+        let truth = corpus.truth(sql).await;
+        assert_scanned(&truth, sql);
+        assert_same_answer(&run, &truth, sql);
     }
 }
 
@@ -181,22 +184,23 @@ async fn row08_nodes_outside_the_allowlist_match_the_scan() {
     }
 }
 
-/// Row 9: an aliased column answers as the column itself; a computed one
-/// scans.
+/// Row 9: a projection between the aggregate and the scan is outside the
+/// walk's allowlist, an alias included: under `SUM` DataFusion keeps
+/// `a AS x` as a `ProjectionExec`, so the alias scans like the computed
+/// `a * 2`. Under q02's filter the alias is gone by the time the rule runs,
+/// and the statement answers as `a <> 0`.
 #[tokio::test]
-async fn row09_an_alias_answers_and_a_computed_projection_scans() {
+async fn row09_a_projection_on_the_walk_scans() {
     let corpus = Corpus::build(&two_parts()).await;
     assert_each_answers(
         &corpus,
-        &[
-            "SELECT SUM(x) FROM (SELECT a AS x FROM logs)",
-            "SELECT COUNT(*) FROM (SELECT a AS x FROM logs) WHERE x <> 0",
-        ],
+        &["SELECT COUNT(*) FROM (SELECT a AS x FROM logs) WHERE x <> 0"],
     )
     .await;
     assert_each_scans(
         &corpus,
         &[
+            "SELECT SUM(x) FROM (SELECT a AS x FROM logs)",
             "SELECT SUM(x) FROM (SELECT a * 2 AS x FROM logs)",
             "SELECT COUNT(*) FROM (SELECT a * 2 AS x FROM logs) WHERE x <> 0",
         ],

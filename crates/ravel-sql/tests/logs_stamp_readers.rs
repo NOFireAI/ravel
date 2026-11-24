@@ -456,6 +456,19 @@ impl Corpus {
     pub(crate) async fn forced(&self, sql: &str) -> Run {
         self.run(sql, self.setup(Fields::Without)).await
     }
+
+    /// The same objects with no stamp at all, so no statistic answers: the
+    /// reference for a not-equal literal that a pre-ADR stamp's extrema
+    /// already decide (outside `[min, max]`, or `min == max == lit`).
+    pub(crate) async fn truth(&self, sql: &str) -> Run {
+        let setup = Setup {
+            segs: self.bare.clone(),
+            stats: None,
+            erasure: Vec::new(),
+            key_index: None,
+        };
+        self.run(sql, setup).await
+    }
 }
 
 pub(crate) fn assert_answered(run: &Run, what: &str) {
@@ -604,9 +617,19 @@ async fn every_shape_answers_from_stamps_with_no_cstat() {
     for sql in answerable_shapes() {
         let run = corpus.stamped(&sql).await;
         assert_answered(&run, &sql);
-        let scan = corpus.forced(&sql).await;
-        assert_scanned(&scan, &sql);
-        assert_same_answer(&run, &scan, &sql);
+        let truth = corpus.truth(&sql).await;
+        assert_scanned(&truth, &sql);
+        assert_same_answer(&run, &truth, &sql);
+        // `w <> 7` is decided by the extrema alone (the first object's range
+        // excludes 7, the second holds only 7), so the stripped stamps answer
+        // it too; every other shape needs fields 6 to 8.
+        let forced = corpus.forced(&sql).await;
+        if sql.contains("w <> 7") {
+            assert_answered(&forced, &sql);
+        } else {
+            assert_scanned(&forced, &sql);
+        }
+        assert_same_answer(&run, &forced, &sql);
     }
     // The figures, recomputed by hand from `two_parts`.
     let run = corpus
@@ -1196,13 +1219,23 @@ async fn assert_clickbench_statement(sql: &str) -> (Phases, Phases) {
     );
     // The statistics load still runs (T5b removes it) and reads the catalog
     // HEAD, absent on an unfolded catalog: the one plan-phase GET.
-    let head = format!("t/{}/catalog/logs/HEAD", tenant().hash().to_hex());
-    let plan_keys: Vec<&String> = run.get_keys.iter().filter(|k| !k.contains("/c/")).collect();
+    // The resolve reads it once too; every other GET is a commit record.
+    let head = format!("t/{}/catalog/l/HEAD", tenant().hash().to_hex());
+    let non_record: Vec<&String> = run
+        .get_keys
+        .iter()
+        .filter(|k| !k.ends_with(".cmt"))
+        .collect();
     assert_eq!(p.plan.0, 1, "{sql}: one plan-phase GET: {p:?}");
     assert_eq!(
-        plan_keys,
-        vec![&head],
-        "{sql}: the plan GET is the HEAD read"
+        non_record,
+        vec![&head, &head],
+        "{sql}: the resolve's and the plan's HEAD reads"
+    );
+    assert_eq!(
+        p.resolve.0,
+        clickbench_parts().len() as u64 + 1,
+        "{sql}: one GET per commit record plus the HEAD"
     );
 
     assert!(

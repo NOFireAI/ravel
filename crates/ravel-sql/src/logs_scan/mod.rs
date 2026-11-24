@@ -2940,7 +2940,6 @@ impl LogsScanExec {
         if matches!(declared.ty, DeclaredType::Str) {
             return None;
         }
-        self.column_stats.as_ref()?;
         let mut total: u64 = 0;
         for seg in self.segments.iter() {
             let (_, SegmentFigure::NotEqual(not_equal)) = resolve_segment_figure(
@@ -3058,7 +3057,6 @@ impl LogsScanExec {
         if !matches!(declared.ty, DeclaredType::I64) {
             return None;
         }
-        self.column_stats.as_ref()?;
         let mut sum: i128 = 0;
         let mut non_null_count: u64 = 0;
         for seg in self.segments.iter() {
