@@ -3867,6 +3867,14 @@ fn compaction_record_lines(record: &ravel_proto::commit::v1::CompactionRecord) -
             part.max_event_ts_ns,
             part.segment_format_version,
         ));
+        let kept = ravel_commit::declared_stats::read_compaction_part(part)
+            .covered()
+            .len();
+        lines.extend(crate::catalog::declared_stamp_lines(
+            &part.declared_column_stats,
+            kept,
+            "    ",
+        ));
     }
     lines
 }
@@ -5667,6 +5675,50 @@ mod tests {
             !lines.iter().any(|l| l.starts_with("superseded_record_key")),
             "{lines:?}"
         );
+    }
+
+    /// `commit decode-compaction` prints each part's field 12 stamp, indented
+    /// under that part's line, then the part's stamp line, compared whole.
+    #[test]
+    fn a_compaction_record_prints_each_parts_stamp() {
+        use crate::catalog::stamp_fixture;
+        let part = |index: u32, stats| ravel_proto::commit::v1::CompactionPart {
+            part_index: index,
+            sample_count: stamp_fixture::ROWS,
+            declared_column_stats: stats,
+            ..Default::default()
+        };
+        let record = ravel_proto::commit::v1::CompactionRecord {
+            format_version: 1,
+            level: 1,
+            parts: vec![
+                part(0, stamp_fixture::entries()),
+                part(1, vec![stamp_fixture::pre_adr()]),
+            ],
+            ..Default::default()
+        };
+        let lines = compaction_record_lines(&record);
+        let at = lines
+            .iter()
+            .position(|l| l == "parts: 2")
+            .expect("a parts line");
+        let part_line = |index: u32| {
+            format!(
+                "  part_index={index} first_series_id= last_series_id= content_hash= \
+                 object_size=0 sample_count=10 series_count=0 run_count=0 min_event_ts_ns=0 \
+                 max_event_ts_ns=0 segment_format_version=0"
+            )
+        };
+        let mut want = vec![part_line(0)];
+        want.extend(stamp_fixture::lines("    "));
+        want.push(part_line(1));
+        want.push(
+            "    stamp[0]: name=\"ResolutionWidth\" declared_type=2 (I64) min=800 max=1920 \
+             null_count=1 sum=ABSENT sum_wide=ABSENT zero_count=ABSENT"
+                .to_string(),
+        );
+        want.push("    stamp: entries=1 kept=1".to_string());
+        assert_eq!(lines[at + 1..].to_vec(), want);
     }
 
     /// The `maintain inspect` decode path refuses a retention tombstone stamped
