@@ -104,6 +104,7 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
     self, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -114,7 +115,9 @@ use ravel_catalog::ColumnStatsRequest;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::logs_pushdown::{filter_has_row_filter, filter_is_exact};
-use crate::logs_scan::{DeclaredColumnSum, DeclaredGroupCounts, LogsScanExec};
+use crate::logs_scan::{
+    DeclaredColumnSum, DeclaredGroupCounts, DeclaredNotEqualCount, FigureCarrier, LogsScanExec,
+};
 use crate::session::LOGS_TABLE;
 use crate::sum::SumKind;
 use crate::sum_plus::{EXACT_SUM_COUNT, sum_count_type};
@@ -474,11 +477,15 @@ fn not_equal_literal(predicate: &Arc<dyn PhysicalExpr>) -> Option<(usize, Scalar
 /// - **SUM/AVG** read the stored sum and counts, so they request no
 ///   dictionary.
 ///
+/// It also returns the figures the answer reads per touched segment
+/// ([`AdmittedAggregate::stamp_figures`]), for the executor to ask each
+/// segment's stamp before it pays the load (ADR-4628 decision 5).
+///
 /// `None` refuses the statement: no statistics load at all.
-pub(crate) fn logical_aggregate_answerable(
+pub(crate) fn logical_aggregate_answerable<'a>(
     aggregate: &Aggregate,
-    declared: &[DeclaredColumn],
-) -> Option<ColumnStatsRequest> {
+    declared: &'a [DeclaredColumn],
+) -> Option<AdmittedAggregate<'a>> {
     let residual = logs_scan_residual(&aggregate.input, declared)?;
     let calls = aggregate
         .aggr_expr
@@ -501,26 +508,39 @@ pub(crate) fn logical_aggregate_answerable(
                         .is_none_or(|col| matches!(col.ty, DeclaredType::I64))
                 }) =>
         {
-            Some(ColumnStatsRequest::summary_only())
+            let mut sums: Vec<StampFigure<'a>> = Vec::new();
+            for col in calls.iter().filter_map(StatsAggregate::col) {
+                if !sums
+                    .iter()
+                    .any(|seen| matches!(seen, StampFigure::Sum(c) if c.key == col.key))
+                {
+                    sums.push(StampFigure::Sum(col));
+                }
+            }
+            Some((ColumnStatsRequest::summary_only(), Some(sums)))
         }
         ([Expr::Column(key)], [StatsAggregate::CountStar]) => {
             let key = declared_named(declared, &key.name).filter(|col| not_str(col))?;
-            Some(ColumnStatsRequest::summary_only().with_dictionary(key.key.as_str()))
+            // The q08 counts read the `.cstat` dictionary, never a stamp.
+            Some((
+                ColumnStatsRequest::summary_only().with_dictionary(key.key.as_str()),
+                None,
+            ))
         }
         _ => return None,
     };
     let mut not_equal = Vec::new();
     let mut unknown = Vec::new();
     for conjunct in &residual {
-        match logical_not_equal_literal(conjunct, declared) {
-            Some(col) => not_equal.push(col),
+        match logical_not_equal_parts(conjunct, declared) {
+            Some(parts) => not_equal.push(parts),
             None => unknown.push(conjunct),
         }
     }
-    let Some(unfiltered_request) = unfiltered_request else {
+    let Some((unfiltered_request, sums)) = unfiltered_request else {
         let mut request = ColumnStatsRequest::summary_only();
         if !unknown.is_empty() {
-            for col in not_equal.iter().filter(|col| not_str(col)) {
+            for (col, _) in not_equal.iter().filter(|(col, _)| not_str(col)) {
                 request.add_dictionary(col.key.as_str());
             }
             for conjunct in &unknown {
@@ -528,14 +548,65 @@ pub(crate) fn logical_aggregate_answerable(
                     request.add_dictionary(col.key.as_str());
                 }
             }
-            return (!request.is_summary_only()).then_some(request);
+            return (!request.is_summary_only()).then_some(AdmittedAggregate {
+                request,
+                stamp_figures: None,
+            });
         }
         return match not_equal.as_slice() {
-            [col] if not_str(col) => Some(request.with_dictionary(col.key.as_str())),
+            [(col, literal)] if not_str(col) => Some(AdmittedAggregate {
+                request: request.with_dictionary(col.key.as_str()),
+                stamp_figures: own_typed_literal(col, literal)
+                    .map(|literal| vec![StampFigure::NotEqual(col, literal)]),
+            }),
             _ => None,
         };
     };
-    (!unknown.is_empty() || not_equal.is_empty()).then_some(unfiltered_request)
+    if !unknown.is_empty() {
+        return Some(AdmittedAggregate {
+            request: unfiltered_request,
+            stamp_figures: None,
+        });
+    }
+    not_equal.is_empty().then_some(AdmittedAggregate {
+        request: unfiltered_request,
+        stamp_figures: sums,
+    })
+}
+
+/// What [`logical_aggregate_answerable`] admits: the `.cstat` request a kept
+/// load carries, and the figures the answer reads per touched segment.
+pub(crate) struct AdmittedAggregate<'a> {
+    pub(crate) request: ColumnStatsRequest,
+    /// One figure per distinct column a sum reads, or the one `<>` count of
+    /// q02; empty for a statement that reads no figure. `None` when the
+    /// figures cannot be decided from stamps: the q08 counts, an unknown
+    /// residual conjunct, or a q02 literal that is not already a constant of
+    /// the column's own scalar type.
+    pub(crate) stamp_figures: Option<Vec<StampFigure<'a>>>,
+}
+
+/// One figure an admitted aggregate reads for every touched segment.
+#[derive(Clone, Debug)]
+pub(crate) enum StampFigure<'a> {
+    /// The exact sum and non-null count of the column.
+    Sum(&'a DeclaredColumn),
+    /// The count of non-null rows not equal to the literal.
+    NotEqual(&'a DeclaredColumn, ScalarValue),
+}
+
+/// `literal`'s value when it is a non-null constant of `col`'s own scalar
+/// type (`Int64` for `I64`, `Boolean` for `Bool`), the only literal a stamp
+/// compares; `None` for any other expression or type.
+fn own_typed_literal(col: &DeclaredColumn, literal: &Expr) -> Option<ScalarValue> {
+    let Expr::Literal(value, _) = literal else {
+        return None;
+    };
+    match (col.ty, value) {
+        (DeclaredType::I64, ScalarValue::Int64(Some(_)))
+        | (DeclaredType::Bool, ScalarValue::Boolean(Some(_))) => Some(value.clone()),
+        _ => None,
+    }
 }
 
 /// The non-`Str` declared columns `expr` references by name.
@@ -664,14 +735,14 @@ fn strip_casts(expr: &Expr) -> &Expr {
 }
 
 /// [`not_equal_literal`] for a logical conjunct: the declared column of a
-/// `<declared column> <> <non-null literal>` (or reversed) predicate. The
-/// literal may sit under a cast ([`strip_casts`]). A cast on the column side
-/// is not matched, which leaves the conjunct unknown to
-/// [`logical_aggregate_answerable`].
-fn logical_not_equal_literal<'a>(
-    conjunct: &Expr,
+/// `<declared column> <> <non-null literal>` (or reversed) predicate, and the
+/// literal with its casts stripped. The literal may sit under a cast
+/// ([`strip_casts`]). A cast on the column side is not matched, which leaves
+/// the conjunct unknown to [`logical_aggregate_answerable`].
+fn logical_not_equal_parts<'a, 'e>(
+    conjunct: &'e Expr,
     declared: &'a [DeclaredColumn],
-) -> Option<&'a DeclaredColumn> {
+) -> Option<(&'a DeclaredColumn, &'e Expr)> {
     let Expr::BinaryExpr(LogicalBinaryExpr {
         left,
         op: Operator::NotEq,
@@ -685,7 +756,9 @@ fn logical_not_equal_literal<'a>(
         _ => return None,
     };
     match strip_casts(literal) {
-        Expr::Literal(value, _) if !value.is_null() => declared_named(declared, &col.name),
+        stripped @ Expr::Literal(value, _) if !value.is_null() => {
+            Some((declared_named(declared, &col.name)?, stripped))
+        }
         _ => None,
     }
 }
@@ -763,7 +836,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
     };
 
     let schema = node.schema();
-    let batch = match (group, agg_kind.as_slice()) {
+    let (batch, split) = match (group, agg_kind.as_slice()) {
         // q02: COUNT(*) WHERE <declared column> <> <literal>. A predicate-
         // free COUNT(*) here is already handled by DataFusion's own built-in
         // AggregateStatistics rule, so require the filter this rule exists
@@ -784,14 +857,16 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
             if literal.is_null() {
                 return Ok(Transformed::no(node));
             }
-            let Some(count) = scan.declared_not_equal_count(k, &literal) else {
+            let Some(DeclaredNotEqualCount { count, carriers }) =
+                scan.declared_not_equal_count(k, &literal)
+            else {
                 return Ok(Transformed::no(node));
             };
             let Some(count) = count_to_i64(count) else {
                 return Ok(Transformed::no(node));
             };
             match count_star_batch(&schema, count) {
-                Some(batch) => batch,
+                Some(batch) => (batch, CarrierSplit::of(&[carriers.as_slice()])),
                 None => return Ok(Transformed::no(node)),
             }
         }
@@ -807,8 +882,12 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
             let Some(counts) = scan.declared_group_counts(k) else {
                 return Ok(Transformed::no(node));
             };
+            let split = CarrierSplit {
+                stamp: 0,
+                cstat: counts.segments,
+            };
             match group_counts_batch(&schema, counts) {
-                Some(batch) => batch,
+                Some(batch) => (batch, split),
                 None => return Ok(Transformed::no(node)),
             }
         }
@@ -832,7 +911,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
                 |k| scan.declared_column_sum(k),
                 || scan.declared_row_count(),
             ) {
-                Some(batch) => batch,
+                Some(answer) => answer,
                 None => return Ok(Transformed::no(node)),
             }
         }
@@ -844,7 +923,7 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
     };
 
     Ok(Transformed::new(
-        Arc::new(MetadataOnlyExec::new(schema, batch)) as Arc<dyn ExecutionPlan>,
+        Arc::new(MetadataOnlyExec::new(schema, batch, split)) as Arc<dyn ExecutionPlan>,
         true,
         datafusion::common::tree_node::TreeNodeRecursion::Jump,
     ))
@@ -900,12 +979,15 @@ fn group_counts_batch(schema: &SchemaRef, counts: DeclaredGroupCounts) -> Option
 /// no call reads a column (a bare `COUNT(*)` is DataFusion's
 /// `AggregateStatistics`'s), when either source declines, or when any one
 /// call's answer cannot be built ([`call_array`]).
+///
+/// The split beside the batch counts each touched segment once over every
+/// column read ([`CarrierSplit::of`]).
 fn ungrouped_batch(
     schema: &SchemaRef,
     calls: &[StatsAggregate<usize>],
     mut read_sum: impl FnMut(usize) -> Option<DeclaredColumnSum>,
     row_count: impl FnOnce() -> Option<u64>,
-) -> Option<RecordBatch> {
+) -> Option<(RecordBatch, CarrierSplit)> {
     if schema.fields().len() != calls.len() {
         return None;
     }
@@ -943,7 +1025,39 @@ fn ungrouped_batch(
             }
         })
         .collect::<Option<Vec<_>>>()?;
-    RecordBatch::try_new(Arc::clone(schema), columns).ok()
+    let carriers: Vec<&[FigureCarrier]> =
+        sums.iter().map(|(_, cs)| cs.carriers.as_slice()).collect();
+    let batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
+    Some((batch, CarrierSplit::of(&carriers)))
+}
+
+/// How many touched segments a [`MetadataOnlyExec`] answer read from each
+/// carrier (ADR-4628 decision 5, "Marker"). Each touched segment is counted
+/// once: as `cstat` when any figure read for it came from `.cstat`, else as
+/// `stamp`, so the two add up to the touched segment count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CarrierSplit {
+    pub(crate) stamp: usize,
+    pub(crate) cstat: usize,
+}
+
+impl CarrierSplit {
+    /// The split over one carrier list per figure read, each in
+    /// touched-segment order.
+    fn of(figures: &[&[FigureCarrier]]) -> CarrierSplit {
+        let segments = figures.iter().map(|f| f.len()).max().unwrap_or(0);
+        let cstat = (0..segments)
+            .filter(|&i| {
+                figures
+                    .iter()
+                    .any(|f| f.get(i) == Some(&FigureCarrier::Cstat))
+            })
+            .count();
+        CarrierSplit {
+            stamp: segments - cstat,
+            cstat,
+        }
+    }
 }
 
 /// The `COUNT(*)` answer as a one-row array. `None` when the output field is
@@ -1027,28 +1141,52 @@ fn count_to_i64(count: u64) -> Option<i64> {
 /// and [`DisplayAs`] both read `MetadataOnlyExec`, distinct from the generic
 /// nodes DataFusion's own built-in statistics rule produces, so a test can
 /// attribute a plan specifically to this optimization.
+///
+/// It also carries how many touched segments the answer read from each
+/// carrier ([`CarrierSplit`]): appended to the `EXPLAIN` line as
+/// `stamp_segments=<s>, cstat_segments=<c>`, and published as the
+/// `segments_answered_from_stamp` and `segments_answered_from_cstat` counters
+/// the executor sums into `SqlStats`.
 #[derive(Debug)]
 pub struct MetadataOnlyExec {
     schema: SchemaRef,
     batch: RecordBatch,
+    split: CarrierSplit,
+    metrics: ExecutionPlanMetricsSet,
     properties: Arc<PlanProperties>,
 }
 
 impl MetadataOnlyExec {
-    fn new(schema: SchemaRef, batch: RecordBatch) -> Self {
+    fn new(schema: SchemaRef, batch: RecordBatch, split: CarrierSplit) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
+        let metrics = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&metrics)
+            .global_counter(SEGMENTS_ANSWERED_FROM_STAMP)
+            .add(split.stamp);
+        MetricBuilder::new(&metrics)
+            .global_counter(SEGMENTS_ANSWERED_FROM_CSTAT)
+            .add(split.cstat);
         MetadataOnlyExec {
             schema,
             batch,
+            split,
+            metrics,
             properties,
         }
     }
 }
+
+/// The [`MetadataOnlyExec`] counter of touched segments answered from their
+/// stamps alone.
+pub(crate) const SEGMENTS_ANSWERED_FROM_STAMP: &str = "segments_answered_from_stamp";
+/// The [`MetadataOnlyExec`] counter of touched segments with at least one
+/// figure answered from `.cstat`.
+pub(crate) const SEGMENTS_ANSWERED_FROM_CSTAT: &str = "segments_answered_from_cstat";
 
 impl DisplayAs for MetadataOnlyExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1056,8 +1194,11 @@ impl DisplayAs for MetadataOnlyExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "MetadataOnlyExec: metadata_only=true, rows={}",
-                    self.batch.num_rows()
+                    "MetadataOnlyExec: metadata_only=true, rows={}, stamp_segments={}, \
+                     cstat_segments={}",
+                    self.batch.num_rows(),
+                    self.split.stamp,
+                    self.split.cstat
                 )
             }
             DisplayFormatType::TreeRender => Ok(()),
@@ -1076,6 +1217,10 @@ impl ExecutionPlan for MetadataOnlyExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     // Visits nothing: this node holds no physical expression it evaluates.
@@ -1224,11 +1369,18 @@ mod tests {
     /// aggregates name it. Line 30's ninety `SUM(w + k)` over one column read
     /// it once; line 3's `SUM(a), COUNT(*), AVG(w)` reads `a` and `w` once each
     /// and the row count once.
+    ///
+    /// T5b: each touched segment is counted once, as `cstat` when any column
+    /// read for it came from `.cstat`. Of the three segments, `a` reads the
+    /// third from `.cstat` and `w` the second, so line 3 counts one stamp
+    /// segment and two `.cstat` ones, and line 30 (only `w`) two and one.
     #[test]
     fn each_column_is_read_once_per_statement() {
+        use FigureCarrier::{Cstat, Stamp};
         let sum_of = |k: usize| DeclaredColumnSum {
             sum: [17, 10405][k],
             non_null_count: [7, 8][k],
+            carriers: [vec![Stamp, Stamp, Cstat], vec![Stamp, Cstat, Stamp]][k].clone(),
         };
         let line_30: Vec<StatsAggregate<usize>> = (0..90)
             .map(|k| StatsAggregate::Sum { col: 1, addend: k })
@@ -1248,7 +1400,10 @@ mod tests {
             vec![1],
             "one read for ninety aggregates on one column"
         );
-        assert_eq!(batch.map(|b| b.num_columns()), Some(90));
+        assert_eq!(
+            batch.map(|(b, split)| (b.num_columns(), split)),
+            Some((90, CarrierSplit { stamp: 2, cstat: 1 }))
+        );
 
         let line_3 = [
             StatsAggregate::Sum { col: 0, addend: 0 },
@@ -1277,6 +1432,9 @@ mod tests {
         );
         assert_eq!(reads, vec![0, 1], "one read per column");
         assert_eq!(counts, 1, "one row-count read");
-        assert_eq!(batch.map(|b| b.num_columns()), Some(4));
+        assert_eq!(
+            batch.map(|(b, split)| (b.num_columns(), split)),
+            Some((4, CarrierSplit { stamp: 1, cstat: 2 }))
+        );
     }
 }
