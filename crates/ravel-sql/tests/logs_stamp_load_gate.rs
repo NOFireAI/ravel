@@ -374,6 +374,32 @@ async fn one_stripped_segment_keeps_the_load() {
     }
 }
 
+/// A q08 count reads only `.cstat`, so on a folded tenant it keeps the load
+/// even with every segment stamped, and counts every touched segment as a
+/// `.cstat` segment. Six groups: 0, 2, 3, 4, 6 and NULL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_q08_count_counts_every_segment_as_cstat() {
+    let store = folded([Stamp::Full; 3]).await;
+    let sql = "SELECT a, COUNT(*) FROM logs GROUP BY a";
+    let run = run_sealed(&store, sql).await;
+    assert_eq!(run.phases.plan, (2, 718), "q08 keeps the load");
+    assert_eq!(run.data_gets, 0, "answered from .cstat");
+    assert_eq!(
+        marker_lines(&run),
+        vec![
+            "MetadataOnlyExec: metadata_only=true, rows=6, stamp_segments=0, cstat_segments=3"
+                .to_string()
+        ],
+        "plan was:\n{}",
+        run.plan
+    );
+    assert_eq!(pruning_split(&run), (0, 3));
+    let forced = unfolded([Stamp::Stripped; 3]).await;
+    let scan = run_sealed(&forced, &format!("{sql} ORDER BY a")).await;
+    let ordered = run_sealed(&store, &format!("{sql} ORDER BY a")).await;
+    assert_same_answer(&ordered.answer, &scan.answer, sql);
+}
+
 /// A statement the rewrite does not answer reads 0 and 0: DataFusion's own
 /// `AggregateStatistics` answers a bare `COUNT(*)` and `MIN`, and the q08
 /// count over a tenant with no `.cstat` scans.

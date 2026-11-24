@@ -588,10 +588,9 @@ pub(crate) fn logical_aggregate_answerable<'a>(
 pub(crate) struct AdmittedAggregate<'a> {
     pub(crate) request: ColumnStatsRequest,
     /// One figure per distinct column a sum reads, or the one `<>` count of
-    /// q02; empty for a statement that reads no figure. `None` when the
-    /// figures cannot be decided from stamps: the q08 counts, an unknown
-    /// residual conjunct, or a q02 literal that is not already a constant of
-    /// the column's own scalar type.
+    /// q02. `None` when the figures cannot be decided from stamps: the q08
+    /// counts, an unknown residual conjunct, or a q02 literal that is not
+    /// already a constant of the column's own scalar type.
     pub(crate) stamp_figures: Option<Vec<StampFigure<'a>>>,
 }
 
