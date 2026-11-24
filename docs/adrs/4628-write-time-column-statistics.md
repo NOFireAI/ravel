@@ -1098,9 +1098,11 @@ In the readers and the resolver:
   `stamp_equal_count` gives no stamp answer for that segment. The segment
   falls to the granted `.cstat` entry, or the statement scans. Decode does
   not yet refuse such a stamp (issue #4672), and this check does not
-  replace that clause. The mirror case is refused neither here nor at
-  decode: a zero count equal to the non-null count beside a min or max
-  that is not the zero. Issue #4672 tracks it with the decode clause.
+  replace that clause. The mirror case is refused only in part: decode
+  refuses a zero count above zero when the zero lies outside the min and
+  max (`with_zero_count`), and nothing refuses a zero count equal to the
+  non-null count when the zero lies inside a min and max that are not both
+  the zero. Issue #4672 tracks that remainder with the decode clause.
 
 At the result type, `sum_array`, `sum_count_array` and `count_to_i64`
 decline a total the result type cannot hold, so the scan raises its own
