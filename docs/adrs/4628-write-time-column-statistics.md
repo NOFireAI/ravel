@@ -386,7 +386,8 @@ limit, not an answer change, and is left for a follow-up.
 **One carrier per segment per column.** For each touched segment the reader
 resolves a figure from exactly one source:
 
-1. the segment's stamp, when the stamp carries the field; otherwise
+1. the segment's stamp, when the stamp carries the field (the figure, for a
+   not-equal count; see the stamp-path guards amendment below); otherwise
 2. the `.cstat` entry, when one is loaded and `merged_view_entry` grants it
    (the rule in force today); otherwise
 3. nothing, and the whole statement scans.
@@ -408,7 +409,8 @@ gate they already call (`metadata_rewrite_stats_are_exact`).
 
 - `SUM(col + k)`, `AVG(col)` and `exact_sum_count(col)`: the sum of the
   per-segment sums in `i128` and the sum of the non-null counts, exactly
-  the inputs `sum_scalar`, `avg_scalar` and `sum_count_batch` take today.
+  the inputs `sum_scalar`, `avg_scalar` and `sum_count_batch` take today
+  (renamed since; see the stamp-path guards amendment below).
 - `COUNT(*) WHERE col <> lit`: per segment, the count of rows equal to
   `lit` is the zero count when `lit` is the zero, 0 when `lit` lies outside
   `[min, max]`, and the non-null count when `min == max == lit`. Any other
@@ -452,10 +454,10 @@ counter and not only as a slow statement.
 
 | Condition | Enforced by |
 |---|---|
-| A pending erasure on the snapshot | `metadata_rewrite_stats_are_exact` (`self.erasure.is_empty()`) in `logs_scan/mod.rs`, and `logs_column_stats_eligible` in `executor.rs` before any plan is built |
+| A pending erasure on the snapshot | `metadata_rewrite_stats_are_exact` (`self.erasure.is_empty()`) in `logs_scan/mod.rs`, and `logs_column_stats_eligible` in `executor.rs` before any plan is built; for a stamp answer only the first (see the stamp-path guards amendment below) |
 | A stale statistic that could hold an erased row | the pending-erasure gate of the first row. No erasure step recomputes or removes `.cstat`, the commit-record stamps or the `.csnap` stamps, and the old values leave only when the sweep deletes the old objects (`ravel-maintain/src/sweep.rs:1306`). Rewrite outputs carry no stamp: written empty (`ravel-maintain/src/erasure_rewrite.rs:1595`, `:1746`) and forced empty in `ravel-catalog/src/fold.rs:911` (the rewrite snapshot entry) and `ravel-catalog/src/catalog.rs:6215` (the live rewrite `SegmentRef`). Read in #3231 comment 7094007593; line numbers re-checked on `origin/main` `476b3ad1b`. See the paragraph below |
 | A pinned commit token admitting a segment the statistics do not cover | coverage is per segment of the snapshot being queried: `derive_l0` stamps a token-resolved record from itself, and the reader loops return `None` at the first segment with no usable figure |
-| A total that leaves the result type | `sum_scalar` (`checked_mul`, `checked_add`, then the `i64` conversion) and `count_to_i64` in `metadata_agg.rs` decline; for `exact_sum_count` the projection's own check raises the same `IntegerSumOverflow` on both paths |
+| A total that leaves the result type | `sum_scalar` (renamed since; see the stamp-path guards amendment below) (`checked_mul`, `checked_add`, then the `i64` conversion) and `count_to_i64` in `metadata_agg.rs` decline; for `exact_sum_count` the projection's own check raises the same `IntegerSumOverflow` on both paths |
 | A ts bound that clips a segment, a content predicate, a row filter, a key equality, a prune arm other than `NumNotEq` | `metadata_rewrite_stats_are_exact`, unchanged |
 | A defective entry | dropped at decode by the clauses in decision 2, counted, and the segment reads as uncovered |
 
@@ -476,7 +478,8 @@ not retire under a snapshot that can still resolve one, and
 - Every `.dreq` under `del/` becomes a pending erasure on the resolved
   snapshot (`list_pending_erasure`, `catalog.rs:4656`), and a pending
   erasure refuses the metadata-only answers this ADR's readers give
-  (`logs_column_stats_eligible`, `executor.rs:5585`;
+  (`logs_column_stats_eligible`, `executor.rs:5585`, which does not refuse
+  a stamp answer: see the stamp-path guards amendment below;
   `metadata_rewrite_stats_are_exact`, `logs_scan/mod.rs:2549`; both in
   `crates/ravel-sql/src`).
 - The sweep's documentation states that it keeps a `.dreq` until its
@@ -503,7 +506,8 @@ to decline for any segment a listed rewrite record supersedes.
 
 On the sum overflow of #3847: a per-object sum can no longer overflow,
 because it is kept in `i128`. What can overflow is the statement's total
-against its `i64` result type, and that still declines at `sum_scalar`, so
+against its `i64` result type, and that still declines at `sum_scalar`
+(renamed since; see the stamp-path guards amendment below), so
 the scan produces the error. #3847's open defect (the scan's per-row
 `col + k` wraps before `sum` sees it) is not changed by this ADR. The
 `SUM(col + k)` shapes here go through `exact_sum_count`, which does not
@@ -1004,3 +1008,111 @@ sized for one executor in under four hours. Every spec declares its
   on the box approved 2026-11-22 (question 7).
 
 Refs: #4628, #3231, #4651, #850, #861, #873, #3243, #3244, #1848, #3847
+
+## Amendment (2026-11-24): the stamp-path guards and the not-equal cases
+
+<!-- amendment-applies: sections="5. Planner use, and composition with `.cstat`|6. Exactness: what forces the scan, and where" pointer="stamp-path guards amendment" -->
+<!-- amendment-supersedes: phrase="when the stamp carries the field" pointer="stamp-path guards amendment" -->
+<!-- amendment-supersedes: phrase="`logs_column_stats_eligible` in `executor.rs` before any plan is built" pointer="stamp-path guards amendment" -->
+<!-- amendment-supersedes: phrase="`logs_column_stats_eligible`, `executor.rs:5585`" pointer="stamp-path guards amendment" -->
+<!-- amendment-supersedes: phrase="`sum_scalar`" pointer="stamp-path guards amendment" -->
+<!-- amendment-supersedes: phrase="`avg_scalar`" pointer="stamp-path guards amendment" -->
+<!-- amendment-supersedes: phrase="`sum_count_batch`" pointer="stamp-path guards amendment" -->
+
+Task T5a (issue #4684) landed the stamp-first readers of decision 5 in
+`crates/ravel-sql`. Read against that code, decisions 5 and 6 are wrong in
+four places. This amendment corrects those four places, lists the checks
+that now guard a stamp answer, and states what changes on existing stores.
+It changes no format and no other decision.
+
+**1. Decision 5, carrier 1: the stamp answers when it carries the figure.**
+The figure for `SUM(col)`, `SUM(col + k)`, `AVG(col)` and
+`exact_sum_count(col)` is the sum (field 6 or 7). The figure for
+`COUNT(*) WHERE col <> lit` is the count of rows equal to `lit`, and only
+one of its three cases needs a new field. The zero case needs field 8. The
+other two need only the extrema and the null count that ADR-0873 already
+stamps: 0 rows equal when `lit` lies outside `[min, max]` or the column has
+no non-null row, and every non-null row when `min == max == lit`. So a
+stamp written before this ADR answers those two cases. A literal is
+compared only as the column's own scalar type (`Int64` for I64, `Boolean`
+for BOOL). The one resolver is `resolve_segment_figure` in
+`crates/ravel-sql/src/logs_scan/mod.rs`. It returns the figure together
+with its carrier (`FigureCarrier::Stamp` or `FigureCarrier::Cstat`).
+
+**2. Decision 6, the pending-erasure row: the load gate does not guard a
+stamp answer.** `logs_column_stats_eligible` in `executor.rs` decides
+whether the `.cstat` load runs. A stamp answer reads no `.cstat`, so a
+refused load no longer refuses it. For a stamp answer, the pending-erasure
+check is `metadata_rewrite_stats_are_exact` alone. The same correction
+applies to the bullet under "On the stale statistic" that names both
+functions. The load gate still guards every `.cstat` figure, and the
+`GROUP BY` counts, which read only `.cstat`.
+
+**3. Decision 6 has no row for the rewrite's own refusals, and a stamp
+answer depends on them.** The checks below are the only guard on a stamp
+answer. They all run while the plan is built. Nothing checks a stamp
+answer again at execution.
+
+In `LogsScanExec::metadata_rewrite_stats_are_exact`
+(`crates/ravel-sql/src/logs_scan/mod.rs`), which both readers,
+`declared_column_sum` and `declared_not_equal_count`, call before they
+read any stamp. A stamp answer is refused when the scan has any of these:
+
+- a pending erasure on the resolved snapshot (`self.erasure`);
+- a content predicate;
+- a prune arm other than `NumNotEq` (`prune_is_rewrite_neutral`);
+- an exact-key equality (`key_equals`) or a key `IN` (`key_in`);
+- a row filter (`row_filters`);
+- a ts bound that does not contain every touched segment.
+
+In the rule's `rewrite` (`crates/ravel-sql/src/metadata_agg.rs`):
+
+| Refused | Check |
+|---|---|
+| A pushed fetch on any node from the final aggregate down to the scan, the scan included | `shuffle_child` above the raw aggregate; the walk below it |
+| A node between the raw aggregate and the scan other than `FilterExec`, `CoalescePartitionsExec`, `CooperativeExec` or `RepartitionExec`, and more than one `FilterExec` | `classify_scan_chain` and the walk |
+| A grouping set, or a group key that is not one plain column. The one grouped shape is the q08 count, which reads `.cstat` only | `group_index` |
+| An aggregate other than `COUNT(*)`, `SUM(col)`, `SUM(col + <integer literal>)`, `AVG(col)` or `exact_sum_count(col)`, a `DISTINCT`, a per-aggregate `FILTER`, a NULL literal or a cast on the column | `classify_aggregate`, `stats_aggregate`, `physical_arg` |
+| For the not-equal count, a filter that is not exactly one `<declared column> <> <non-null literal>`; for the sums, any filter | `not_equal_literal`, and the shape arms of `rewrite` |
+| A column that is not declared on the scan | `declared_index_for_output` |
+
+In the readers and the resolver:
+
+- A sum needs an I64 column. A not-equal count needs a column that is not
+  `Str`, and a literal of the column's own scalar type
+  (`literal_stat_value`).
+- `stamp_coverage` needs the stamp's type to equal the column's declared
+  type, with value kinds that match.
+- A segment with no figure from either carrier declines the whole
+  statement (`resolve_segment_figure`).
+
+At the result type, `sum_array`, `avg_array`, `sum_count_array` and
+`count_to_i64` decline a total the result type cannot hold, so the scan
+raises its own error.
+
+**4. Renamed functions.** `sum_scalar`, `avg_scalar` and `sum_count_batch`
+are now `sum_array`, `avg_array` and `sum_count_array` in
+`crates/ravel-sql/src/metadata_agg.rs`. Their checks are unchanged.
+`sum_array` declines a total outside `i64`, so the scan raises
+`IntegerSumOverflow`. `sum_count_array` declines a sum outside
+`Decimal128(38, 0)` or a count outside `i64`, and the projection raises
+the same error on both paths.
+
+**Behaviour change on existing stores.** Before T5a, `COUNT(*) WHERE col <>
+lit` on a declared I64 column needed, for every touched segment, a loaded
+`.cstat` entry with its value dictionary, and a stamp whose min, max and
+null count matched that entry (`merged_view_entry`). After T5a, a segment
+answers from its stamp alone when its stamp puts `lit` outside `[min, max]`
+or has `min == max == lit`. This is true of any stamp written since
+ADR-0873, on folded and unfolded catalogs, and the answer needs no `.cstat`
+load and no data-object GET. On a BOOL column, `<> false` and `<> true`
+reach the rule as the filters `f` and `NOT f`, so both still scan.
+
+Such an answer trusts the stamp's min, max and null count and the segment's
+`sample_count`. `MIN`, `MAX` and `COUNT(col)` have answered from the same
+figures since ADR-0873. The matching `.cstat` entry was a second witness
+for the not-equal count, and it no longer applies in these two cases. What
+protects the answer is the producers' correctness and the decode-time
+clauses of ADR-0873 and decision 2. No reader compares a stamp with the
+rows of its object. No `SUM` or `AVG` answer changes on an existing store:
+no producer writes fields 6 to 8 before tasks T3 and T4.
