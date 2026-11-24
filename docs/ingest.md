@@ -1322,8 +1322,10 @@ stamp holds the column's min, max and null count over the rows the record
 covers, read through the merged view (the record's own attribute, else the
 stream's resource or scope value), and, from ADR-4628, the exact sum of its
 non-null values (`I64` only; field 6 when it fits i64, else the 16-byte
-`sum_wide`) and its zero count, the non-null rows equal to 0 or false. A
-column with no non-null row stamps a sum of 0 and a zero count of 0. The
+`sum_wide`) and its zero count, the non-null rows equal to 0 or false. An
+`I64` column with no non-null row stamps a sum of 0, and any column with no
+non-null row stamps a zero count of 0; a `BOOL` column never carries a sum.
+The
 row and columnar write paths fold the same figures, and `ravel-cli load`
 writes through the same flush. The running figures are folded as each
 write merges into the shard buffer, so their cost falls in the `merge`
