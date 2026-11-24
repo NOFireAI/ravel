@@ -993,6 +993,25 @@ enum Command {
         /// anything but exhaustive.
         #[arg(long, value_enum, value_name = "CHOICE", default_value_t)]
         page_choice: ravel_cli::load::LoadPageChoice,
+        /// Withhold the declared-column stamp's sum and zero count (fields 6
+        /// to 8, ADR-4628) from the commit records this logs load writes. The
+        /// min, max and null count are still written. On an unfolded catalog,
+        /// SUM, AVG and a `<> 0` count where 0 lies inside a segment's min
+        /// and max then scan those segments; on a folded one the `.cstat`
+        /// statistics can still answer them.
+        ///
+        /// Set it when the commit records sit under an Object Lock: a sum
+        /// written to a locked record stays until that record's retain-until
+        /// (ADR-4628 question 6b). It changes only the records this load
+        /// writes: a later compaction of these segments by a process that
+        /// does not withhold recomputes the fields from the rows.
+        ///
+        /// The summary's `stamp aggregates` line and the report JSON's
+        /// `declared_stat_aggregates` field say which the load wrote. A
+        /// metrics or spans load writes no stamp, ignores this flag and warns
+        /// when it is set.
+        #[arg(long = "no-declared-stat-aggregates", action = clap::ArgAction::SetFalse)]
+        emit_declared_stat_aggregates: bool,
         /// The bytes of built batches a logs load may hold at once (issue
         /// #2626). Every batch is charged before it is built, at an estimate
         /// from the previous batch's bytes per row (zero for the first batch),
@@ -3143,6 +3162,15 @@ enum CatalogCommand {
         /// alone: no part object is fetched.
         #[arg(long)]
         json: bool,
+        /// Under each part's `stamps:` census line, print every decoded entry's
+        /// identity (level, shard, ingest hour, writer id, epoch and sequence)
+        /// followed by its declared-column stamp lines: each wire entry with
+        /// its min, max, null count, sum, wide sum and zero count, then
+        /// `stamp: entries=<n> kept=<k>`, where kept counts the entries a
+        /// reader keeps after validation. Not with `--json`, which reads HEAD
+        /// alone.
+        #[arg(long, conflicts_with = "json")]
+        entries: bool,
     },
     /// Re-list sealed commit records for one (tenant, signal) and diff against
     /// that signal's snapshot; exits nonzero if the snapshot mismatches sealed
@@ -3722,6 +3750,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant,
                     signal,
                     json,
+                    entries,
                 },
         } => {
             catalog::inspect(
@@ -3730,6 +3759,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 &tenant,
                 signal,
                 json,
+                entries,
             )
             .await
         }
@@ -4595,6 +4625,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             group_target_blocks,
             chunk_order,
             page_choice,
+            emit_declared_stat_aggregates,
             load_memory_bytes,
             fold_after_load,
             ipcrypt_config,
@@ -4637,6 +4668,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 group_target_blocks,
                 chunk_order.unwrap_or_default(),
                 page_choice,
+                ravel_cli::load::DeclaredStatAggregates::from_emit(emit_declared_stat_aggregates),
                 load_memory_bytes,
                 fold_after_load,
                 &ipcrypt,
@@ -5635,26 +5667,45 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
 fn commit_decode(bytes: &[u8]) -> anyhow::Result<()> {
     let record = ravel_commit::record::decode(bytes)
         .map_err(|err| anyhow::anyhow!("failed to decode commit record: {err}"))?;
-    println!("format_version: {}", record.format_version);
-    println!("tenant_hash: {}", hex::encode(&record.tenant_hash));
-    println!("signal: {}", record.signal);
-    println!("shard: {}", record.shard);
-    println!("writer_id: {}", record.writer_id);
-    println!("writer_epoch: {}", record.writer_epoch);
-    println!("writer_seq: {}", record.writer_seq);
-    println!("object_key: {}", record.object_key);
-    println!("object_size: {}", record.object_size);
-    println!("content_hash: {}", hex::encode(&record.content_hash));
-    println!("sample_count: {}", record.sample_count);
-    println!("series_count: {}", record.series_count);
-    println!("min_event_ts_ns: {}", record.min_event_ts_ns);
-    println!("max_event_ts_ns: {}", record.max_event_ts_ns);
-    println!("min_ingest_ts_ns: {}", record.min_ingest_ts_ns);
-    println!("max_ingest_ts_ns: {}", record.max_ingest_ts_ns);
-    println!("segment_format_version: {}", record.segment_format_version);
-    println!("created_unix_ns: {}", record.created_unix_ns);
-    println!("ingest_hour_bucket: {}", record.ingest_hour_bucket);
+    for line in commit_decode_lines(&record) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// The lines [`commit_decode`] prints for a decoded record: its scalar fields,
+/// then its declared-column stamp (field 20).
+fn commit_decode_lines(record: &ravel_proto::commit::v1::CommitRecord) -> Vec<String> {
+    let mut lines = vec![
+        format!("format_version: {}", record.format_version),
+        format!("tenant_hash: {}", hex::encode(&record.tenant_hash)),
+        format!("signal: {}", record.signal),
+        format!("shard: {}", record.shard),
+        format!("writer_id: {}", record.writer_id),
+        format!("writer_epoch: {}", record.writer_epoch),
+        format!("writer_seq: {}", record.writer_seq),
+        format!("object_key: {}", record.object_key),
+        format!("object_size: {}", record.object_size),
+        format!("content_hash: {}", hex::encode(&record.content_hash)),
+        format!("sample_count: {}", record.sample_count),
+        format!("series_count: {}", record.series_count),
+        format!("min_event_ts_ns: {}", record.min_event_ts_ns),
+        format!("max_event_ts_ns: {}", record.max_event_ts_ns),
+        format!("min_ingest_ts_ns: {}", record.min_ingest_ts_ns),
+        format!("max_ingest_ts_ns: {}", record.max_ingest_ts_ns),
+        format!("segment_format_version: {}", record.segment_format_version),
+        format!("created_unix_ns: {}", record.created_unix_ns),
+        format!("ingest_hour_bucket: {}", record.ingest_hour_bucket),
+    ];
+    let kept = ravel_commit::declared_stats::read_commit_record(record)
+        .covered()
+        .len();
+    lines.extend(catalog::declared_stamp_lines(
+        &record.declared_column_stats,
+        kept,
+        "",
+    ));
+    lines
 }
 
 /// One `catalog list --json` line. The level is its plain name, never the
@@ -5796,8 +5847,8 @@ mod tests {
 
     use super::rspan_status_mask_names;
     use super::{
-        BloomScopeCommand, Cli, ClusteringKeyCommand, Command, TypedAttrColumnCommand,
-        key_index_columns, tenancy,
+        BloomScopeCommand, CatalogCommand, Cli, ClusteringKeyCommand, Command,
+        TypedAttrColumnCommand, commit_decode_lines, key_index_columns, tenancy,
     };
     use ravel_rspan::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
 
@@ -6704,6 +6755,172 @@ mod tests {
         }
     }
 
+    /// `commit decode` prints every scalar line it printed before, in order,
+    /// then the record's field 20 stamp: the wire entries (a both-sums entry
+    /// included) and `kept` from `read_commit_record`, compared whole.
+    #[test]
+    fn commit_decode_prints_the_scalar_lines_then_the_stamp() {
+        use ravel_proto::commit::v1::declared_column_stat_value::Kind;
+        use ravel_proto::commit::v1::{
+            CommitRecord, DeclaredColumnMinMax, DeclaredColumnStatValue,
+        };
+        let i64v = |v| {
+            Some(DeclaredColumnStatValue {
+                kind: Some(Kind::I64(v)),
+            })
+        };
+        let wide = 10 * (1i128 << 62);
+        let record = CommitRecord {
+            format_version: 1,
+            tenant_hash: vec![0xAB; 16],
+            signal: 3,
+            shard: 2,
+            writer_id: "w".to_string(),
+            writer_epoch: 4,
+            writer_seq: 5,
+            object_key: "t/k/l/l0/x.rlog".to_string(),
+            object_size: 6,
+            content_hash: vec![0xCD; 2],
+            sample_count: 10,
+            series_count: 7,
+            min_event_ts_ns: 8,
+            max_event_ts_ns: 9,
+            min_ingest_ts_ns: 11,
+            max_ingest_ts_ns: 12,
+            segment_format_version: 13,
+            created_unix_ns: 14,
+            ingest_hour_bucket: 15,
+            declared_column_stats: vec![
+                DeclaredColumnMinMax {
+                    name: "AdvEngineID".to_string(),
+                    declared_type: 2,
+                    min: i64v(0),
+                    max: i64v(3),
+                    null_count: 0,
+                    sum: Some(12),
+                    sum_wide: Vec::new(),
+                    zero_count: Some(4),
+                },
+                DeclaredColumnMinMax {
+                    name: "UserID".to_string(),
+                    declared_type: 2,
+                    min: i64v(1 << 62),
+                    max: i64v(1 << 62),
+                    null_count: 0,
+                    sum: None,
+                    sum_wide: wide.to_le_bytes().to_vec(),
+                    zero_count: None,
+                },
+                DeclaredColumnMinMax {
+                    name: "Both".to_string(),
+                    declared_type: 2,
+                    min: i64v(1 << 62),
+                    max: i64v(1 << 62),
+                    null_count: 0,
+                    sum: Some(1),
+                    sum_wide: wide.to_le_bytes().to_vec(),
+                    zero_count: None,
+                },
+            ],
+        };
+        let want: Vec<String> = [
+            "format_version: 1",
+            "tenant_hash: abababababababababababababababab",
+            "signal: 3",
+            "shard: 2",
+            "writer_id: w",
+            "writer_epoch: 4",
+            "writer_seq: 5",
+            "object_key: t/k/l/l0/x.rlog",
+            "object_size: 6",
+            "content_hash: cdcd",
+            "sample_count: 10",
+            "series_count: 7",
+            "min_event_ts_ns: 8",
+            "max_event_ts_ns: 9",
+            "min_ingest_ts_ns: 11",
+            "max_ingest_ts_ns: 12",
+            "segment_format_version: 13",
+            "created_unix_ns: 14",
+            "ingest_hour_bucket: 15",
+            "stamp[0]: name=\"AdvEngineID\" declared_type=2 (I64) min=0 max=3 null_count=0 \
+             sum=12 sum_wide=ABSENT zero_count=4",
+            "stamp[1]: name=\"UserID\" declared_type=2 (I64) min=4611686018427387904 \
+             max=4611686018427387904 null_count=0 sum=ABSENT sum_wide=46116860184273879040 \
+             zero_count=ABSENT",
+            "stamp[2]: name=\"Both\" declared_type=2 (I64) min=4611686018427387904 \
+             max=4611686018427387904 null_count=0 sum=1 sum_wide=46116860184273879040 \
+             zero_count=ABSENT",
+            "stamp: entries=3 kept=2",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        assert_eq!(commit_decode_lines(&record), want);
+    }
+
+    /// `load` carries `--no-declared-stat-aggregates` as the emit switch:
+    /// absent means emit, the flag withholds, and it takes no value.
+    #[test]
+    fn load_carries_the_declared_stat_aggregates_opt_out() {
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(
+                [
+                    "ravel",
+                    "load",
+                    "--parquet",
+                    "x.parquet",
+                    "--tenant",
+                    "acme",
+                    "--mapping",
+                    "m.toml",
+                ]
+                .iter()
+                .copied()
+                .chain(extra.iter().copied()),
+            )
+            .map(|cli| match cli.command {
+                Command::Load {
+                    emit_declared_stat_aggregates,
+                    ..
+                } => emit_declared_stat_aggregates,
+                _ => panic!("expected the load subcommand"),
+            })
+        };
+        assert!(parse(&[]).expect("no flag"), "absent means emit");
+        assert!(!parse(&["--no-declared-stat-aggregates"]).expect("the opt-out"));
+        let err = parse(&["--no-declared-stat-aggregates=true"]).expect_err("takes no value");
+        assert_eq!(err.kind(), clap::error::ErrorKind::TooManyValues, "{err}");
+    }
+
+    /// `catalog inspect --entries` parses, and with `--json` clap refuses it:
+    /// the JSON form reads HEAD alone and has no entries to list.
+    #[test]
+    fn catalog_inspect_entries_conflicts_with_json() {
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(
+                ["ravel", "catalog", "inspect", "--tenant", "acme"]
+                    .iter()
+                    .copied()
+                    .chain(extra.iter().copied()),
+            )
+            .map(|cli| match cli.command {
+                Command::Catalog {
+                    command: CatalogCommand::Inspect { entries, json, .. },
+                } => (entries, json),
+                _ => panic!("expected catalog inspect"),
+            })
+        };
+        assert_eq!(parse(&[]).expect("plain"), (false, false));
+        assert_eq!(parse(&["--entries"]).expect("entries"), (true, false));
+        let err = parse(&["--entries", "--json"]).expect_err("a conflict");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{err}"
+        );
+    }
+
     /// Issue #4409: `load` with no `--page-choice` writes the pages an
     /// explicit `--page-choice exhaustive` load writes, byte for byte, on a
     /// file where the estimated load's pages differ. The value clap resolves
@@ -6811,6 +7028,7 @@ mod tests {
                 ravel_ingest::RlogGroupTargetBlocks::DEFAULT,
                 ravel_ingest::RlogChunkOrder::DEFAULT,
                 choice,
+                ravel_cli::load::DeclaredStatAggregates::default(),
                 None,
                 false,
                 &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

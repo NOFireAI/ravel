@@ -662,6 +662,12 @@ pub struct LoadLayoutReport {
     /// which writes no RLOG object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_choice: Option<LoadPageChoice>,
+    /// Whether a logs load's commit records carry the declared-column stamp's
+    /// sum and zero count: `false` under `--no-declared-stat-aggregates`
+    /// (ADR-4628 decision 8). Absent from a metrics or spans load, which
+    /// writes no such stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_stat_aggregates: Option<bool>,
 }
 
 /// The prefix of the summary line carrying [`LoadLayoutReport`] as JSON.
@@ -834,6 +840,14 @@ pub fn render_layout_summary(report: &LoadLayoutReport) -> String {
     if let Some(choice) = report.page_choice {
         let _ = writeln!(out, "  page choice      : {}", choice.name());
     }
+    if let Some(emit) = report.declared_stat_aggregates {
+        let text = if emit {
+            "emitted"
+        } else {
+            "withheld (--no-declared-stat-aggregates)"
+        };
+        let _ = writeln!(out, "  stamp aggregates : {text}");
+    }
     match serde_json::to_string(report) {
         Ok(json) => {
             let _ = writeln!(out, "{LOAD_REPORT_JSON_PREFIX}{json}");
@@ -874,6 +888,46 @@ mod tests {
         ] {
             assert!(!text.contains("page choice"), "{text}");
             assert!(!text.contains("page_choice"), "{text}");
+        }
+    }
+
+    /// ADR-4628 decision 8: a logs load's summary names whether its stamps
+    /// carry the sum and zero count on one line and in one report JSON field;
+    /// a metrics or spans load prints neither.
+    #[test]
+    fn only_a_logs_summary_names_the_stamp_aggregates() {
+        for (value, line, json) in [
+            (
+                DeclaredStatAggregates::Emit,
+                "  stamp aggregates : emitted",
+                "\"declared_stat_aggregates\":true",
+            ),
+            (
+                DeclaredStatAggregates::Withhold,
+                "  stamp aggregates : withheld (--no-declared-stat-aggregates)",
+                "\"declared_stat_aggregates\":false",
+            ),
+        ] {
+            let logs = LoadReport {
+                declared_stat_aggregates: value,
+                ..LoadReport::default()
+            };
+            let text = render_layout_summary(&logs.layout_report());
+            assert_eq!(
+                text.lines()
+                    .filter(|l| l.contains("stamp aggregates"))
+                    .collect::<Vec<_>>(),
+                vec![line],
+                "{text}"
+            );
+            assert_eq!(text.matches(json).count(), 1, "{text}");
+        }
+        for text in [
+            render_layout_summary(&MetricsLoadReport::default().layout_report()),
+            render_layout_summary(&SpansLoadReport::default().layout_report()),
+        ] {
+            assert!(!text.contains("stamp aggregates"), "{text}");
+            assert!(!text.contains("declared_stat_aggregates"), "{text}");
         }
     }
 

@@ -514,6 +514,7 @@ max_ingest_ts_ns: 1732400060050000000
 segment_format_version: 7
 created_unix_ns: 1732400060123456789
 ingest_hour_bucket: 2025112718
+stamp: entries=0 kept=0
 ```
 
 A commit record never holds sample data. It is a small pointer plus enough
@@ -529,6 +530,83 @@ metadata to prune without opening the segment.
 - `signal` is the numeric signal code (`1` = metrics).
 - `ingest_hour_bucket` is the same hour that the key of the object encodes.
   The catalog groups listings by it.
+
+The last lines are the record's declared-column stamp (field 20): one
+`stamp[i]` line per entry, then `stamp: entries=<n> kept=<k>`. A metrics
+record carries none, as above. A logs record carries one entry for each
+declared `I64` or `BOOL` column it covers:
+
+```
+stamp[0]: name="AdvEngineID" declared_type=2 (I64) min=0 max=5 null_count=0 sum=21 sum_wide=ABSENT zero_count=4
+stamp[1]: name="ResolutionWidth" declared_type=2 (I64) min=1000 max=1009 null_count=0 sum=10045 sum_wide=ABSENT zero_count=0
+stamp[2]: name="UserID" declared_type=2 (I64) min=4611686018427387904 max=4611686018427387913 null_count=0 sum=ABSENT sum_wide=46116860184273879085 zero_count=0
+stamp: entries=3 kept=3
+```
+
+- Each line prints the entry as stored, before any validation. A field the
+  entry does not carry prints `ABSENT`, never `0`.
+- `sum` is the exact sum of the column's non-null values when it fits a
+  64-bit integer, and `sum_wide` the same sum when it does not, printed as
+  an exact decimal. A 16-byte `sum_wide` prints as its decimal;
+  any other length prints `INVALID(<n> bytes)`. A valid entry never carries
+  both, so an entry that does is printed with both and is dropped by the
+  reader.
+- `zero_count` counts the non-null rows equal to 0 (or `false`).
+- An entry written by a release that predates the sum and zero count, or
+  by a load run with `--no-declared-stat-aggregates`, has `sum=ABSENT
+  sum_wide=ABSENT zero_count=ABSENT`. On an unfolded catalog a query over
+  that segment then scans for `SUM`, `AVG` and a `<> 0` count where 0 lies
+  inside the segment's min and max.
+- `kept` counts the entries the query reader keeps after checking them
+  against the record's row count. `kept` below `entries` means the reader
+  dropped an entry as inconsistent.
+
+`commit decode-compaction` prints the same lines for each output part,
+indented under that part's line, with `kept` from the part's own row count.
+
+## `catalog inspect`
+
+The command decodes a signal's catalog HEAD and every snapshot part it
+names. For each part, after the `entries (decoded):` count, it prints a
+census of the declared-column stamps the part's entries carry:
+
+```sh
+ravel-cli catalog inspect --tenant acme --signal logs
+```
+
+```
+  part[0] range=0..=496953 key=t/3f2a.../catalog/l/snap/....csnap blake3=... size=... entry_count=3
+    ...
+    entries (decoded): 3
+    stamps: entries=3 stamped=2 with_sum=1 with_sum_wide=1 with_zero_count=1
+```
+
+- `stamped` counts the entries with at least one stamp entry.
+- Each `with_` figure counts the entries with at least one stamp entry
+  that carries that field: `with_sum` the narrow sum, `with_sum_wide` the
+  wide sum, `with_zero_count` the zero count. An entry sealed from records
+  that carry no sum or zero count, such as records written under
+  `--no-declared-stat-aggregates`, counts in `stamped` and in none of them.
+
+`--entries` adds, under the census, each entry's identity and its stamp
+lines, in the form `commit decode` prints them. `kept` there counts what
+the query reader keeps of the entry's stamp:
+
+```sh
+ravel-cli catalog inspect --tenant acme --signal logs --entries
+```
+
+```
+    stamps: entries=3 stamped=2 with_sum=1 with_sum_wide=1 with_zero_count=1
+      entry[0] level=0 shard=0 ingest_hour_bucket=496953 writer_id=0101... writer_epoch=1 writer_seq=1
+        stamp[0]: name="AdvEngineID" declared_type=2 (I64) min=0 max=3 null_count=0 sum=12 sum_wide=ABSENT zero_count=4
+        stamp: entries=1 kept=1
+      ...
+```
+
+The entry is named by its identity, not by its data object key. `--entries`
+cannot be combined with `--json`, which reads HEAD alone and fetches no
+part.
 
 ## `inspect cstat`
 

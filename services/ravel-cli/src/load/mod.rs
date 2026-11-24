@@ -358,6 +358,8 @@ mod hour_stride;
 pub use hour_stride::*;
 mod page_choice;
 pub use page_choice::*;
+mod declared_stat_aggregates;
+pub use declared_stat_aggregates::*;
 
 /// Result of a successful (or partially-durable) load, for the summary output.
 #[derive(Debug, Clone, Default)]
@@ -475,6 +477,9 @@ pub struct LoadReport {
     /// The page choice every RLOG object this load wrote was sealed with
     /// (`--page-choice`, issue #4212).
     pub page_choice: LoadPageChoice,
+    /// Whether the commit records this load wrote carry the stamp's sum and
+    /// zero count (`--no-declared-stat-aggregates`, ADR-4628 decision 8).
+    pub declared_stat_aggregates: DeclaredStatAggregates,
     /// The logs pipeline's per-stage timing breakdown (ADR-0104 decision 1),
     /// snapshotted once the load finished. Present only under the
     /// `stage-timing` feature; with it off this field does not exist, so a
@@ -551,6 +556,7 @@ impl LoadReport {
             decode_wait_ms: Some(whole_millis(self.decode_wait)),
             write_wait_ms: Some(whole_millis(self.write_wait)),
             page_choice: Some(self.page_choice),
+            declared_stat_aggregates: Some(self.declared_stat_aggregates.emits()),
         }
     }
 }
