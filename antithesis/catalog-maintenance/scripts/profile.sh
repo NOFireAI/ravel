@@ -29,13 +29,10 @@ case "$WORKLOAD_PROFILE" in
         # It runs the whole catalog-maintenance workload as well, so it owns
         # the catalog area too.
         PROFILE_OWNED_TSV="catalog resharding maintenance"
-        # The first is reached only by the divergent-input record race, D5
-        # item 7 of the #4340 step 5 decision; the second only when a
-        # maintain worker warm-starts from a peer's memo snapshot, which the
-        # local loop does not force (antithesis/reshard-ownership/README.md,
-        # "The expected set").
-        PROFILE_PENDING="maintenance: a loser observing a divergent input-set hash fails closed and never overwrites the record
-maintenance: a seeded memo entry is never fresher than its snapshot"
+        # Reached only when a maintain worker warm-starts from a peer's memo
+        # snapshot, which the local loop does not force
+        # (antithesis/reshard-ownership/README.md, "The expected set").
+        PROFILE_PENDING="maintenance: a seeded memo entry is never fresher than its snapshot"
         ;;
     *)
         echo "refused: WORKLOAD_PROFILE is '$WORKLOAD_PROFILE', not catalog-maintenance or reshard-ownership" >&2
