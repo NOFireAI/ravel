@@ -4829,10 +4829,11 @@ expect_check_err "check series si8: the switch off leaves the series figures mis
 
 # The Ravel-only history band file (issue #3941's pre-registration) against
 # case ro8's run: its L0 listing reached the deadline at 120013 ms, its L1
-# read-back matched in 12 ms with 40 GETs on its series listing (100 over
-# the whole read-back), and the object counts are set to
-# history's (87,608 L0 data objects, 24 L1 parts). A copy with the L1
-# listing at 40000 ms is out of band.
+# read-back matched in 12 ms. The case sets the counts to history's after
+# #4645: 87,608 L0 data objects, 120 L1 parts and 300 GETs on the series
+# listing (ro8 itself has 40). A copy with the L1 listing at 40000 ms is
+# out of band, and so is one with 25 L1 parts and 40 listing GETs, below
+# both lower bounds.
 RO_BANDS="${HERE}/../stage1-bands.ravel-only.history.json"
 RO_FIGURES="$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["figures"]))' "${RO_BANDS}")"
 rm -rf "${TMP}/check-ro" && cp -R "${TMP}/ro8/out" "${TMP}/check-ro"
@@ -4853,6 +4854,12 @@ run_check ro-slow-l1 "${RO_BANDS}" "${TMP}/check-ro"
 expect_rc "check ravel-only L1 listing at 40000 ms" 1
 expect_check_err "check ravel-only: the L1 listing at 40000 ms is out of band" 'out of band ravel_only_l1_series_query_ms = 40000 not in [0, 30000] (stamps.json ravel_only.l1.series_query_ms)'
 expect_check_err "check ravel-only: one failure counted" "stage1-check: 1 of ${RO_FIGURES} figures failed"
+python3 -I -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); l1=d["ravel_only"]["l1"]; l1["series_query_ms"]=12; l1["objects"]["l1"]["count"]=25; l1["readback"]["series_store_get_calls"]=40; json.dump(d,open(p,"w"))' "${TMP}/check-ro/stamps.json"
+run_check ro-low-l1 "${RO_BANDS}" "${TMP}/check-ro"
+expect_rc "check ravel-only L1 parts and listing GETs below their lower bounds" 1
+expect_check_err "check ravel-only: 25 L1 parts is below the band" 'out of band ravel_only_l1_parts = 25 not in [76, 260] (stamps.json ravel_only.l1.objects.l1.count)'
+expect_check_err "check ravel-only: 40 listing GETs is below the band" 'out of band ravel_only_l1_series_store_get_calls = 40 not in [150, 800] (stamps.json ravel_only.l1.readback.series_store_get_calls)'
+expect_check_err "check ravel-only: two failures counted" "stage1-check: 2 of ${RO_FIGURES} figures failed"
 
 # The arms' bands: every figure in band on case za's run, every arm on, but
 # the reference prune band, n/a since the extra-hour and l1 arms changed the
