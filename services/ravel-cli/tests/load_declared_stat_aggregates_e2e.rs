@@ -1354,3 +1354,87 @@ async fn migrate_withholds_the_stamp_aggregates_with_the_flag() {
     }
     assert_statements_over_parts(&emitted, &withheld, 2, "migrate").await;
 }
+
+/// Runs the built binary's `maintain <args>` against an explicit
+/// `--store memory`, returning whether it exited zero, its stdout and its
+/// stderr.
+fn run_maintain_binary(args: &[&str]) -> (bool, String, String) {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"));
+    for (key, _) in std::env::vars() {
+        if key.starts_with("RAVEL_") {
+            cmd.env_remove(key);
+        }
+    }
+    let out = cmd
+        .args(["--store", "memory", "--tenant-hash-unkeyed", "maintain"])
+        .args(args)
+        .output()
+        .expect("ravel-cli runs");
+    (
+        out.status.success(),
+        String::from_utf8(out.stdout).expect("utf8 stdout"),
+        String::from_utf8(out.stderr).expect("utf8 stderr"),
+    )
+}
+
+/// The built binary carries the parsed flag from `main`'s dispatch into the
+/// config each maintain producer runs with: the settings line, read off that
+/// config, says `emitted` without the flag and `withheld` with it. On the
+/// empty store `compact-bucket` and `compact-tenant` find nothing to do and
+/// exit zero; `migrate` prints its settings and then fails on the missing
+/// provisioning record.
+#[test]
+fn the_binary_maintain_producers_report_the_stamp_aggregate_choice() {
+    let commands: [(&[&str], bool); 3] = [
+        (
+            &[
+                "compact-bucket",
+                "--tenant",
+                "acme",
+                "--signal",
+                "logs",
+                "--shard",
+                "0",
+                "--hour",
+                "100",
+            ],
+            true,
+        ),
+        (
+            &[
+                "compact-tenant",
+                "--tenant",
+                "acme",
+                "--signal",
+                "logs",
+                "--shards",
+                "1",
+            ],
+            true,
+        ),
+        (
+            &[
+                "migrate", "--tenant", "acme", "--signal", "logs", "--shards", "1",
+            ],
+            false,
+        ),
+    ];
+    for (command, succeeds) in commands {
+        for (extra, want) in [
+            (None, "declared_stat_aggregates: emitted"),
+            (
+                Some("--no-declared-stat-aggregates"),
+                "declared_stat_aggregates: withheld",
+            ),
+        ] {
+            let mut args = command.to_vec();
+            args.extend(extra);
+            let (ok, stdout, stderr) = run_maintain_binary(&args);
+            assert_eq!(ok, succeeds, "{args:?}: {stdout}{stderr}");
+            if !succeeds {
+                assert!(stderr.contains("no provisioning record exists"), "{stderr}");
+            }
+            assert_eq!(settings_lines(&stdout), [want], "{args:?}: {stdout}");
+        }
+    }
+}

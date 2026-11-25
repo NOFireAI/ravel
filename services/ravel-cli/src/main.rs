@@ -6957,6 +6957,69 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::TooManyValues, "{err}");
     }
 
+    /// `maintain compact-bucket`, `compact-tenant` and `migrate` each carry
+    /// `--no-declared-stat-aggregates` as the emit switch: absent means emit,
+    /// the flag withholds, and it takes no value.
+    #[test]
+    fn maintain_producers_carry_the_declared_stat_aggregates_opt_out() {
+        let commands: [&[&str]; 3] = [
+            &[
+                "compact-bucket",
+                "--tenant",
+                "acme",
+                "--signal",
+                "logs",
+                "--shard",
+                "0",
+                "--hour",
+                "100",
+            ],
+            &["compact-tenant", "--tenant", "acme", "--signal", "logs"],
+            &["migrate", "--tenant", "acme", "--signal", "logs"],
+        ];
+        for command in commands {
+            let parse = |extra: &[&str]| {
+                Cli::try_parse_from(
+                    ["ravel", "maintain"]
+                        .iter()
+                        .chain(command.iter())
+                        .chain(extra.iter())
+                        .copied(),
+                )
+                .map(|cli| match cli.command {
+                    Command::Maintain {
+                        command:
+                            super::MaintainCommand::CompactBucket {
+                                emit_declared_stat_aggregates,
+                                ..
+                            }
+                            | super::MaintainCommand::CompactTenant {
+                                emit_declared_stat_aggregates,
+                                ..
+                            }
+                            | super::MaintainCommand::Migrate {
+                                emit_declared_stat_aggregates,
+                                ..
+                            },
+                    } => emit_declared_stat_aggregates,
+                    _ => panic!("expected a maintain producer"),
+                })
+            };
+            let name = command[0];
+            assert!(parse(&[]).expect("no flag"), "{name}: absent means emit");
+            assert!(
+                !parse(&["--no-declared-stat-aggregates"]).expect("the opt-out"),
+                "{name}: the flag withholds"
+            );
+            let err = parse(&["--no-declared-stat-aggregates=true"]).expect_err("takes no value");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::TooManyValues,
+                "{name}: {err}"
+            );
+        }
+    }
+
     /// `catalog inspect --entries` parses, and with `--json` clap refuses it:
     /// the JSON form reads HEAD alone and has no entries to list.
     #[test]
