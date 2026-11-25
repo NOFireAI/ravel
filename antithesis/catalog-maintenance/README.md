@@ -1126,8 +1126,8 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   read, 60 s for each of up to 25 clock moves, 150 s for the wait after the
   window jump, 960 s for the early multiset check, and 2380 s for a drawn
   race or sweep still holding the driver's gate when the `eventually` is
-  due. `local-run.sh` holds its own
-  copy of the 842 s, and a driver unit test checks it against the constant.
+  due. `local-run.sh` holds its own copy of the 842 s, and a driver unit
+  test checks it against the constant.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
   self-check. The model expects one seeded record moved to another write, so
   `catalog: compaction preserves the acked multiset` must appear in
