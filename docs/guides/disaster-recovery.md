@@ -143,12 +143,12 @@ has two options:
 - Start every logs producer with `--no-declared-stat-aggregates`, from its
   first start on a release that writes stamp sums. A cluster run by the
   Kubernetes operator sets the flag with `spec.noDeclaredStatAggregates:
-  true` ([Kubernetes guide](kubernetes.md#withholding-stamp-sums)); the operator passes no other
-  argument through.
+  true` ([Kubernetes guide](kubernetes.md#withholding-stamp-sums)).
 - First shorten that retention to inside the deadline, and scope the catalog
   lock to `catalog/<signal>/HEAD`.
 
-A sum written to a locked record stays until its retain-until. See
+A sum or a zero count written to a locked record stays until its
+retain-until. The flag does not withhold the min and max. See
 [Withholding stamp sums](operations/configuration.md#withholding-stamp-sums)
 for the producers and for what the flag changes.
 
