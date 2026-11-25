@@ -83,13 +83,14 @@ straggler back.
 Before steps 2 to 5, right after recovery, the eventually runs
 catalog-maintenance's early multiset check (fold, compaction, audits, scans
 and token reads; `../catalog-maintenance/README.md`, "The multiset checks").
-It runs after the sealing jump, so after the increase that jump activates,
-and before the eventually's decrease. Then the eventually runs
+It runs after the sealing jump when one was taken, so after the increase
+that jump activates (with no jump, step 2 activates the increase after the
+check), and before the eventually's decrease. Then the eventually runs
 catalog-maintenance's own sequence (fold and record races, the unfolded and
 unreadable-HEAD sweeps, fold, compaction, audits, sweep jumps, the restart
-and token reads, the final multiset check), all after both reshards. Every clock move prints `clock: moved forward by <N> s outside the
-planned jumps (reshard: ...)`, which `local-run.sh` adds to the offset it
-expects.
+and token reads, the final multiset check), all after both reshards. Every
+clock move prints `clock: moved forward by <N> s outside the planned jumps
+(reshard: ...)`, which `local-run.sh` adds to the offset it expects.
 
 The driver keeps the record's generation history (`audit::ShardHistory`). It
 bounds sweeps and bucket scans by the shard ceiling, which stays 6 after the
@@ -212,9 +213,9 @@ eventually, under the same message: early, right after recovery and before
 the reshard situations, and at the end, after them (a `phase` detail field
 of `early` or `final`). The end comes about 1630 s after faults stop, and in
 the first runs of this profile 0 or 1 timeline per run lived that long. The
-early check starts right after recovery and the clock jump and is
-estimated at 60 to 120 s in Antithesis (1 s in the local loop), so it
-counts on many more. The final check is still the only one sure to run after a decrease.
+early check starts right after recovery and the clock jump and is estimated
+at 60 to 120 s in Antithesis (1 s in the local loop), so it counts on many
+more. The final check is still the only one sure to run after a decrease.
 
 No owned always-assertion is pending (`PROFILE_PENDING` in
 `scripts/profile.sh` is empty for this profile), so `local-run.sh` fails a
