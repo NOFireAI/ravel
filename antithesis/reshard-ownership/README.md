@@ -212,9 +212,9 @@ eventually, under the same message: early, right after recovery and before
 the reshard situations, and at the end, after them (a `phase` detail field
 of `early` or `final`). The end comes about 1630 s after faults stop, and in
 the first runs of this profile 0 or 1 timeline per run lived that long. The
-early check starts right after recovery and the clock jump and takes 60 to
-120 s, so it counts on many more. The
-final check is still the only one sure to run after a decrease.
+early check starts right after recovery and the clock jump and is
+estimated at 60 to 120 s in Antithesis (1 s in the local loop), so it
+counts on many more. The final check is still the only one sure to run after a decrease.
 
 No owned always-assertion is pending (`PROFILE_PENDING` in
 `scripts/profile.sh` is empty for this profile), so `local-run.sh` fails a
