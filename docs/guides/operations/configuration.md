@@ -1320,8 +1320,9 @@ The same flag exists on every process that writes stamps:
 `ravel-server --mode query` runs none of these and refuses the flag at
 startup. Without the flag every surface emits the sum and the zero count.
 The `maintain` commands print a `declared_stat_aggregates: emitted` or
-`declared_stat_aggregates: withheld` line, and `load` a `stamp aggregates`
-line.
+`declared_stat_aggregates: withheld` line on a logs run and, given the flag
+on a metrics or spans run, a warning that the run ignores it; `load` prints
+a `stamp aggregates` line.
 
 What it changes: new records and parts omit the sum and the zero count. On
 an unfolded catalog, `SUM`, `AVG` and a `<> 0` count where 0 lies inside a
