@@ -84,13 +84,13 @@ Before steps 2 to 5, right after recovery, the eventually runs
 catalog-maintenance's early multiset check (fold, compaction, audits, scans
 and token reads; `../catalog-maintenance/README.md`, "The multiset checks").
 It runs after the sealing jump when one was taken, so after the increase
-that jump activates (with no jump, step 2 activates the increase after the
-check), and before the eventually's decrease. Then the eventually runs
-catalog-maintenance's own sequence (fold and record races, the unfolded and
-unreadable-HEAD sweeps, fold, compaction, audits, sweep jumps, the restart
-and token reads, the final multiset check), all after both reshards. Every
-clock move prints `clock: moved forward by <N> s outside the planned jumps
-(reshard: ...)`, which `local-run.sh` adds to the offset it expects.
+that jump activates (with no jump, `ensure_increase` activates step 1's
+increase after the check, before step 2), and before the eventually's
+decrease. Then the eventually runs catalog-maintenance's own sequence (fold
+and record races, the unfolded and unreadable-HEAD sweeps, fold,
+compaction, audits, sweep jumps, the restart and token reads, the final
+multiset check), all after both reshards. Every clock move prints `clock:
+moved forward by <N> s outside the planned jumps (reshard: ...)`, which `local-run.sh` adds to the offset it expects.
 
 The driver keeps the record's generation history (`audit::ShardHistory`). It
 bounds sweeps and bucket scans by the shard ceiling, which stays 6 after the
