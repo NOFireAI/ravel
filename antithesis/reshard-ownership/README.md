@@ -80,10 +80,14 @@ may run ("Drawn under faults" below). Steps 2 to 5 run in the eventually,
 except that step 4 is skipped there when the drawn rule already read a
 straggler back.
 
-Then the eventually runs catalog-maintenance's own sequence (fold and record
-races, the unfolded and unreadable-HEAD sweeps, fold, compaction, audits,
-sweep jumps, the restart and token reads, the multiset check), all after both
-reshards. Every clock move prints `clock: moved forward by <N> s outside the
+Before steps 2 to 5, right after recovery, the eventually runs
+catalog-maintenance's early multiset check (fold, compaction, audits, scans
+and token reads; `../catalog-maintenance/README.md`, "The multiset checks").
+It runs after the sealing jump, so after the increase that jump activates,
+and before the eventually's decrease. Then the eventually runs
+catalog-maintenance's own sequence (fold and record races, the unfolded and
+unreadable-HEAD sweeps, fold, compaction, audits, sweep jumps, the restart
+and token reads, the final multiset check), all after both reshards. Every clock move prints `clock: moved forward by <N> s outside the
 planned jumps (reshard: ...)`, which `local-run.sh` adds to the offset it
 expects.
 
@@ -202,6 +206,15 @@ too; plus the driver's own literals. Every other area's unreached
 always-assertion is listed, not gated (`../catalog-maintenance/README.md`,
 "The expected set"). Every `catalog: ` always-assertion was hit in each of
 three local runs of this profile, so owning the area adds no pending entry.
+
+`catalog: compaction preserves the acked multiset` is evaluated twice per
+eventually, under the same message: early, right after recovery and before
+the reshard situations, and at the end, after them (a `phase` detail field
+of `early` or `final`). The end comes about 1630 s after faults stop, and in
+the first runs of this profile 0 or 1 timeline per run lived that long. The
+early check starts right after recovery and the clock jump and takes 60 to
+120 s, so it counts on many more. The
+final check is still the only one sure to run after a decrease.
 
 No owned always-assertion is pending (`PROFILE_PENDING` in
 `scripts/profile.sh` is empty for this profile), so `local-run.sh` fails a
