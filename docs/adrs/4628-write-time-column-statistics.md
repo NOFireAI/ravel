@@ -1099,14 +1099,15 @@ In the readers and the resolver:
   statement (`resolve_segment_figure`).
 - A stamp whose zero count is 0 while its min or max is the type's zero,
   over a segment with non-null rows, cannot describe its object, so
-  `stamp_equal_count` gives no stamp answer for that segment. The segment
-  falls to the granted `.cstat` entry, or the statement scans. Decode
+  `stamp_equal_count` gives no stamp answer for that segment. Decode
   refuses this stamp and its mirror, a zero count equal to the non-null
   count, above 0, beside a min or max that is not the type's zero
   (`aggregate_defect` in `crates/ravel-commit/src/declared_stats.rs`,
-  issue #4672). `stamp_equal_count` keeps its own check for both, so a
-  stamp that reaches the reader by any path still gives no answer for that
-  segment.
+  issue #4672). `stamp_equal_count` keeps its own check for both. A stamp
+  that reaches `stamp_equal_count` with either contradiction gives no
+  stamp answer, and the segment falls to the granted `.cstat` entry or
+  the statement scans. Decode drops such a stamp first, and a segment
+  whose stamp was dropped has no granted `.cstat` entry, so it scans.
 
 At the result type, `sum_array`, `sum_count_array` and `count_to_i64`
 decline a total the result type cannot hold, so the scan raises its own
