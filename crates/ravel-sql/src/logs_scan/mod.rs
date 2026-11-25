@@ -1215,10 +1215,12 @@ fn stamp_figure(
 /// carries one; 0 when `lit` lies outside `[min, max]` or no non-null row
 /// exists; every non-null row when `min == max == lit`; otherwise `None`.
 ///
-/// A zero count of 0 beside a `min` or `max` that is the zero, over a
-/// segment with non-null rows, contradicts itself (an extremum is a value
-/// some row holds), so the stamp answers nothing for that segment and the
-/// resolver falls to the `.cstat` entry or declines.
+/// Over a segment with non-null rows, two zero counts contradict the
+/// extrema, and for either the stamp answers nothing for that segment, so
+/// the resolver falls to the `.cstat` entry or declines: a zero count of 0
+/// beside a `min` or `max` that is the zero (an extremum is a value some row
+/// holds), and a zero count equal to the non-null count beside a `min` or
+/// `max` that is not the zero (every non-null row would be the zero).
 fn stamp_equal_count(
     stat: &ravel_types::declared_stats::DeclaredColumnStat,
     lit: DeclaredStatValue,
@@ -1229,9 +1231,11 @@ fn stamp_equal_count(
         DeclaredStatValue::I64(0) | DeclaredStatValue::Bool(false)
     );
     if is_zero && let Some(zero_count) = stat.zero_count() {
-        if zero_count == 0
-            && non_null_count > 0
-            && (stat.min() == Some(lit) || stat.max() == Some(lit))
+        let min_zero = stat.min() == Some(lit);
+        let max_zero = stat.max() == Some(lit);
+        if non_null_count > 0
+            && ((zero_count == 0 && (min_zero || max_zero))
+                || (zero_count == non_null_count && !(min_zero && max_zero)))
         {
             return None;
         }
@@ -4865,14 +4869,21 @@ mod figure_resolver_tests {
     }
 
     fn seg(stamps: &[DeclaredColumnStat]) -> SegmentRef {
+        let (seg, dropped) = seg_read(stamps);
+        assert_eq!(dropped, 0, "valid stamps");
+        seg
+    }
+
+    /// The segment a commit record carrying `stamps` yields through the real
+    /// decode, with the number of entries decode dropped.
+    fn seg_read(stamps: &[DeclaredColumnStat]) -> (SegmentRef, usize) {
         let mut record = ravel_proto::commit::v1::CommitRecord {
             sample_count: SAMPLE_COUNT,
             ..Default::default()
         };
         ravel_commit::declared_stats::stamp_commit_record(&mut record, stamps);
         let validated = ravel_commit::declared_stats::read_commit_record(&record);
-        assert_eq!(validated.covered().len(), stamps.len(), "valid stamps");
-        SegmentRef {
+        let seg = SegmentRef {
             data_object_key: "logs/seg-1.rlog".to_string(),
             object_size: 1,
             min_event_ts_ns: 0,
@@ -4889,7 +4900,8 @@ mod figure_resolver_tests {
             level: ravel_catalog::SegmentLevel::L0,
             segment_format_version: u32::from(ravel_logseg::footer::VERSION),
             declared_column_stats: DeclaredColumnStats::from_validated(&validated),
-        }
+        };
+        (seg, validated.dropped().len())
     }
 
     fn i64_value(v: i64) -> ColumnValue {
@@ -5117,6 +5129,12 @@ mod figure_resolver_tests {
     /// An I64 stamp `[min, max]` with NULL count 1 and zero count 0, over the
     /// five-row segment, so four rows are non-null.
     fn zero_count_zero_stamp(min: i64, max: i64) -> DeclaredColumnStat {
+        zero_count_stamp(min, max, 0)
+    }
+
+    /// An I64 stamp `[min, max]` with NULL count 1 and `zero_count`, over the
+    /// five-row segment, so four rows are non-null.
+    fn zero_count_stamp(min: i64, max: i64, zero_count: u64) -> DeclaredColumnStat {
         DeclaredColumnStat::new(
             COL,
             DeclaredStatType::I64,
@@ -5125,9 +5143,26 @@ mod figure_resolver_tests {
             1,
         )
         .expect("valid stamp")
-        .with_zero_count(0)
-        .expect("the stamp the decode gap admits")
+        .with_zero_count(zero_count)
+        .expect("zero inside the range")
     }
+
+    /// A BOOL stamp `[false, true]` with NULL count 1 and `zero_count`.
+    fn bool_zero_count_stamp(zero_count: u64) -> DeclaredColumnStat {
+        DeclaredColumnStat::new(
+            COL,
+            DeclaredStatType::Bool,
+            Some(DeclaredStatValue::Bool(false)),
+            Some(DeclaredStatValue::Bool(true)),
+            1,
+        )
+        .expect("valid stamp")
+        .with_zero_count(zero_count)
+        .expect("false inside the range")
+    }
+
+    const ZERO: DeclaredStatValue = DeclaredStatValue::I64(0);
+    const FALSE: DeclaredStatValue = DeclaredStatValue::Bool(false);
 
     /// A reconciled entry agreeing with [`zero_count_zero_stamp`]`(min, max)`:
     /// four non-null rows `{min, min, max, max}` and one NULL.
@@ -5167,63 +5202,97 @@ mod figure_resolver_tests {
         LoadedColumnStats::from_maps(segments, HashMap::new())
     }
 
-    /// A zero count of 0 beside an extremum that is 0, over non-null rows,
-    /// cannot describe its object: the stamp gives no not-equal answer for
-    /// `<> 0`, with the minimum or the maximum at 0. With no `.cstat` the
-    /// figure is `None`; with a granted entry it is the entry's.
-    ///
-    /// Prove-the-test: remove the zero-count check in `stamp_equal_count` and
-    /// each read answers `(Stamp, NotEqual(4))`.
-    #[test]
-    fn a_zero_count_of_zero_beside_a_zero_extremum_gives_no_stamp_answer() {
+    /// `stamp`, a zero count that contradicts its extrema over the four
+    /// non-null rows, gives no figure from `stamp_equal_count`. Decode drops
+    /// it, so the segment reaches the resolver unstamped and has no figure,
+    /// with or without a `.cstat` entry for rows `{min, min, max, max}`.
+    fn assert_contradiction_gives_no_stamp_answer(stamp: DeclaredColumnStat) {
+        let (Some(DeclaredStatValue::I64(min)), Some(DeclaredStatValue::I64(max))) =
+            (stamp.min(), stamp.max())
+        else {
+            panic!("an I64 stamp with extrema");
+        };
+        assert_eq!(
+            stamp_equal_count(&stamp, ZERO, 4),
+            None,
+            "[{min}, {max}] zero count {:?}",
+            stamp.zero_count()
+        );
+        let (seg, dropped) = seg_read(&[stamp]);
+        assert_eq!(dropped, 1, "[{min}, {max}]: decode drops the stamp");
         let zero = ScalarValue::Int64(Some(0));
-        for (min, max) in [(0, 5), (-5, 0)] {
-            let seg = seg(&[zero_count_zero_stamp(min, max)]);
-            assert_eq!(
-                resolve_segment_figure(&i64_col(), &seg, None, FigureRequest::NotEqual(&zero)),
-                None,
-                "[{min}, {max}] with no .cstat"
-            );
-            let stats = agreeing_entry(&seg, min, max);
-            assert_eq!(
-                resolve_segment_figure(
-                    &i64_col(),
-                    &seg,
-                    Some(&stats),
-                    FigureRequest::NotEqual(&zero)
-                ),
-                Some((FigureCarrier::Cstat, SegmentFigure::NotEqual(2))),
-                "[{min}, {max}] falls to the granted entry: two rows hold the non-zero end"
-            );
-        }
-    }
-
-    /// The BOOL side of the same guard: `min false, max true` with zero count
-    /// 0 gives no stamp answer for `<> false`.
-    ///
-    /// Prove-the-test: remove the zero-count check in `stamp_equal_count` and
-    /// this reads `(Stamp, NotEqual(4))`.
-    #[test]
-    fn a_bool_zero_count_of_zero_beside_a_false_extremum_gives_no_stamp_answer() {
-        let stamp = DeclaredColumnStat::new(
-            COL,
-            DeclaredStatType::Bool,
-            Some(DeclaredStatValue::Bool(false)),
-            Some(DeclaredStatValue::Bool(true)),
-            1,
-        )
-        .expect("valid stamp")
-        .with_zero_count(0)
-        .expect("the stamp the decode gap admits");
-        let seg = seg(&[stamp]);
+        assert_eq!(
+            resolve_segment_figure(&i64_col(), &seg, None, FigureRequest::NotEqual(&zero)),
+            None,
+            "[{min}, {max}] with no .cstat"
+        );
+        let stats = agreeing_entry(&seg, min, max);
         assert_eq!(
             resolve_segment_figure(
-                &DeclaredColumn::new(COL, DeclaredType::Bool),
+                &i64_col(),
                 &seg,
-                None,
-                FigureRequest::NotEqual(&ScalarValue::Boolean(Some(false)))
+                Some(&stats),
+                FigureRequest::NotEqual(&zero)
             ),
-            None
+            None,
+            "[{min}, {max}]: with no stamp, `merged_view_entry` grants no entry"
+        );
+    }
+
+    /// A zero count of 0 beside an extremum that is the zero, over non-null
+    /// rows, cannot describe its object: an extremum is a value some row
+    /// holds. Minimum or maximum at 0, and the BOOL `[false, true]`.
+    ///
+    /// Prove-the-test: remove the zero-count checks in `stamp_equal_count`
+    /// and each direct read answers `Some(0)`.
+    #[test]
+    fn a_zero_count_of_zero_beside_a_zero_extremum_gives_no_stamp_answer() {
+        for (min, max) in [(0, 5), (-5, 0)] {
+            assert_contradiction_gives_no_stamp_answer(zero_count_zero_stamp(min, max));
+        }
+        assert_eq!(stamp_equal_count(&bool_zero_count_stamp(0), FALSE, 4), None);
+    }
+
+    /// A zero count equal to the non-null count says every non-null row is
+    /// the zero, so a minimum or maximum that is not the zero contradicts it.
+    /// `[0, 5]` and `[-3, 4]` with zero count 4 of 4, and the BOOL
+    /// `[false, true]` with 4 false rows of 4.
+    ///
+    /// Prove-the-test: remove the zero-count checks in `stamp_equal_count`
+    /// and each direct read answers `Some(4)`; require both extrema to be
+    /// non-zero and the `[0, 5]` and BOOL reads answer `Some(4)`.
+    #[test]
+    fn a_zero_count_equal_to_non_null_beside_a_nonzero_extremum_gives_no_stamp_answer() {
+        for (min, max) in [(0, 5), (-3, 4)] {
+            assert_contradiction_gives_no_stamp_answer(zero_count_stamp(min, max, 4));
+        }
+        assert_eq!(stamp_equal_count(&bool_zero_count_stamp(4), FALSE, 4), None);
+    }
+
+    /// The boundaries of both checks: each stamp can describe its object,
+    /// decode keeps it, and `stamp_equal_count` answers its zero count.
+    #[test]
+    fn zero_counts_consistent_with_the_extrema_still_answer() {
+        for (stamp, lit, non_null, expected) in [
+            (zero_count_stamp(-5, 5, 0), ZERO, 4, 0),
+            (zero_count_stamp(0, 0, 4), ZERO, 4, 4),
+            (zero_count_stamp(0, 5, 1), ZERO, 4, 1),
+            (zero_count_stamp(-3, 4, 3), ZERO, 4, 3),
+            (bool_zero_count_stamp(1), FALSE, 4, 1),
+            (bool_zero_count_stamp(3), FALSE, 4, 3),
+        ] {
+            assert_eq!(
+                stamp_equal_count(&stamp, lit, non_null),
+                Some(expected),
+                "{stamp:?}"
+            );
+            let (_, dropped) = seg_read(&[stamp]);
+            assert_eq!(dropped, 0, "decode keeps it");
+        }
+        // Neither check applies with no non-null row.
+        assert_eq!(
+            stamp_equal_count(&zero_count_zero_stamp(0, 5), ZERO, 0),
+            Some(0)
         );
     }
 

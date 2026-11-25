@@ -666,3 +666,144 @@ fn zero_count_clause_zero_count_below_non_null_when_min_max_are_zero_is_a_counte
         },
     );
 }
+
+/// Read `entry` alone through `carrier`'s read function on a carrier of
+/// [`SAMPLE_COUNT`] rows, and assert it is kept with its zero count and
+/// nothing is counted under any label.
+fn assert_kept(carrier: StatCarrier, entry: DeclaredColumnMinMax) {
+    let zero_count = entry.zero_count;
+    let (read, delta, others) = with_delta(carrier, || match carrier {
+        StatCarrier::CommitRecord => read_commit_record(&decoded_record(vec![entry])),
+        StatCarrier::CompactionPart => read_compaction_part(&decoded_part(vec![entry])),
+        StatCarrier::SnapshotEntry => read_snapshot_entry_twin(&decoded_record(vec![entry])),
+        StatCarrier::Cstat => unreachable!("no stamp reader reads under cstat"),
+    });
+    assert!(read.dropped().is_empty(), "dropped: {:?}", read.dropped());
+    assert_eq!(read.covered().len(), 1);
+    assert_eq!(read.covered()[0].zero_count(), zero_count);
+    assert_eq!((delta, others), (0, 0), "nothing counted");
+}
+
+/// Issue #4672 clause A: an extremum is a value some row holds, so a zero
+/// count of 0 beside a min or max of 0 (or false) over non-null rows cannot
+/// describe its object.
+#[test]
+fn zero_count_clause_zero_count_of_zero_beside_a_zero_extremum_is_a_counted_drop() {
+    for (min, max, carrier) in [
+        (0, 5, StatCarrier::CommitRecord),
+        (-5, 0, StatCarrier::CompactionPart),
+        (0, 5, StatCarrier::SnapshotEntry),
+    ] {
+        let mut entry = i64_entry(min, max, 10);
+        entry.zero_count = Some(0);
+        assert_counted_drop(
+            carrier,
+            entry,
+            DeclaredStatDefect::ZeroCountZeroBesideZeroExtremum {
+                name: "UserID".to_string(),
+                non_null: 90,
+            },
+        );
+    }
+    for carrier in [StatCarrier::CompactionPart, StatCarrier::SnapshotEntry] {
+        let mut entry = bool_entry(false, true);
+        entry.zero_count = Some(0);
+        assert_counted_drop(
+            carrier,
+            entry,
+            DeclaredStatDefect::ZeroCountZeroBesideZeroExtremum {
+                name: "IsRefresh".to_string(),
+                non_null: 100,
+            },
+        );
+    }
+}
+
+/// Issue #4672 clause B: a zero count equal to the non-null count says
+/// every non-null row is the zero, so a min or max that is not the zero
+/// contradicts it.
+#[test]
+fn zero_count_clause_zero_count_equal_to_non_null_beside_a_nonzero_extremum_is_a_counted_drop() {
+    for (min, max, carrier) in [
+        (0, 5, StatCarrier::CommitRecord),
+        (-3, 4, StatCarrier::CompactionPart),
+        (-3, 4, StatCarrier::SnapshotEntry),
+    ] {
+        let mut entry = i64_entry(min, max, 10);
+        entry.zero_count = Some(90);
+        assert_counted_drop(
+            carrier,
+            entry,
+            DeclaredStatDefect::ZeroCountAllBesideNonZeroExtremum {
+                name: "UserID".to_string(),
+                zero_count: 90,
+                non_null: 90,
+            },
+        );
+    }
+    for carrier in [StatCarrier::CommitRecord, StatCarrier::SnapshotEntry] {
+        let mut entry = bool_entry(false, true);
+        entry.zero_count = Some(100);
+        assert_counted_drop(
+            carrier,
+            entry,
+            DeclaredStatDefect::ZeroCountAllBesideNonZeroExtremum {
+                name: "IsRefresh".to_string(),
+                zero_count: 100,
+                non_null: 100,
+            },
+        );
+    }
+}
+
+/// With the zero outside `[1, 5]`, a zero count equal to the non-null count
+/// is refused by the entry-local check in `with_zero_count`, which decode
+/// runs before the clauses that compare with the non-null count.
+#[test]
+fn zero_count_clause_zero_count_equal_to_non_null_with_zero_outside_the_range_is_out_of_range() {
+    let mut entry = i64_entry(1, 5, 10);
+    entry.zero_count = Some(90);
+    assert_counted_drop(
+        StatCarrier::CommitRecord,
+        entry,
+        DeclaredStatDefect::Invalid(DeclaredStatError::ZeroCountOutsideRange {
+            name: "UserID".to_string(),
+            zero_count: 90,
+        }),
+    );
+}
+
+/// The boundaries of clauses A and B: each of these stamps can describe its
+/// object, so every carrier keeps it with its zero count and counts nothing.
+#[test]
+fn zero_count_clause_boundaries_keep_the_stamp() {
+    // Zero inside the range, neither extremum the zero.
+    let mut inside = i64_entry(-5, 5, 10);
+    inside.zero_count = Some(0);
+    // Every non-null row the zero.
+    let mut all_zero = i64_entry(0, 0, 10);
+    all_zero.zero_count = Some(90);
+    // One zero row among 90 non-null, with the minimum at 0.
+    let mut one_zero = i64_entry(0, 5, 10);
+    one_zero.zero_count = Some(1);
+    // No non-null row, zero count 0.
+    let mut all_null = encode(
+        &DeclaredColumnStat::new("UserID", DeclaredStatType::I64, None, None, SAMPLE_COUNT)
+            .expect("all-null stat"),
+    );
+    all_null.zero_count = Some(0);
+    // No zero count beside a zero minimum.
+    let absent = i64_entry(0, 5, 10);
+    // BOOL: one false row among 100 non-null rows of both values.
+    let mut bool_one = bool_entry(false, true);
+    bool_one.zero_count = Some(1);
+    for entry in [inside, all_zero, one_zero, all_null, absent, bool_one] {
+        for carrier in [
+            StatCarrier::CommitRecord,
+            StatCarrier::CompactionPart,
+            StatCarrier::SnapshotEntry,
+        ] {
+            assert_kept(carrier, entry.clone());
+        }
+    }
+}

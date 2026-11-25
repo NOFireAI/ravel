@@ -562,16 +562,18 @@ async fn not_equal_literals_of_another_type_scan() {
     }
 }
 
-/// A stamp with a zero count of 0 over an object whose minimum `a` is 0, the
-/// stamp the decode gap admits (#4672): it cannot describe its object, so
-/// `COUNT(*) WHERE a <> 0` scans and equals the forced scan, which counts
-/// the two non-zero rows, not the three non-null ones.
+/// Two stamps whose zero count contradicts their extrema over an object
+/// whose minimum `a` is 0 and whose other non-null values are 3 and 5: a
+/// zero count of 0, and a zero count of 3 (every non-null row). Neither can
+/// describe its object. Decode drops each (issue #4672), so `COUNT(*) WHERE
+/// a <> 0` scans and equals the forced scan, which counts the two non-zero
+/// rows.
 ///
-/// Prove-the-test: remove the zero-count check in `stamp_equal_count`; the
-/// statement then answers 3 from the stamp, failing `assert_scanned` (and
-/// the value).
+/// Prove-the-test: remove the two zero-count clauses from `aggregate_defect`
+/// and the drop count fails; remove the `stamp_equal_count` checks as well
+/// and the statement answers from the stamp, failing `assert_scanned`.
 #[tokio::test]
-async fn a_zero_count_of_zero_beside_a_zero_minimum_scans() {
+async fn a_zero_count_that_contradicts_the_extrema_scans() {
     let rows = vec![
         row(0, Some(0), None),
         row(10, Some(3), None),
@@ -588,15 +590,20 @@ async fn a_zero_count_of_zero_beside_a_zero_minimum_scans() {
             1
         )
     );
-    let lying = true_stamp
-        .with_zero_count(0)
-        .expect("the decode gap admits it");
     let sql = "SELECT COUNT(*) FROM logs WHERE a <> 0";
-    let mut setup = corpus.setup(Fields::With);
-    setup.segs = vec![corpus.seg_with(0, std::slice::from_ref(&lying))];
-    let run = corpus.run(sql, setup).await;
-    assert_scanned(&run, sql);
     let forced = corpus.forced(sql).await;
-    assert_same_answer(&run, &forced, sql);
-    assert_eq!(int64(&run), 2, "3 and 5");
+    for zero_count in [0, 3] {
+        let lying = true_stamp
+            .clone()
+            .with_zero_count(zero_count)
+            .expect("zero inside the range");
+        let (seg, dropped) = corpus.seg_read(0, std::slice::from_ref(&lying));
+        assert_eq!(dropped, 1, "zero count {zero_count}: decode drops the stamp");
+        let mut setup = corpus.setup(Fields::With);
+        setup.segs = vec![seg];
+        let run = corpus.run(sql, setup).await;
+        assert_scanned(&run, sql);
+        assert_same_answer(&run, &forced, sql);
+        assert_eq!(int64(&run), 2, "3 and 5");
+    }
 }
