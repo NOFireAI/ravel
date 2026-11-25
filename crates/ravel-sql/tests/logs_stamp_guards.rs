@@ -598,7 +598,10 @@ async fn a_zero_count_that_contradicts_the_extrema_scans() {
             .with_zero_count(zero_count)
             .expect("zero inside the range");
         let (seg, dropped) = corpus.seg_read(0, std::slice::from_ref(&lying));
-        assert_eq!(dropped, 1, "zero count {zero_count}: decode drops the stamp");
+        assert_eq!(
+            dropped, 1,
+            "zero count {zero_count}: decode drops the stamp"
+        );
         let mut setup = corpus.setup(Fields::With);
         setup.segs = vec![seg];
         let run = corpus.run(sql, setup).await;

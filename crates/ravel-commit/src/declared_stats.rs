@@ -1992,9 +1992,7 @@ mod tests {
     ) -> Option<u64> {
         match (min_zero, max_zero) {
             (true, true) => Some(non_null),
-            (true, false) | (false, true) => {
-                (non_null >= 2).then(|| 1 + seed % (non_null - 1))
-            }
+            (true, false) | (false, true) => (non_null >= 2).then(|| 1 + seed % (non_null - 1)),
             (false, false) if zero_inside => Some(seed % non_null.max(1)),
             (false, false) => Some(0),
         }

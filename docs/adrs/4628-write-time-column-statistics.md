@@ -319,7 +319,10 @@ metric under its carrier label, as any defective entry is today.
   a nonzero sum with zero non-null rows;
 - a zero count above the non-null count; a nonzero zero count when 0 (or
   false) lies outside `[min, max]`; a zero count below the non-null count
-  when `min == max == 0`.
+  when `min == max == 0`; a zero count of 0 when min or max is 0 (or false)
+  and a non-null row exists; a zero count equal to the non-null count,
+  above 0, when min or max is not 0 (or false) (the last two from issue
+  #4672; see the stamp-path guards amendment below).
 
 **Absent means scan.** Each field has its own presence. An entry with no
 sum cannot answer `SUM` or `AVG` for that segment; an entry with no zero
@@ -1013,6 +1016,7 @@ Refs: #4628, #3231, #4651, #850, #861, #873, #3243, #3244, #1848, #3847
 ## Amendment (2026-11-24): the stamp-path guards and the not-equal cases
 
 <!-- amendment-applies: sections="5. Planner use, and composition with `.cstat`|6. Exactness: what forces the scan, and where" pointer="stamp-path guards amendment" -->
+<!-- amendment-applies: sections="2. What is stored, and when absence means scan" pointer="stamp-path guards amendment" -->
 <!-- amendment-supersedes: phrase="when the stamp carries the field" pointer="stamp-path guards amendment" -->
 <!-- amendment-supersedes: phrase="`logs_column_stats_eligible` in `executor.rs` before any plan is built" pointer="stamp-path guards amendment" -->
 <!-- amendment-supersedes: phrase="`logs_column_stats_eligible`, `executor.rs:5585`" pointer="stamp-path guards amendment" -->
@@ -1096,13 +1100,13 @@ In the readers and the resolver:
 - A stamp whose zero count is 0 while its min or max is the type's zero,
   over a segment with non-null rows, cannot describe its object, so
   `stamp_equal_count` gives no stamp answer for that segment. The segment
-  falls to the granted `.cstat` entry, or the statement scans. Decode does
-  not yet refuse such a stamp (issue #4672), and this check does not
-  replace that clause. The mirror case is refused only in part: decode
-  refuses a zero count above zero when the zero lies outside the min and
-  max (`with_zero_count`), and nothing refuses a zero count equal to the
-  non-null count when the zero lies inside a min and max that are not both
-  the zero. Issue #4672 tracks that remainder with the decode clause.
+  falls to the granted `.cstat` entry, or the statement scans. Decode
+  refuses this stamp and its mirror, a zero count equal to the non-null
+  count, above 0, beside a min or max that is not the type's zero
+  (`aggregate_defect` in `crates/ravel-commit/src/declared_stats.rs`,
+  issue #4672). `stamp_equal_count` keeps its own check for both, so a
+  stamp that reaches the reader by any path still gives no answer for that
+  segment.
 
 At the result type, `sum_array`, `sum_count_array` and `count_to_i64`
 decline a total the result type cannot hold, so the scan raises its own
