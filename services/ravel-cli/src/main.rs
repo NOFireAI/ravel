@@ -2394,6 +2394,7 @@ impl ScratchArgs {
             range_records: self.range_records,
             merge_resident_ceiling_bytes: None,
             geometry_floor_decoded_rows: None,
+            declared_stat_aggregates: maintain::DeclaredStatAggregates::default(),
         };
         options.validate()?;
         Ok(options)
@@ -2621,6 +2622,21 @@ enum MaintainCommand {
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
+        /// Withhold the declared-column stamp's sum and zero count (fields 6
+        /// to 8, ADR-4628 decision 8) from the logs compaction parts this run
+        /// writes. The min, max and null count are still written. On an
+        /// unfolded catalog, SUM, AVG and a `<> 0` count where 0 lies inside
+        /// a part's min and max then scan those parts; on a folded one the
+        /// `.cstat` statistics can still answer them.
+        ///
+        /// A setting of this run, not persisted: a later compaction of the
+        /// same rows by a process that does not withhold writes the fields
+        /// again, so every process that writes stamps must set it. Fields
+        /// already written stay, and a record under an Object Lock keeps them
+        /// until its retain-until (ADR-4628 question 6b). The report's
+        /// `declared_stat_aggregates:` line says which the run wrote.
+        #[arg(long = "no-declared-stat-aggregates", action = clap::ArgAction::SetFalse)]
+        emit_declared_stat_aggregates: bool,
         #[command(flatten)]
         scratch: ScratchArgs,
         #[command(flatten)]
@@ -2768,6 +2784,21 @@ enum MaintainCommand {
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
+        /// Withhold the declared-column stamp's sum and zero count (fields 6
+        /// to 8, ADR-4628 decision 8) from the logs compaction parts this run
+        /// writes. The min, max and null count are still written. On an
+        /// unfolded catalog, SUM, AVG and a `<> 0` count where 0 lies inside
+        /// a part's min and max then scan those parts; on a folded one the
+        /// `.cstat` statistics can still answer them.
+        ///
+        /// A setting of this run, not persisted: a later compaction of the
+        /// same rows by a process that does not withhold writes the fields
+        /// again, so every process that writes stamps must set it. Fields
+        /// already written stay, and a record under an Object Lock keeps them
+        /// until its retain-until (ADR-4628 question 6b). The report's
+        /// `declared_stat_aggregates:` line says which the run wrote.
+        #[arg(long = "no-declared-stat-aggregates", action = clap::ArgAction::SetFalse)]
+        emit_declared_stat_aggregates: bool,
         #[command(flatten)]
         scratch: ScratchArgs,
         #[command(flatten)]
@@ -2879,6 +2910,21 @@ enum MaintainCommand {
         /// default: such a bucket is then reported as reencode_blocked.
         #[arg(long)]
         reencode_compaction_parts: bool,
+        /// Withhold the declared-column stamp's sum and zero count (fields 6
+        /// to 8, ADR-4628 decision 8) from the logs parts this run writes, a
+        /// migration's or a re-encode's. The min, max and null count are still
+        /// written. On an unfolded catalog, SUM, AVG and a `<> 0` count where
+        /// 0 lies inside a part's min and max then scan those parts; on a
+        /// folded one the `.cstat` statistics can still answer them.
+        ///
+        /// A setting of this run, not persisted: a later compaction of the
+        /// same rows by a process that does not withhold writes the fields
+        /// again, so every process that writes stamps must set it. Fields
+        /// already written stay, and a record under an Object Lock keeps them
+        /// until its retain-until (ADR-4628 question 6b). The report's
+        /// `declared_stat_aggregates:` line says which the run writes.
+        #[arg(long = "no-declared-stat-aggregates", action = clap::ArgAction::SetFalse)]
+        emit_declared_stat_aggregates: bool,
         #[command(flatten)]
         tenant_kms: store::TenantKmsArgs,
     },
@@ -3790,12 +3836,18 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     l1_part_memory_target_bytes,
                     max_l1_part_bytes,
                     compaction_zstd_level,
+                    emit_declared_stat_aggregates,
                     scratch,
                     tenant_kms,
                 },
         } => {
             maintain::check_fence_flush_lifetime(late_commit_fence, max_flush_lifetime)?;
-            let scratch = scratch.options()?;
+            let scratch = maintain::ScratchOptions {
+                declared_stat_aggregates: maintain::DeclaredStatAggregates::from_emit(
+                    emit_declared_stat_aggregates,
+                ),
+                ..scratch.options()?
+            };
             maintain::compact_with_part_split_targets(
                 store::build_tenant_data_store(
                     &cli.store,
@@ -3839,12 +3891,18 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     input_read_concurrency,
                     bucket_concurrency,
                     compaction_zstd_level,
+                    emit_declared_stat_aggregates,
                     scratch,
                     tenant_kms,
                 },
         } => {
             maintain::check_fence_flush_lifetime(late_commit_fence, max_flush_lifetime)?;
-            let scratch = scratch.options()?;
+            let scratch = maintain::ScratchOptions {
+                declared_stat_aggregates: maintain::DeclaredStatAggregates::from_emit(
+                    emit_declared_stat_aggregates,
+                ),
+                ..scratch.options()?
+            };
             maintain::compact_tenant(
                 store::build_tenant_data_store(
                     &cli.store,
@@ -3957,6 +4015,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     late_commit_fence,
                     dry_run,
                     reencode_compaction_parts,
+                    emit_declared_stat_aggregates,
                     tenant_kms,
                 },
         } => {
@@ -3980,6 +4039,9 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 maintain::MigrateSwitches {
                     dry_run,
                     reencode_compaction_parts,
+                    declared_stat_aggregates: maintain::DeclaredStatAggregates::from_emit(
+                        emit_declared_stat_aggregates,
+                    ),
                 },
                 &maintain::ClaimOptions::for_invocation(no_claim)
                     .with_late_commit_fence(late_commit_fence.mode()),

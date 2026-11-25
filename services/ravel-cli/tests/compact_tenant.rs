@@ -3136,6 +3136,7 @@ async fn compact_bucket_routes_a_many_input_bucket_through_the_two_level_merge()
             range_records: None,
             merge_resident_ceiling_bytes: Some(two_level_ceiling()),
             geometry_floor_decoded_rows: Some(0),
+            ..ScratchOptions::default()
         },
     )
     .await
@@ -3199,6 +3200,7 @@ async fn compact_tenant_with_scratch_dir_compacts_the_two_level_bucket() {
             range_records: None,
             merge_resident_ceiling_bytes: None,
             geometry_floor_decoded_rows: Some(0),
+            ..ScratchOptions::default()
         },
     )
     .await
