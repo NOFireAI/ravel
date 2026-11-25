@@ -459,7 +459,8 @@ driver action that forces its situation, and each such action:
 
 The step list in the first bullet gained two raw-S3 tampers on a compaction
 record the driver's own `ravel-cli` run just published; see the
-record-tamper amendment below.
+record-tamper amendment below. It also gained a late delivery of a commit
+record a server sent and abandoned; see the late-replay amendment below.
 
 Two parts of the catalog-maintenance topology change with it. Decision 4's
 topology gains an `s3proxy` container between the ravel-server containers
@@ -607,3 +608,42 @@ hold cap, or a loser's requests can be retried near the store client's
 180 s bound. A false evaluation carries the race in the assertion's details
 (`tamper_in_place_at_release`, `released_at_age_ms`, `undo`), so triage can
 tell it from a mutant. Owner decision (delegated), 2026-11-24 (#4340).
+
+## Amendment (2026-11-25): a late commit record by replay (#4561)
+
+<!-- amendment-applies: sections="Amendment (2026-11-18): forced situations for silent mutants (#4336)" pointer="late-replay amendment" -->
+
+This is the late-replay amendment. The forced-situation amendment's step
+list gains one step: a level-0 commit record PUT that a server sent and then
+abandoned is delivered late by the driver. The proxy answers every attempt
+with 503 and forwards none. After a clock move, the driver sends the same
+bytes, to the same key, through raw S3: byte-identical, create-only, and with
+the server's checksum. The catalog-maintenance workload's late-records race
+uses it (`antithesis/catalog-maintenance/README.md`, "The forced races").
+
+The step models a PUT that the store applies after its sender gave up.
+ADR-4561 says nothing bounds when that can happen. A server cannot itself send
+such a PUT across the 3900 s late-commit cutoff on this rig: SigV4 refuses a
+request more than 900 s from the store's clock, and the server abandons the
+flush rather than re-sending. So the harness supplies the delivery, never the
+bytes.
+
+A step of this kind is legitimate only when all of these hold:
+
+- The data object the record names is stored before the replay.
+- The replay is create-only, and a refusal because the key exists (412)
+  reports the situation as not reached, with nothing to undo.
+- The write was a single attempt that the driver recorded as not
+  acknowledged, so the driver's model allows zero or one copy of it, and no
+  token read reads it.
+- There is no undo. ADR-4561's R6 forbids deleting a late record: it is
+  served, kept, held, expired and counted exactly as before.
+- The driver's write gate is held from the capture to the replay.
+- Reaching the situation is a sometimes-assertion that the local loop
+  requires, as with the other forced rules.
+
+The assertions it makes reachable are the late-commit fence's
+`maintain: a plan left a late commit record out` and
+`maintain: a published record names no late commit record`, plus the
+driver's own check that a server's compaction record names no late commit
+record. Owner decision (delegated), 2026-11-25 (#4561).
