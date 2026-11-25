@@ -145,7 +145,8 @@ async fn seed_l0(store: &dyn ObjectStoreBackend, shard: u32, hour: u32, seq: u64
         .expect("put commit record");
 }
 
-/// The `key=` value of every `entry[i]` line, keyed by the entry's level.
+/// Every `entry[i]` line's `key=` value (the rest of the line), mapped to the
+/// entry's level.
 fn printed_keys(report: &str) -> BTreeMap<String, String> {
     report
         .lines()
@@ -157,9 +158,9 @@ fn printed_keys(report: &str) -> BTreeMap<String, String> {
                 .unwrap_or_else(|| panic!("no level in {line:?}"))
                 .to_string();
             let key = line
-                .split(' ')
-                .find_map(|field| field.strip_prefix("key="))
+                .split_once(" key=")
                 .unwrap_or_else(|| panic!("no key in {line:?}"))
+                .1
                 .to_string();
             (key, level)
         })

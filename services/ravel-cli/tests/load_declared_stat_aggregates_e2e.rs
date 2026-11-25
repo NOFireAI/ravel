@@ -714,12 +714,28 @@ async fn a_withholding_load_scans_and_answers_what_the_emitting_load_answers() {
             0,
             "{label}"
         );
-        assert!(withheld.data_gets > 0, "{label}: the statement scans");
+        let phases = phase_gets(&withheld.stats);
         println!(
-            "test 12 {label}: phases {:?} data-object GETs {}",
-            phase_gets(&withheld.stats),
+            "test 12 {label}: phases {phases:?} data-object GETs {}",
             withheld.data_gets
         );
+        assert_eq!(
+            withheld.data_gets, OBJECTS,
+            "{label}: the statement scans each object once"
+        );
+        // The plan GET is the statistics load reading the absent catalog HEAD.
+        let want: Vec<(String, u64)> = [
+            ("resolve", 4),
+            ("plan", 1),
+            ("probe", 0),
+            ("scan", OBJECTS),
+            ("keyIndex", 0),
+            ("fetch", 0),
+        ]
+        .into_iter()
+        .map(|(phase, gets)| (phase.to_string(), gets))
+        .collect();
+        assert_eq!(phases, want, "{label}");
     }
 
     let min_max = "SELECT MIN(\"UserID\"), MAX(\"UserID\") FROM logs";
