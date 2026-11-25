@@ -1382,7 +1382,8 @@ fn run_maintain_binary(args: &[&str]) -> (bool, String, String) {
 /// config, says `emitted` without the flag and `withheld` with it. On the
 /// empty store `compact-bucket` and `compact-tenant` find nothing to do and
 /// exit zero; `migrate` prints its settings and then fails on the missing
-/// provisioning record.
+/// provisioning record. A `--signal metrics` run of each prints no settings
+/// line, and with the flag writes the one warning to stderr.
 #[test]
 fn the_binary_maintain_producers_report_the_stamp_aggregate_choice() {
     let commands: [(&[&str], bool); 3] = [
@@ -1435,6 +1436,51 @@ fn the_binary_maintain_producers_report_the_stamp_aggregate_choice() {
                 assert!(stderr.contains("no provisioning record exists"), "{stderr}");
             }
             assert_eq!(settings_lines(&stdout), [want], "{args:?}: {stdout}");
+            assert!(
+                !stderr.contains("--no-declared-stat-aggregates"),
+                "{args:?}: {stderr}"
+            );
+        }
+        // The same command over metrics: no logs part is written, so no
+        // settings line prints, and the flag draws exactly one warning.
+        let run_noun = if command[0] == "migrate" {
+            "migrate"
+        } else {
+            "compaction"
+        };
+        let metrics: Vec<&str> = command
+            .iter()
+            .map(|arg| if *arg == "logs" { "metrics" } else { arg })
+            .collect();
+        let warning = format!(
+            "warning: a metrics {run_noun} ignores --no-declared-stat-aggregates. Only logs \
+             compaction parts carry a declared-column stamp."
+        );
+        for (extra, warnings) in [(None, 0), (Some("--no-declared-stat-aggregates"), 1)] {
+            let mut args = metrics.clone();
+            args.extend(extra);
+            let (ok, stdout, stderr) = run_maintain_binary(&args);
+            assert_eq!(ok, succeeds, "{args:?}: {stdout}{stderr}");
+            assert_eq!(
+                settings_lines(&stdout),
+                Vec::<&str>::new(),
+                "{args:?}: {stdout}"
+            );
+            assert_eq!(
+                stderr.lines().filter(|l| *l == warning).count(),
+                warnings,
+                "{args:?}: {stderr}"
+            );
+            assert!(
+                !stdout.contains("--no-declared-stat-aggregates"),
+                "{args:?}: {stdout}"
+            );
+            if warnings == 0 {
+                assert!(
+                    !stderr.contains("--no-declared-stat-aggregates"),
+                    "{args:?}: {stderr}"
+                );
+            }
         }
     }
 }

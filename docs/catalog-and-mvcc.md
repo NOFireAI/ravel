@@ -3382,8 +3382,9 @@ rewrite drops rows. `CompactorConfig::emit_declared_stat_aggregates`
 and null count unchanged; `--no-declared-stat-aggregates` sets it on
 `ravel-server --mode maintain` (the maintenance loop and the background
 migrate) and on `ravel-cli maintain compact-bucket`, `compact-tenant` and
-`migrate`. No reader uses the
-part's sum or zero count until ADR-4628 T5.
+`migrate`. A reader reads the part's sum and zero count the way it reads a
+commit record's (docs/query-engine.md, "Logs aggregates from exact
+per-object column statistics").
 
 `object_key` is informational. Readers MUST reconstruct the data key from
 (tenant_hash, signal, shard, writer_id, epoch, seq, content_hash) and treat
