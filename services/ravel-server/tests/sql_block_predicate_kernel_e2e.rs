@@ -188,6 +188,7 @@ impl Fixture {
 
 fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: Default::default(),

@@ -27,6 +27,7 @@ use ravel_types::{Signal, TenantHash, TenantId};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
+pub use crate::load::DeclaredStatAggregates;
 use crate::store::{DefaultedMemoryEmptyWalk, StoreSelection, require_tenant_data_present};
 
 /// CLI signal selector for the `--signal` flag.
@@ -338,8 +339,15 @@ pub enum CompactorKnobError {
 /// [`CompactorConfig::level1_workers`], [`CompactorConfig::level2_workers`],
 /// [`CompactorConfig::rlog_run_block_target_records`] and
 /// [`CompactorConfig::rlog_range_records`]. The default sets none of them.
+///
+/// It also carries the invocation's `--no-declared-stat-aggregates` choice,
+/// which [`build_compactor_config`] places in
+/// [`CompactorConfig::emit_declared_stat_aggregates`]; the default emits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScratchOptions {
+    /// Whether the logs output parts carry the declared-column stamp's sum
+    /// and zero count (ADR-4628 decision 8).
+    pub declared_stat_aggregates: DeclaredStatAggregates,
     pub scratch_dir: Option<std::path::PathBuf>,
     pub scratch_max_bytes: Option<u64>,
     pub level1_workers: Option<usize>,
@@ -501,6 +509,7 @@ pub fn build_compactor_config(
         // ADR-1746 decision 4: refuse to write below a bucket's recorded
         // format floor, the default `migrate_family` also falls back to.
         format_floor: Some(ravel_ingest::FormatFloorPolicy::default()),
+        emit_declared_stat_aggregates: scratch.declared_stat_aggregates.emits(),
         ..CompactorConfig::default()
     };
     if let Some(ns) = max_flush_lifetime_ns {
@@ -575,6 +584,16 @@ fn claim_lease_for_derivation(claims: &ClaimOptions) -> Duration {
 /// `rlog_max_l1_part_bytes` (the RLOG stored-size cap),
 /// `rspan_l1_part_memory_target_bytes`, and `max_l1_part_bytes` (the shared
 /// cap RSEG reads).
+/// The settings line naming whether the run's logs output parts carry the
+/// stamp's sum and zero count, read off the config the run uses.
+fn declared_stat_aggregates_line(config: &CompactorConfig) -> &'static str {
+    if config.emit_declared_stat_aggregates {
+        "declared_stat_aggregates: emitted"
+    } else {
+        "declared_stat_aggregates: withheld"
+    }
+}
+
 fn write_part_split_lines(
     out: &mut dyn Write,
     config: &CompactorConfig,
@@ -782,6 +801,7 @@ pub async fn compact_to(
     writeln!(out, "dry_run: {dry_run}")?;
     write_part_split_lines(out, &config, &memory_target)?;
     writeln!(out, "{claims_line}")?;
+    writeln!(out, "{}", declared_stat_aggregates_line(&config))?;
     let outcome = match outcome {
         ClaimedCompaction::Ran(outcome) => outcome,
         ClaimedCompaction::SkippedClaimed(skip) => {
@@ -1330,6 +1350,7 @@ pub async fn compact_tenant_to(
     )?;
     writeln!(out, "dry_run: {dry_run}")?;
     writeln!(out, "{claims_line}")?;
+    writeln!(out, "{}", declared_stat_aggregates_line(&config))?;
 
     // Build the walk in deterministic order (shard ascending, then hour
     // ascending), truncating each shard at and including its first unsealed
@@ -2904,6 +2925,10 @@ pub struct MigrateSwitches {
     /// version 2 compaction record over a bucket whose one compaction record
     /// holds parts below the target.
     pub reencode_compaction_parts: bool,
+    /// Whether the logs parts the walk writes (a migration or a re-encode)
+    /// carry the declared-column stamp's sum and zero count, set on
+    /// [`CompactorConfig::emit_declared_stat_aggregates`]. The default emits.
+    pub declared_stat_aggregates: DeclaredStatAggregates,
 }
 
 /// [`migrate`], with the report written to `out` instead of stdout. The
@@ -2941,6 +2966,7 @@ pub async fn migrate_to(
     let clock = wall_clock()?;
     let mut config = CompactorConfig {
         reencode_writer_enabled: switches.reencode_compaction_parts,
+        emit_declared_stat_aggregates: switches.declared_stat_aggregates.emits(),
         ..CompactorConfig::default()
     };
     writeln!(
@@ -2954,6 +2980,7 @@ pub async fn migrate_to(
         "reencode_compaction_parts: {}",
         switches.reencode_compaction_parts
     )?;
+    writeln!(out, "{}", declared_stat_aggregates_line(&config))?;
     if switches.dry_run {
         return migrate_dry_run(
             out,

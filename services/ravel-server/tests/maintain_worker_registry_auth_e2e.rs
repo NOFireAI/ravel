@@ -61,6 +61,7 @@ fn keys_from_cli(path: &str) -> MaintainRecordKeys {
 
 fn maintain_config(tenant: &TenantId, keys: MaintainRecordKeys) -> ServerConfig {
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),

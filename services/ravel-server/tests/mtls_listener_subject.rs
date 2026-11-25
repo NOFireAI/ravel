@@ -56,6 +56,7 @@ async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Runni
         .expect("--mtls-enabled builds an mTLS resolver");
 
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Some(ravel_maintain::AuditPipelineConfig {
             audit_mode: ravel_maintain::AuditMode::Required,

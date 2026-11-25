@@ -495,6 +495,7 @@ pub async fn start_ingest_server(
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let loopback: std::net::SocketAddr = "127.0.0.1:0".parse()?;
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Arrival,
         audit_pipeline: None,
         audit_text: Default::default(),

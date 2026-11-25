@@ -47,6 +47,7 @@ fn maintain_record_keys(mode: Mode) -> Option<ravel_maintain::worker_set::Mainta
 /// window) and the maintenance loop left disabled, so only the scrubber acts.
 fn maintain_config(mode: Mode, tenant: &TenantId) -> ServerConfig {
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),

@@ -168,6 +168,7 @@ fn server_config(agents: AgentsConfig, mode: Mode) -> ServerConfig {
         );
     }
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),

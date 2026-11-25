@@ -269,6 +269,7 @@ fn server_config(
     audit_text: ravel_maintain::AuditTextPolicy,
 ) -> ServerConfig {
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline,
         audit_text,

@@ -264,6 +264,7 @@ impl Fixture {
 
 fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: None,
         audit_text: Default::default(),

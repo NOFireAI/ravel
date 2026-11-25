@@ -1008,8 +1008,8 @@ entries, and ADR-4628 adds the exact sum (`I64` only) and the zero count
 (`I64` and `BOOL`). The logs flush, `ravel-cli load` included, writes the
 sum and zero count from issue #4670 on. A producer process setting
 withholds them (`IngestConfig::emit_declared_stat_aggregates`, ADR-4628
-decision 8); as of this amendment no server or loader flag sets it, and
-issue #4672 tracks that surface. Logs compaction, migrate and force 2
+decision 8); docs/ingest.md names the server and loader flags that set it.
+Logs compaction, migrate and force 2
 write them from issue #4671 on, under
 `CompactorConfig::emit_declared_stat_aggregates`. These are numeric values
 of the stamped rows. A sum can recover an erased value: the pre-rewrite sum
