@@ -76,8 +76,8 @@ enum Stamp {
     /// Neither column does (an older fold's or writer's output).
     Stripped,
     /// `a` claims a zero count of 0 beside its minimum of 0 over non-null
-    /// rows (the zero-count guard of `stamp_equal_count`), with its true sum;
-    /// `w` is full.
+    /// rows, which decode drops (`aggregate_defect`), with its true sum; `w`
+    /// is full.
     ZeroCountLie,
 }
 
@@ -93,7 +93,7 @@ fn stamps_for(rows: &[Row], stamp: Stamp) -> Vec<DeclaredColumnStat> {
                 .with_sum(full("a").sum().expect("sum"))
                 .expect("sum")
                 .with_zero_count(0)
-                .expect("decode admits a zero count of 0 beside a min of 0");
+                .expect("zero inside the range");
             vec![lie, full("w")]
         }
     }
@@ -532,11 +532,10 @@ async fn s5_a_pending_erasure_loads_nothing() {
     assert_eq!(run.phases.plan.0, 1, "no request: the load is kept");
 }
 
-/// (s6): segment 1's stamp carries a zero count of 0 beside a minimum of 0
-/// over non-null rows, which `stamp_equal_count` refuses, so the stamp gives
-/// no figure for `a <> 0` although field 8 is present: the load is kept and
-/// the statement scans, equal to the forced scan (which counts segment 1's
-/// one non-zero row, not three).
+/// (s6): segment 1's stamp for `a` carries a zero count of 0 beside a
+/// minimum of 0 over non-null rows, which decode drops, so segment 1 has no
+/// figure for `a <> 0`: the load is kept and the statement scans, equal to
+/// the forced scan (which counts segment 1's one non-zero row, not three).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s6_a_refused_zero_count_keeps_the_load() {
     let lie = unfolded([Stamp::ZeroCountLie, Stamp::Full, Stamp::Full]).await;
