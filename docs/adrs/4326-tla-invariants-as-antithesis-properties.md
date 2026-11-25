@@ -644,22 +644,29 @@ A step of this kind is legitimate only when all of these hold:
 - The data object the record names is stored before the replay.
 - The replay is create-only, and a refusal because the key exists (412)
   reports the situation as not reached, with nothing to undo.
-- The server's write whose commit record is captured was sent as a single
-  attempt, and the driver recorded it as not acknowledged. So the driver's
-  model allows zero or one copy of it, and no token read reads it.
+- The server's write was never acknowledged, and the replay is a single
+  create-only attempt. So the driver's model allows zero or one copy of the
+  write, and no token read reads it.
 - The race ends before its hour can seal for the fold, and the driver bounds
   every leg it holds the write gate across:
-  - the abandonment wait: the server's store client retries a refused PUT
-    within its retry budget of about 180 s plus one 20 s request;
+  - the abandonment wait, which is the ingest flush's whole commit-PUT
+    budget. `ravel-ingest` retries the commit-record PUT up to
+    `put_retry_max_attempts + 1` times (5 by default), and each attempt is
+    one store-client operation of up to its 180 s retry budget plus one
+    20 s request, with backoff between attempts. The flush deadline bounds
+    the whole leg. The driver caps its wait for the server's abandonment at
+    that budget and reports not reached past it;
   - the clock move, with its HEAD-quiet wait;
   - the replay and the LIST;
   - the wait for the servers' compaction record, which the driver caps.
 
-  The capture and the abandonment happen while hour H still has time left.
-  The legs after the clock move start at the late-commit cutoff C(H) and
-  must end before the hour's fold seal. The driver checks their sum against
-  the fold safety margin, which is the gap between the two, less the seconds
-  the move lands past C(H).
+  The capture happens while hour H still has time left. The abandonment
+  wait can run past the end of H, but it ends before the clock move, and
+  the driver's clock is then still before C(H). The legs after the clock
+  move start at the late-commit cutoff C(H) and must end before the hour's
+  fold seal. The driver checks their sum against the fold safety margin,
+  which is the gap between the two, less the seconds the move lands past
+  C(H).
 - There is no undo. ADR-4561's R6 forbids deleting a late record: it is
   served, kept, held, expired and counted exactly as before.
 - The driver's write gate is held from the capture to the replay.
