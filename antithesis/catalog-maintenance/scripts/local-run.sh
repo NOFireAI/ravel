@@ -131,7 +131,16 @@ DRAWN_IN_FLIGHT=$((2200 + 3 * 60))
 # one reread (README.md, "HEAD holds still before every move"): 60 s each.
 # After the window jump the driver waits up to 150 s more for a server sweep
 # to delete an input.
-END_LIMIT=$((SECS + DRAWN_IN_FLIGHT + 4800 + 6 * TAMPER_RACE_S + 900 + 25 * 60 + 150))
+# Right after recovery, before the forced races, the eventually runs an early
+# multiset check (README.md, "The multiset checks"). Its fold, compaction,
+# two audits and second fold are counted at their observed cost, 60 s (the
+# same steps took 57 s at the end of an Antithesis eventually), plus 300 s
+# for one of them running to its CLI timeout. Each of the two nodes' scans
+# is counted at its bound, the 120 s re-read deadline plus one 30 s read
+# timeout (300 s). Its token reads answer at their first attempt once faults
+# stopped and are counted in the 60 s. 60 + 300 + 300 = 660 s.
+EARLY_MULTISET_S=660
+END_LIMIT=$((SECS + DRAWN_IN_FLIGHT + 4800 + 6 * TAMPER_RACE_S + 900 + 25 * 60 + 150 + EARLY_MULTISET_S))
 # The reshard profile's situations run first in the eventually: the
 # activation writes, the fence (a 75 s stale-view wait, one move, writes
 # that may each wait out a store timeout, and up to 300 s of recovery), and

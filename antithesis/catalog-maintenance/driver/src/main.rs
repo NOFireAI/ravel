@@ -2945,6 +2945,176 @@ impl Shared {
         }
     }
 
+    /// The eventually's on-demand fold and compaction, each tried up to
+    /// three times, an audit, then a fold that lets HEAD name the
+    /// compaction's output and an audit of what that HEAD resolves. With
+    /// faults stopped both run over every hour the jump sealed. Returns
+    /// whether that last fold succeeded.
+    fn fold_compact_audit(&self) -> bool {
+        for (what, op) in [
+            ("fold", Shared::fold as fn(&Shared) -> bool),
+            ("compaction", Shared::compact),
+        ] {
+            let done = (0..3).any(|attempt| {
+                if attempt > 0 {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+                op(self)
+            });
+            if !done {
+                println!("eventually: the on-demand {what} failed three times");
+            }
+        }
+        self.audit(&|_| 0);
+        let folded = self.fold();
+        if !folded {
+            println!("eventually: the fold after the compaction failed");
+        }
+        self.audit(&|_| 0);
+        folded
+    }
+
+    /// The multiset check right after recovery. The forced situations take
+    /// most of the eventually, and few Antithesis timelines live long enough
+    /// to reach the final check after them. It is skipped, with the reason
+    /// printed, when a rule the stop cut short may have left behind what the
+    /// forced situations would clear first: an s3 proxy rule, a pending
+    /// tamper undo, or a HEAD no fold rebuilt.
+    fn early_multiset_check(&self) {
+        let began = Instant::now();
+        if self.proxy_cmd("pass").is_err() {
+            println!("eventually: early multiset check skipped: the s3 proxy kept its rules");
+            return;
+        }
+        let pending = lock(&self.pending_undos).len();
+        if pending > 0 {
+            println!(
+                "eventually: early multiset check skipped: {pending} tamper undo(s) still pending"
+            );
+            return;
+        }
+        if !self.fold_compact_audit() {
+            println!(
+                "eventually: early multiset check skipped: the fold after the compaction failed"
+            );
+            return;
+        }
+        let found = self.multiset_check(MultisetPhase::Early);
+        println!(
+            "eventually: early multiset check took {} s ({found})",
+            began.elapsed().as_secs()
+        );
+    }
+
+    /// The whole multiset, once faults stopped: a settled no-token scan of
+    /// each node, which must hold every seeded record exactly once, and a
+    /// token read of every acked live write, which must find each at least
+    /// once.
+    fn multiset_check(&self, phase: MultisetPhase) -> MultisetFound {
+        let acked: Vec<Write> = {
+            let m = lock(&self.model);
+            m.acked_logs
+                .iter()
+                .filter_map(|id| m.writes.get(id).cloned())
+                .collect()
+        };
+        let label = match phase {
+            MultisetPhase::Early => "early multiset check",
+            MultisetPhase::Final => "multiset check",
+        };
+        println!(
+            "eventually: {label}; {} seeded records, {} acked live writes",
+            self.seeded.len(),
+            acked.len()
+        );
+        let n = self.ravel.nodes.len();
+        let mut seeded_missing = Vec::new();
+        let mut seeded_over = Vec::new();
+        let mut phantoms = Vec::new();
+        let mut over = Vec::new();
+        let mut missing = Vec::new();
+        let mut unreadable = Vec::new();
+        let mut rows = Vec::new();
+        for node in 0..n {
+            match self.settled_scan(node) {
+                Ok(v) => {
+                    let tag = |l: &String| format!("node {node} scan: {l}");
+                    seeded_missing.extend(v.seeded_missing.iter().map(tag));
+                    seeded_over.extend(v.seeded_over.iter().map(tag));
+                    phantoms.extend(v.phantoms.iter().map(tag));
+                    over.extend(v.over.iter().map(tag));
+                    rows.push(v.rows);
+                }
+                Err(e) => unreadable.push(format!("node {node} scan: {e}")),
+            }
+        }
+        for (i, chunk) in acked.chunks(TOKEN_BATCH).enumerate() {
+            match retry_read(|attempt| self.token_read((i + attempt) % n, chunk)) {
+                Ok(j) => {
+                    phantoms.extend(j.phantoms);
+                    over.extend(j.over);
+                    over.extend(j.over_after_replay);
+                    missing.extend(j.missing);
+                }
+                Err(e) => unreadable.push(format!(
+                    "token read of writes {:?}: {e}",
+                    chunk.iter().map(|w| w.id).collect::<Vec<_>>()
+                )),
+            }
+        }
+        let jump = *lock(&self.jump);
+        let sweep_jump = *lock(&self.sweep_jump);
+        let holds = seeded_missing.is_empty()
+            && seeded_over.is_empty()
+            && phantoms.is_empty()
+            && over.is_empty()
+            && missing.is_empty()
+            && unreadable.is_empty();
+        let details = json!({
+            "phase": phase.name(),
+            "compaction_record_seen": self.compacted.load(Ordering::SeqCst),
+            "clock_jump": jump.map(|j| json!({
+                "before_ns": j.before_ns,
+                "after_ns": j.after_ns,
+                "reached_driver": j.reached_driver,
+            })),
+            "sweep_jump_after_ns": sweep_jump.map(|(_, w)| w.after_ns),
+            "sweep_deleted_inputs": lock(&self.sweeps).confirmed(),
+            "rows_per_node": rows,
+            "acked_live_writes": acked.len(),
+            "seeded_missing": first(&seeded_missing),
+            "seeded_over": first(&seeded_over),
+            "phantoms": first(&phantoms),
+            "over": first(&over),
+            "missing": first(&missing),
+            "unreadable": first(&unreadable),
+        });
+        // The SDK reports only the first pass of each call site, so each
+        // phase has its own site: with one, the early pass would hide every
+        // final one.
+        macro_rules! assert_multiset {
+            () => {
+                assert_always!(
+                    holds,
+                    "catalog: compaction preserves the acked multiset",
+                    &details
+                )
+            };
+        }
+        match phase {
+            MultisetPhase::Early => assert_multiset!(),
+            MultisetPhase::Final => assert_multiset!(),
+        }
+        MultisetFound {
+            seeded_missing: seeded_missing.len(),
+            seeded_over: seeded_over.len(),
+            phantoms: phantoms.len(),
+            over: over.len(),
+            missing: missing.len(),
+            unreadable: unreadable.len(),
+        }
+    }
+
     /// The local loop's stand-in for a node-restart fault (README.md, "Token
     /// reads across the lifecycle"): ask `local-run.sh` to restart `node`,
     /// wait for its confirmation and for every node to serve, then write once
@@ -3274,8 +3444,9 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     if lock(&s.head_key).is_none() {
         let _ = s.inspect_json();
     }
-    // The reshard profile's situations run first, so every race, fold,
-    // compaction, sweep and read below runs across both reshards.
+    s.early_multiset_check();
+    // The reshard profile's situations run next, so every race, fold,
+    // compaction, sweep and read after them runs across both reshards.
     #[cfg(feature = "reshard")]
     reshard::eventually(s);
     for _ in 0..FOLD_RACES_EVENTUALLY {
@@ -3305,30 +3476,9 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         s.unfolded_sweep("eventually");
     }
     s.unreadable_head_sweep("eventually");
-    // With faults stopped the fold and the compaction run over every hour
-    // the jump sealed, so the multiset below is checked after both.
-    for (what, op) in [
-        ("fold", Shared::fold as fn(&Shared) -> bool),
-        ("compaction", Shared::compact),
-    ] {
-        let done = (0..3).any(|attempt| {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_secs(2));
-            }
-            op(s)
-        });
-        if !done {
-            println!("eventually: the on-demand {what} failed three times");
-        }
-    }
-    s.audit(&|_| 0);
-    // A fold after the compaction lets HEAD name its output, and the audit
-    // records what that HEAD resolves; the token reads then run while the
-    // compacted inputs' commit records are still there.
-    if !s.fold() {
-        println!("eventually: the fold after the compaction failed");
-    }
-    s.audit(&|_| 0);
+    s.fold_compact_audit();
+    // The token reads run while the compacted inputs' commit records are
+    // still there.
     s.eventually_token_reads(1, "eventually: compacted", None);
     // The races above may have taken every earlier compaction record past
     // its protection horizon and swept its inputs, so one read goes to an
@@ -3352,93 +3502,51 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
     s.eventually_token_reads(2, "eventually: swept", restarted);
     println!("token reads by outcome: {:?}", lock(&s.token_tally));
 
-    let acked: Vec<Write> = {
-        let m = lock(&s.model);
-        m.acked_logs
-            .iter()
-            .filter_map(|id| m.writes.get(id).cloned())
-            .collect()
-    };
-    println!(
-        "eventually: multiset check; {} seeded records, {} acked live writes",
-        s.seeded.len(),
-        acked.len()
-    );
-    let n = s.ravel.nodes.len();
-    let mut seeded_missing = Vec::new();
-    let mut seeded_over = Vec::new();
-    let mut phantoms = Vec::new();
-    let mut over = Vec::new();
-    let mut missing = Vec::new();
-    let mut unreadable = Vec::new();
-    let mut rows = Vec::new();
-    for node in 0..n {
-        match s.settled_scan(node) {
-            Ok(v) => {
-                let tag = |l: &String| format!("node {node} scan: {l}");
-                seeded_missing.extend(v.seeded_missing.iter().map(tag));
-                seeded_over.extend(v.seeded_over.iter().map(tag));
-                phantoms.extend(v.phantoms.iter().map(tag));
-                over.extend(v.over.iter().map(tag));
-                rows.push(v.rows);
-            }
-            Err(e) => unreadable.push(format!("node {node} scan: {e}")),
-        }
-    }
-    for (i, chunk) in acked.chunks(TOKEN_BATCH).enumerate() {
-        match retry_read(|attempt| s.token_read((i + attempt) % n, chunk)) {
-            Ok(j) => {
-                phantoms.extend(j.phantoms);
-                over.extend(j.over);
-                over.extend(j.over_after_replay);
-                missing.extend(j.missing);
-            }
-            Err(e) => unreadable.push(format!(
-                "token read of writes {:?}: {e}",
-                chunk.iter().map(|w| w.id).collect::<Vec<_>>()
-            )),
-        }
-    }
-    let jump = *lock(&s.jump);
-    let sweep_jump = *lock(&s.sweep_jump);
-    assert_always!(
-        seeded_missing.is_empty()
-            && seeded_over.is_empty()
-            && phantoms.is_empty()
-            && over.is_empty()
-            && missing.is_empty()
-            && unreadable.is_empty(),
-        "catalog: compaction preserves the acked multiset",
-        &json!({
-            "compaction_record_seen": s.compacted.load(Ordering::SeqCst),
-            "clock_jump": jump.map(|j| json!({
-                "before_ns": j.before_ns,
-                "after_ns": j.after_ns,
-                "reached_driver": j.reached_driver,
-            })),
-            "sweep_jump_after_ns": sweep_jump.map(|(_, w)| w.after_ns),
-            "sweep_deleted_inputs": lock(&s.sweeps).confirmed(),
-            "rows_per_node": rows,
-            "acked_live_writes": acked.len(),
-            "seeded_missing": first(&seeded_missing),
-            "seeded_over": first(&seeded_over),
-            "phantoms": first(&phantoms),
-            "over": first(&over),
-            "missing": first(&missing),
-            "unreadable": first(&unreadable),
-        })
-    );
-    println!(
-        "eventually: ending the timeline (seeded missing {}, seeded over {}, phantoms {}, \
-         over {}, missing {}, unreadable {})",
-        seeded_missing.len(),
-        seeded_over.len(),
-        phantoms.len(),
-        over.len(),
-        missing.len(),
-        unreadable.len()
-    );
+    let found = s.multiset_check(MultisetPhase::Final);
+    println!("eventually: ending the timeline ({found})");
     std::process::exit(0);
+}
+
+/// Where in the eventually a multiset check runs: `Early` right after
+/// recovery, before any forced situation, and `Final` at its end.
+#[derive(Clone, Copy)]
+enum MultisetPhase {
+    Early,
+    Final,
+}
+
+impl MultisetPhase {
+    fn name(self) -> &'static str {
+        match self {
+            MultisetPhase::Early => "early",
+            MultisetPhase::Final => "final",
+        }
+    }
+}
+
+/// How many findings of each kind one multiset check made.
+struct MultisetFound {
+    seeded_missing: usize,
+    seeded_over: usize,
+    phantoms: usize,
+    over: usize,
+    missing: usize,
+    unreadable: usize,
+}
+
+impl std::fmt::Display for MultisetFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "seeded missing {}, seeded over {}, phantoms {}, over {}, missing {}, unreadable {}",
+            self.seeded_missing,
+            self.seeded_over,
+            self.phantoms,
+            self.over,
+            self.missing,
+            self.unreadable
+        )
+    }
 }
 
 /// Retry a read for up to two minutes: nodes that just restarted can answer

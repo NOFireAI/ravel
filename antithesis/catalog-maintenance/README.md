@@ -117,7 +117,7 @@ compaction record is seen the workload jumps the clock twice more.
 | `audit` | The store audit below. |
 | `check_bounds` | The upper-bound check below, on one node. |
 | `token_lifecycle_read` | While faults may run: reads one acked write back with its commit tokens on a drawn node, drawing the write from all of them, from those with a compacted input, or from those whose input commit record the sweep check confirmed deleted, and drawing whether to read it twice on that node ("Token reads across the lifecycle"). |
-| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs up to six fold races until a server fold lost its CAS, up to five record races until a server's record PUT lost, up to three divergent-record races and then up to three missing-part races until each reached its situation, the unfolded-record sweep unless one already reached its situation, and the unreadable-HEAD sweep, then folds, compacts, audits, folds and audits again and token-reads up to six writes with a compacted input, then compacts a fresh bucket and token-reads one of its writes ("The fresh compaction read"), takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, in the local loop has `local-run.sh` restart a node, token-reads up to six writes whose input commit record was swept, runs the full multiset check and ends the timeline. |
+| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs the early multiset check (folds, compacts, audits, folds, audits and checks the full multiset; "The multiset checks"), runs up to six fold races until a server fold lost its CAS, up to five record races until a server's record PUT lost, up to three divergent-record races and then up to three missing-part races until each reached its situation, the unfolded-record sweep unless one already reached its situation, and the unreadable-HEAD sweep, then folds, compacts, audits, folds and audits again and token-reads up to six writes with a compacted input, then compacts a fresh bucket and token-reads one of its writes ("The fresh compaction read"), takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, in the local loop has `local-run.sh` restart a node, token-reads up to six writes whose input commit record was swept, runs the full multiset check and ends the timeline. |
 
 The forced eventually runs inside the state machine, like a drawn one: once
 `WORKLOAD_EVENTUALLY_AFTER_SECS` passes, the timer only sets a flag, and the
@@ -144,6 +144,24 @@ each node, re-read for up to two minutes while its only finding is absent
 records, must hold every seeded record exactly once, and a read of every
 acked live write with its commit tokens must find each at least once. A read
 that fails for two minutes counts as a violation, not as a pass.
+
+The `eventually` runs that check twice, both under `catalog: compaction
+preserves the acked multiset`, with a `phase` detail field that says which.
+Each phase has its own call site of the assertion, because the SDK reports
+only the first pass of each site: with one site the early pass would hide
+every final one.
+The `early` check runs right after recovery and the clock jump, before any
+forced situation: a fold, a compaction, an audit, a fold and an audit, then
+the scans and token reads. The `final` check runs at the end, after the
+forced races, the sweeps and the deletions they lead to. The forced
+situations take about 1400 s of the eventually, and an Antithesis timeline
+rarely lives that long after faults stop: in four runs, 0 or 1 lineage per
+run reached the final check. The early check takes about 60 to 120 s, so it
+counts on many more timelines. It is skipped, with a line that says why,
+when the s3 proxy does not lift its rules, when a tamper undo is still
+pending, or when the fold after the compaction fails: state a rule cut
+short by the stop can leave behind, which the forced situations clear
+before the final check.
 
 ### Token reads across the lifecycle
 
@@ -318,7 +336,7 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: every object HEAD names exists` | always | `audit` | Every key the stable HEAD names is in the LIST taken while HEAD did not change, and the text parse of that HEAD matches its JSON form. |
 | `catalog: every data object the catalog resolves exists` | always | `audit` | Every data object `rlog footprint` reports is in that LIST. |
 | `catalog: the system recovers once faults stop` | always | `eventually` | Every node is ready and answers SQL, and every maintenance node is ready, within 300 s of faults stopping. |
-| `catalog: compaction preserves the acked multiset` | always | `eventually` | After faults stop, a fold and a compaction: each seeded record is stored exactly once, each acked live record at least once (read with its commit tokens), no live record more often than its attempts allow, no row names a record that was never written, and every read answered. |
+| `catalog: compaction preserves the acked multiset` | always | `eventually` | After faults stop, a fold and a compaction, checked twice (`phase` `early` and `final`, "The multiset checks"): each seeded record is stored exactly once, each acked live record at least once (read with its commit tokens), no live record more often than its attempts allow, no row names a record that was never written, and every read answered. |
 | `catalog: a token read returns each acked record of its write exactly once` | always | `token_lifecycle_read`, `eventually` | Every token read that gave a verdict returned each record of the write exactly once and nothing else, and was not refused as unsatisfiable twice ("Token reads across the lifecycle"). Reads without a verdict are counted, not judged. |
 | `catalog: a token read ran after its input was compacted` | sometimes | `token_lifecycle_read`, `eventually` | A read gave a verdict while a compaction record named one of the write's inputs and that input's commit record was still in the store. |
 | `catalog: a token read ran after HEAD named the compaction output` | sometimes | `token_lifecycle_read`, `eventually` | A read gave a verdict after a stable HEAD served one of the write's inputs from the covering record's output. |
@@ -1103,8 +1121,9 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   plus `forced::TAMPER_RACE_S` (842 s) for each of up to six
   divergent-record and missing-part races, 900 s for its fresh compaction
   read, 60 s for each of up to 25 clock moves, 150 s for the wait after the
-  window jump, and 2380 s for a drawn race or sweep still holding the
-  driver's gate when the `eventually` is due. `local-run.sh` holds its own
+  window jump, 660 s for the early multiset check, and 2380 s for a drawn
+  race or sweep still holding the driver's gate when the `eventually` is
+  due. `local-run.sh` holds its own
   copy of the 842 s, and a driver unit test checks it against the constant.
 - `WORKLOAD_INJECT_SWAPPED_RECORD=1 scripts/local-run.sh <out-dir>` is the
   self-check. The model expects one seeded record moved to another write, so
