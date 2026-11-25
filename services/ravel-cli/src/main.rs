@@ -2628,7 +2628,6 @@ enum MaintainCommand {
         /// unfolded catalog, SUM, AVG and a `<> 0` count where 0 lies inside
         /// a part's min and max then scan those parts; on a folded one the
         /// `.cstat` statistics can still answer them.
-        ///
         /// A setting of this run, not persisted: a later compaction of the
         /// same rows by a process that does not withhold writes the fields
         /// again, so every process that writes stamps must set it. Fields
@@ -2790,7 +2789,6 @@ enum MaintainCommand {
         /// unfolded catalog, SUM, AVG and a `<> 0` count where 0 lies inside
         /// a part's min and max then scan those parts; on a folded one the
         /// `.cstat` statistics can still answer them.
-        ///
         /// A setting of this run, not persisted: a later compaction of the
         /// same rows by a process that does not withhold writes the fields
         /// again, so every process that writes stamps must set it. Fields
@@ -2916,7 +2914,6 @@ enum MaintainCommand {
         /// written. On an unfolded catalog, SUM, AVG and a `<> 0` count where
         /// 0 lies inside a part's min and max then scan those parts; on a
         /// folded one the `.cstat` statistics can still answer them.
-        ///
         /// A setting of this run, not persisted: a later compaction of the
         /// same rows by a process that does not withhold writes the fields
         /// again, so every process that writes stamps must set it. Fields

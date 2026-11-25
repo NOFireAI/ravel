@@ -1300,6 +1300,49 @@ Startup refuses `--maintain-scratch-max-bytes`, `--maintain-level1-workers`,
 `--maintain-level2-workers` or `--maintain-run-block-records` given without
 `--maintain-scratch-dir`, and any of them set to `0`.
 
+## Withholding stamp sums
+
+Every logs commit record and every logs compaction part carries a stamp
+per typed attribute column: min, max, null count, and by default also the sum
+(`I64` columns) and the count of zero values. `--no-declared-stat-aggregates` makes a
+process write the stamps it produces without the sum and the zero count.
+The min, max and null count are still written.
+
+The same flag exists on every process that writes stamps:
+
+| Surface | Writes |
+|---|---|
+| `ravel-server` in `--mode all` or `gateway` (ingest role) | The commit records of each logs flush. |
+| `ravel-server --mode maintain` (maintain role) | The parts of each logs compaction, migrate and re-encode that the maintenance loop and the background migrate write. |
+| `ravel-cli load` | The commit records of a logs load. |
+| `ravel-cli maintain compact-bucket`, `compact-tenant` and `migrate` | The parts of the logs compactions, migrations and re-encodes the run writes. |
+
+`ravel-server --mode query` runs none of these and refuses the flag at
+startup. Without the flag every surface emits the sum and the zero count.
+The `maintain` commands print a `declared_stat_aggregates: emitted` or
+`declared_stat_aggregates: withheld` line, and `load` a `stamp aggregates`
+line.
+
+What it changes: new records and parts omit the sum and the zero count. On
+an unfolded catalog, `SUM`, `AVG` and a `<> 0` count where 0 lies inside a
+segment's min and max then read those segments instead of answering from
+the stamp. A folded catalog can still answer them from its `.cstat`
+statistics.
+
+What it does not change:
+
+- Fields already written stay. A record under an Object Lock keeps them
+  until its retain-until.
+- `.cstat` statistics are untouched; a fold still writes its sums there.
+- It is not persisted. It applies only to the process that was started
+  with it, so every process that flushes or compacts logs must carry it.
+  A compaction by a process without it recomputes the sum and the zero
+  count from the rows and writes them back into its output.
+
+A cluster run by the Kubernetes operator cannot set the flag today: the
+operator builds each pod's arguments itself and passes no extra argument
+through.
+
 ## Retention and garbage-collection configuration
 
 These values govern when the bytes of a deleted object go away. They must

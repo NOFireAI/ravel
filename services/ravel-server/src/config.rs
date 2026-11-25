@@ -1170,9 +1170,8 @@ pub struct Cli {
     /// (`--mode maintain`) writes. The min, max and null count are still
     /// written. On an unfolded catalog, SUM, AVG and a `<> 0` count where 0
     /// lies inside a segment's min and max then scan those segments; on a
-    /// folded one the `.cstat` statistics can still answer them.
-    ///
-    /// A process setting, not a persisted record: every process that writes
+    /// folded one the `.cstat` statistics can still answer them. A process
+    /// setting, not a persisted record: every process that writes
     /// stamps must set it, because a compactor that does not withhold
     /// recomputes the fields from the rows. Fields already written stay, and
     /// a record under an Object Lock keeps them until its retain-until
