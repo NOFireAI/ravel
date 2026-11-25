@@ -169,7 +169,7 @@ Decode and print HEAD and every referenced snapshot part for one (tenant, signal
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--entries` |  |  | Under each part's `stamps:` census line, print every decoded entry's identity (level, shard, ingest hour, writer id, epoch and sequence) followed by its declared-column stamp lines: each wire entry with its min, max, null count, sum, wide sum and zero count, then `stamp: entries=<n> kept=<k>`, where kept counts the entries a reader keeps after validation. Not with `--json`, which reads HEAD alone |
+| `--entries` |  |  | Under each part's `stamps:` census line, print every decoded entry's identity (level, shard, ingest hour, writer id, epoch and sequence) and the data object key derived from it (`key=`, or `key=UNDERIVABLE(<reason>)` when the identity cannot form one), followed by its declared-column stamp lines: each wire entry with its min, max, null count, sum, wide sum and zero count, then `stamp: entries=<n> kept=<k>`, where kept counts the entries a reader keeps after validation. Not with `--json`, which reads HEAD alone |
 | `--json` |  |  | Print HEAD and every part ref as one JSON document, from HEAD alone: no part object is fetched |
 | `--signal` |  | `metrics` | Which signal's HEAD to decode. Defaults to metrics |
 | `--tenant` |  |  |  |

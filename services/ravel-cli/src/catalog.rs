@@ -1375,16 +1375,79 @@ pub fn snapshot_stamp_census_line(entries: &[ravel_proto::catalog::v1::SnapshotE
     )
 }
 
-/// One snapshot entry under `catalog inspect --entries`: its identity, then
-/// its stamp lines. ravel-catalog exposes no public derivation of an entry's
-/// data object key, so the identity is printed instead of the key.
+/// The data object key a snapshot entry names, derived the way the catalog
+/// derives it for a fetch: level 0 is an ingest object keyed by its writer
+/// identity and content hash; level 1 is a compaction or rewrite part, whose
+/// `writer_id` carries the input-set hash and `writer_epoch` the part index.
+/// `Err` holds why the key cannot be derived from this entry.
+fn snapshot_entry_data_key(
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    entry: &ravel_proto::catalog::v1::SnapshotEntry,
+) -> Result<String, String> {
+    let content_hash: [u8; 32] = entry
+        .content_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("content_hash is {} bytes, not 32", entry.content_hash.len()))?;
+    match entry.level {
+        0 => {
+            let writer_id: [u8; 16] = entry
+                .writer_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("writer_id is {} bytes, not 16", entry.writer_id.len()))?;
+            ravel_commit::keys::data_key(
+                tenant_hash,
+                signal,
+                entry.shard,
+                Uuid::from_bytes(writer_id),
+                entry.writer_epoch,
+                entry.writer_seq,
+                &content_hash,
+            )
+            .map_err(|err| err.to_string())
+        }
+        1 => {
+            let input_set_hash: [u8; 32] = entry.writer_id.as_slice().try_into().map_err(|_| {
+                format!(
+                    "level 1 writer_id is {} bytes, not 32",
+                    entry.writer_id.len()
+                )
+            })?;
+            let part_index = u32::try_from(entry.writer_epoch)
+                .map_err(|_| format!("part index {} exceeds u32", entry.writer_epoch))?;
+            ravel_commit::keys::l1_part_key(
+                tenant_hash,
+                signal,
+                entry.shard,
+                entry.ingest_hour_bucket,
+                &hex::encode(&input_set_hash[..8]),
+                part_index,
+                &hex::encode(&content_hash[..8]),
+            )
+            .map_err(|err| err.to_string())
+        }
+        other => Err(format!("level {other} is neither 0 nor 1")),
+    }
+}
+
+/// One snapshot entry under `catalog inspect --entries`: its identity and
+/// data object key, then its stamp lines. A key that cannot be derived
+/// prints as `UNDERIVABLE(<reason>)` and the listing goes on.
 fn snapshot_entry_lines(
     index: usize,
+    tenant_hash: &TenantHash,
+    signal: Signal,
     entry: &ravel_proto::catalog::v1::SnapshotEntry,
 ) -> Vec<String> {
+    let key = match snapshot_entry_data_key(tenant_hash, signal, entry) {
+        Ok(key) => key,
+        Err(reason) => format!("UNDERIVABLE({reason})"),
+    };
     let mut lines = vec![format!(
         "      entry[{index}] level={} shard={} ingest_hour_bucket={} writer_id={} \
-         writer_epoch={} writer_seq={}",
+         writer_epoch={} writer_seq={} key={key}",
         entry.level,
         entry.shard,
         entry.ingest_hour_bucket,
@@ -1568,7 +1631,7 @@ pub async fn render_inspect_with_entries(
         out.push('\n');
         if entries {
             for (i, entry) in decoded.entries.iter().enumerate() {
-                for line in snapshot_entry_lines(i, entry) {
+                for line in snapshot_entry_lines(i, &tenant_hash, signal.to_signal(), entry) {
                     out.push_str(&line);
                     out.push('\n');
                 }
@@ -3081,6 +3144,13 @@ mod tests {
             stamped_snapshot_entry(1, &stamp_fixture::entries()),
             stamped_snapshot_entry(2, &[stamp_fixture::pre_adr()]),
             stamped_snapshot_entry(3, &[]),
+            ravel_proto::catalog::v1::SnapshotEntry {
+                level: 1,
+                writer_id: [[0xC1; 8], [0xC2; 8], [0xC3; 8], [0xC4; 8]].concat(),
+                writer_epoch: 2,
+                writer_seq: 0,
+                ..stamped_snapshot_entry(4, &[])
+            },
         ];
         let part_bytes =
             ravel_catalog::encode_part(tenant_hash.0, 0, 1, 20, &entries).expect("encode part");
@@ -3103,7 +3173,7 @@ mod tests {
                 key,
                 blake3: vec![0; 32],
                 size: part_bytes.len() as u64,
-                entry_count: 3,
+                entry_count: 4,
                 watermark_hour: 20,
                 min_hour: 0,
                 column_stats: None,
@@ -3147,30 +3217,41 @@ mod tests {
             let lines: Vec<String> = report.lines().map(str::to_string).collect();
             let at = lines
                 .iter()
-                .position(|l| l == "    entries (decoded): 3")
+                .position(|l| l == "    entries (decoded): 4")
                 .unwrap_or_else(|| panic!("no entries line in:\n{report}"));
             lines[at + 1..].to_vec()
         };
-        let census = "    stamps: entries=3 stamped=2 with_sum=1 with_sum_wide=1 with_zero_count=1"
+        let census = "    stamps: entries=4 stamped=2 with_sum=1 with_sum_wide=1 with_zero_count=1"
             .to_string();
 
         let plain = render(false).await;
         assert_eq!(after_count(&plain), vec![census.clone()], "{plain}");
 
+        let t = tenant_hash.to_hex();
+        let l0_key = |writer: &str, seq: &str| {
+            format!(
+                "key=t/{t}/m/l0/0000/{w}-{w2}-{w2}-{w2}-{w6}.1.{seq}.bbbbbbbbbbbbbbbb.rseg",
+                w = writer.repeat(4),
+                w2 = writer.repeat(2),
+                w6 = writer.repeat(6),
+            )
+        };
         let listed = render(true).await;
         let mut want = vec![
             census,
             format!(
                 "      entry[0] level=0 shard=0 ingest_hour_bucket=10 writer_id={} \
-                 writer_epoch=1 writer_seq=1",
-                "01".repeat(16)
+                 writer_epoch=1 writer_seq=1 {}",
+                "01".repeat(16),
+                l0_key("01", "00000000000000000001")
             ),
         ];
         want.extend(stamp_fixture::lines("        "));
         want.push(format!(
             "      entry[1] level=0 shard=0 ingest_hour_bucket=10 writer_id={} \
-             writer_epoch=1 writer_seq=2",
-            "02".repeat(16)
+             writer_epoch=1 writer_seq=2 {}",
+            "02".repeat(16),
+            l0_key("02", "00000000000000000002")
         ));
         want.push(
             "        stamp[0]: name=\"ResolutionWidth\" declared_type=2 (I64) min=800 max=1920 \
@@ -3180,10 +3261,101 @@ mod tests {
         want.push("        stamp: entries=1 kept=1".to_string());
         want.push(format!(
             "      entry[2] level=0 shard=0 ingest_hour_bucket=10 writer_id={} \
-             writer_epoch=1 writer_seq=3",
-            "03".repeat(16)
+             writer_epoch=1 writer_seq=3 {}",
+            "03".repeat(16),
+            l0_key("03", "00000000000000000003")
+        ));
+        want.push("        stamp: entries=0 kept=0".to_string());
+        want.push(format!(
+            "      entry[3] level=1 shard=0 ingest_hour_bucket=10 writer_id={}{}{}{} \
+             writer_epoch=2 writer_seq=0 \
+             key=t/{t}/m/l1/0000/19700101T10/c1c1c1c1c1c1c1c1.0002.bbbbbbbbbbbbbbbb.rseg",
+            "c1".repeat(8),
+            "c2".repeat(8),
+            "c3".repeat(8),
+            "c4".repeat(8),
         ));
         want.push("        stamp: entries=0 kept=0".to_string());
         assert_eq!(after_count(&listed), want, "{listed}");
+    }
+
+    /// An entry whose key cannot be derived prints `UNDERIVABLE(<reason>)`
+    /// in place of the key, whole line compared, and the listing still
+    /// renders its stamp lines. The part codec refuses these entries, so
+    /// they are rendered directly rather than through a stored part.
+    #[test]
+    fn an_underivable_entry_key_prints_its_reason() {
+        let tenant_hash = TenantId::new("cli-inspect-underivable").hash();
+        let base = stamped_snapshot_entry(5, &[]);
+        let line = |entry: ravel_proto::catalog::v1::SnapshotEntry| {
+            snapshot_entry_lines(0, &tenant_hash, Signal::Logs, &entry)
+        };
+        let lines = line(ravel_proto::catalog::v1::SnapshotEntry {
+            writer_id: vec![5; 15],
+            ..base.clone()
+        });
+        assert_eq!(
+            lines,
+            vec![
+                format!(
+                    "      entry[0] level=0 shard=0 ingest_hour_bucket=10 writer_id={} \
+                     writer_epoch=1 writer_seq=5 key=UNDERIVABLE(writer_id is 15 bytes, not 16)",
+                    "05".repeat(15)
+                ),
+                "        stamp: entries=0 kept=0".to_string(),
+            ]
+        );
+        let key_of = |entry: ravel_proto::catalog::v1::SnapshotEntry| {
+            let first = line(entry).remove(0);
+            let at = first.find(" key=").expect("a key field");
+            first[at + 1..].to_string()
+        };
+        assert_eq!(
+            key_of(ravel_proto::catalog::v1::SnapshotEntry {
+                content_hash: vec![0xBB; 31],
+                ..base.clone()
+            }),
+            "key=UNDERIVABLE(content_hash is 31 bytes, not 32)"
+        );
+        assert_eq!(
+            key_of(ravel_proto::catalog::v1::SnapshotEntry {
+                level: 2,
+                ..base.clone()
+            }),
+            "key=UNDERIVABLE(level 2 is neither 0 nor 1)"
+        );
+        let level1 = ravel_proto::catalog::v1::SnapshotEntry {
+            level: 1,
+            writer_id: vec![0xC1; 32],
+            ..base.clone()
+        };
+        assert_eq!(
+            key_of(ravel_proto::catalog::v1::SnapshotEntry {
+                writer_epoch: u64::from(u32::MAX) + 1,
+                ..level1.clone()
+            }),
+            "key=UNDERIVABLE(part index 4294967296 exceeds u32)"
+        );
+        assert_eq!(
+            key_of(ravel_proto::catalog::v1::SnapshotEntry {
+                writer_id: vec![0xC1; 16],
+                ..level1.clone()
+            }),
+            "key=UNDERIVABLE(level 1 writer_id is 16 bytes, not 32)"
+        );
+        assert_eq!(
+            key_of(ravel_proto::catalog::v1::SnapshotEntry {
+                writer_epoch: 10_000,
+                ..level1
+            }),
+            "key=UNDERIVABLE(part index 10000 exceeds the 4-digit key width (max 9999))"
+        );
+        assert_eq!(
+            key_of(ravel_proto::catalog::v1::SnapshotEntry {
+                shard: 10_000,
+                ..base
+            }),
+            "key=UNDERIVABLE(shard 10000 exceeds the 4-digit key width (max 9999))"
+        );
     }
 }
