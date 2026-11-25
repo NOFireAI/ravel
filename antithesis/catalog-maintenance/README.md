@@ -153,16 +153,17 @@ every final one.
 The `early` check runs right after recovery and the clock jump, before any
 forced situation: a fold, a compaction, an audit, a fold and an audit, then
 the scans and token reads. The `final` check runs at the end, after the
-forced races, the sweeps and the deletions they lead to. The forced
-situations take about 1400 s of the eventually, and an Antithesis timeline
-rarely lives that long after faults stop: in four runs, 0 or 1 lineage per
-run reached the final check. The early check is estimated at 60 to 120 s
-in Antithesis, from the 57 s the same steps took at the end of an
-Antithesis eventually (it took 1 s in the local loop), so it counts on many
-more timelines. It is skipped, with a line that says why,
-when the s3 proxy does not lift its rules, when a tamper undo is still
-pending, or when the fold after the compaction fails: state a rule cut
-short by the stop can leave behind, which the forced situations clear
+forced races, the sweeps and the deletions they lead to. An Antithesis
+timeline rarely lives long after faults stop. Measured on the
+reshard-ownership profile, which runs this eventually with its reshard
+situations first, the forced situations took about 1400 s, and in four
+runs 0 or 1 lineage per run reached the final check (#4340). The early
+check is estimated at 60 to 120 s in Antithesis, from the 57 s the same
+steps took at the end of an Antithesis eventually (it took 1 s in the local
+loop), so it counts on many more timelines. It is skipped, with a line that
+says why, when the s3 proxy does not lift its rules, when a tamper undo is
+still pending, or when the fold after the compaction fails: state a rule
+cut short by the stop can leave behind, which the forced situations clear
 before the final check.
 
 ### Token reads across the lifecycle
@@ -1123,7 +1124,7 @@ The same steps as ingest-durability, from this directory's `scripts/`:
   plus `forced::TAMPER_RACE_S` (842 s) for each of up to six
   divergent-record and missing-part races, 900 s for its fresh compaction
   read, 60 s for each of up to 25 clock moves, 150 s for the wait after the
-  window jump, 660 s for the early multiset check, and 2380 s for a drawn
+  window jump, 960 s for the early multiset check, and 2380 s for a drawn
   race or sweep still holding the driver's gate when the `eventually` is
   due. `local-run.sh` holds its own
   copy of the 842 s, and a driver unit test checks it against the constant.
