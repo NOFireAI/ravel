@@ -212,9 +212,11 @@ section gives the bound.
 
 A logs commit record holds a stamp for each declared `I64` and `BOOL`
 column: its min, max and null count, and by default its sum (`I64` only) and
-its count of zero values. A sum can give back an erased value, so a locked
-commit record of a tenant with such a column costs an erasure obligation as
-well as a reclamation delay.
+its count of zero values. The min and max are values of the column. A sum
+can give back an erased value, and a zero count can tell whether an erased
+value was 0 or `false`, which for a `BOOL` column is the value itself. A
+locked commit record of a tenant with such a column therefore costs an
+erasure obligation as well as a reclamation delay.
 
 **The catalog keyspace.** A fourth mechanism, the unreferenced-catalog sweep,
 gives a compliance lock on `t/*/catalog/*/*` a further cost. The lock
@@ -250,7 +252,7 @@ its erasure deadline has two options:
 - Start every logs producer with `--no-declared-stat-aggregates`, from its
   first start on a release that writes stamp sums. A cluster run by the
   Kubernetes operator sets the flag with `spec.noDeclaredStatAggregates:
-  true` ([Kubernetes guide](../kubernetes.md)); the operator passes no other
+  true` ([Kubernetes guide](../kubernetes.md#withholding-stamp-sums)); the operator passes no other
   argument through.
 - First shorten that retention to inside the deadline, and scope the catalog
   lock to `catalog/<signal>/HEAD`.
