@@ -97,6 +97,72 @@ pub fn parse_record_key(key: &str) -> Option<RecordKey> {
     })
 }
 
+/// Where a level-0 logs commit record sits, and the flush identity it names.
+#[derive(Debug, PartialEq, Eq)]
+pub struct L0Key {
+    /// `t/<tenant_hash>/`.
+    pub tenant_prefix: String,
+    pub shard: u32,
+    pub hour: u64,
+    /// `<writer>.<epoch>.<seq:020>`, shared with the record's data object.
+    pub stem: String,
+}
+
+impl L0Key {
+    /// `<tenant_prefix>l/l0/<shard:04>/<stem>.`: the data object of this flush
+    /// is the one key under it ending in `.rseg` (`ravel_commit::keys::data_key`
+    /// appends the content hash before the suffix).
+    pub fn data_prefix(&self) -> String {
+        format!(
+            "{}l/l0/{:04}/{}.",
+            self.tenant_prefix, self.shard, self.stem
+        )
+    }
+}
+
+/// The parts of a level-0 logs commit record key
+/// `t/<tenant_hash>/l/c/<shard:04>/<YYYYMMDDTHH>/<uuid>.<epoch>.<seq:020>.cmt`
+/// (`ravel_commit::keys::commit_key`); `None` for any other key, a compaction
+/// or rewrite record and every other signal's record included. A metrics
+/// shard records the commit keys it abandons, so `capture-commit` must never
+/// take one of those.
+pub fn parse_l0_commit_key(key: &str) -> Option<L0Key> {
+    let parts: Vec<&str> = key.split('/').collect();
+    let [t, tenant, signal, c, shard, hour, name] = parts.as_slice() else {
+        return None;
+    };
+    if *t != "t" || *signal != "l" || *c != "c" || tenant.is_empty() {
+        return None;
+    }
+    if shard.len() != 4 || !shard.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let stem = name.strip_suffix(".cmt")?;
+    let [writer, epoch, seq] = stem.split('.').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !is_uuid(writer) || !digits(epoch) || seq.len() != 20 || !digits(seq) {
+        return None;
+    }
+    Some(L0Key {
+        tenant_prefix: format!("t/{tenant}/"),
+        shard: shard.parse().ok()?,
+        hour: parse_hour_string(hour)?,
+        stem: stem.to_string(),
+    })
+}
+
+/// A hyphenated UUID: hex groups of 8, 4, 4, 4 and 12.
+fn is_uuid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// `<tenant_prefix>l/c/<shard:04>/<YYYYMMDDTHH>/`: one logs bucket's records.
 pub fn bucket_prefix(tenant_prefix: &str, shard: u32, hour: u64) -> String {
     format!("{tenant_prefix}l/c/{shard:04}/{}/", hour_string(hour))
@@ -204,6 +270,41 @@ mod tests {
             "t/0a0b/l/c/0003/20261117T16/l1.0011223344556677.cmt/x",
         ] {
             assert_eq!(parse_record_key(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn only_level_0_logs_commit_record_keys_parse_as_l0() {
+        let w = "5f0c6a2e-8b1d-4c3a-9e7f-112233445566";
+        let key = format!("t/0a0b/l/c/0003/20261117T16/{w}.1794931200.00000000000000000007.cmt");
+        let parsed = parse_l0_commit_key(&key).expect("an L0 key");
+        assert_eq!(
+            parsed,
+            L0Key {
+                tenant_prefix: "t/0a0b/".to_string(),
+                shard: 3,
+                hour: 1_794_931_200 / 3600,
+                stem: format!("{w}.1794931200.00000000000000000007"),
+            }
+        );
+        assert_eq!(
+            parsed.data_prefix(),
+            format!("t/0a0b/l/l0/0003/{w}.1794931200.00000000000000000007.")
+        );
+        for other in [
+            "t/0a0b/l/c/0003/20261117T16/l1.0011223344556677.cmt".to_string(),
+            "t/0a0b/l/c/0003/20261117T16/rw.0011223344556677.cmt".to_string(),
+            format!("t/0a0b/m/c/0003/20261117T16/{w}.1.00000000000000000007.cmt"),
+            format!("t/0a0b/l/c/3/20261117T16/{w}.1.00000000000000000007.cmt"),
+            format!("t/0a0b/l/c/0003/2026111716/{w}.1.00000000000000000007.cmt"),
+            format!("t/0a0b/l/c/0003/20261117T16/{w}.1.7.cmt"),
+            format!("t/0a0b/l/c/0003/20261117T16/{w}.x.00000000000000000007.cmt"),
+            format!("t/0a0b/l/c/0003/20261117T16/{w}.1.00000000000000000007.rseg"),
+            "t/0a0b/l/c/0003/20261117T16/w1.1.00000000000000000007.cmt".to_string(),
+            format!("t/0a0b/l/l0/0003/{w}.1.00000000000000000007.0011223344556677.rseg"),
+            format!("x/0a0b/l/c/0003/20261117T16/{w}.1.00000000000000000007.cmt"),
+        ] {
+            assert_eq!(parse_l0_commit_key(&other), None, "{other}");
         }
     }
 

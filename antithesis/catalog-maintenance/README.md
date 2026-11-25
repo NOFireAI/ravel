@@ -114,10 +114,11 @@ compaction record is seen the workload jumps the clock twice more.
 | `race_missing_parts` | Rarely, once HEAD is known: one missing-part race ("The forced races"). |
 | `sweep_unfolded` | Rarely, once HEAD is known and at most once per timeline: the unfolded-record sweep ("The forced races"). |
 | `sweep_unreadable_head` | Rarely, once HEAD is known and at most once per timeline: the unreadable-HEAD sweep ("The forced races"). |
+| `race_late_records` | Rarely, once HEAD is known and until one reached its situation: one late-records race ("The late-records race"). |
 | `audit` | The store audit below. |
 | `check_bounds` | The upper-bound check below, on one node. |
 | `token_lifecycle_read` | While faults may run: reads one acked write back with its commit tokens on a drawn node, drawing the write from all of them, from those with a compacted input, or from those whose input commit record the sweep check confirmed deleted, and drawing whether to read it twice on that node ("Token reads across the lifecycle"). |
-| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs the early multiset check (folds, compacts, audits, folds, audits and checks the full multiset; "The multiset checks"), runs up to six fold races until a server fold lost its CAS, up to five record races until a server's record PUT lost, up to three divergent-record races and then up to three missing-part races until each reached its situation, the unfolded-record sweep unless one already reached its situation, and the unreadable-HEAD sweep, then folds, compacts, audits, folds and audits again and token-reads up to six writes with a compacted input, then compacts a fresh bucket and token-reads one of its writes ("The fresh compaction read"), takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, in the local loop has `local-run.sh` restart a node, token-reads up to six writes whose input commit record was swept, runs the full multiset check and ends the timeline. |
+| `eventually` | Rarely (and always after `WORKLOAD_EVENTUALLY_AFTER_SECS` when that is set): stops faults, waits up to 300 s for every node to serve, jumps the clocks if no rule did, runs the early multiset check (folds, compacts, audits, folds, audits and checks the full multiset; "The multiset checks"), runs up to six fold races until a server fold lost its CAS, up to five record races until a server's record PUT lost, up to three divergent-record races and then up to three missing-part races until each reached its situation, the unfolded-record sweep unless one already reached its situation, the unreadable-HEAD sweep, and up to three late-records races until one reached its situation, then folds, compacts, audits, folds and audits again and token-reads up to six writes with a compacted input, then compacts a fresh bucket and token-reads one of its writes ("The fresh compaction read"), takes the sweep jumps if a compaction record was seen and no rule took them, sweeps every shard, folds and audits again, in the local loop has `local-run.sh` restart a node, token-reads up to six writes whose input commit record was swept, runs the full multiset check and ends the timeline. |
 
 The forced eventually runs inside the state machine, like a drawn one: once
 `WORKLOAD_EVENTUALLY_AFTER_SECS` passes, the timer only sets a flag, and the
@@ -358,6 +359,8 @@ Every literal starts with `catalog: ` or `clock: `.
 | `catalog: a server's compaction record PUT lost to a record whose part is missing from the store` | sometimes | `race_missing_parts`, `eventually` | As above, and a GET just before the release found absent the part of the `ravel-cli` compaction's record that the driver deleted. |
 | `catalog: HEAD stayed unreadable while the clocks passed the protection horizon` | sometimes | `sweep_unreadable_head`, `eventually` | HEAD still held the sweep's own garbage after the clocks moved past the protection horizon and the 150 s wait for the servers' sweeps. Server HEAD PUTs are refused throughout, so this alone does not show a server swept; `local-run.sh` also requires the SUT's `catalog: delete pass refused on an unreadable HEAD`, hit when a server's sweep reads the undecodable HEAD and stops. |
 | `catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it` | sometimes | `sweep_unfolded`, `eventually` | HEAD's bytes were the same after both jumps and the servers' sweeps as before the compaction, the record was still there, and the store held at least one of its inputs before the jumps. |
+| `catalog: a server planned a bucket holding a late commit record` | sometimes | `race_late_records`, `eventually` | The late-records race replayed a server's abandoned commit record, stamped at or after its bucket's late-commit cutoff, into a bucket with no compaction record while the driver's clock was under the cutoff plus 60 s, and a maintenance server then published the bucket's compaction record, which decoded ("The late-records race"). |
+| `catalog: a server's compaction record names no late commit record` | always | `race_late_records`, `eventually` | That compaction record does not name the replayed key among its inputs (ADR-4561 R4). |
 | `clock: the driver's clock jumped forward` | reachable | `jump_clock`, `eventually` | The jump reached the driver's own clock. |
 | `clock: the clocks jumped past the sweep's protection horizon and pinned-query window` | reachable | `jump_clock`, `eventually` | Both sweep jumps reached the driver's own clock. |
 | `catalog: an on-demand sweep succeeded` | reachable | `sweep`, the sweep jumps, `eventually` | `maintain sweep` exited 0. |
@@ -552,7 +555,11 @@ mutant (ADR-4326 decision 3). The driver forces each situation with a rule
 `race_missing_parts`, `sweep_unfolded`, `sweep_unreadable_head`), runs each
 again in the `eventually` (all but the last until reached once, the
 unreadable-HEAD sweep once), and asserts reaching it as a
-sometimes-assertion that `local-run.sh` requires in a plain run.
+sometimes-assertion that `local-run.sh` requires in a plain run. A
+seventh race, the late-records race (`race_late_records`), forces no
+mutant's situation: it makes the late-commit fence's properties
+(ADR-4561) hold over a bucket that a server plans and compacts while it
+holds a late commit record ("The late-records race").
 
 Every step is something the system must survive anyway: every clock moves
 forward together, never back; a `ravel-cli` maintenance run happens
@@ -853,6 +860,86 @@ forward. The deleting pass is the servers' own scheduled sweep, and the
 mutant is selected only in the four ravel-server containers, so any delete
 comes from them. Clean code deletes nothing while HEAD is unreadable.
 
+### The late-records race
+
+ADR-4561 fences maintenance off commit records the store stamped at or
+after their bucket's late-commit cutoff `C(H) = end(H) +
+max_flush_lifetime + clock_skew_allowance` (3900 s here): a plan leaves them
+out, and everything else still serves and keeps them. The seeded hours'
+records are all late (`ravel-cli load` writes them long after their hours
+end), so `maintain: a plan left a late commit record out` holds without
+this race, but those buckets hold nothing on time, and no plan of them
+publishes. A server cannot itself send a commit PUT that lands past
+`C(H)` on this rig: rustfs refuses a request signed more than 900 s from its
+clock (403 `RequestTimeTooSkewed`), and the server abandons the flush rather
+than re-sending it. So the race lets a server send the record, refuses every
+attempt at the proxy, and delivers the server's bytes itself after a clock
+move. Its steps, with the write gate held throughout:
+
+1. Move every clock to just past the next hour's start if the current hour
+   H has under 600 s left. `s3proxy`: `pass`, then `capture-commit`.
+2. Send one strict single-row write to one node, once, never retried; the
+   model records the attempt and its answer, never an acknowledgement. The
+   proxy refuses the flush's commit record PUT (the write gate holds every
+   other write back, so the next level-0 commit record PUT is this write's)
+   and `captured` reports its key, its `x-amz-checksum-*` header and its
+   body. Nothing captured within 30 s, a key of another tenant or hour, or a
+   PUT with no checksum header is not reached.
+3. Write up to four more times until the record's bucket holds two on-time
+   level-0 records, the fewest a plan publishes from
+   (`DEFAULT_MIN_COMPACTION_INPUTS`); the late record is not one of them.
+4. Keep the rule standing until the server gave the flush up: its node's
+   `ravel_ingest_abandoned_retry_exhausted_total` went up and no PUT of the
+   key came for 20 s. The flush's publish loop makes five attempts, each one
+   store-client operation of up to 180 s plus one 20 s request, so the
+   server can take about 1000 s plus backoff to give up, bounded by the
+   3600 s flush deadline. The wait is capped at 1028 s (the 1000 s, 8 s of
+   backoff between attempts, the 20 s quiet span), and past it the race is
+   not reached. Only then `pass`.
+5. LIST the record's data prefix (`l/l0/<shard>/<writer>.<epoch>.<seq>.`)
+   and HEAD the one `.rseg` under it. No data object is not reached: the
+   replay never publishes a record without its data.
+6. Move every clock, HEAD held still first ("HEAD holds still before every
+   move"), so the driver's clock reads `C(H) + 5 s`, and pause 3 s.
+7. PUT the captured bytes to the captured key through raw S3, create-only
+   (`If-None-Match: *`) and with the captured checksum header, which rustfs
+   verifies against the bytes. A 412 is not reached, with nothing to undo.
+   LIST the bucket: the replayed record's `LastModified` is at or after
+   `C(H)`, no compaction record is there yet, and the driver's clock is
+   still under `C(H) + 60 s`, the fence's settle, so no server has planned
+   the bucket yet.
+8. Wait up to 180 s for `maint1` or `maint2` to publish the bucket's
+   compaction record; the clocks pass `C(H) + 60 s` on their own and the next
+   maintenance pass plans it. Decode it (`commit decode-compaction`). Reached:
+   `catalog: a server planned a bucket holding a late commit record`. The
+   record must not name the replayed key: `catalog: a server's compaction
+   record names no late commit record`. Each maintenance node's
+   `ravel_maintain_late_commit_records_total` goes into the log.
+
+The legs after the move start at `C(H)` and end before the fold seals hour
+H, 900 s later (`FOLD_SAFETY_MARGIN_S`): the move's own tail, the pause, the
+replay, its LIST, the 180 s wait with one poll round, the decode and the
+metrics reads take at most 777 s (`late::AFTER_MOVE_S`, checked at compile
+time against 900 s less the 5 s aim and a reread), and a race that returns
+from the move too late for them is not reached. `local-run.sh` budgets one
+race at its bound as `LATE_RACE_S`, which a driver test holds equal to
+`late::RACE_S`.
+
+Why legitimate: ADR-4326's late-replay amendment (PR #4707) adds this step
+to the forced-situation step list. It models a PUT the store applies after
+its sender gave up, which ADR-4561 says nothing bounds; the harness supplies
+the delivery, never the bytes. The data object is stored before the replay;
+the replay is create-only and a 412 is not reached; the write was one
+attempt recorded as not acknowledged, so the model allows zero or one copy
+of it and no token read reads it; there is no undo, since R6 forbids
+deleting a late record, which every reader serves and every sweep keeps;
+the write gate is held from the capture to the replay; and `local-run.sh`
+requires the race's sometimes-assertion. The record stays a raw level-0
+record in its bucket for the timeline's life, and the multiset counts its
+row once.
+
+### The proxy
+
 The proxy (`driver/src/proxy.rs`, `driver/src/bin/s3_proxy.rs`) forwards
 every byte unchanged, Host header included, so each SigV4 signature still
 verifies at rustfs, and parses only request heads, to frame bodies and to
@@ -870,7 +957,25 @@ method on the key and every other key as they were. Every other rule judges
 only PUTs. The plain driver never sets `refuse-read`: `driver-reshard`, the
 reshard-ownership profile's driver, sets it on the tenant's provisioning
 record, `t/<h>/l/prov`, to fail the servers' view refresh and reach the
-stale-writer fence (`../reshard-ownership/README.md`). A killed or
+stale-writer fence (`../reshard-ownership/README.md`).
+`capture-commit`, the late-records race's rule, refuses the next level-0
+commit record PUT from any server, the key shape
+`t/<tenant>/l/c/<shard>/<hour>/<writer>.<epoch>.<seq>.cmt` (no compaction or
+rewrite record), which the driver cannot know before the flush. It matches a
+logs record only, never a metrics shard's: that shard records the keys it
+abandons, and a replay of one would make the SUT's `commit: an abandoned
+flush's commit record never lands past the fold's seal margin` false on
+correct code. The amendment also allows a spans record, which this workload
+does not write, so the rule does not match one. It claims
+the key before it reads anything, reads the request's whole body and its
+`x-amz-checksum-*` header, answers the existing `503 SlowDown`, and forwards
+nothing. Every later PUT of that key is refused the same way, and counted,
+while the rule stands. `captured` reports `<key> <header>:<checksum> <puts>
+<quiet_ms> <base64 body>`: the PUTs of the key refused so far and the time
+since the last, which tell the driver when the server gave up. It is the
+one rule that reads a request's payload, and it keeps a body only when a
+content length frames it and it is at most 32 KiB; the control log prints a
+long reply cut short. `pass` clears it. A killed or
 restarted proxy has no rules, so a race it interrupts leaves the servers on
 the plain path and the race reports not reached.
 
@@ -1116,6 +1221,12 @@ The same steps as ingest-durability, from this directory's `scripts/`:
     unreadable while the clocks passed the protection horizon`, together with
     the SUT's `catalog: delete pass refused on an unreadable HEAD`, which
     shows a server's sweep read that HEAD and stopped;
+  - the late-records race reached its situation, `catalog: a server planned
+    a bucket holding a late commit record`, and `catalog: a server's
+    compaction record names no late commit record` held, and so did the
+    SUT's late-commit fence properties, `maintain: a plan left a late commit
+    record out` and `maintain: a published record names no late commit
+    record`, required by name since `maintain: ` is not an owned prefix;
   - the SUT's `maintenance: a loser observed a divergent input set and
     alarmed` held, and the two maintenance properties its mutants break,
     `maintenance: a loser observing a divergent input-set hash fails closed

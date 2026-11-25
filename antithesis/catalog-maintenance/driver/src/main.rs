@@ -14,7 +14,10 @@
 //! losing to a concurrent compaction, the same with the winner record's
 //! input-set hash diverging or one of its parts gone, a sweep past a
 //! compaction record that HEAD has not folded, and a sweep past the
-//! protection horizon while HEAD is unreadable. Token reads read an acked
+//! protection horizon while HEAD is unreadable. A seventh, the late-records
+//! race, replays a server's abandoned commit record past its bucket's
+//! late-commit cutoff so a server plans that bucket holding a late record
+//! (`late.rs`). Token reads read an acked
 //! write back with its commit tokens before and after its input is
 //! compacted, folded and swept, and
 //! judge every answer exactly against the model. The eventually stops
@@ -25,6 +28,7 @@ mod audit;
 mod cli;
 mod clock;
 mod forced;
+mod late;
 mod multiset;
 mod race;
 #[cfg(feature = "reshard")]
@@ -351,6 +355,11 @@ struct Shared {
     unreadable_started: AtomicBool,
     /// Unreadable-HEAD sweeps run; numbers each one's HEAD garbage.
     unreadable_sweeps: AtomicU64,
+    /// Late-records races run.
+    late_races: AtomicU64,
+    /// Whether a late-records race reached its situation; the drawn rule
+    /// stops and the eventually runs none once one has.
+    late_reached: AtomicBool,
     /// Every key an audit or the sweep jump has listed, and the swept
     /// inputs confirmed gone. Keys are never reused, so one listed here and
     /// absent from a later LIST was deleted.
@@ -519,22 +528,7 @@ impl Shared {
         };
         let body = otlp::logs_request(w.id, records, streams, w.ts_ns);
         for attempt_no in 0..=MAX_RETRIES {
-            let k = self.begin_attempt(w.id);
-            let n = node();
-            let sent = self.ticks.fetch_add(1, Ordering::SeqCst);
-            let sent_ns = now_ns();
-            let reply = self.ravel.export(
-                n,
-                "/v1/logs",
-                &body,
-                w.mode.header(),
-                None,
-                false,
-                WRITE_TIMEOUT,
-            );
-            let attempt = classify(&reply);
-            self.record_ack(w.id, n, (sent, sent_ns), &attempt);
-            self.finish_attempt(w.id, k, attempt.clone());
+            let attempt = self.attempt(&w, &body, node());
             let retryable = match attempt {
                 Attempt::NoResponse => true,
                 Attempt::Refused { status } => status == 503 || status == 429,
@@ -546,6 +540,35 @@ impl Shared {
             }
         }
         (Some(w.id), false)
+    }
+
+    /// One strict log write of `records` records over `streams` streams,
+    /// sent once to `node` and never retried; the attempt is in the model
+    /// with its outcome. `None` when the model is full and nothing was sent.
+    fn write_once(&self, records: u32, streams: u32, node: usize) -> Option<(u64, Attempt)> {
+        let w = self.register(records)?;
+        let body = otlp::logs_request(w.id, records, streams, w.ts_ns);
+        Some((w.id, self.attempt(&w, &body, node)))
+    }
+
+    /// Send one attempt of `w` to node `n` and record it and its outcome.
+    fn attempt(&self, w: &Write, body: &[u8], n: usize) -> Attempt {
+        let k = self.begin_attempt(w.id);
+        let sent = self.ticks.fetch_add(1, Ordering::SeqCst);
+        let sent_ns = now_ns();
+        let reply = self.ravel.export(
+            n,
+            "/v1/logs",
+            body,
+            w.mode.header(),
+            None,
+            false,
+            WRITE_TIMEOUT,
+        );
+        let attempt = classify(&reply);
+        self.record_ack(w.id, n, (sent, sent_ns), &attempt);
+        self.finish_attempt(w.id, k, attempt.clone());
+        attempt
     }
 
     fn begin_attempt(&self, id: u64) -> usize {
@@ -3305,6 +3328,26 @@ impl Workload {
         s.unreadable_head_sweep("drawn");
     }
 
+    /// Rarely, once HEAD is known and until one reached its situation, one
+    /// late-records race (README.md, "The late-records race").
+    #[rule(groups = ["main"], weight = 1)]
+    fn race_late_records(&self, tc: TestCase) {
+        self.0.halt_if_stopping();
+        let s = &self.0;
+        if s.late_reached.load(Ordering::SeqCst) || lock(&s.head_key).is_none() {
+            return;
+        }
+        if !tc.draw(gs::weighted_booleans(0.02)) {
+            return;
+        }
+        let quiet = s.gate.write().unwrap_or_else(|e| e.into_inner());
+        if s.stop.stopping() {
+            release_and_halt(quiet);
+        }
+        let node = draw_node(&tc, s.ravel.nodes.len());
+        late::race(s, "drawn", node);
+    }
+
     /// The reshard profile only: rarely, once the sealing jump activated the
     /// increase, and at most once per timeline, a decrease cycle and the
     /// forged token read while faults may run.
@@ -3476,6 +3519,12 @@ fn run_eventually(s: &Shared, reason: &str) -> ! {
         s.unfolded_sweep("eventually");
     }
     s.unreadable_head_sweep("eventually");
+    for n in 0..late::RACES_EVENTUALLY {
+        if s.late_reached.load(Ordering::SeqCst) {
+            break;
+        }
+        late::race(s, "eventually", n as usize % s.ravel.nodes.len().max(1));
+    }
     s.fold_compact_audit();
     // The token reads run while the compacted inputs' commit records are
     // still there.
@@ -3824,6 +3873,8 @@ fn main(tc: TestCase) {
         unfolded_reached: AtomicBool::new(false),
         unreadable_started: AtomicBool::new(false),
         unreadable_sweeps: AtomicU64::new(0),
+        late_races: AtomicU64::new(0),
+        late_reached: AtomicBool::new(false),
         sweeps: Mutex::new(audit::SweepLedger::default()),
         inputs_of: Mutex::new(BTreeMap::new()),
         acks: Mutex::new(token::AckLedger::default()),

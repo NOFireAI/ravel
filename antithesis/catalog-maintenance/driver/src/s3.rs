@@ -27,6 +27,9 @@ pub struct Response {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ListPage {
     pub keys: Vec<String>,
+    /// Each listed object's key with its `LastModified` in unix
+    /// milliseconds, `None` when that does not parse.
+    pub stamped: Vec<(String, Option<i64>)>,
     /// The continuation token when the listing is truncated.
     pub next: Option<String>,
 }
@@ -55,17 +58,38 @@ impl Store {
     }
 
     fn request(&self, method: &str, path_and_query: &str, body: Option<&[u8]>) -> Response {
+        self.request_with(method, path_and_query, body, &[])
+    }
+
+    /// [`Store::request`] with extra request headers, each `Name: value`,
+    /// which curl signs with the rest. A HEAD is sent with `-I`, since `-X
+    /// HEAD` waits for a body to `--max-time`.
+    fn request_with(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        body: Option<&[u8]>,
+        headers: &[String],
+    ) -> Response {
         let url = format!("{}/{}{}", self.endpoint, self.bucket, path_and_query);
         let n = SCRATCH.fetch_add(1, Ordering::SeqCst);
         let out = std::env::temp_dir().join(format!("s3-{}-{n}.out", std::process::id()));
         let input = std::env::temp_dir().join(format!("s3-{}-{n}.in", std::process::id()));
         let mut cmd = Command::new("curl");
         let max_time = MAX_TIME_S.to_string();
-        cmd.args(["-s", "--max-time", &max_time, "-X", method])
-            .args(["--aws-sigv4", &self.sigv4, "--user", &self.user])
+        cmd.args(["-s", "--max-time", &max_time]);
+        if method == "HEAD" {
+            cmd.arg("-I");
+        } else {
+            cmd.args(["-X", method]);
+        }
+        cmd.args(["--aws-sigv4", &self.sigv4, "--user", &self.user])
             .arg("-o")
             .arg(&out)
             .args(["-w", "%{http_code}"]);
+        for h in headers {
+            cmd.arg("-H").arg(h);
+        }
         if let Some(bytes) = body {
             if std::fs::write(&input, bytes).is_err() {
                 return Response {
@@ -103,7 +127,25 @@ impl Store {
     /// `LIST_PAGE_ATTEMPTS` times; after that the listing fails, and a caller
     /// treats a failed listing as no answer, never as an empty bucket.
     pub fn list(&self, prefix: &str) -> Result<Vec<String>, String> {
-        let mut keys = Vec::new();
+        Ok(self
+            .list_pages(prefix)?
+            .into_iter()
+            .flat_map(|page| page.keys)
+            .collect())
+    }
+
+    /// [`Store::list`] with each key's `LastModified`, in unix milliseconds
+    /// (`None` when the listing's stamp does not parse).
+    pub fn list_stamped(&self, prefix: &str) -> Result<Vec<(String, Option<i64>)>, String> {
+        Ok(self
+            .list_pages(prefix)?
+            .into_iter()
+            .flat_map(|page| page.stamped)
+            .collect())
+    }
+
+    fn list_pages(&self, prefix: &str) -> Result<Vec<ListPage>, String> {
+        let mut pages = Vec::new();
         let mut token: Option<String> = None;
         loop {
             let mut query = format!("?list-type=2&prefix={}", encode(prefix));
@@ -124,11 +166,51 @@ impl Store {
                     }
                 }
             };
-            keys.extend(page.keys);
-            match page.next {
+            let next = page.next.clone();
+            pages.push(page);
+            match next {
                 Some(t) => token = Some(t),
-                None => return Ok(keys),
+                None => return Ok(pages),
             }
+        }
+    }
+
+    /// Whether the object exists, by a HEAD.
+    pub fn exists(&self, key: &str) -> Result<bool, String> {
+        let r = self.request("HEAD", &format!("/{key}"), None);
+        if !r.complete {
+            return Err(format!(
+                "HEAD {key}: curl did not finish (status {})",
+                r.status
+            ));
+        }
+        match r.status {
+            200 => Ok(true),
+            404 => Ok(false),
+            s => Err(format!("HEAD {key} answered {s}")),
+        }
+    }
+
+    /// A create-only PUT (`If-None-Match: *`) carrying `headers` too: `Ok(true)`
+    /// when it created the object, `Ok(false)` when the store refused it
+    /// because the key exists (412).
+    pub fn put_create(&self, key: &str, bytes: &[u8], headers: &[String]) -> Result<bool, String> {
+        let mut all = vec!["If-None-Match: *".to_string()];
+        all.extend(headers.iter().cloned());
+        let r = self.request_with("PUT", &format!("/{key}"), Some(bytes), &all);
+        if !r.complete {
+            return Err(format!(
+                "PUT {key}: curl did not finish (status {})",
+                r.status
+            ));
+        }
+        match r.status {
+            200 => Ok(true),
+            412 => Ok(false),
+            s => Err(format!(
+                "PUT {key} answered {s}: {}",
+                String::from_utf8_lossy(&r.body)
+            )),
         }
     }
 
@@ -215,8 +297,61 @@ pub fn parse_list_page(complete: bool, status: u16, xml: &str) -> Result<ListPag
     };
     Ok(ListPage {
         keys: tag_values(xml, "Key"),
+        stamped: stamped_contents(xml),
         next,
     })
+}
+
+/// Each `<Contents>` entry's key and `LastModified` (unix milliseconds).
+pub fn stamped_contents(xml: &str) -> Vec<(String, Option<i64>)> {
+    xml.split("<Contents>")
+        .skip(1)
+        .filter_map(|entry| {
+            let entry = entry.split("</Contents>").next().unwrap_or("");
+            let key = tag_values(entry, "Key").into_iter().next()?;
+            let stamp = tag_values(entry, "LastModified")
+                .first()
+                .and_then(|s| last_modified_ms(s));
+            Some((key, stamp))
+        })
+        .collect()
+}
+
+/// An S3 `LastModified` stamp, `YYYY-MM-DDTHH:MM:SS[.fff...]Z`, in unix
+/// milliseconds, any digits past the millisecond dropped; `None` for anything
+/// else.
+pub fn last_modified_ms(s: &str) -> Option<i64> {
+    let rest = s.strip_suffix('Z')?;
+    let (whole, frac) = rest.split_once('.').unwrap_or((rest, ""));
+    let b = whole.as_bytes();
+    if b.len() != 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<u64> {
+        let part = whole.get(r)?;
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let hour = ravel_antithesis_catalog_driver::keys::parse_hour_string(&format!(
+        "{}{}{}T{}",
+        whole.get(0..4)?,
+        whole.get(5..7)?,
+        whole.get(8..10)?,
+        whole.get(11..13)?
+    ))?;
+    let (min, sec) = (num(14..16)?, num(17..19)?);
+    if min > 59 || sec > 59 || !frac.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let ms: u64 = format!("{frac:0<3}").get(0..3)?.parse().ok()?;
+    i64::try_from(((hour * 3600 + min * 60 + sec) * 1000) + ms).ok()
 }
 
 /// Percent-encode a query value (RFC 3986 unreserved characters kept).
@@ -289,9 +424,52 @@ mod tests {
             parse_list_page(true, 200, PAGE),
             Ok(ListPage {
                 keys: vec!["t/ab/a".to_string(), "t/ab/b".to_string()],
+                stamped: vec![("t/ab/a".to_string(), None), ("t/ab/b".to_string(), None)],
                 next: None,
             })
         );
+    }
+
+    #[test]
+    fn listed_stamps_are_read_to_the_millisecond() {
+        let xml = "<ListBucketResult><IsTruncated>false</IsTruncated>\
+                   <Contents><Key>t/ab/a</Key><LastModified>2026-11-17T16:00:05.123Z</LastModified></Contents>\
+                   <Contents><Key>t/ab/b</Key><LastModified>bogus</LastModified></Contents>\
+                   <Contents><LastModified>2026-11-17T16:00:05Z</LastModified><Key>t/ab/c</Key></Contents>\
+                   </ListBucketResult>";
+        assert_eq!(
+            stamped_contents(xml),
+            vec![
+                ("t/ab/a".to_string(), Some(1_794_931_205_123)),
+                ("t/ab/b".to_string(), None),
+                ("t/ab/c".to_string(), Some(1_794_931_205_000)),
+            ]
+        );
+        assert_eq!(last_modified_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            last_modified_ms("2026-11-17T16:00:05.1Z"),
+            Some(1_794_931_205_100)
+        );
+        assert_eq!(
+            last_modified_ms("2026-11-17T16:00:05.123456Z"),
+            Some(1_794_931_205_123)
+        );
+        // A leap day, and the second before the next hour.
+        assert_eq!(
+            last_modified_ms("2024-02-29T05:59:59.999Z"),
+            Some(1_709_186_399_999)
+        );
+        for bad in [
+            "2026-11-17T16:00:05.123",
+            "2026-11-17 16:00:05Z",
+            "2026-11-17T16:60:05Z",
+            "2026-11-17T16:00:60Z",
+            "2026-13-17T16:00:05Z",
+            "2026-11-17T16:00:05.1x3Z",
+            "2026-11-17T16:0a:05Z",
+        ] {
+            assert_eq!(last_modified_ms(bad), None, "{bad}");
+        }
     }
 
     #[test]
