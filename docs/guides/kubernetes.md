@@ -387,6 +387,7 @@ and an Azure one in
 | `spec.retention.default` | string | none | Duration string, e.g. `30d`. |
 | `spec.retention.tenants` | map | none | Per-tenant overrides, tenant name to duration. |
 | `spec.probes.dedicatedHealthPort` | boolean | `true` | Probe the dedicated health listener on 4316 instead of the main HTTP port. Requires a server image of v0.19.0 or newer, which has `--listen-health`. Set `false` to keep probes on the main HTTP port. An existing cluster keeps its stored value; see "The dedicated health port" below. |
+| `spec.noDeclaredStatAggregates` | boolean | `false` | `true` renders `--no-declared-stat-aggregates` on the gateway and maintain pods, never on the query pods. Apply `crd.yaml` first and set it in the same change as a server image that has the flag. See "Withholding stamp sums" below. |
 
 `spec.storage` sets exactly one of `s3` and `azure`: a CEL rule on
 `storage` refuses a spec with neither or both at admission, and the
@@ -1439,6 +1440,43 @@ The gateway, maintain, ingest-router and qualify pods get none of these flags.
 - Turning `spec.query.mcp` on or off, or editing it while it is enabled,
   changes the query Deployment's arguments and rolls the query pods. With
   `enabled: false`, editing the other fields changes nothing.
+
+### Withholding stamp sums
+
+`spec.noDeclaredStatAggregates: true` renders the bare
+`--no-declared-stat-aggregates` flag on the gateway pods (`--mode gateway`,
+which flushes logs commit records) and on the maintain pods
+(`--mode maintain`, which writes logs compaction, migrate and re-encode
+parts). Those
+processes then write each declared-column stamp without its sum and zero
+count. The query pods never get the flag: `ravel-server --mode query`
+writes no stamps and refuses it at startup. Unset, no pod gets the flag and
+every argument list is what it was without the field.
+
+It is one cluster field rather than one per Deployment because the setting
+is not persisted: a pod without it writes the fields again, a gateway pod on
+its next flush and a maintain pod on its next compaction.
+
+What the flag changes and does not change, and when to set it, is in
+[Withholding stamp sums](operations/configuration.md#withholding-stamp-sums)
+in the configuration guide.
+
+Two hazards:
+
+- An API server that still holds the old `RavelCluster` schema drops the
+  unknown field silently on admission, so the pods run without the flag.
+  Apply the new `deploy/k8s/operator/crd.yaml` before setting the field.
+- A `ravel-server` image older than the first release with the flag refuses
+  it at pod start. Set the field in the same change as `spec.image` moves to
+  such a release, not ahead of it.
+
+A deployment with erasure obligations that keeps compliance retention
+on commit records or on the catalog keyspace longer than its erasure
+deadline starts every logs producer with `--no-declared-stat-aggregates`
+from its first start on this release, or first shortens that retention
+to inside the deadline and scopes the catalog lock to
+`catalog/<signal>/HEAD`. A sum written to a locked record stays until its
+retain-until.
 
 ## Probe semantics
 

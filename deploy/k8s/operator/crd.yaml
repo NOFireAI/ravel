@@ -570,6 +570,11 @@
                     },
                     "type": "object"
                   },
+                  "noDeclaredStatAggregates": {
+                    "default": false,
+                    "description": "Withhold the declared-column stamp's sum and zero count (ADR-4628\ndecision 8): renders the bare `--no-declared-stat-aggregates` flag on\nthe gateway and maintain pods, the two tiers that write logs stamps,\nand never on the query pods, whose `--mode query` refuses it. One\ncluster field rather than one per tier, because a tier that does not\nwithhold writes the fields again on its next flush or compaction.\nA server image older than the first release with the flag refuses it\nat startup, so set this in the same change as such an image. Unset\n(the default) renders nothing.",
+                    "type": "boolean"
+                  },
                   "probes": {
                     "default": {
                       "dedicatedHealthPort": true

@@ -145,6 +145,18 @@ pub struct RavelClusterSpec {
     /// rule (see [`ravel_cluster_crd`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_overrides: Option<ShardOverridesSpec>,
+
+    /// Withhold the declared-column stamp's sum and zero count (ADR-4628
+    /// decision 8): renders the bare `--no-declared-stat-aggregates` flag on
+    /// the gateway and maintain pods, the two tiers that write logs stamps,
+    /// and never on the query pods, whose `--mode query` refuses it. One
+    /// cluster field rather than one per tier, because a tier that does not
+    /// withhold writes the fields again on its next flush or compaction.
+    /// A server image older than the first release with the flag refuses it
+    /// at startup, so set this in the same change as such an image. Unset
+    /// (the default) renders nothing.
+    #[serde(default)]
+    pub no_declared_stat_aggregates: bool,
 }
 
 /// Reference to a Secret in the same namespace as the `RavelCluster`.
@@ -3966,6 +3978,49 @@ mod tests {
         assert!(
             cel_admits(true, Some((false, "ravelNative"))),
             "exposure + disabled ravelNative affinity is allowed"
+        );
+    }
+
+    /// #4709: `noDeclaredStatAggregates` is an optional boolean on the cluster
+    /// spec. A spec without it deserialises with it false, so an existing
+    /// cluster renders no flag, and the camelCase name reaches the field.
+    #[test]
+    fn no_declared_stat_aggregates_is_an_optional_cluster_boolean_defaulting_false() {
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert!(!spec.no_declared_stat_aggregates);
+
+        let mut with_field = base;
+        with_field["noDeclaredStatAggregates"] = serde_json::json!(true);
+        let spec: RavelClusterSpec =
+            serde_json::from_value(with_field).expect("deserialize with field");
+        assert!(spec.no_declared_stat_aggregates);
+
+        let crd = ravel_cluster_crd();
+        let spec_schema = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .expect("spec schema");
+        let prop = spec_schema
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("noDeclaredStatAggregates"))
+            .expect("noDeclaredStatAggregates on the cluster spec");
+        assert_eq!(prop.type_.as_deref(), Some("boolean"));
+        assert!(
+            !spec_schema
+                .required
+                .iter()
+                .flatten()
+                .any(|r| r == "noDeclaredStatAggregates"),
+            "the field is optional"
         );
     }
 
