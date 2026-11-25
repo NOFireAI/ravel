@@ -98,8 +98,9 @@ The cost differs for each prefix family:
   a commit record becomes the later of the sweep's bound plus `E_v` and its
   retain-until. See "Required bucket configuration" in the object store
   contract for the bound. A logs commit record of a tenant that declares an
-  `I64` or `BOOL` column holds a stamp for each such column, with its sum
-  by default. A sum can give back an erased value, so the lock on these
+  `I64` or `BOOL` column holds a stamp for each such column: its min and
+  max and, by default, its zero count and, for an `I64` column, its sum. A
+  sum can give back an erased value, so the lock on these
   records also costs an erasure obligation.
 - **Catalog keyspace.** The three mechanisms above never target the catalog
   keyspace. A fourth mechanism does: the unreferenced-catalog sweep deletes
@@ -116,7 +117,7 @@ column:
   the swept objects holds the column value of the subject.
 - For an `I64` or `BOOL` column, a replaced snapshot part among the swept
   objects holds the stamps of its entries: the min and max of the column
-  and, by default, its sum and zero count.
+  and, by default, its zero count and, for an `I64` column, its sum.
 - The sweep deletes the object only once the fold has reconciled that hour
   and the object is older than `protection_horizon`.
 - The delete succeeds as a delete marker, but the locked version keeps the
@@ -138,7 +139,10 @@ commit records or on the catalog keyspace longer than its erasure deadline
 has two options:
 
 - Start every logs producer with `--no-declared-stat-aggregates`, from its
-  first start on a release that writes stamp sums.
+  first start on a release that writes stamp sums. A cluster run by the
+  Kubernetes operator sets the flag with `spec.noDeclaredStatAggregates:
+  true` ([Kubernetes guide](kubernetes.md)); the operator passes no other
+  argument through.
 - First shorten that retention to inside the deadline, and scope the catalog
   lock to `catalog/<signal>/HEAD`.
 
@@ -922,7 +926,7 @@ produce the `--check` result, which is not a rehearsal record.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock, versioning and the lifecycle rules), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound + E_v, R)` where `R` is the locked version's retain-until: the sweep's delete succeeds as a delete marker, and the locked version is removed once `R` and noncurrent-version expiry have both passed. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim; for any tenant with a declared `I64` or `BOOL` column a replaced snapshot part holds stamps whose sum can give back an erased value, as a locked logs commit record does. That bound is not `max(bound + E_v, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, and the sweep deletes it only once it is also older than `protection_horizon`, so it is `max(max(T_f, T_w + protection_horizon) + S + E_v, R)`, where `T_f` is when the fold reconciles that hour (or HEAD is rebuilt), `T_w` is the stale object's `last_modified`, `S` is one sweep interval (default 5 min), and `R` is the locked version's retain-until. The maintenance IAM policy Ravel ships permits that delete (its catalog deny is scoped to `catalog/<signal>/HEAD`); a copy of that template predating the narrowing denies it outright and leaves the bound open-ended until it is re-applied. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and the catalog keyspace `t/*/catalog/*/*` (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock, versioning and the lifecycle rules), and the mechanism or the default retention is verified out of band | None for `sys/` and the provisioning records (no erasable subject value, and no sweep deletes them). For the commit records, `max(bound + E_v, R)` where `R` is the locked version's retain-until: the sweep's delete succeeds as a delete marker, and the locked version is removed once `R` and noncurrent-version expiry have both passed. For the catalog keyspace, the unreferenced-catalog sweep does delete its snapshot and index objects, and for any tenant with a typed string or bytes attribute column a stale per-part column-statistics object stores an erased value verbatim; for any tenant with a declared `I64` or `BOOL` column a replaced snapshot part holds stamps (min, max and by default the zero count, and for an `I64` column the sum, which can give back an erased value), as a locked logs commit record does. That bound is not `max(bound + E_v, R)`: the object stays referenced until the fold reconciles that hour or HEAD is rebuilt, and the sweep deletes it only once it is also older than `protection_horizon`, so it is `max(max(T_f, T_w + protection_horizon) + S + E_v, R)`, where `T_f` is when the fold reconciles that hour (or HEAD is rebuilt), `T_w` is the stale object's `last_modified`, `S` is one sweep interval (default 5 min), and `R` is the locked version's retain-until. The maintenance IAM policy Ravel ships permits that delete (its catalog deny is scoped to `catalog/<signal>/HEAD`); a copy of that template predating the narrowing denies it outright and leaves the bound open-ended until it is re-applied. Scope the mechanism to `catalog/<signal>/HEAD` alone to drop the retention half of it | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
 | **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured**. A harness rehearsal record publishes a restore-completeness RPO, not this replication-lag RPO, so the field stays unmeasured until a rehearsal with bucket replication and a live writer measures it. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound + E_v, D)`; query-time exclusion still immediate | As level 1 |

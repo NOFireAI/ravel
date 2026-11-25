@@ -227,7 +227,7 @@ costs an erasure obligation as well as a reclamation delay.
   own column value.
 - For a tenant that declares an `I64` or `BOOL` column, a replaced snapshot
   part is one of those objects. Its entries hold the same stamps as the
-  commit records, the sum included.
+  commit records, the sum of an `I64` column included.
 - The lock does not delay that delete, which succeeds as a delete marker. The
   locked version keeps the value in storage.
 - The sweep deletes the object only after the fold reconciles that hour and
@@ -248,7 +248,10 @@ compliance retention on commit records or on the catalog keyspace longer than
 its erasure deadline has two options:
 
 - Start every logs producer with `--no-declared-stat-aggregates`, from its
-  first start on a release that writes stamp sums.
+  first start on a release that writes stamp sums. A cluster run by the
+  Kubernetes operator sets the flag with `spec.noDeclaredStatAggregates:
+  true` ([Kubernetes guide](../kubernetes.md)); the operator passes no other
+  argument through.
 - First shorten that retention to inside the deadline, and scope the catalog
   lock to `catalog/<signal>/HEAD`.
 
