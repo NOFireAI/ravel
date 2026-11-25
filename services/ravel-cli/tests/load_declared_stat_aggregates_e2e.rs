@@ -37,14 +37,18 @@ use ravel_cli::load::{
     self, DEFAULT_DECODE_QUEUE_BATCHES, DeclaredStatAggregates, LOAD_REPORT_JSON_PREFIX,
     LoadMemoryRequest, LoadPageChoice, PER_BATCH_TARGET_BYTES,
 };
-use ravel_cli::maintain::SignalArg;
+use ravel_cli::maintain::{
+    ClaimOptions, MigrateSwitches, ScratchOptions, SignalArg, compact_tenant_to, compact_to,
+    migrate_to,
+};
+use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_ingest::{Clock, RlogChunkOrder, RlogGroupTargetBlocks, RlogZstdLevel};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError, list_all,
 };
-use ravel_proto::commit::v1::CommitRecord;
+use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord};
 use ravel_query::http::StaticBearerTokenResolver;
 use ravel_server::declared_columns::TenantConfigDeclaredColumns;
 use ravel_server::typed_attr_config::TypedAttrColumnConfig;
@@ -924,4 +928,429 @@ fn the_binary_reports_the_stamp_aggregate_choice() {
     let json = report_json(&stdout);
     assert_eq!(json["declared_stat_aggregates"], Value::Null, "{json}");
     assert!(json.get("declared_stat_aggregates").is_none(), "{json}");
+}
+
+// Test 12 for the `maintain` producers: `compact-tenant`, `compact-bucket`
+// and `migrate` with and without `--no-declared-stat-aggregates`, each run
+// in process over the emitting tenant the loader wrote above.
+
+const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+const GIB: u64 = 1 << 30;
+
+/// The loaded rows' one ingest hour.
+fn load_hour() -> u32 {
+    u32::try_from(CLOCK_NS / NS_PER_HOUR).expect("hour fits u32")
+}
+
+/// Three hours past the load: the hour is sealed under every default margin.
+const COMPACT_NS: i64 = CLOCK_NS + 3 * NS_PER_HOUR;
+
+/// The thirty rows fit one L1 part.
+const PARTS: u64 = 1;
+
+/// Every compaction record (`l1.*.cmt`) under the tenant's logs prefix.
+async fn compaction_records(store: &KeyCountingStore, tenant: &str) -> Vec<CompactionRecord> {
+    let prefix = format!("t/{}/l/c/", TenantId::new(tenant).hash().to_hex());
+    let mut records = Vec::new();
+    for meta in list_all(&store.inner, &prefix).await.expect("list") {
+        let name = meta.key.rsplit('/').next().expect("a name");
+        if !(name.starts_with("l1.") && name.ends_with(".cmt")) {
+            continue;
+        }
+        let data = store
+            .inner
+            .get(&meta.key, GetRange::Full)
+            .await
+            .expect("get record")
+            .data;
+        records.push(ravel_commit::record::decode_compaction(&data).expect("a compaction record"));
+    }
+    records
+}
+
+/// The `declared_stat_aggregates:` lines a report printed.
+fn settings_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|l| l.starts_with("declared_stat_aggregates:"))
+        .collect()
+}
+
+/// The emitting tenant loaded, then compacted by `maintain compact-tenant`
+/// with `stamps`. Returns the world and the report text.
+async fn compacted_world(stamps: DeclaredStatAggregates) -> (World, String) {
+    let w = world(false).await;
+    let mut out: Vec<u8> = Vec::new();
+    let report = compact_tenant_to(
+        &mut out,
+        Arc::clone(&w.store) as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        EMIT_TENANT,
+        SignalArg::Logs,
+        Some(1),
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        1,
+        None,
+        Some(32 * GIB),
+        COMPACT_NS,
+        &ClaimOptions::fresh(),
+        &ScratchOptions {
+            declared_stat_aggregates: stamps,
+            ..ScratchOptions::default()
+        },
+    )
+    .await
+    .expect("compact-tenant runs");
+    let text = String::from_utf8(out).expect("utf8 report");
+    assert_eq!(report.compacted, 1, "{text}");
+    assert_eq!(report.parts_written as u64, PARTS, "{text}");
+    (w, text)
+}
+
+/// Every entry of `part`: the three columns, min and max present, null
+/// count 0, and fields 6 to 8 present exactly when `emitted`, with the
+/// figures the thirty rows give (field 7 for `UserID`, whose sum leaves
+/// i64).
+fn assert_part_stamp(part: &CompactionPart, emitted: bool, path: &str) {
+    assert_eq!(part.sample_count, ROWS as u64, "{path}");
+    let mut names: Vec<&str> = part
+        .declared_column_stats
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["AdvEngineID", "ResolutionWidth", "UserID"],
+        "{path}"
+    );
+    for entry in &part.declared_column_stats {
+        assert!(
+            entry.min.is_some() && entry.max.is_some(),
+            "{path}: {entry:?}"
+        );
+        assert_eq!(entry.null_count, 0, "{path}: {entry:?}");
+        if !emitted {
+            assert_eq!(
+                (entry.sum, entry.sum_wide.len(), entry.zero_count),
+                (None, 0, None),
+                "{path}: {entry:?}"
+            );
+        }
+    }
+    if emitted {
+        let rows: Vec<usize> = (0..ROWS).collect();
+        let validated = ravel_commit::declared_stats::read_compaction_part(part);
+        for (name, value) in [
+            ("AdvEngineID", adv_engine_id as fn(usize) -> i64),
+            ("ResolutionWidth", resolution_width),
+            ("UserID", user_id),
+        ] {
+            let stat = validated
+                .covered()
+                .iter()
+                .find(|s| s.name() == name)
+                .unwrap_or_else(|| panic!("{path}: {name} covered"));
+            let sum: i128 = rows.iter().map(|&r| i128::from(value(r))).sum();
+            let zeros = rows.iter().filter(|&&r| value(r) == 0).count() as u64;
+            assert_eq!(
+                (stat.sum(), stat.zero_count()),
+                (Some(sum), Some(zeros)),
+                "{path}: {name}"
+            );
+        }
+        let user = part
+            .declared_column_stats
+            .iter()
+            .find(|e| e.name == "UserID")
+            .expect("UserID entry");
+        assert_eq!(user.sum, None, "{path}: the UserID sum leaves i64");
+        assert!(!user.sum_wide.is_empty(), "{path}: field 7 carries it");
+    }
+}
+
+/// The four statements over an emitting and a withholding compacted world:
+/// the emitting one answers from the part stamps with no data-object GET,
+/// the withholding one scans with exact GETs and answers the same.
+async fn assert_statements_over_parts(
+    emitted: &World,
+    withheld: &World,
+    compaction_records: u64,
+    label: &str,
+) {
+    for (sql, want) in statements() {
+        let short = format!("{label} {}", &sql[..sql.len().min(60)]);
+        let e = run(&emitted.app(), &emitted.store, EMIT_TOKEN, &sql).await;
+        let w = run(&withheld.app(), &withheld.store, EMIT_TOKEN, &sql).await;
+        let e_phases = phase_gets(&e.stats);
+        let w_phases = phase_gets(&w.stats);
+        println!(
+            "{short}: emitted stamp={} gets={} phases {e_phases:?}; withheld stamp={} gets={} \
+             phases {w_phases:?}",
+            pruning(&e.stats, "segmentsAnsweredFromStamp"),
+            e.data_gets,
+            pruning(&w.stats, "segmentsAnsweredFromStamp"),
+            w.data_gets,
+        );
+        assert_cells(&short, &e.row, &want);
+        assert_cells(&short, &w.row, &want);
+        assert_same_answer(&short, &w.row, &e.row);
+        assert_eq!(pruning(&e.stats, "segments"), PARTS, "{short}");
+        assert_eq!(
+            pruning(&e.stats, "segmentsAnsweredFromStamp"),
+            PARTS,
+            "{short}"
+        );
+        assert_eq!(e.data_gets, 0, "{short}");
+        assert_eq!(phases_of(compaction_records, 0, 0), e_phases, "{short}");
+        assert_eq!(pruning(&w.stats, "segments"), PARTS, "{short}");
+        assert_eq!(pruning(&w.stats, "segmentsAnsweredFromStamp"), 0, "{short}");
+        assert_eq!(pruning(&w.stats, "segmentsAnsweredFromCstat"), 0, "{short}");
+        assert_eq!(
+            w.data_gets, PART_SCAN_GETS,
+            "{short}: the statement scans each part"
+        );
+        assert_eq!(
+            phases_of(compaction_records, 1, PART_SCAN_GETS),
+            w_phases,
+            "{short}"
+        );
+    }
+
+    let min_max = "SELECT MIN(\"UserID\"), MAX(\"UserID\") FROM logs";
+    let r = run(&withheld.app(), &withheld.store, EMIT_TOKEN, min_max).await;
+    let users: Vec<i64> = (0..ROWS).map(user_id).collect();
+    assert_cells(
+        min_max,
+        &r.row,
+        &[
+            Cell::Int(*users.iter().min().expect("rows")),
+            Cell::Int(*users.iter().max().expect("rows")),
+        ],
+    );
+    assert_eq!(
+        r.data_gets, 0,
+        "{label}: MIN and MAX answer from the withheld stamps"
+    );
+}
+
+/// Data-object GETs a statement issues to scan the one compacted part.
+const PART_SCAN_GETS: u64 = 1;
+
+/// The exact per-phase GETs of a statement over the compacted tenant: one
+/// resolve GET for the absent catalog HEAD and one per record the bucket
+/// lists (the `OBJECTS` commit records and `compaction_records`), `plan`
+/// GETs (the statistics load reading the absent catalog HEAD, which a
+/// statement answered from the stamps skips), and `scan`.
+fn phases_of(compaction_records: u64, plan: u64, scan: u64) -> Vec<(String, u64)> {
+    [
+        ("resolve", 1 + OBJECTS + compaction_records),
+        ("plan", plan),
+        ("probe", 0),
+        ("scan", scan),
+        ("keyIndex", 0),
+        ("fetch", 0),
+    ]
+    .into_iter()
+    .map(|(phase, gets)| (phase.to_string(), gets))
+    .collect()
+}
+
+/// Test 12, `maintain compact-tenant`: without the flag the compaction part
+/// carries fields 6 to 8 with the rows' figures and the statements answer
+/// from it; with the flag the part carries min, max and null count only and
+/// the statements scan it and answer the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_tenant_withholds_the_stamp_aggregates_with_the_flag() {
+    let (emitted, e_text) = compacted_world(DeclaredStatAggregates::Emit).await;
+    let (withheld, w_text) = compacted_world(DeclaredStatAggregates::Withhold).await;
+    assert_eq!(
+        settings_lines(&e_text),
+        ["declared_stat_aggregates: emitted"],
+        "{e_text}"
+    );
+    assert_eq!(
+        settings_lines(&w_text),
+        ["declared_stat_aggregates: withheld"],
+        "{w_text}"
+    );
+    for (world, is_emitted) in [(&emitted, true), (&withheld, false)] {
+        let records = compaction_records(&world.store, EMIT_TENANT).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].parts.len() as u64, PARTS);
+        for part in &records[0].parts {
+            assert_part_stamp(part, is_emitted, "compact-tenant");
+        }
+    }
+    assert_statements_over_parts(&emitted, &withheld, 1, "compact-tenant").await;
+}
+
+/// `maintain compact-bucket` reaches the same `build_compactor_config` from
+/// its own entry: with the flag its one part withholds fields 6 to 8 and its
+/// report names the choice; without it the part carries them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_bucket_withholds_the_stamp_aggregates_with_the_flag() {
+    for (stamps, emitted, line) in [
+        (
+            DeclaredStatAggregates::Emit,
+            true,
+            "declared_stat_aggregates: emitted",
+        ),
+        (
+            DeclaredStatAggregates::Withhold,
+            false,
+            "declared_stat_aggregates: withheld",
+        ),
+    ] {
+        let w = world(false).await;
+        let mut out: Vec<u8> = Vec::new();
+        compact_to(
+            &mut out,
+            Arc::clone(&w.store) as Arc<dyn ObjectStoreBackend>,
+            MEMORY,
+            EMIT_TENANT,
+            SignalArg::Logs,
+            0,
+            load_hour(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(32 * GIB),
+            ravel_maintain::FixedClock::new(COMPACT_NS),
+            &ClaimOptions::fresh(),
+            &ScratchOptions {
+                declared_stat_aggregates: stamps,
+                ..ScratchOptions::default()
+            },
+        )
+        .await
+        .expect("compact-bucket runs");
+        let text = String::from_utf8(out).expect("utf8 report");
+        assert_eq!(settings_lines(&text), [line], "{text}");
+        let records = compaction_records(&w.store, EMIT_TENANT).await;
+        assert_eq!(records.len(), 1, "{text}");
+        assert_eq!(records[0].parts.len() as u64, PARTS);
+        assert_part_stamp(&records[0].parts[0], emitted, "compact-bucket");
+    }
+}
+
+/// The emitting tenant compacted with the default, its compaction record
+/// then aged as an older build would have left it (every part one RLOG
+/// version below the current one and no fields 6 to 8), and `maintain
+/// migrate --reencode-compaction-parts` run with `stamps`. Returns the world
+/// and the migrate report.
+async fn migrated_world(stamps: DeclaredStatAggregates) -> (World, String) {
+    let (w, _) = compacted_world(DeclaredStatAggregates::Emit).await;
+    let prefix = format!("t/{}/l/c/", TenantId::new(EMIT_TENANT).hash().to_hex());
+    let keys: Vec<String> = list_all(&w.store.inner, &prefix)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|m| m.key)
+        .filter(|k| {
+            let name = k.rsplit('/').next().expect("a name");
+            name.starts_with("l1.") && name.ends_with(".cmt")
+        })
+        .collect();
+    assert_eq!(keys.len(), 1);
+    let data = w
+        .store
+        .inner
+        .get(&keys[0], GetRange::Full)
+        .await
+        .expect("get")
+        .data;
+    let mut rec = ravel_commit::record::decode_compaction(&data).expect("decode");
+    for part in &mut rec.parts {
+        part.segment_format_version -= 1;
+        for e in &mut part.declared_column_stats {
+            e.sum = None;
+            e.sum_wide.clear();
+            e.zero_count = None;
+        }
+    }
+    w.store
+        .inner
+        .put(
+            &keys[0],
+            ravel_commit::record::encode_compaction(&rec),
+            PutOptions::default(),
+        )
+        .await
+        .expect("age the record");
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = migrate_to(
+        &mut out,
+        Arc::clone(&w.store) as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        EMIT_TENANT,
+        SignalArg::Logs,
+        1,
+        None,
+        None,
+        0,
+        MigrateSwitches {
+            reencode_compaction_parts: true,
+            declared_stat_aggregates: stamps,
+            ..MigrateSwitches::default()
+        },
+        &ClaimOptions::fresh(),
+    )
+    .await;
+    // The re-encode publishes its successor, and the superseded record keeps
+    // counting below the target until a sweep deletes it, so the run refuses
+    // the floor raise and exits non-zero, as for any first re-encode.
+    let err = result.expect_err("the floor stays until a sweep");
+    assert!(
+        err.to_string()
+            .contains("refused to raise the rlog floor for tenant stamp-emit"),
+        "{err}"
+    );
+    (w, String::from_utf8(out).expect("utf8 report"))
+}
+
+/// The force 2 successor (format version 2) the migrate walk wrote.
+async fn reencoded_record(store: &KeyCountingStore) -> CompactionRecord {
+    let mut successors: Vec<CompactionRecord> = compaction_records(store, EMIT_TENANT)
+        .await
+        .into_iter()
+        .filter(|r| r.format_version == 2)
+        .collect();
+    assert_eq!(successors.len(), 1, "one force 2 successor");
+    successors.remove(0)
+}
+
+/// Test 12, `maintain migrate`: the part a force 2 re-encode writes carries
+/// fields 6 to 8 without the flag and none of them with it, the report names
+/// the choice, and the statements over the re-encoded tenant answer from the
+/// emitting part's stamps and scan the withholding one, with equal answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migrate_withholds_the_stamp_aggregates_with_the_flag() {
+    let (emitted, e_text) = migrated_world(DeclaredStatAggregates::Emit).await;
+    let (withheld, w_text) = migrated_world(DeclaredStatAggregates::Withhold).await;
+    assert_eq!(
+        settings_lines(&e_text),
+        ["declared_stat_aggregates: emitted"],
+        "{e_text}"
+    );
+    assert_eq!(
+        settings_lines(&w_text),
+        ["declared_stat_aggregates: withheld"],
+        "{w_text}"
+    );
+    for (world, is_emitted) in [(&emitted, true), (&withheld, false)] {
+        let rec = reencoded_record(&world.store).await;
+        assert_eq!(rec.parts.len() as u64, PARTS);
+        assert_part_stamp(&rec.parts[0], is_emitted, "migrate");
+    }
+    assert_statements_over_parts(&emitted, &withheld, 2, "migrate").await;
 }
