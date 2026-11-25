@@ -1170,6 +1170,14 @@ fn phases_of(compaction_records: u64, plan: u64, scan: u64) -> Vec<(String, u64)
 async fn compact_tenant_withholds_the_stamp_aggregates_with_the_flag() {
     let (emitted, e_text) = compacted_world(DeclaredStatAggregates::Emit).await;
     let (withheld, w_text) = compacted_world(DeclaredStatAggregates::Withhold).await;
+    for (world, is_emitted) in [(&emitted, true), (&withheld, false)] {
+        let records = compaction_records(&world.store, EMIT_TENANT).await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].parts.len() as u64, PARTS);
+        for part in &records[0].parts {
+            assert_part_stamp(part, is_emitted, "compact-tenant");
+        }
+    }
     assert_eq!(
         settings_lines(&e_text),
         ["declared_stat_aggregates: emitted"],
@@ -1180,14 +1188,6 @@ async fn compact_tenant_withholds_the_stamp_aggregates_with_the_flag() {
         ["declared_stat_aggregates: withheld"],
         "{w_text}"
     );
-    for (world, is_emitted) in [(&emitted, true), (&withheld, false)] {
-        let records = compaction_records(&world.store, EMIT_TENANT).await;
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].parts.len() as u64, PARTS);
-        for part in &records[0].parts {
-            assert_part_stamp(part, is_emitted, "compact-tenant");
-        }
-    }
     assert_statements_over_parts(&emitted, &withheld, 1, "compact-tenant").await;
 }
 
@@ -1234,11 +1234,11 @@ async fn compact_bucket_withholds_the_stamp_aggregates_with_the_flag() {
         .await
         .expect("compact-bucket runs");
         let text = String::from_utf8(out).expect("utf8 report");
-        assert_eq!(settings_lines(&text), [line], "{text}");
         let records = compaction_records(&w.store, EMIT_TENANT).await;
         assert_eq!(records.len(), 1, "{text}");
         assert_eq!(records[0].parts.len() as u64, PARTS);
         assert_part_stamp(&records[0].parts[0], emitted, "compact-bucket");
+        assert_eq!(settings_lines(&text), [line], "{text}");
     }
 }
 
@@ -1337,6 +1337,11 @@ async fn reencoded_record(store: &KeyCountingStore) -> CompactionRecord {
 async fn migrate_withholds_the_stamp_aggregates_with_the_flag() {
     let (emitted, e_text) = migrated_world(DeclaredStatAggregates::Emit).await;
     let (withheld, w_text) = migrated_world(DeclaredStatAggregates::Withhold).await;
+    for (world, is_emitted) in [(&emitted, true), (&withheld, false)] {
+        let rec = reencoded_record(&world.store).await;
+        assert_eq!(rec.parts.len() as u64, PARTS);
+        assert_part_stamp(&rec.parts[0], is_emitted, "migrate");
+    }
     assert_eq!(
         settings_lines(&e_text),
         ["declared_stat_aggregates: emitted"],
@@ -1347,11 +1352,6 @@ async fn migrate_withholds_the_stamp_aggregates_with_the_flag() {
         ["declared_stat_aggregates: withheld"],
         "{w_text}"
     );
-    for (world, is_emitted) in [(&emitted, true), (&withheld, false)] {
-        let rec = reencoded_record(&world.store).await;
-        assert_eq!(rec.parts.len() as u64, PARTS);
-        assert_part_stamp(&rec.parts[0], is_emitted, "migrate");
-    }
     assert_statements_over_parts(&emitted, &withheld, 2, "migrate").await;
 }
 
