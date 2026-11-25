@@ -67,6 +67,7 @@ async fn start_test_server_with_store_metrics(
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
@@ -1370,6 +1371,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
@@ -1606,6 +1608,7 @@ async fn start_attribution_server() -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

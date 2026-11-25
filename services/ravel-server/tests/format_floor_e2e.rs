@@ -189,6 +189,7 @@ async fn start_ingest_server(
         ravel_ingest::format_floor_metrics(),
     ));
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

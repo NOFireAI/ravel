@@ -50,6 +50,7 @@ async fn start_test_server_over(store: Arc<MemoryStore>) -> ravel_server::Runnin
     let mtls_resolver = ravel_server::tenant::build_resolver(mtls_tokens, false);
 
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),

@@ -1881,8 +1881,10 @@ fields 6 to 8) from the commit records this logs load writes.
   `declared_stat_aggregates` field say which the load wrote, for a logs
   load only. A metrics or spans load writes no stamp, ignores the flag and
   prints a warning when it is set.
-- `ravel-server` and `ravel-cli maintain` take no such flag yet: the
-  server's logs flush and every logs compaction write the fields.
+- `ravel-server` (ingest and maintain roles) and `ravel-cli maintain
+  compact-bucket`, `compact-tenant` and `migrate` take the same flag, and
+  every process that flushes or compacts logs must carry it. See
+  [Withholding stamp sums](operations/configuration.md#withholding-stamp-sums).
 
 ### Clustering key and bloom scope
 

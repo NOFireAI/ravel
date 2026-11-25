@@ -1384,6 +1384,7 @@ async fn start_keyed_coordinator(
         false,
     );
     let config = ravel_server::ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),

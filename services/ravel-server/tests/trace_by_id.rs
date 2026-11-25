@@ -73,6 +73,7 @@ fn server_config(mcp_enabled: bool) -> ServerConfig {
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     tokens.insert(OTHER_TOKEN.to_string(), TenantId::new(OTHER_TENANT));
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Some(ravel_maintain::AuditPipelineConfig {
             audit_mode: ravel_maintain::AuditMode::Required,

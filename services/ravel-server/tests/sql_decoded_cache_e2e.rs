@@ -408,6 +408,7 @@ fn sample(body: &str, name: &str) -> u64 {
 
 fn server_config(tokens: HashMap<String, TenantId>, decoded_cache_max_bytes: u64) -> ServerConfig {
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: None,
         audit_text: Default::default(),

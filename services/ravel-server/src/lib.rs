@@ -594,6 +594,14 @@ pub struct ServerConfig {
     /// `--idle-flush-byte-floor`, whose help states the buffered-mode loss
     /// window a non-zero floor accepts.
     pub idle_flush_byte_floor: usize,
+    /// Forwarded to [`ravel_ingest::IngestConfig::emit_declared_stat_aggregates`]
+    /// on the logs pipeline only: whether the declared-column stamps its
+    /// commit records carry the sum and zero count (ADR-4628 decision 8).
+    /// `true` emits them; `false` withholds them, as
+    /// `--no-declared-stat-aggregates` does. The metrics and spans pipelines
+    /// write no stamp. The maintain role's compactor takes the same switch
+    /// through `maintain.compactor`.
+    pub emit_declared_stat_aggregates: bool,
     pub tenant_resolver: Arc<dyn TenantResolver>,
     /// The dedicated mTLS listener (ADR-0050 section 1), `None` unless
     /// `--mtls-enabled`. Serves the same ingest and query surface as the
@@ -2120,6 +2128,71 @@ fn mcp_settings(
     })
 }
 
+/// The `IngestConfig` [`start`] builds the metrics router with, before it
+/// sets the fold seal margin.
+fn metrics_ingest_config(config: &ServerConfig) -> IngestConfig {
+    IngestConfig {
+        shard_count: config.shard_count,
+        max_inflight_flushes: config.max_inflight_flushes,
+        max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
+        flush_object_backstop_multiple: config.flush_object_backstop_multiple,
+        max_queued_flushes: config.max_queued_flushes as usize,
+        adaptive_flush_delay: config.adaptive_flush_delay,
+        max_flush_delay: config.max_flush_delay,
+        max_flush_delay_idle: config.max_flush_delay_idle,
+        min_flush_bytes: config.min_flush_bytes,
+        idle_flush_byte_floor: config.idle_flush_byte_floor,
+        // ADR-0076 decision 4: follows the actually-configured
+        // max_flush_delay, not just its default, so the adaptive
+        // corridor never contradicts the operator's chosen budget.
+        // Must exceed max_flush_delay by the same reserve
+        // IngestConfig::default() uses -- setting it equal (as
+        // this call site once did) collapses the adaptive
+        // corridor to the floor unconditionally.
+        strict_visibility_budget_ns: crate::config::duration_nanos_saturating(
+            config.max_flush_delay,
+        )
+        .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
+        ..IngestConfig::default()
+    }
+}
+
+/// The `IngestConfig` [`start`] builds the log router with, before it sets
+/// the fold seal margin. The logs pipeline is the one whose commit records carry a declared-column stamp,
+/// so it alone takes [`ServerConfig::emit_declared_stat_aggregates`].
+fn log_ingest_config(config: &ServerConfig) -> IngestConfig {
+    IngestConfig {
+        shard_count: config.shard_count,
+        max_inflight_flushes: config.max_inflight_flushes,
+        max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
+        flush_object_backstop_multiple: config.flush_object_backstop_multiple,
+        max_queued_flushes: config.max_queued_flushes as usize,
+        max_flush_delay: config.max_flush_delay,
+        max_flush_delay_idle: config.max_flush_delay_idle,
+        min_flush_bytes: config.min_flush_bytes,
+        idle_flush_byte_floor: config.idle_flush_byte_floor,
+        emit_declared_stat_aggregates: config.emit_declared_stat_aggregates,
+        ..IngestConfig::default()
+    }
+}
+
+/// The `IngestConfig` [`start`] builds the span router with, before it sets
+/// the fold seal margin.
+fn span_ingest_config(config: &ServerConfig) -> IngestConfig {
+    IngestConfig {
+        shard_count: config.shard_count,
+        max_inflight_flushes: config.max_inflight_flushes,
+        max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
+        flush_object_backstop_multiple: config.flush_object_backstop_multiple,
+        max_queued_flushes: config.max_queued_flushes as usize,
+        max_flush_delay: config.max_flush_delay,
+        max_flush_delay_idle: config.max_flush_delay_idle,
+        min_flush_bytes: config.min_flush_bytes,
+        idle_flush_byte_floor: config.idle_flush_byte_floor,
+        ..IngestConfig::default()
+    }
+}
+
 /// Checks one pipeline's [`IngestConfig`] cross-field constraints before a
 /// router is built from it (ADR-1737 decision 1), and turns a violation into a
 /// startup refusal that names the flags an operator set rather than the struct
@@ -2763,29 +2836,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     let ingest_router = if config.mode.holds_ingest_buffer() {
         let ingest_config = validated_ingest_config(
             IngestConfig {
-                shard_count: config.shard_count,
-                max_inflight_flushes: config.max_inflight_flushes,
-                max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
-                flush_object_backstop_multiple: config.flush_object_backstop_multiple,
-                max_queued_flushes: config.max_queued_flushes as usize,
-                adaptive_flush_delay: config.adaptive_flush_delay,
-                max_flush_delay: config.max_flush_delay,
-                max_flush_delay_idle: config.max_flush_delay_idle,
-                min_flush_bytes: config.min_flush_bytes,
-                idle_flush_byte_floor: config.idle_flush_byte_floor,
-                // ADR-0076 decision 4: follows the actually-configured
-                // max_flush_delay, not just its default, so the adaptive
-                // corridor never contradicts the operator's chosen budget.
-                // Must exceed max_flush_delay by the same reserve
-                // IngestConfig::default() uses -- setting it equal (as
-                // this call site once did) collapses the adaptive
-                // corridor to the floor unconditionally.
-                strict_visibility_budget_ns: crate::config::duration_nanos_saturating(
-                    config.max_flush_delay,
-                )
-                .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
                 fold_seal,
-                ..IngestConfig::default()
+                ..metrics_ingest_config(&config)
             },
             Signal::Metrics,
         )?;
@@ -2862,17 +2914,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         let indexed_fields = Arc::new(ravel_ingest::IndexedFieldsOverlay::new(indexed_fields_base));
         let log_ingest_config = validated_ingest_config(
             IngestConfig {
-                shard_count: config.shard_count,
-                max_inflight_flushes: config.max_inflight_flushes,
-                max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
-                flush_object_backstop_multiple: config.flush_object_backstop_multiple,
-                max_queued_flushes: config.max_queued_flushes as usize,
-                max_flush_delay: config.max_flush_delay,
-                max_flush_delay_idle: config.max_flush_delay_idle,
-                min_flush_bytes: config.min_flush_bytes,
-                idle_flush_byte_floor: config.idle_flush_byte_floor,
                 fold_seal,
-                ..IngestConfig::default()
+                ..log_ingest_config(&config)
             },
             Signal::Logs,
         )?;
@@ -2901,17 +2944,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     let span_ingest_router = if config.mode.holds_ingest_buffer() {
         let span_ingest_config = validated_ingest_config(
             IngestConfig {
-                shard_count: config.shard_count,
-                max_inflight_flushes: config.max_inflight_flushes,
-                max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
-                flush_object_backstop_multiple: config.flush_object_backstop_multiple,
-                max_queued_flushes: config.max_queued_flushes as usize,
-                max_flush_delay: config.max_flush_delay,
-                max_flush_delay_idle: config.max_flush_delay_idle,
-                min_flush_bytes: config.min_flush_bytes,
-                idle_flush_byte_floor: config.idle_flush_byte_floor,
                 fold_seal,
-                ..IngestConfig::default()
+                ..span_ingest_config(&config)
             },
             Signal::Spans,
         )?;
@@ -5292,6 +5326,33 @@ mod start_catalog_wiring_tests {
 }
 
 #[cfg(test)]
+mod pipeline_ingest_config_tests {
+    use super::*;
+
+    /// `ServerConfig::emit_declared_stat_aggregates` reaches the logs
+    /// pipeline's `IngestConfig` and no other: the metrics and spans routers
+    /// write no declared-column stamp and keep the ingest default whatever the
+    /// flag says. A library caller's config (the shared test support, which
+    /// emits as every literal does) emits.
+    #[test]
+    fn only_the_logs_pipeline_takes_the_declared_stat_aggregates_switch() {
+        let emitting = startup_test_support::server_config(Mode::All);
+        assert!(emitting.emit_declared_stat_aggregates);
+        assert!(IngestConfig::default().emit_declared_stat_aggregates);
+        let withholding = ServerConfig {
+            emit_declared_stat_aggregates: false,
+            ..startup_test_support::server_config(Mode::All)
+        };
+        assert!(log_ingest_config(&emitting).emit_declared_stat_aggregates);
+        assert!(!log_ingest_config(&withholding).emit_declared_stat_aggregates);
+        for config in [&emitting, &withholding] {
+            assert!(metrics_ingest_config(config).emit_declared_stat_aggregates);
+            assert!(span_ingest_config(config).emit_declared_stat_aggregates);
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod shutdown_drain_tests {
     use std::sync::Arc;
@@ -6258,6 +6319,7 @@ mod startup_test_support {
     /// bound to ephemeral loopback ports.
     pub(super) fn server_config(mode: Mode) -> ServerConfig {
         ServerConfig {
+            emit_declared_stat_aggregates: true,
             mode,
             listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
             listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),

@@ -345,6 +345,7 @@ async fn migrate_reencode_writes_l1_parts_and_its_record_under_the_tenant_key() 
         MigrateSwitches {
             dry_run: false,
             reencode_compaction_parts: true,
+            ..MigrateSwitches::default()
         },
         &ClaimOptions::fresh(),
     )

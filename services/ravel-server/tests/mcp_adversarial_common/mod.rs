@@ -59,6 +59,7 @@ pub fn server_config() -> ServerConfig {
     tokens.insert(TOKEN_A.to_string(), TenantId::new(TENANT_A));
     tokens.insert(TOKEN_B.to_string(), TenantId::new(TENANT_B));
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: None,
         audit_text: ravel_maintain::AuditTextPolicy::default(),

@@ -2452,6 +2452,7 @@ mod catalog_cache_tests {
     /// tests below; the rest is here because `ServerConfig` has no `Default`.
     fn server_config() -> crate::ServerConfig {
         crate::ServerConfig {
+            emit_declared_stat_aggregates: true,
             mode: crate::Mode::All,
             listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
             listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
