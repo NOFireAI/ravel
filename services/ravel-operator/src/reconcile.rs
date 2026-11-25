@@ -1891,7 +1891,8 @@ fn deployment(
 /// The gateway Deployment: `--mode gateway`, HTTP + gRPC listeners, and tenant
 /// tokens. RollingUpdate strategy. It carries no fold flag: the scheduled fold
 /// runs on the maintain tier (ADR-1693), and `ravel-server` refuses either
-/// fold flag in `--mode gateway`.
+/// fold flag in `--mode gateway`. `spec.noDeclaredStatAggregates` renders
+/// `--no-declared-stat-aggregates` here and on the maintain tier.
 pub fn desired_gateway_deployment(
     spec: &RavelClusterSpec,
     instance: &str,
@@ -1918,6 +1919,10 @@ pub fn desired_gateway_deployment(
     if let Some(share) = spec.gateway.max_inflight_flushes_per_tenant {
         args.push("--max-inflight-flushes-per-tenant".to_string());
         args.push(share.to_string());
+    }
+    // `--mode gateway` flushes logs commit records and accepts the flag.
+    if spec.no_declared_stat_aggregates {
+        args.push("--no-declared-stat-aggregates".to_string());
     }
 
     let tier_override = spec.gateway.credentials_secret_ref.as_ref();
@@ -2330,6 +2335,11 @@ pub fn desired_maintain_deployment(
             args.push("--fold-interval-secs".to_string());
             args.push(secs.to_string());
         }
+    }
+    // `--mode maintain` writes logs compaction and migrate parts and accepts
+    // the flag; `--mode query` refuses it, so it is not in `common_store_args`.
+    if spec.no_declared_stat_aggregates {
+        args.push("--no-declared-stat-aggregates".to_string());
     }
     // GC horizons (#1083): rendered only on this tier, and only when set, since
     // maintain is the only role that validates itself against `sys/gc`. The
@@ -5025,6 +5035,7 @@ mod tests {
                 tenants: BTreeMap::from([("acme".to_string(), "7d".to_string())]),
             }),
             shard_overrides: None,
+            no_declared_stat_aggregates: false,
         }
     }
 
@@ -6335,6 +6346,107 @@ mod tests {
             args_of(&desired_query_deployment(spec, "prod", &ctx())),
             args_of(&maintain),
         ]
+    }
+
+    /// The exact gateway, query and maintain argument lists `base_spec`
+    /// renders with `noDeclaredStatAggregates` unset.
+    fn base_spec_expected_args() -> [Vec<String>; 3] {
+        let store = [
+            "--store",
+            "s3",
+            "--shards",
+            "8",
+            "--s3-bucket",
+            "ravel-data",
+            "--s3-region",
+            "eu-west-1",
+            "--require-bucket-protection",
+            "--tenant-hash-unkeyed",
+            "--s3-endpoint",
+            "http://rustfs:9000",
+            "--s3-allow-http",
+        ];
+        let tokens = [
+            "--tenant-token",
+            "$(RAVEL_TENANT_TOKEN_0)=acme",
+            "--tenant-token",
+            "$(RAVEL_TENANT_TOKEN_1)=globex",
+        ];
+        let gateway = [
+            "--mode",
+            "gateway",
+            "--listen-http",
+            "0.0.0.0:4318",
+            "--listen-grpc",
+            "0.0.0.0:4317",
+        ]
+        .into_iter()
+        .chain(store)
+        .chain(tokens);
+        let query = ["--mode", "query", "--listen-http", "0.0.0.0:4318"]
+            .into_iter()
+            .chain(store)
+            .chain(tokens);
+        let maintain = [
+            "--mode",
+            "maintain",
+            "--listen-http",
+            "0.0.0.0:4318",
+            "--maintain-key-file",
+            "/etc/ravel/maintain-key/keys",
+        ]
+        .into_iter()
+        .chain(store)
+        .chain(tokens)
+        .chain([
+            "--maintain-interval-secs",
+            "600",
+            "--retention-default",
+            "30d",
+            "--retention-tenant",
+            "acme=7d",
+        ]);
+        [
+            gateway.map(str::to_string).collect(),
+            query.map(str::to_string).collect(),
+            maintain.map(str::to_string).collect(),
+        ]
+    }
+
+    /// #4709: `spec.noDeclaredStatAggregates` renders the bare
+    /// `--no-declared-stat-aggregates` exactly once on the gateway and the
+    /// maintain pods, which write logs stamps, and never on the query pods,
+    /// whose `--mode query` refuses it. Unset leaves all three argument lists
+    /// exactly as they were.
+    #[test]
+    fn no_declared_stat_aggregates_renders_on_gateway_and_maintain_only() {
+        const FLAG: &str = "--no-declared-stat-aggregates";
+        let count = |args: &[String]| args.iter().filter(|a| *a == FLAG).count();
+
+        let unset = base_spec();
+        assert!(!unset.no_declared_stat_aggregates);
+        let [gateway, query, maintain] = base_spec_expected_args();
+        let [g, q, m]: [Vec<String>; 3] =
+            server_args(&unset).try_into().expect("three server tiers");
+        assert_eq!(g, gateway, "unset: gateway args unchanged");
+        assert_eq!(q, query, "unset: query args unchanged");
+        assert_eq!(m, maintain, "unset: maintain args unchanged");
+
+        let mut set = base_spec();
+        set.no_declared_stat_aggregates = true;
+        let [g, q, m]: [Vec<String>; 3] = server_args(&set).try_into().expect("three server tiers");
+        assert_eq!(count(&g), 1, "set: gateway carries the flag once: {g:?}");
+        assert_eq!(count(&m), 1, "set: maintain carries the flag once: {m:?}");
+        assert_eq!(count(&q), 0, "set: query never carries the flag: {q:?}");
+        assert_eq!(q, query, "set: query args unchanged");
+        let without_flag =
+            |args: Vec<String>| -> Vec<String> { args.into_iter().filter(|a| a != FLAG).collect() };
+        assert_eq!(without_flag(g), gateway, "set: gateway gains only the flag");
+        assert_eq!(
+            without_flag(m),
+            maintain,
+            "set: maintain gains only the flag"
+        );
     }
 
     /// `uploadIntegrity` and `requestStoredChecksum` render as

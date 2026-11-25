@@ -4684,6 +4684,7 @@ mod tests {
             gc: None,
             retention: None,
             shard_overrides: None,
+            no_declared_stat_aggregates: false,
         }
     }
 
@@ -8151,6 +8152,7 @@ mod tests {
                 gc: None,
                 retention: None,
                 shard_overrides: None,
+                no_declared_stat_aggregates: false,
             }
         }
 
