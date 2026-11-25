@@ -143,6 +143,7 @@ pub async fn start_server_on(
         ..ravel_server::AlertEvalConfig::default()
     };
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),

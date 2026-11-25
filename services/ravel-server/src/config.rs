@@ -136,6 +136,15 @@ impl Mode {
     pub fn holds_ingest_buffer(self) -> bool {
         matches!(self, Mode::All | Mode::Gateway)
     }
+
+    /// Whether this mode runs a producer of declared-column stamps, and so
+    /// reads `--no-declared-stat-aggregates`: the logs ingest router
+    /// ([`Mode::holds_ingest_buffer`]) or the maintenance loop and its
+    /// background migrate, which [`crate::start`] spawns only in
+    /// [`Mode::Maintain`]. [`Mode::Query`] runs neither.
+    pub fn writes_declared_column_stamps(self) -> bool {
+        self.holds_ingest_buffer() || matches!(self, Mode::Maintain)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1153,6 +1162,24 @@ pub struct Cli {
           default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
           value_parser = clap::value_parser!(u64).range(1..))]
     pub fold_key_index_build_max_pairs: u64,
+
+    /// Withholds the declared-column stamp's sum and zero count (fields 6 to
+    /// 8, ADR-4628 decision 8) from the logs commit records this process's
+    /// ingest role (`--mode all` and `gateway`) flushes and from the logs
+    /// compaction, migrate and force 2 output parts its maintain role
+    /// (`--mode maintain`) writes. The min, max and null count are still
+    /// written. On an unfolded catalog, SUM, AVG and a `<> 0` count where 0
+    /// lies inside a segment's min and max then scan those segments; on a
+    /// folded one the `.cstat` statistics can still answer them.
+    ///
+    /// A process setting, not a persisted record: every process that writes
+    /// stamps must set it, because a compactor that does not withhold
+    /// recomputes the fields from the rows. Fields already written stay, and
+    /// a record under an Object Lock keeps them until its retain-until
+    /// (ADR-4628 question 6b). Refused in `--mode query`, which runs no
+    /// producer.
+    #[arg(long = "no-declared-stat-aggregates", action = clap::ArgAction::SetFalse)]
+    pub emit_declared_stat_aggregates: bool,
 
     /// How often each tenant's maintenance task (`--mode maintain`) wakes up to
     /// run retention, compaction, and the sweeper over every shard, in seconds.
@@ -7644,6 +7671,17 @@ impl Cli {
                 }
             }
         }
+        if passed("emit_declared_stat_aggregates") && !cli.mode.writes_declared_column_stamps() {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "--no-declared-stat-aggregates withholds the stamp sum and zero count a log \
+                     flush or a logs compaction writes, and --mode {mode} runs no producer of \
+                     them: it neither ingests nor compacts. Drop the flag, or set it on the \
+                     ingest and maintain tiers."
+                ),
+            ));
+        }
         // Checked here rather than by clap's `requires`, so a mode that runs
         // no fold refuses the budget for that reason first.
         if passed("fold_key_index_build_max_pairs") && !cli.fold_key_index_leaves {
@@ -9467,6 +9505,7 @@ impl Cli {
                 ravel_ingest::format_floor_metrics(),
             )),
             late_commit_fence: self.maintenance.late_commit_fence.mode(),
+            emit_declared_stat_aggregates: self.emit_declared_stat_aggregates,
             ..ravel_maintain::CompactorConfig::default()
         };
         let memory_target = self.resolve_l1_part_memory_target(
@@ -18746,6 +18785,67 @@ mod tests {
         let cli = cli(args);
         let gc_runtime = cli.resolve_gc_runtime(Duration::from_secs(30))?;
         cli.resolve_compactor_config(&gc_runtime, &resolved_from(&cli))
+    }
+
+    /// `--no-declared-stat-aggregates` (ADR-4628 decision 8): absent means
+    /// emit, the flag withholds, it takes no value, and it is accepted in the
+    /// three modes that run a stamp producer and refused in `query`, which
+    /// runs none, with an error that names the flag and says so.
+    #[test]
+    fn declared_stat_aggregates_emit_by_default_and_the_opt_out_is_refused_in_query_mode() {
+        let parse = |mode: &str, extra: &[&str]| {
+            let mut args = vec!["ravel-server", "--mode", mode];
+            args.extend_from_slice(extra);
+            Cli::parse_validated_from(args)
+        };
+        for (mode, producer) in [
+            ("all", Mode::All),
+            ("gateway", Mode::Gateway),
+            ("maintain", Mode::Maintain),
+        ] {
+            assert!(producer.writes_declared_column_stamps(), "{mode}");
+            let cli = parse(mode, &[]).unwrap_or_else(|err| panic!("--mode {mode}: {err}"));
+            assert!(
+                cli.emit_declared_stat_aggregates,
+                "--mode {mode}: absent emits"
+            );
+            let cli = parse(mode, &["--no-declared-stat-aggregates"])
+                .unwrap_or_else(|err| panic!("--mode {mode} accepts the opt-out: {err}"));
+            assert!(
+                !cli.emit_declared_stat_aggregates,
+                "--mode {mode}: the flag withholds"
+            );
+        }
+        let err = parse("all", &["--no-declared-stat-aggregates=true"])
+            .expect_err("the flag takes no value");
+        assert_eq!(err.kind(), clap::error::ErrorKind::TooManyValues, "{err}");
+
+        assert!(!Mode::Query.writes_declared_column_stamps());
+        let cli = parse("query", &[]).expect("a query process without the flag starts");
+        assert!(cli.emit_declared_stat_aggregates);
+        let err = parse("query", &["--no-declared-stat-aggregates"])
+            .expect_err("query mode runs no producer and refuses the flag");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let message = err.to_string();
+        assert!(
+            message.contains(
+                "--no-declared-stat-aggregates withholds the stamp sum and zero count a log \
+                 flush or a logs compaction writes, and --mode query runs no producer of them"
+            ),
+            "{message}"
+        );
+    }
+
+    /// The flag reaches the `CompactorConfig` `main` hands every maintain
+    /// task (the maintenance loop and the background migrate share it):
+    /// emitting without the flag, withholding with it.
+    #[test]
+    fn resolve_compactor_config_carries_the_declared_stat_aggregates_opt_out() {
+        let emitting = compactor(&["--mode", "maintain"]).expect("resolves");
+        assert!(emitting.emit_declared_stat_aggregates);
+        let withholding =
+            compactor(&["--mode", "maintain", "--no-declared-stat-aggregates"]).expect("resolves");
+        assert!(!withholding.emit_declared_stat_aggregates);
     }
 
     /// The RLOG merge's resident ceiling (ADR-3819 D1) is the merge cursor

@@ -107,6 +107,7 @@ pub async fn start_with(
     let gate = faults.hold(Op::Put, Some(signal.data_prefix()), Occurrence::Always);
     let store: Arc<dyn ObjectStoreBackend> = faults;
     let mut config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: policy,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),

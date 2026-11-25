@@ -419,6 +419,7 @@ fn server_config(cli: &Cli, mode: Mode, tenant: &TenantId) -> anyhow::Result<Ser
     let concurrency = cli.resolve_flush_concurrency();
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     Ok(ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: cli.strict_flush_policy,
         audit_pipeline: None,
         audit_text: Default::default(),

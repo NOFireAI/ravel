@@ -635,6 +635,7 @@ async fn main() -> anyhow::Result<()> {
         idle_flush_byte_floor: cli
             .resolve_idle_flush_byte_floor()
             .context("failed to resolve --idle-flush-byte-floor")?,
+        emit_declared_stat_aggregates: cli.emit_declared_stat_aggregates,
         tenant_resolver: resolver_bundle.resolver,
         mtls_listener,
         fold_tenants,
@@ -1403,6 +1404,44 @@ mod tests {
         assert_eq!(
             non_test
                 .matches(concat!("compat_gate::", "enforce("))
+                .count(),
+            1
+        );
+    }
+
+    /// `--no-declared-stat-aggregates` reaches `ServerConfig`, which `start`
+    /// forwards to the logs pipeline's `IngestConfig`, from the parsed flag
+    /// and nowhere else; and the maintain tasks' compactor is the one
+    /// `resolve_compactor_config` built, which carries the same flag. The
+    /// field's type accepts a literal `true` just as well, so this is
+    /// asserted over the source, as above. Whitespace is stripped so the
+    /// needles survive rustfmt's line breaks.
+    #[test]
+    fn server_config_takes_the_declared_stat_aggregates_flag() {
+        let src: String = include_str!("main.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let main_src = &src[..src.find("#[cfg(test)]").expect("test module present")];
+        let assigned = concat!(
+            "emit_declared_stat_aggregates:",
+            "cli.emit_declared_stat_aggregates,"
+        );
+        assert_eq!(main_src.matches(assigned).count(), 1);
+        assert_eq!(
+            main_src
+                .matches(concat!("emit_declared_", "stat_aggregates:"))
+                .count(),
+            1
+        );
+        let resolved = concat!(
+            "letcompactor=cli.resolve_",
+            "compactor_config(&gc_runtime,&performance)?;"
+        );
+        assert_eq!(main_src.matches(resolved).count(), 1);
+        assert_eq!(
+            main_src
+                .matches(concat!("compactor", ",retention,"))
                 .count(),
             1
         );

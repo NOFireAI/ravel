@@ -46,6 +46,7 @@ async fn start_server(agents: AgentsConfig) -> ravel_server::Running {
 
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
