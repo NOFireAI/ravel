@@ -283,6 +283,24 @@ pub enum DeclaredStatDefect {
         zero_count: u64,
         non_null: u64,
     },
+    /// A zero count of 0 while `min` or `max` is the zero (`0` or `false`)
+    /// over non-null rows. An extremum is a value some row holds, so at least
+    /// one row is the zero.
+    #[error(
+        "declared column {name:?}: min or max is the zero, so zero_count 0 contradicts the extrema over {non_null} non-null rows"
+    )]
+    ZeroCountZeroBesideZeroExtremum { name: String, non_null: u64 },
+    /// A zero count equal to the non-null count, above 0, states every
+    /// non-null row is the zero, so `min` and `max` must both be the zero;
+    /// one of them is not.
+    #[error(
+        "declared column {name:?}: zero_count {zero_count} equals the non-null count {non_null}, so min and max must both be the zero"
+    )]
+    ZeroCountAllBesideNonZeroExtremum {
+        name: String,
+        zero_count: u64,
+        non_null: u64,
+    },
 }
 
 /// One dropped entry, with its position in the record's list so a defect
@@ -523,18 +541,23 @@ fn aggregate_defect(stat: &DeclaredColumnStat, non_null: u64) -> Option<Declared
                 non_null,
             });
         }
-        let all_zero = matches!(
-            (stat.min(), stat.max()),
-            (
-                Some(DeclaredStatValue::I64(0)),
-                Some(DeclaredStatValue::I64(0))
-            ) | (
-                Some(DeclaredStatValue::Bool(false)),
-                Some(DeclaredStatValue::Bool(false))
-            )
-        );
-        if all_zero && zero_count < non_null {
+        let min_zero = is_type_zero(stat.min());
+        let max_zero = is_type_zero(stat.max());
+        if min_zero && max_zero && zero_count < non_null {
             return Some(DeclaredStatDefect::ZeroCountBelowNonNullAllZero {
+                name: name(),
+                zero_count,
+                non_null,
+            });
+        }
+        if zero_count == 0 && non_null > 0 && (min_zero || max_zero) {
+            return Some(DeclaredStatDefect::ZeroCountZeroBesideZeroExtremum {
+                name: name(),
+                non_null,
+            });
+        }
+        if zero_count == non_null && non_null > 0 && !(min_zero && max_zero) {
+            return Some(DeclaredStatDefect::ZeroCountAllBesideNonZeroExtremum {
                 name: name(),
                 zero_count,
                 non_null,
@@ -542,6 +565,14 @@ fn aggregate_defect(stat: &DeclaredColumnStat, non_null: u64) -> Option<Declared
         }
     }
     None
+}
+
+/// Whether `value` is its type's zero: I64 `0` or BOOL `false`.
+fn is_type_zero(value: Option<DeclaredStatValue>) -> bool {
+    matches!(
+        value,
+        Some(DeclaredStatValue::I64(0) | DeclaredStatValue::Bool(false))
+    )
 }
 
 /// The shared read pass, and the sole constructor of [`ValidatedDeclaredStats`].
@@ -1948,6 +1979,25 @@ mod tests {
         ]
     }
 
+    /// A zero count, drawn from `seed`, that the zero-count clauses accept
+    /// beside extrema with the given zero shape over `non_null` rows, or
+    /// `None` when none does (one extremum is the zero, the other is not, and
+    /// fewer than two rows are non-null).
+    fn valid_zero_count(
+        min_zero: bool,
+        max_zero: bool,
+        zero_inside: bool,
+        non_null: u64,
+        seed: u64,
+    ) -> Option<u64> {
+        match (min_zero, max_zero) {
+            (true, true) => Some(non_null),
+            (true, false) | (false, true) => (non_null >= 2).then(|| 1 + seed % (non_null - 1)),
+            (false, false) if zero_inside => Some(seed % non_null.max(1)),
+            (false, false) => Some(0),
+        }
+    }
+
     /// A valid I64 or BOOL stat carrying any combination of the new fields,
     /// with the row count of the record that carries it.
     fn summed_stat_strategy() -> impl Strategy<Value = (DeclaredColumnStat, u64)> {
@@ -1967,19 +2017,19 @@ mod tests {
                 let low = i128::from(non_null) * i128::from(min);
                 let high = i128::from(non_null) * i128::from(max);
                 sum_in(low, high).prop_map(move |sum| {
-                    let zero_count = if min == 0 && max == 0 {
-                        non_null
-                    } else if min <= 0 && 0 <= max {
-                        zero_seed % (non_null.saturating_add(1)).max(1)
-                    } else {
-                        0
-                    };
+                    let zero_count = valid_zero_count(
+                        min == 0,
+                        max == 0,
+                        min <= 0 && 0 <= max,
+                        non_null,
+                        zero_seed,
+                    );
                     let stat = i64_sum_stat(
                         min,
                         max,
                         null_count,
                         has_sum.then_some(sum),
-                        has_zero.then_some(zero_count),
+                        zero_count.filter(|_| has_zero),
                     );
                     (stat, rows)
                 })
@@ -1995,11 +2045,6 @@ mod tests {
                 let null_count = nulls % rows;
                 let non_null = rows - null_count;
                 let (min, max) = if a <= b { (a, b) } else { (b, a) };
-                let zero_count = match (min, max) {
-                    (false, false) => non_null,
-                    (false, true) => zero_seed % non_null.saturating_add(1).max(1),
-                    _ => 0,
-                };
                 let stat = DeclaredColumnStat::new(
                     "IsRefresh",
                     DeclaredStatType::Bool,
@@ -2007,9 +2052,11 @@ mod tests {
                     Some(DeclaredStatValue::Bool(max)),
                     null_count,
                 )
-                .expect("valid bool stat")
-                .with_zero_count(zero_count)
-                .expect("valid zero count");
+                .expect("valid bool stat");
+                let stat = match valid_zero_count(!min, !max, !min, non_null, zero_seed) {
+                    Some(zero_count) => stat.with_zero_count(zero_count).expect("valid zero count"),
+                    None => stat,
+                };
                 (stat, rows)
             });
         let all_null = (rows_strategy(), any::<bool>(), any::<bool>()).prop_map(
@@ -2047,6 +2094,88 @@ mod tests {
                 prop_assert_eq!(sum_field(&wire), None);
             }
         }
+    }
+
+    /// The stamp a producer computes from `rows` (`None` is a NULL row): the
+    /// extrema, null count, exact sum and zero count of the non-null values.
+    fn i64_stat_from_rows(rows: &[Option<i64>]) -> DeclaredColumnStat {
+        let values: Vec<i64> = rows.iter().flatten().copied().collect();
+        let null_count = (rows.len() - values.len()) as u64;
+        let min = values.iter().min().copied().map(DeclaredStatValue::I64);
+        let max = values.iter().max().copied().map(DeclaredStatValue::I64);
+        let sum: i128 = values.iter().map(|v| i128::from(*v)).sum();
+        let zeros = values.iter().filter(|v| **v == 0).count() as u64;
+        DeclaredColumnStat::new("UserID", DeclaredStatType::I64, min, max, null_count)
+            .expect("extrema from rows")
+            .with_sum(sum)
+            .expect("sum from rows")
+            .with_zero_count(zeros)
+            .expect("zero count from rows")
+    }
+
+    fn bool_stat_from_rows(rows: &[Option<bool>]) -> DeclaredColumnStat {
+        let values: Vec<bool> = rows.iter().flatten().copied().collect();
+        let null_count = (rows.len() - values.len()) as u64;
+        let min = values.iter().min().copied().map(DeclaredStatValue::Bool);
+        let max = values.iter().max().copied().map(DeclaredStatValue::Bool);
+        let zeros = values.iter().filter(|v| !**v).count() as u64;
+        DeclaredColumnStat::new("IsRefresh", DeclaredStatType::Bool, min, max, null_count)
+            .expect("extrema from rows")
+            .with_zero_count(zeros)
+            .expect("zero count from rows")
+    }
+
+    /// An I64 value with 0 and its neighbours weighted in, so the zero-count
+    /// clauses see zero extrema, zero counts of 0 and all-zero columns.
+    fn row_i64() -> impl Strategy<Value = Option<i64>> {
+        prop::option::weighted(0.8, prop_oneof![4 => -3i64..=3, 1 => special_i64()])
+    }
+
+    /// Every decode clause holds on the stamp computed from the object's own
+    /// rows: the read keeps it, drops nothing, and `aggregate_defect` finds
+    /// nothing in it.
+    fn assert_rows_stamp_kept(stat: &DeclaredColumnStat, rows: u64) -> Result<(), TestCaseError> {
+        let non_null = rows - stat.null_count();
+        prop_assert_eq!(aggregate_defect(stat, non_null), None);
+        let mut record = base_record();
+        record.sample_count = rows;
+        stamp_commit_record(&mut record, std::slice::from_ref(stat));
+        let read = read_commit_record(&record::decode(&record::encode(&record)).expect("decodes"));
+        prop_assert!(read.dropped().is_empty(), "dropped: {:?}", read.dropped());
+        prop_assert_eq!(read.covered(), std::slice::from_ref(stat));
+        Ok(())
+    }
+
+    proptest! {
+        /// Issue #4672: the zero-count clauses refuse no stamp computed from
+        /// real rows, I64 or BOOL.
+        #[test]
+        fn stamps_computed_from_rows_pass_every_clause(
+            i64_rows in prop::collection::vec(row_i64(), 1..48),
+            bool_rows in prop::collection::vec(prop::option::weighted(0.8, any::<bool>()), 1..48),
+        ) {
+            assert_rows_stamp_kept(&i64_stat_from_rows(&i64_rows), i64_rows.len() as u64)?;
+            assert_rows_stamp_kept(&bool_stat_from_rows(&bool_rows), bool_rows.len() as u64)?;
+        }
+    }
+
+    /// `aggregate_defect` applies the zero-count-of-0 clause only over
+    /// non-null rows. Every decode path passes a non-null count of 0 only
+    /// with the extrema absent, so this calls it directly with extrema at
+    /// zero and no non-null row.
+    #[test]
+    fn a_zero_count_of_zero_over_no_non_null_row_is_not_refused() {
+        let stat = i64_stat("UserID", 0, 5, 0)
+            .with_zero_count(0)
+            .expect("zero inside the range");
+        assert_eq!(aggregate_defect(&stat, 0), None);
+        assert_eq!(
+            aggregate_defect(&stat, 1),
+            Some(DeclaredStatDefect::ZeroCountZeroBesideZeroExtremum {
+                name: "UserID".to_string(),
+                non_null: 1,
+            })
+        );
     }
 
     /// The bytes the encoder wrote for this entry before ADR-4628, derived
