@@ -210,6 +210,12 @@ therefore bounds how long their bytes physically remain. It does not bound
 how long the sweep waits. The contract page's "Required bucket configuration"
 section gives the bound.
 
+A logs commit record holds a stamp for each declared `I64` and `BOOL`
+column: its min, max and null count, and by default its sum (`I64` only) and
+its count of zero values. A sum can give back an erased value, so a locked
+commit record of a tenant with such a column costs an erasure obligation as
+well as a reclamation delay.
+
 **The catalog keyspace.** A fourth mechanism, the unreferenced-catalog sweep,
 gives a compliance lock on `t/*/catalog/*/*` a further cost. The lock
 costs an erasure obligation as well as a reclamation delay.
@@ -219,6 +225,9 @@ costs an erasure obligation as well as a reclamation delay.
 - For a tenant that declares a typed string or bytes attribute column, one of
   those objects is a per-part column-statistics object. It holds the subject's
   own column value.
+- For a tenant that declares an `I64` or `BOOL` column, a replaced snapshot
+  part is one of those objects. Its entries hold the same stamps as the
+  commit records, the sum included.
 - The lock does not delay that delete, which succeeds as a delete marker. The
   locked version keeps the value in storage.
 - The sweep deletes the object only after the fold reconciles that hour and
@@ -233,6 +242,19 @@ you apply the current template. The contract page's "Required bucket
 configuration" section, under "A lock on the catalog family", has the
 four-step mechanism, the exact bound, the IAM ceiling and the HEAD-scoping
 advice.
+
+**Stamp sums under a lock.** A deployment with erasure obligations that keeps
+compliance retention on commit records or on the catalog keyspace longer than
+its erasure deadline has two options:
+
+- Start every logs producer with `--no-declared-stat-aggregates`, from its
+  first start on a release that writes stamp sums.
+- First shorten that retention to inside the deadline, and scope the catalog
+  lock to `catalog/<signal>/HEAD`.
+
+A sum written to a locked record stays until its retain-until.
+[Withholding stamp sums](configuration.md#withholding-stamp-sums) lists the
+producers and what the flag changes.
 
 **Every bucket that Ravel writes to must have one lifecycle rule.** Configure
 `AbortIncompleteMultipartUpload` with a cleanup period of seven days or less.
