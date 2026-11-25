@@ -641,6 +641,12 @@ bytes.
 
 A step of this kind is legitimate only when all of these hold:
 
+- The replayed record belongs to a logs or spans shard, whose flush does
+  not record abandoned keys. On the metrics shard the replay would make
+  `commit: an abandoned flush's commit record never lands past the fold's
+  seal margin` false on correct code, because that assertion judges an
+  abandoned key's landing time against the seal point
+  (`formal/tla/commit/traceability.md`, the NoPublishAfterAbandon row).
 - The data object the record names is stored before the replay.
 - The replay is create-only, and a refusal because the key exists (412)
   reports the situation as not reached, with nothing to undo.
@@ -667,9 +673,11 @@ A step of this kind is legitimate only when all of these hold:
   fold seal. The driver checks their sum against the fold safety margin,
   which is the gap between the two, less the seconds the move lands past
   C(H).
-- There is no undo. ADR-4561's R6 forbids deleting a late record: it is
-  served, kept, held, expired and counted exactly as before.
-- The driver's write gate is held from the capture to the replay.
+- There is no undo. ADR-4561's R6 keeps a late record on every read, hold,
+  retention and sweep path exactly as before, so deleting it would be a
+  tamper those paths observe.
+- The driver's write gate is held from the capture to the end of the race,
+  the compaction-record wait included.
 - Reaching the situation is a sometimes-assertion that the local loop
   requires, as with the other forced rules.
 
