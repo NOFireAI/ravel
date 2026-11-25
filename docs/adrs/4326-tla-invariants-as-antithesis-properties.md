@@ -460,7 +460,9 @@ driver action that forces its situation, and each such action:
 The step list in the first bullet gained two raw-S3 tampers on a compaction
 record the driver's own `ravel-cli` run just published; see the
 record-tamper amendment below. It also gained a late delivery of a commit
-record a server sent and abandoned; see the late-replay amendment below.
+record a server sent and abandoned, and the `s3proxy` rule list below gained
+the rule that refuses and captures that record's PUT; see the late-replay
+amendment below.
 
 Two parts of the catalog-maintenance topology change with it. Decision 4's
 topology gains an `s3proxy` container between the ravel-server containers
@@ -621,6 +623,15 @@ bytes, to the same key, through raw S3: byte-identical, create-only, and with
 the server's checksum. The catalog-maintenance workload's late-records race
 uses it (`antithesis/catalog-maintenance/README.md`, "The forced races").
 
+The `s3proxy` gains one rule for it, beside the rules the forced-situation
+amendment lists. The rule refuses the next level-0 commit record PUT from any
+server: the key shape `t/<tenant>/l/c/<shard>/<hour>/<writer>.<epoch>.<seq>.cmt`,
+which the driver cannot know before the flush. It reads that request's whole
+body and its checksum header, answers it with the proxy's existing 503, and
+forwards nothing. It refuses every later PUT of the same key while the rule
+stands. It reports the key, the checksum and the body to the driver over the
+control port. This is the one proxy rule that reads a request's payload.
+
 The step models a PUT that the store applies after its sender gave up.
 ADR-4561 says nothing bounds when that can happen. A server cannot itself send
 such a PUT across the 3900 s late-commit cutoff on this rig: SigV4 refuses a
@@ -633,9 +644,22 @@ A step of this kind is legitimate only when all of these hold:
 - The data object the record names is stored before the replay.
 - The replay is create-only, and a refusal because the key exists (412)
   reports the situation as not reached, with nothing to undo.
-- The write was a single attempt that the driver recorded as not
-  acknowledged, so the driver's model allows zero or one copy of it, and no
-  token read reads it.
+- The server's write whose commit record is captured was sent as a single
+  attempt, and the driver recorded it as not acknowledged. So the driver's
+  model allows zero or one copy of it, and no token read reads it.
+- The race ends before its hour can seal for the fold, and the driver bounds
+  every leg it holds the write gate across:
+  - the abandonment wait: the server's store client retries a refused PUT
+    within its retry budget of about 180 s plus one 20 s request;
+  - the clock move, with its HEAD-quiet wait;
+  - the replay and the LIST;
+  - the wait for the servers' compaction record, which the driver caps.
+
+  The capture and the abandonment happen while hour H still has time left.
+  The legs after the clock move start at the late-commit cutoff C(H) and
+  must end before the hour's fold seal. The driver checks their sum against
+  the fold safety margin, which is the gap between the two, less the seconds
+  the move lands past C(H).
 - There is no undo. ADR-4561's R6 forbids deleting a late record: it is
   served, kept, held, expired and counted exactly as before.
 - The driver's write gate is held from the capture to the replay.
