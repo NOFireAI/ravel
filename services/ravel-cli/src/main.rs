@@ -2632,8 +2632,10 @@ enum MaintainCommand {
         /// same rows by a process that does not withhold writes the fields
         /// again, so every process that writes stamps must set it. Fields
         /// already written stay, and a record under an Object Lock keeps them
-        /// until its retain-until (ADR-4628 question 6b). The report's
-        /// `declared_stat_aggregates:` line says which the run wrote.
+        /// until its retain-until (ADR-4628 question 6b). A logs run's report
+        /// has a `declared_stat_aggregates:` line saying which it wrote; a
+        /// metrics or spans run writes no stamp and warns on stderr that it
+        /// ignores the flag.
         #[arg(long = "no-declared-stat-aggregates", action = clap::ArgAction::SetFalse)]
         emit_declared_stat_aggregates: bool,
         #[command(flatten)]
@@ -2793,8 +2795,10 @@ enum MaintainCommand {
         /// same rows by a process that does not withhold writes the fields
         /// again, so every process that writes stamps must set it. Fields
         /// already written stay, and a record under an Object Lock keeps them
-        /// until its retain-until (ADR-4628 question 6b). The report's
-        /// `declared_stat_aggregates:` line says which the run wrote.
+        /// until its retain-until (ADR-4628 question 6b). A logs run's report
+        /// has a `declared_stat_aggregates:` line saying which it wrote; a
+        /// metrics or spans run writes no stamp and warns on stderr that it
+        /// ignores the flag.
         #[arg(long = "no-declared-stat-aggregates", action = clap::ArgAction::SetFalse)]
         emit_declared_stat_aggregates: bool,
         #[command(flatten)]
@@ -2918,8 +2922,10 @@ enum MaintainCommand {
         /// same rows by a process that does not withhold writes the fields
         /// again, so every process that writes stamps must set it. Fields
         /// already written stay, and a record under an Object Lock keeps them
-        /// until its retain-until (ADR-4628 question 6b). The report's
-        /// `declared_stat_aggregates:` line says which the run writes.
+        /// until its retain-until (ADR-4628 question 6b). A logs run's report
+        /// has a `declared_stat_aggregates:` line saying which it writes; a
+        /// metrics or spans run writes no stamp and warns on stderr that it
+        /// ignores the flag.
         #[arg(long = "no-declared-stat-aggregates", action = clap::ArgAction::SetFalse)]
         emit_declared_stat_aggregates: bool,
         #[command(flatten)]

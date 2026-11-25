@@ -584,16 +584,6 @@ fn claim_lease_for_derivation(claims: &ClaimOptions) -> Duration {
 /// `rlog_max_l1_part_bytes` (the RLOG stored-size cap),
 /// `rspan_l1_part_memory_target_bytes`, and `max_l1_part_bytes` (the shared
 /// cap RSEG reads).
-/// The settings line naming whether the run's logs output parts carry the
-/// stamp's sum and zero count, read off the config the run uses.
-fn declared_stat_aggregates_line(config: &CompactorConfig) -> &'static str {
-    if config.emit_declared_stat_aggregates {
-        "declared_stat_aggregates: emitted"
-    } else {
-        "declared_stat_aggregates: withheld"
-    }
-}
-
 fn write_part_split_lines(
     out: &mut dyn Write,
     config: &CompactorConfig,
@@ -611,6 +601,42 @@ fn write_part_split_lines(
         config.l1_part_memory_target_bytes
     )?;
     writeln!(out, "max_l1_part_bytes: {}", config.max_l1_part_bytes)
+}
+
+/// The settings line naming whether the run's logs output parts carry the
+/// stamp's sum and zero count, read off the config the run uses, or `None`
+/// for a metrics or spans run, which writes no declared-column stamp.
+fn declared_stat_aggregates_line(
+    config: &CompactorConfig,
+    signal: SignalArg,
+) -> Option<&'static str> {
+    match (signal, config.emit_declared_stat_aggregates) {
+        (SignalArg::Metrics | SignalArg::Spans, _) => None,
+        (SignalArg::Logs, true) => Some("declared_stat_aggregates: emitted"),
+        (SignalArg::Logs, false) => Some("declared_stat_aggregates: withheld"),
+    }
+}
+
+/// The warning for a `--no-declared-stat-aggregates` a metrics or spans
+/// maintain run cannot use, or `None` when the stamp fields are emitted or the
+/// run is a logs run. `run` names the run in the message (`compaction`,
+/// `migrate`). Only logs compaction parts carry a declared-column stamp.
+pub(crate) fn unused_declared_stat_aggregates_warning(
+    declared_stat_aggregates: DeclaredStatAggregates,
+    signal: SignalArg,
+    run: &str,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    (!declared_stat_aggregates.emits()).then(|| {
+        format!(
+            "warning: a {noun} {run} ignores --no-declared-stat-aggregates. Only logs \
+             compaction parts carry a declared-column stamp."
+        )
+    })
 }
 
 /// `maintain compact-bucket`: run one compaction pass over a single bucket.
@@ -782,6 +808,13 @@ pub async fn compact_to(
     if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
         eprintln!("{note}");
     }
+    if let Some(warning) = unused_declared_stat_aggregates_warning(
+        scratch.declared_stat_aggregates,
+        signal,
+        "compaction",
+    ) {
+        eprintln!("{warning}");
+    }
     let claims_line = install_claims(&mut config, dry_run, claims);
 
     selection.print_header();
@@ -801,7 +834,9 @@ pub async fn compact_to(
     writeln!(out, "dry_run: {dry_run}")?;
     write_part_split_lines(out, &config, &memory_target)?;
     writeln!(out, "{claims_line}")?;
-    writeln!(out, "{}", declared_stat_aggregates_line(&config))?;
+    if let Some(line) = declared_stat_aggregates_line(&config, signal) {
+        writeln!(out, "{line}")?;
+    }
     let outcome = match outcome {
         ClaimedCompaction::Ran(outcome) => outcome,
         ClaimedCompaction::SkippedClaimed(skip) => {
@@ -1314,6 +1349,13 @@ pub async fn compact_tenant_to(
     if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
         eprintln!("{note}");
     }
+    if let Some(warning) = unused_declared_stat_aggregates_warning(
+        scratch.declared_stat_aggregates,
+        signal,
+        "compaction",
+    ) {
+        eprintln!("{warning}");
+    }
     selection.print_header();
     require_tenant_data_present(
         selection,
@@ -1350,7 +1392,9 @@ pub async fn compact_tenant_to(
     )?;
     writeln!(out, "dry_run: {dry_run}")?;
     writeln!(out, "{claims_line}")?;
-    writeln!(out, "{}", declared_stat_aggregates_line(&config))?;
+    if let Some(line) = declared_stat_aggregates_line(&config, signal) {
+        writeln!(out, "{line}")?;
+    }
 
     // Build the walk in deterministic order (shard ascending, then hour
     // ascending), truncating each shard at and including its first unsealed
@@ -2948,6 +2992,13 @@ pub async fn migrate_to(
     claims: &ClaimOptions,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
+    if let Some(warning) = unused_declared_stat_aggregates_warning(
+        switches.declared_stat_aggregates,
+        signal,
+        "migrate",
+    ) {
+        eprintln!("{warning}");
+    }
     selection.print_header();
     require_tenant_data_present(
         selection,
@@ -2980,7 +3031,9 @@ pub async fn migrate_to(
         "reencode_compaction_parts: {}",
         switches.reencode_compaction_parts
     )?;
-    writeln!(out, "{}", declared_stat_aggregates_line(&config))?;
+    if let Some(line) = declared_stat_aggregates_line(&config, signal) {
+        writeln!(out, "{line}")?;
+    }
     if switches.dry_run {
         return migrate_dry_run(
             out,
@@ -3933,6 +3986,67 @@ mod tests {
     /// These fixtures build their own `MemoryStore`, which is the explicit
     /// `--store memory` case (issue #1024): an empty result stays a success.
     const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
+
+    /// A metrics or spans compaction or migrate warns on the stamp aggregate
+    /// opt-out, naming the signal and the run; a logs run never warns, and no
+    /// run warns without the flag.
+    #[test]
+    fn metrics_and_spans_maintain_runs_warn_on_the_stamp_aggregate_opt_out_and_logs_does_not() {
+        for run in ["compaction", "migrate"] {
+            for value in [
+                DeclaredStatAggregates::Emit,
+                DeclaredStatAggregates::Withhold,
+            ] {
+                assert_eq!(
+                    unused_declared_stat_aggregates_warning(value, SignalArg::Logs, run),
+                    None
+                );
+            }
+            for (signal, noun) in [(SignalArg::Metrics, "metrics"), (SignalArg::Spans, "spans")] {
+                assert_eq!(
+                    unused_declared_stat_aggregates_warning(
+                        DeclaredStatAggregates::Emit,
+                        signal,
+                        run
+                    ),
+                    None
+                );
+                assert_eq!(
+                    unused_declared_stat_aggregates_warning(
+                        DeclaredStatAggregates::Withhold,
+                        signal,
+                        run
+                    ),
+                    Some(format!(
+                        "warning: a {noun} {run} ignores --no-declared-stat-aggregates. Only \
+                         logs compaction parts carry a declared-column stamp."
+                    ))
+                );
+            }
+        }
+    }
+
+    /// The settings line prints for a logs run only, naming the config's
+    /// choice; a metrics or spans run prints none.
+    #[test]
+    fn the_stamp_aggregate_settings_line_is_logs_only() {
+        for (emit, want) in [
+            (true, "declared_stat_aggregates: emitted"),
+            (false, "declared_stat_aggregates: withheld"),
+        ] {
+            let config = CompactorConfig {
+                emit_declared_stat_aggregates: emit,
+                ..CompactorConfig::default()
+            };
+            assert_eq!(
+                declared_stat_aggregates_line(&config, SignalArg::Logs),
+                Some(want)
+            );
+            for signal in [SignalArg::Metrics, SignalArg::Spans] {
+                assert_eq!(declared_stat_aggregates_line(&config, signal), None);
+            }
+        }
+    }
 
     /// With the fence on, a `--max-flush-lifetime` other than the default is
     /// refused, naming both flags and the cutoff it would move. The default
