@@ -936,6 +936,16 @@ Each of these states or needs "a dropped PUT cannot land later". None of
 them is fixed by this document; they are reported per the repository rule on
 contradictions between specs and code.
 
+Status note, added when this document reached main: every status below is as
+of `9961091`. ADR-4561's landing has since addressed item 2 (the comment in
+`crates/ravel-maintain/src/bucket.rs` now says a PUT issued before the seal can
+still land later, so a sealed bucket's LIST is not a complete input set on its
+own) and item 4 (`docs/ingest.md` now says a PUT issued inside the bound can
+still be applied by the store after the seal). Item 3's proof sketch is still
+in `docs/catalog-and-mvcc.md`, corrected by the paragraphs that follow it.
+Item 1, the metrics-only property, stays as it is on purpose: the
+`formal/tla/commit/traceability.md` row for NoPublishAfterAbandon says why.
+
 1. **The Antithesis property "commit: an abandoned flush's commit record
    never lands past the fold's seal margin"**
    (`crates/ravel-ingest/src/shard.rs:1005-1007`). Three problems.
