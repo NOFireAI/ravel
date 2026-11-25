@@ -863,8 +863,8 @@ pub struct IngestConfig {
     /// the producer opt-out of ADR-4628 decision 8: every stamp then carries
     /// neither, with min, max and null count unchanged, so the segments it
     /// writes scan for the statements those fields answer. A process setting,
-    /// not a persisted record; neither ravel-server nor `ravel-cli load` sets
-    /// it from a flag yet.
+    /// not a persisted record; `--no-declared-stat-aggregates` sets it on
+    /// ravel-server's logs pipeline and on `ravel-cli load`.
     pub emit_declared_stat_aggregates: bool,
 }
 

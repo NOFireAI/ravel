@@ -1372,6 +1372,7 @@ fn reencode_report_head(dry_run: bool, reencode: bool) -> String {
     format!(
         "dry_run: {dry_run}\n\
          reencode_compaction_parts: {reencode}\n\
+         declared_stat_aggregates: emitted\n\
          tenant: {REENCODE_TENANT}\n\
          signal: Logs\n\
          family: rlog\n\
@@ -1468,6 +1469,7 @@ async fn migrate_with_the_reencode_flag_reencodes_the_bucket_and_reports_it_migr
         MigrateSwitches {
             dry_run: false,
             reencode_compaction_parts: true,
+            ..MigrateSwitches::default()
         },
         &ClaimOptions::fresh(),
     )
@@ -1551,6 +1553,7 @@ async fn migrate_prints_the_report_and_a_held_line_and_exits_nonzero() {
         MigrateSwitches {
             dry_run: false,
             reencode_compaction_parts: true,
+            ..MigrateSwitches::default()
         },
         &ClaimOptions::fresh(),
     )
@@ -1622,6 +1625,7 @@ async fn migrate_prints_a_bucket_whose_claim_another_process_holds() {
         MigrateSwitches {
             dry_run: false,
             reencode_compaction_parts: true,
+            ..MigrateSwitches::default()
         },
         &ClaimOptions::fresh(),
     )
@@ -1681,6 +1685,7 @@ async fn migrate_dry_run_with_the_reencode_flag_writes_nothing() {
         MigrateSwitches {
             dry_run: true,
             reencode_compaction_parts: true,
+            ..MigrateSwitches::default()
         },
         &ClaimOptions::fresh(),
     )
@@ -1846,6 +1851,7 @@ async fn migrate_exits_zero_when_another_writer_resolved_a_not_migrated_bucket()
         format!(
             "dry_run: false\n\
              reencode_compaction_parts: false\n\
+             declared_stat_aggregates: emitted\n\
              tenant: {RESOLVED_TENANT}\n\
              signal: Logs\n\
              family: rlog\n\

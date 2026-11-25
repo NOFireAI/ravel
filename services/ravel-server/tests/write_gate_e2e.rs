@@ -129,6 +129,7 @@ async fn start_ingest_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let config = ServerConfig {
+        emit_declared_stat_aggregates: true,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

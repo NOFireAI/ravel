@@ -170,6 +170,7 @@ fn server_config(
     let mut tokens = std::collections::HashMap::new();
     tokens.insert("testtoken".to_string(), TenantId::new("acme"));
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),

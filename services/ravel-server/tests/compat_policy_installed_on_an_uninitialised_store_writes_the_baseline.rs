@@ -174,6 +174,7 @@ fn config(mode: Mode) -> ServerConfig {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     ServerConfig {
+        emit_declared_stat_aggregates: true,
         // `required`: a refused audit write fails the query, so a 200 proves
         // the audit record was written.
         audit_pipeline: matches!(mode, Mode::All).then(|| ravel_maintain::AuditPipelineConfig {

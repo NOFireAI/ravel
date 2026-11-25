@@ -3379,7 +3379,10 @@ that part's rows only; an I64 column with no non-null row carries sum 0 and
 zero count 0. An erasure-rewrite output part carries no stamp, because the
 rewrite drops rows. `CompactorConfig::emit_declared_stat_aggregates`
 (default `true`) withholds both fields when `false` and leaves the min, max
-and null count unchanged; no task wires a flag to it yet. No reader uses the
+and null count unchanged; `--no-declared-stat-aggregates` sets it on
+`ravel-server --mode maintain` (the maintenance loop and the background
+migrate) and on `ravel-cli maintain compact-bucket`, `compact-tenant` and
+`migrate`. No reader uses the
 part's sum or zero count until ADR-4628 T5.
 
 `object_key` is informational. Readers MUST reconstruct the data key from
