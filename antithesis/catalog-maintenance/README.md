@@ -156,8 +156,10 @@ the scans and token reads. The `final` check runs at the end, after the
 forced races, the sweeps and the deletions they lead to. The forced
 situations take about 1400 s of the eventually, and an Antithesis timeline
 rarely lives that long after faults stop: in four runs, 0 or 1 lineage per
-run reached the final check. The early check takes about 60 to 120 s, so it
-counts on many more timelines. It is skipped, with a line that says why,
+run reached the final check. The early check is estimated at 60 to 120 s
+in Antithesis, from the 57 s the same steps took at the end of an
+Antithesis eventually (it took 1 s in the local loop), so it counts on many
+more timelines. It is skipped, with a line that says why,
 when the s3 proxy does not lift its rules, when a tamper undo is still
 pending, or when the fold after the compaction fails: state a rule cut
 short by the stop can leave behind, which the forced situations clear
