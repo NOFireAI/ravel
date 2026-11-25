@@ -1340,9 +1340,9 @@ What it does not change:
   A compaction by a process without it recomputes the sum and the zero
   count from the rows and writes them back into its output.
 
-A cluster run by the Kubernetes operator cannot set the flag today: the
-operator builds each pod's arguments itself and passes no extra argument
-through.
+A cluster run by the Kubernetes operator sets the flag with
+`spec.noDeclaredStatAggregates: true`, which renders it on the gateway and
+maintain pods ([Kubernetes guide](../kubernetes.md#withholding-stamp-sums)).
 
 ## Retention and garbage-collection configuration
 
