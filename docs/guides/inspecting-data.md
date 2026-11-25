@@ -588,9 +588,9 @@ ravel-cli catalog inspect --tenant acme --signal logs
   that carry no sum or zero count, such as records written under
   `--no-declared-stat-aggregates`, counts in `stamped` and in none of them.
 
-`--entries` adds, under the census, each entry's identity and its stamp
-lines, in the form `commit decode` prints them. `kept` there counts what
-the query reader keeps of the entry's stamp:
+`--entries` adds, under the census, each entry's identity, its data
+object key and its stamp lines, in the form `commit decode` prints them.
+`kept` there counts what the query reader keeps of the entry's stamp:
 
 ```sh
 ravel-cli catalog inspect --tenant acme --signal logs --entries
@@ -598,15 +598,23 @@ ravel-cli catalog inspect --tenant acme --signal logs --entries
 
 ```
     stamps: entries=3 stamped=2 with_sum=1 with_sum_wide=1 with_zero_count=1
-      entry[0] level=0 shard=0 ingest_hour_bucket=496953 writer_id=0101... writer_epoch=1 writer_seq=1
+      entry[0] level=0 shard=0 ingest_hour_bucket=496953 writer_id=0101... writer_epoch=1 writer_seq=1 key=t/<tenant-hash>/l/l0/0000/01010101-....1.00000000000000000001.bbbbbbbbbbbbbbbb.rseg
         stamp[0]: name="AdvEngineID" declared_type=2 (I64) min=0 max=3 null_count=0 sum=12 sum_wide=ABSENT zero_count=4
         stamp: entries=1 kept=1
       ...
 ```
 
-The entry is named by its identity, not by its data object key. `--entries`
-cannot be combined with `--json`, which reads HEAD alone and fetches no
-part.
+The key is derived from the entry's identity the way the catalog derives
+it to fetch the object. A level 0 entry is an ingest object, keyed by its
+shard, writer id, epoch, sequence and content hash. A level 1 entry is a
+compaction or rewrite part: its `writer_id` holds the input-set hash and
+its `writer_epoch` the part index, and the key is the L1 segment key
+built from the first 8 bytes of each hash, the shard, the ingest hour and
+the part index. When the identity cannot form a key (a writer id or content
+hash of the wrong length, a shard or part index past the key's width,
+another level), the line prints `key=UNDERIVABLE(<reason>)` and the listing goes
+on. `--entries` cannot be combined with `--json`, which reads HEAD alone
+and fetches no part.
 
 ## `inspect cstat`
 
