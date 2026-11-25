@@ -374,6 +374,22 @@ impl Corpus {
         }
     }
 
+    /// Segment `i` carrying what the real decode keeps of `stamps`, with the
+    /// number of entries it dropped.
+    pub(crate) fn seg_read(&self, i: usize, stamps: &[DeclaredColumnStat]) -> (SegmentRef, usize) {
+        let mut record = CommitRecord {
+            sample_count: self.bare[i].sample_count,
+            ..Default::default()
+        };
+        ravel_commit::declared_stats::stamp_commit_record(&mut record, stamps);
+        let read = ravel_commit::declared_stats::read_commit_record(&record);
+        let seg = SegmentRef {
+            declared_column_stats: DeclaredColumnStats::from_validated(&read),
+            ..self.bare[i].clone()
+        };
+        (seg, read.dropped().len())
+    }
+
     /// Every segment stamped from its own rows.
     pub(crate) fn segs(&self, fields: Fields) -> Vec<SegmentRef> {
         (0..self.bare.len())
