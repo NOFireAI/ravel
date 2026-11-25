@@ -104,6 +104,14 @@ SETUP_LIMIT=900
 # run (60 s once they stopped). A driver unit test holds this line equal to
 # it, so the two cannot drift apart.
 TAMPER_RACE_S=842
+# One late-records race with every wait and request at its bound, its clock
+# moves' quiet waits aside: late::RACE_S in driver/src/late.rs, whose doc
+# lists the terms. Most of it is the 1028 s wait for the server to abandon
+# the captured commit PUT (five store-client operations of 180 s plus a 20 s
+# request, the backoff between, a 20 s quiet span) and the 777 s from the
+# move past the cutoff to the end. A driver unit test holds this line equal
+# to it.
+LATE_RACE_S=2831
 # The eventually waits up to 300 s for recovery, then jumps the clocks, runs
 # up to six fold races, five record races, one unfolded-record sweep and one
 # unreadable-HEAD sweep (README.md, "The forced races"; about 2200 s between
@@ -120,6 +128,12 @@ TAMPER_RACE_S=842
 # clock moves of its own (the unfolded-record sweep's), whichever is longer.
 DRAWN_IN_FLIGHT=$((2200 + 3 * 60))
 [ $((TAMPER_RACE_S + 60)) -gt "$DRAWN_IN_FLIGHT" ] && DRAWN_IN_FLIGHT=$((TAMPER_RACE_S + 60))
+# A drawn late-records race and its two moves (into the next hour and past
+# the cutoff) can be in flight too.
+[ $((LATE_RACE_S + 2 * 60)) -gt "$DRAWN_IN_FLIGHT" ] && DRAWN_IN_FLIGHT=$((LATE_RACE_S + 2 * 60))
+# The eventually runs up to three late-records races (late::RACES_EVENTUALLY)
+# after the unreadable-HEAD sweep, each with up to two clock moves of 60 s.
+LATE_RACES_S=$((3 * (LATE_RACE_S + 2 * 60)))
 # The fresh compaction read
 # (README.md, "The fresh compaction read") adds 900 s: its compact-bucket
 # timeout (300 s), the 120 s wait for the record, six token reads at their
@@ -141,7 +155,7 @@ DRAWN_IN_FLIGHT=$((2200 + 3 * 60))
 # their first attempt once faults stopped and are counted in the 60 s.
 # 60 + 600 + 300 = 960 s.
 EARLY_MULTISET_S=960
-END_LIMIT=$((SECS + DRAWN_IN_FLIGHT + 4800 + 6 * TAMPER_RACE_S + 900 + 25 * 60 + 150 + EARLY_MULTISET_S))
+END_LIMIT=$((SECS + DRAWN_IN_FLIGHT + 4800 + 6 * TAMPER_RACE_S + LATE_RACES_S + 900 + 25 * 60 + 150 + EARLY_MULTISET_S))
 # The reshard profile's situations run in the eventually after the early
 # multiset check and before the forced races: the
 # activation writes, the fence (a 75 s stale-view wait, one move, writes
@@ -165,7 +179,12 @@ TOKEN_READ="catalog: a token read returns each acked record of its write exactly
 # that never reaches it cannot tell that mutant from clean code. The driver
 # cannot see a server's sweep pass, so the SUT's own "delete pass refused on
 # an unreadable HEAD" (both delete paths in ravel-maintain) is required too:
-# it proves a server sweep read the undecodable HEAD and stopped. The two
+# it proves a server sweep read the undecodable HEAD and stopped. The
+# late-records race must reach a server's plan of a bucket holding a late
+# commit record, whose compaction record names none; beside it the SUT's two
+# late-commit fence properties are required by name, since `maintain: ` is not
+# an owned prefix (the seeded hours' records are all late, so the plan one
+# holds without the race too). The two
 # tampering record races each reach the situation one maintenance mutant
 # needs, and the maintenance properties those mutants break must each have
 # been evaluated and held: the divergent-input-set one is evaluated only
@@ -199,6 +218,10 @@ REQUIRED=(
     "catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it"
     "catalog: HEAD stayed unreadable while the clocks passed the protection horizon"
     "catalog: delete pass refused on an unreadable HEAD"
+    "catalog: a server planned a bucket holding a late commit record"
+    "catalog: a server's compaction record names no late commit record"
+    "maintain: a plan left a late commit record out"
+    "maintain: a published record names no late commit record"
     "catalog: a token read ran after its input was compacted"
     "catalog: a token read ran after HEAD named the compaction output"
     "catalog: a token read ran after its input commit record was swept"

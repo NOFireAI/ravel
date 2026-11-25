@@ -26,10 +26,19 @@
 //!   failing those reads would, as a set of its own that `thaw-read` lifts.
 //!   Every other method on the key, and every request for another key, is
 //!   judged as without it.
+//! - `capture-commit`: refuse the next PUT of a level-0 logs commit record
+//!   ([`keys::parse_l0_commit_key`]) from any server: read its whole head and
+//!   body, forward nothing, answer it `503 SlowDown`, and keep its key, its
+//!   `x-amz-checksum-*` header and its body. Every later PUT of that key is
+//!   refused the same way while the rule stands. This is the one rule that
+//!   reads a request's payload (README.md, "The late-records race").
+//! - `captured`: what `capture-commit` took, as [`parse_captured`] reads it,
+//!   or `none`.
 //! - `held`: `held <key> <age_ms>`, or `none`.
 //! - `held-result`: `<key> <status>` of the last forwarded held request, or
 //!   `none`.
-//! - `release`, `pass`: release the hold; `pass` also lifts every rule.
+//! - `release`, `pass`: release the hold; `pass` also lifts every rule and
+//!   clears what `capture-commit` took.
 //!
 //! A restarted proxy starts with no rules, so a proxy killed mid-race
 //! leaves the servers on the plain path.
@@ -107,6 +116,10 @@ const PROCESS_FDS: usize = 64;
 const REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// The largest request head the proxy reads.
 const MAX_HEAD: usize = 64 * 1024;
+/// The largest commit record body `capture-commit` keeps. A one-row flush's
+/// record is far smaller; a larger body is refused and claimed like any
+/// other, and only reported as not captured.
+pub const MAX_CAPTURED_BODY: u64 = 32 * 1024;
 
 /// The soft open-file limit under which `connections` relayed and `control`
 /// control connections at once cannot run out of descriptors.
@@ -250,6 +263,26 @@ struct State {
     refuse_read_keys: BTreeSet<String>,
     /// The key and upstream status of the last forwarded held request.
     held_result: Option<(String, u16)>,
+    /// Set by `capture-commit` until a level-0 commit record PUT is claimed.
+    capture_commit: bool,
+    /// The level-0 commit record key `capture-commit` claimed, and what it
+    /// took of the request.
+    claimed: Option<Claim>,
+}
+
+/// One level-0 commit record PUT `capture-commit` refused, with every later
+/// PUT of its key.
+struct Claim {
+    key: String,
+    /// The `x-amz-checksum-*` header name and value; `None` until the body is
+    /// read, and when the PUT carried none.
+    checksum: Option<(String, String)>,
+    /// `None` until the whole body was read, and for a body that could not
+    /// be kept.
+    body: Option<Vec<u8>>,
+    /// PUTs of the key refused so far, the claimed one included.
+    puts: u64,
+    last_put: Instant,
 }
 
 /// What happens to one request.
@@ -260,6 +293,23 @@ pub enum Admit {
     /// A released held request: forward it on a dedicated upstream
     /// connection, read its response status, and record it as `held-result`.
     Capture(String),
+    /// The level-0 commit record PUT `capture-commit` claimed: read its whole
+    /// body, keep it with [`Rules::record_claimed`], and refuse it.
+    Claim,
+}
+
+/// What `captured` reports.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Captured {
+    pub key: String,
+    /// The `x-amz-checksum-*` header the PUT carried, name and value.
+    pub checksum: Option<(String, String)>,
+    /// The PUTs of the key refused so far, the claimed one included.
+    pub puts: u64,
+    /// How long since the last of them.
+    pub quiet: Duration,
+    /// The request body; `None` when it was not read whole or not kept.
+    pub body: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -331,6 +381,13 @@ impl Rules {
                     None => "none".to_string(),
                 };
             }
+            ("capture-commit", "") => s.capture_commit = true,
+            ("captured", "") => {
+                return match &s.claimed {
+                    Some(c) => captured_reply(c),
+                    None => "none".to_string(),
+                };
+            }
             _ => return format!("error: unknown command {:?}", command.trim()),
         }
         "ok".to_string()
@@ -353,6 +410,24 @@ impl Rules {
             || (record && s.refuse_records)
         {
             return Admit::Refuse;
+        }
+        if let Some(c) = s.claimed.as_mut().filter(|c| c.key == key) {
+            c.puts += 1;
+            c.last_put = Instant::now();
+            return Admit::Refuse;
+        }
+        if s.capture_commit && s.claimed.is_none() && keys::parse_l0_commit_key(key).is_some() {
+            // Claimed before the body is read, so no PUT of the key is
+            // forwarded even when reading this one fails.
+            s.capture_commit = false;
+            s.claimed = Some(Claim {
+                key: key.to_string(),
+                checksum: None,
+                body: None,
+                puts: 1,
+                last_put: Instant::now(),
+            });
+            return Admit::Claim;
         }
         let hold_this_key = s.hold_key.as_deref() == Some(key);
         let hold = hold_this_key || (record && s.hold_next_record);
@@ -385,6 +460,128 @@ impl Rules {
     pub fn record_held_result(&self, key: &str, status: u16) {
         self.lock().held_result = Some((key.to_string(), status));
     }
+
+    /// Keep the checksum header and body of the claimed PUT of `key`, once
+    /// its body was read whole; a `pass` since the claim keeps nothing.
+    pub fn record_claimed(&self, key: &str, checksum: Option<(String, String)>, body: Vec<u8>) {
+        if let Some(c) = self.lock().claimed.as_mut().filter(|c| c.key == key) {
+            c.checksum = checksum;
+            c.body = Some(body);
+        }
+    }
+}
+
+/// The `captured` reply: `<key> <checksum> <puts> <quiet_ms> <body>`, the
+/// checksum as `<header>:<value>` or `-`, the body standard base64 or `-`
+/// when it was not kept.
+fn captured_reply(c: &Claim) -> String {
+    let checksum = c.checksum.as_ref().map_or_else(
+        || "-".to_string(),
+        |(name, value)| format!("{name}:{value}"),
+    );
+    let body = c
+        .body
+        .as_deref()
+        .map_or_else(|| "-".to_string(), base64_encode);
+    format!(
+        "{} {checksum} {} {} {body}",
+        c.key,
+        c.puts,
+        c.last_put.elapsed().as_millis()
+    )
+}
+
+/// A `captured` reply; `None` for `none` and for anything malformed.
+pub fn parse_captured(reply: &str) -> Option<Captured> {
+    let [key, checksum, puts, quiet_ms, body] = reply.split(' ').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let checksum = match checksum {
+        "-" => None,
+        c => {
+            let (name, value) = c.split_once(':')?;
+            Some((name.to_string(), value.to_string()))
+        }
+    };
+    let body = match body {
+        "-" => None,
+        b => Some(base64_decode(b)?),
+    };
+    Some(Captured {
+        key: key.to_string(),
+        checksum,
+        puts: puts.parse().ok()?,
+        quiet: Duration::from_millis(quiet_ms.parse().ok()?),
+        body,
+    })
+}
+
+/// The `x-amz-checksum-<algorithm>` header of a request head, name in lower
+/// case, the value as sent; `None` when there is none. The algorithm-naming
+/// headers (`-algorithm`, `-type`, `-mode`) carry no checksum and are skipped.
+pub fn checksum_header(raw: &[u8]) -> Option<(String, String)> {
+    String::from_utf8_lossy(raw)
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            let name = name.trim().to_ascii_lowercase();
+            let alg = name.strip_prefix("x-amz-checksum-")?;
+            if matches!(alg, "algorithm" | "type" | "mode") {
+                return None;
+            }
+            Some((name, value.trim().to_string()))
+        })
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64, padded.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(B64[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Standard base64, padded, as [`base64_encode`] writes it; `None` for
+/// anything else.
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    for (i, quad) in b.chunks(4).enumerate() {
+        let last = i + 1 == b.len() / 4;
+        let pad = quad.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for &c in &quad[..4 - pad] {
+            let v = B64.iter().position(|&x| x == c)?;
+            n = n << 6 | v as u32;
+        }
+        n <<= 6 * pad as u32;
+        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        out.extend_from_slice(&bytes[..3 - pad]);
+    }
+    // A non-canonical encoding (stray bits under the padding) is refused.
+    (base64_encode(&out) == s).then_some(out)
 }
 
 /// How a message body is framed.
@@ -702,6 +899,24 @@ fn requests(
                 copy_body(&mut reader, &mut up_write, &head.body)?;
                 up_write.flush()?;
             }
+            Admit::Claim => {
+                // The body is read whole before the refusal, so the client
+                // reads the 503 rather than a reset. Only a content-length
+                // body is kept: a chunked one carries its framing.
+                let mut body = Vec::new();
+                copy_body(&mut reader, &mut body, &head.body)?;
+                match head.body {
+                    Body::Length(n) if n <= MAX_CAPTURED_BODY => {
+                        rules.record_claimed(&key, checksum_header(&head.raw), body);
+                    }
+                    _ => eprintln!("s3-proxy: claimed {key} but kept no body ({:?})", head.body),
+                }
+                let mut w = client.try_clone()?;
+                w.write_all(&refusal_to(&head.method))?;
+                w.flush()?;
+                let _ = up.shutdown(Shutdown::Both);
+                return Ok(());
+            }
             Admit::Capture(key) => {
                 // No pipelining: the held request is the client's only
                 // in-flight one, so the raw-copy `answers` thread has no bytes
@@ -834,7 +1049,7 @@ pub fn serve_control(
                     return;
                 };
                 let reply = rules.apply(&line);
-                println!("s3-proxy: {} -> {reply}", line.trim());
+                println!("s3-proxy: {} -> {}", line.trim(), loggable(&reply));
                 if writeln!(w, "{reply}").is_err() {
                     return;
                 }
@@ -852,8 +1067,24 @@ pub fn serve_control(
 pub const CONTROL_DEADLINE: Duration = Duration::from_secs(7);
 /// The connect's own cap, inside [`CONTROL_DEADLINE`].
 const CONTROL_CONNECT: Duration = Duration::from_secs(2);
-/// The longest control reply read; a reply is one short line.
-const MAX_CONTROL_REPLY: usize = 4096;
+/// The longest control reply read: one line, at most a `captured` reply
+/// with a [`MAX_CAPTURED_BODY`] body in base64.
+const MAX_CONTROL_REPLY: usize = 64 * 1024;
+const _: () = assert!(MAX_CAPTURED_BODY as usize / 3 * 4 + 4 + 4096 <= MAX_CONTROL_REPLY);
+
+/// A control reply as the proxy logs it: a long one (a `captured` body) cut
+/// to its start and its length.
+pub fn loggable(reply: &str) -> String {
+    const KEEP: usize = 200;
+    if reply.len() <= KEEP {
+        return reply.to_string();
+    }
+    let mut end = KEEP;
+    while !reply.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... ({} bytes)", &reply[..end], reply.len())
+}
 
 /// What is left of `deadline` at `now`; `Err` naming `what` once nothing
 /// is, so no step starts with a zero timeout.
@@ -1089,6 +1320,144 @@ mod tests {
         );
         assert!(rules.apply("refuse-key").starts_with("error"));
         assert!(rules.apply("bogus").starts_with("error"));
+    }
+
+    const L0: &str = "t/0a0b/l/c/0003/20261117T16/\
+                      5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1794931200.00000000000000000007.cmt";
+    const L0_OTHER: &str = "t/0a0b/l/c/0001/20261117T16/\
+                            5f0c6a2e-8b1d-4c3a-9e7f-112233445566.1794931200.00000000000000000008.cmt";
+
+    #[test]
+    fn a_capture_claims_one_l0_commit_put_and_refuses_its_key_until_pass() {
+        let rules = Rules::default();
+        let cap = Duration::from_millis(10);
+        assert_eq!(rules.apply("captured"), "none");
+        assert_eq!(rules.apply("capture-commit"), "ok");
+        // Only an L0 commit record PUT is claimed.
+        assert_eq!(rules.admit("GET", L0, cap), Admit::Forward);
+        assert_eq!(rules.admit("PUT", RECORD, cap), Admit::Forward);
+        assert_eq!(
+            rules.admit("PUT", "t/0a0b/l/l0/0003/x.rseg", cap),
+            Admit::Forward
+        );
+        // Never a metrics shard's commit record: that shard records the keys
+        // it abandons, and the replay would land one past the fold's seal
+        // margin on correct code.
+        assert_eq!(
+            rules.admit("PUT", &L0.replace("/l/c/", "/m/c/"), cap),
+            Admit::Forward
+        );
+        assert_eq!(rules.admit("PUT", L0, cap), Admit::Claim);
+        // The next L0 PUT of another key is not, and every later PUT of the
+        // claimed key is refused and counted.
+        assert_eq!(rules.admit("PUT", L0_OTHER, cap), Admit::Forward);
+        assert_eq!(rules.admit("PUT", L0, cap), Admit::Refuse);
+        assert_eq!(rules.admit("PUT", L0, cap), Admit::Refuse);
+        assert_eq!(rules.admit("GET", L0, cap), Admit::Forward);
+        // Claimed with nothing read yet: no checksum, no body.
+        let c = parse_captured(&rules.apply("captured")).expect("a capture");
+        assert_eq!(
+            (c.key.as_str(), c.checksum, c.puts, c.body),
+            (L0, None, 3, None)
+        );
+        let crc = (
+            "x-amz-checksum-crc64nvme".to_string(),
+            "Ab+/9w==".to_string(),
+        );
+        rules.record_claimed(L0, Some(crc.clone()), b"record bytes".to_vec());
+        let c = parse_captured(&rules.apply("captured")).expect("a capture");
+        assert_eq!(c.key, L0);
+        assert_eq!(c.checksum, Some(crc));
+        assert_eq!(c.body.as_deref(), Some(&b"record bytes"[..]));
+        assert!(c.quiet < Duration::from_secs(5));
+        // `pass` clears the capture and lifts the refusal.
+        assert_eq!(rules.apply("pass"), "ok");
+        assert_eq!(rules.apply("captured"), "none");
+        assert_eq!(rules.admit("PUT", L0, cap), Admit::Forward);
+        // A record kept after a pass is dropped.
+        rules.record_claimed(L0, None, b"late".to_vec());
+        assert_eq!(rules.apply("captured"), "none");
+    }
+
+    #[test]
+    fn captured_replies_parse() {
+        assert_eq!(parse_captured("none"), None);
+        let c = parse_captured(&format!("{L0} x-amz-checksum-crc64nvme:AAEC== 5 1200 cmVj"))
+            .expect("parses");
+        assert_eq!(
+            c,
+            Captured {
+                key: L0.to_string(),
+                checksum: Some(("x-amz-checksum-crc64nvme".to_string(), "AAEC==".to_string())),
+                puts: 5,
+                quiet: Duration::from_millis(1200),
+                body: Some(b"rec".to_vec()),
+            }
+        );
+        let bare = parse_captured(&format!("{L0} - 1 0 -")).expect("parses");
+        assert_eq!((bare.checksum, bare.body), (None, None));
+        for bad in [
+            format!("{L0} - 1 0"),
+            format!("{L0} - x 0 -"),
+            format!("{L0} nocolon 1 0 -"),
+            format!("{L0} - 1 0 cmV"),
+        ] {
+            assert_eq!(parse_captured(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn base64_round_trips_and_refuses_what_it_does_not_write() {
+        for (bytes, text) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (&[0xfb, 0xff, 0xbf][..], "+/+/"),
+        ] {
+            assert_eq!(base64_encode(bytes), text);
+            assert_eq!(base64_decode(text).as_deref(), Some(bytes), "{text}");
+        }
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(base64_decode(&base64_encode(&all)), Some(all));
+        for bad in ["Zg=", "Zg", "Z===", "Zg==Zg==", "Zh==", "Zm9v!A==", "Zm-v"] {
+            assert_eq!(base64_decode(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_checksum_header_is_found_whatever_its_algorithm() {
+        let head =
+            |h: &str| format!("PUT /ravel/k HTTP/1.1\r\nHost: x\r\n{h}Content-Length: 1\r\n\r\n");
+        assert_eq!(
+            checksum_header(head("X-Amz-Checksum-CRC64NVME: AAEC==\r\n").as_bytes()),
+            Some(("x-amz-checksum-crc64nvme".to_string(), "AAEC==".to_string()))
+        );
+        assert_eq!(
+            checksum_header(
+                head("x-amz-checksum-algorithm: CRC32C\r\nx-amz-checksum-crc32c: q83v7w==\r\n")
+                    .as_bytes()
+            ),
+            Some(("x-amz-checksum-crc32c".to_string(), "q83v7w==".to_string()))
+        );
+        assert_eq!(
+            checksum_header(head("x-amz-content-sha256: abc\r\n").as_bytes()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_long_control_reply_is_logged_cut() {
+        assert_eq!(loggable("ok"), "ok");
+        let long = format!("{L0} - 1 0 {}", "A".repeat(4000));
+        let logged = loggable(&long);
+        assert!(logged.starts_with(L0), "{logged}");
+        assert!(
+            logged.ends_with(&format!("... ({} bytes)", long.len())),
+            "{logged}"
+        );
+        assert!(logged.len() < 260, "{logged}");
     }
 
     #[test]
@@ -1638,6 +2007,53 @@ mod tests {
         assert!(body.contains("<Code>SlowDown</Code>"));
         // Nothing more reached the upstream.
         assert_eq!(seen.lock().expect("locks").len(), put.len() + chunked.len());
+    }
+
+    #[test]
+    fn a_captured_commit_put_is_read_whole_refused_and_never_forwarded() {
+        let (up, seen) = upstream();
+        let rules = Arc::new(Rules::default());
+        let addr = proxy(up, Arc::clone(&rules));
+        rules.apply("capture-commit");
+        let body = [0u8, 1, 2, 0xff, b' ', b'\n'];
+        let put = |key: &str| {
+            let mut req = format!(
+                "PUT /ravel/{key} HTTP/1.1\r\nHost: s3proxy:9000\r\n\
+                 x-amz-checksum-crc64nvme: AAEC==\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(&body);
+            req
+        };
+        let refused = |key: &str| {
+            let mut conn = TcpStream::connect(&addr).expect("connects");
+            conn.write_all(&put(key)).expect("writes");
+            let mut reply = Vec::new();
+            conn.read_to_end(&mut reply).expect("reads to the close");
+            reply
+        };
+        assert_eq!(refused(L0), super::refusal());
+        // The retry of the same key is refused too.
+        assert_eq!(refused(L0), super::refusal());
+        let c = parse_captured(&rules.apply("captured")).expect("a capture");
+        assert_eq!(c.key, L0);
+        assert_eq!(
+            c.checksum,
+            Some(("x-amz-checksum-crc64nvme".to_string(), "AAEC==".to_string()))
+        );
+        assert_eq!(c.body.as_deref(), Some(&body[..]));
+        assert_eq!(c.puts, 2);
+        assert!(
+            seen.lock().expect("locks").is_empty(),
+            "nothing was forwarded"
+        );
+        // Another L0 key goes through.
+        let mut conn = TcpStream::connect(&addr).expect("connects");
+        let mut r = BufReader::new(conn.try_clone().expect("clones"));
+        conn.write_all(&put(L0_OTHER)).expect("writes");
+        assert!(answer(&mut r).starts_with("HTTP/1.1 200"));
+        assert_eq!(seen.lock().expect("locks").clone(), put(L0_OTHER));
     }
 
     #[test]
