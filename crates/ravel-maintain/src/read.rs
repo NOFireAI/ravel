@@ -110,6 +110,9 @@ impl BucketListing {
     /// listed commit record less the late ones. On an unclassified listing this
     /// is [`Self::commit_keys`].
     pub fn planning_commit_keys(&self) -> Vec<String> {
+        if ravel_invariant::inv_mutant!("catalog/plan-takes-late-record") {
+            return self.commit_keys.clone();
+        }
         if self.late_commit_keys.is_empty() {
             return self.commit_keys.clone();
         }
@@ -1284,5 +1287,38 @@ mod tests {
             .expect("load catalog");
         assert_eq!(catalog.series.len(), 2);
         assert_eq!(store.suffix_lengths(), [65_536]);
+    }
+
+    /// A listing of two commit records whose second is stamped at the cutoff,
+    /// classified, so the fence leaves that one out of the plan.
+    fn listing_with_one_late_record() -> BucketListing {
+        let cutoff_ns = 2_000 * 1_000_000;
+        let mut listing = BucketListing {
+            commit_keys: vec!["c/0/1/a.1.1.cmt".into(), "c/0/1/b.1.1.cmt".into()],
+            commit_last_modified_ms: vec![1_999, 2_000],
+            ..Default::default()
+        };
+        listing.classify_late(cutoff_ns);
+        assert_eq!(listing.late_commit_keys, ["c/0/1/b.1.1.cmt"]);
+        listing
+    }
+
+    #[test]
+    fn a_plan_leaves_the_late_record_out() {
+        let listing = listing_with_one_late_record();
+        assert_eq!(listing.planning_commit_keys(), ["c/0/1/a.1.1.cmt"]);
+    }
+
+    #[test]
+    fn mutant_plan_takes_late_record_plans_the_late_record() {
+        let Some(_mutant) = crate::publish::tests::scoped_mutant("catalog/plan-takes-late-record")
+        else {
+            return;
+        };
+        let listing = listing_with_one_late_record();
+        assert_eq!(
+            listing.planning_commit_keys(),
+            ["c/0/1/a.1.1.cmt", "c/0/1/b.1.1.cmt"]
+        );
     }
 }

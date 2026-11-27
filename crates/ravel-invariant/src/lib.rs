@@ -490,6 +490,7 @@ pub mod mutant {
         "catalog/compaction-loser-overwrites",
         "catalog/sweep-superseded-no-head-gate",
         "catalog/corrupt-head-ignores-delete-gate",
+        "catalog/plan-takes-late-record",
         "lifecycle/refresh-failure-is-no-hold",
         "lifecycle/delete-before-horizon",
         "lifecycle/rewrite-keeps-erased-records",
