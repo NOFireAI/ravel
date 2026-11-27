@@ -102,7 +102,7 @@ as it does `format-drill`.
 | Area | Mutants (negative cfg stem); each also runs in Antithesis |
 |---|---|
 | commit | `ack-before-commit`, `commit-before-data`, `mismatched-identity-idempotent` (also pins the identity RNG), `marker-before-all-shards` |
-| catalog | `lost-cas-proceeds`, `compaction-swaps-record`, `sweep-superseded-no-head-gate`, `corrupt-head-ignores-delete-gate`; the #4335 amendment below adds `compaction-loser-overwrites` and names the property each compaction mutant breaks |
+| catalog | `lost-cas-proceeds`, `compaction-swaps-record`, `sweep-superseded-no-head-gate`, `corrupt-head-ignores-delete-gate`; the #4335 amendment below adds `compaction-loser-overwrites` and names the property each compaction mutant breaks; the late-fence mutant amendment below adds `plan-takes-late-record` |
 | common | `lost-response-not-applied`, `cas-accepts-stale-version`, `list-never-progresses` (bounded page count), in a driver-side broken store, since RustFS cannot be mutated |
 | lifecycle | `refresh-failure-is-no-hold`, `delete-before-horizon`, `rewrite-keeps-erased-records`, `complete-ignores-served-set` |
 | resharding, maintenance | `mo-diverge-overwrites-record`, `mo-missing-part-reports-converged`, `no-writer-fence`, `token-validated-against-count` |
@@ -113,7 +113,9 @@ Antithesis hours), and then fail its property in its own Antithesis run, with
 a counterexample whose condition is false. Never reached does not count; a
 mutant whose situation faults rarely produce gets a driver action that
 forces it (see the forced-situation amendment below). A mutant whose property passes, or that fails only
-another property, means the property is vacuous and blocks the wave.
+another property, means the property is vacuous and blocks the wave. One
+mutant must make two properties false, not either one (see the late-fence
+mutant amendment below).
 
 ### 4. Workloads
 
@@ -192,7 +194,9 @@ one hour above it. Twenty-nine runs at that rate cost about 29 hours beyond
 their caps, so the rerun reserve is 15 hours, not 24, and the epic plans to the
 whole of the raised budget. A further rerun beyond that reserve needs the
 owner's go. The #4335 amendment below brings the mutant count to 20; the
-twentieth mutant's Antithesis run is not priced here. "Every new SUT
+twentieth mutant's Antithesis run is not priced here. The late-fence mutant
+amendment below adds a twenty-first mutant and records the owner's go for its
+run. "Every new SUT
 assertion reached" counts only the areas a workload owns (see the
 per-workload amendment below).
 
@@ -686,3 +690,55 @@ The assertions it makes reachable are the late-commit fence's
 `maintain: a published record names no late commit record`, plus the
 driver's own check that a server's compaction record names no late commit
 record. Owner decision (delegated), 2026-11-25 (#4561).
+
+## Amendment (2026-11-27): a mutant for the late-commit fence (#4561)
+
+<!-- amendment-applies: sections="3. Mutant controls|7. Budget" pointer="late-fence mutant amendment" -->
+
+This is the late-fence mutant amendment. Decision 3's catalog row gains a
+sixth mutant, `plan-takes-late-record`. Under it,
+`BucketListing::planning_commit_keys` in `crates/ravel-maintain/src/read.rs`
+returns every listed commit record, so a plan takes a record stamped at or
+after its bucket's late-commit cutoff, which ADR-4561 R4 forbids.
+
+Decision 3 makes a mutant the Rust form of a broken-switch negative config.
+`formal/tla/catalog/CatalogMVCC.tla` gains the fence for that config to
+switch off: a commit record that lands after its bucket's maintain seal is
+marked late, a compaction's inputs leave late records out, and an invariant
+says no compaction record names a late record. The config
+`negative/plan-takes-late-record.cfg` turns the switch on and must violate
+that invariant. Until the model has the fence, its `DoCompact` takes every
+level-0 record of the hour, which contradicts R4.
+
+The named property is the catalog-maintenance driver's `catalog: a server's
+compaction record names no late commit record`. It judges the compaction
+record as the store holds it, decoded, and only the late-records race
+produces the situation it needs. The SUT's `maintain: a published record names
+no late commit record` must go false in the same run. This mutant passes only
+when both properties are false, in the local loop and in its Antithesis run.
+Either one alone does not count.
+
+The reason is that the mutant leaves classification alone. The listing still
+records which commit records are late, and only the plan stops leaving them
+out. The SUT property compares a published record's inputs with that
+classification, so it goes false wherever a plan meets a late record. The
+seeded hours' records are all late (`ravel-cli load` writes them long after
+their hours end), so it goes false on the first compaction, with no race. A
+rule that accepted either property would then pass this mutant without ever
+showing that the driver's audit can fail. The driver property can go false
+only through the race, so requiring it too proves the race reaches the
+mutant's situation and that the audit sees it.
+
+The Antithesis band for the run is pre-registered on #4561: both properties
+fail with a counterexample, and the race's `catalog: a server planned a
+bucket holding a late commit record` is reached. If the SUT property fails
+and the driver property holds, the race was not reached or the audit is
+vacuous. That blocks, and it is not rerun blind.
+
+Decision 7 does not price this mutant's Antithesis run. It is a mutant run as
+decision 7 defines one, a 12-hour cap and about one hour of overshoot, and
+with the plain catalog-maintenance run #4561 pre-registers beside it the two
+come to about 30 compute hours, of about 1100 left. A run outside the plan
+needs the owner's go, and the owner gave it. The local loop comes first and
+costs no Antithesis hours; the Antithesis run starts only after both
+properties went false there. Owner decision (delegated), 2026-11-27 (#4561).
