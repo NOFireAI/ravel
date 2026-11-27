@@ -184,7 +184,7 @@ occurs as a literal in Rust and a property the table carries, or `none:
 |---|---|---|---|
 | Clean smoke, per workload config (5) | 12 | completes; every guarantee passes; every new SUT assertion reached | predicted; the 12-hour smoke run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 compute hours over 16 minutes of billable time (`snouty runs usage`), measured 2026-11-16 |
 | Overshoot above the cap, per run | about 1 | billed hours within cap + 1 | measured 2026-11-16: run 4d85276e32085a10291c9eddd59d34b3-67-0 billed 13.0 under a cap of 12, run 5bafcae0c50b1efc354cb19c89294955-67-0 billed 25.0 under a cap of 24 (`snouty runs usage`) |
-| Mutant control in Antithesis, every mutant (19; 20 per the #4335 amendment below) | 12 each | named property fails with a counterexample | predicted |
+| Mutant control in Antithesis, every mutant (19; 20 per the #4335 amendment below; 21 per the late-fence mutant amendment below) | 12 each | named property fails with a counterexample | predicted |
 | Mutant control, local loop, every mutant | 0 | named property false in the SDK's local output | predicted |
 | Long run, per workload config (5) | 24 | no new guarantee failure, or one issue per failure | predicted |
 | Whole epic | caps of 423, plus about 29 overshoot, about 452 of about 452 remaining | 5 smokes (60), 19 mutant runs (228; the twentieth the #4335 amendment below adds is not priced), 5 long runs (120), 15 for reruns; 29 runs at about 1 hour of overshoot each; one smoke and one long run per workload config, not per area | predicted; budget raised by the owner 2026-11-16 from 200 to about 490; 38 compute hours billed before this epic (13.0 and 25.0), measured 2026-11-16 (`snouty runs usage`, runs.md) |
@@ -712,33 +712,42 @@ level-0 record of the hour, which contradicts R4.
 
 The named property is the catalog-maintenance driver's `catalog: a server's
 compaction record names no late commit record`. It judges the compaction
-record as the store holds it, decoded, and only the late-records race
-produces the situation it needs. The SUT's `maintain: a published record names
-no late commit record` must go false in the same run. This mutant passes only
-when both properties are false, in the local loop and in its Antithesis run.
-Either one alone does not count.
+record as the store holds it, decoded. The SUT's `maintain: a published
+record names no late commit record` must go false in the same run. This
+mutant passes only when both properties are false, in the local loop and in
+its Antithesis run. Either one alone does not count. The catalog
+`antithesis-mutants.tsv` row names the driver property, as decision 6's one
+property per line requires, and the workload's local loop requires the SUT
+property beside it.
 
-The reason is that the mutant leaves classification alone. The listing still
-records which commit records are late, and only the plan stops leaving them
-out. The SUT property compares a published record's inputs with that
-classification, so it goes false wherever a plan meets a late record. The
-seeded hours' records are all late (`ravel-cli load` writes them long after
-their hours end), so it goes false on the first compaction, with no race. A
-rule that accepted either property would then pass this mutant without ever
-showing that the driver's audit can fail. The driver property can go false
-only through the race, so requiring it too proves the race reaches the
-mutant's situation and that the audit sees it.
+Both properties go false only through the late-records race. A plan
+publishes only from at least two commit records
+(`DEFAULT_MIN_COMPACTION_INPUTS`). The seeded hours' records are all late,
+but each seeded bucket holds one record, so no plan of it publishes, with the
+mutant or without it. The live hours' records are on time. The race builds
+the one bucket that holds two on-time records and a late one. Under the
+mutant, the server's plan of that bucket takes all three. The SUT property
+goes false at the publish, because it compares the record's inputs with the
+listing's classification, which the mutant leaves alone. The driver property
+goes false when the driver decodes the stored record.
 
-The Antithesis band for the run is pre-registered on #4561: both properties
-fail with a counterexample, and the race's `catalog: a server planned a
-bucket holding a late commit record` is reached. If the SUT property fails
-and the driver property holds, the race was not reached or the audit is
-vacuous. That blocks, and it is not rerun blind.
+The two properties check the same fact from two sides: the server, from the
+listing it planned from, and the driver, from the stored bytes. A rule that
+accepted either one would pass this mutant if one of the two checks could
+never fail, which is the vacuous-property case decision 3 exists to catch.
+Requiring both shows that each check can fail. If the SUT property fails and
+the driver property holds, the driver's audit missed what the server
+published. If the driver property fails
+and the SUT property holds, the server's classification broke.
+
+The Antithesis band, to be pre-registered on #4561 before the run: both
+properties fail with a counterexample, and the race's `catalog: a server
+planned a bucket holding a late commit record` is reached. A run where only
+one of the two fails blocks, and is not rerun blind.
 
 Decision 7 does not price this mutant's Antithesis run. It is a mutant run as
-decision 7 defines one, a 12-hour cap and about one hour of overshoot, and
-with the plain catalog-maintenance run #4561 pre-registers beside it the two
-come to about 30 compute hours, of about 1100 left. A run outside the plan
-needs the owner's go, and the owner gave it. The local loop comes first and
-costs no Antithesis hours; the Antithesis run starts only after both
-properties went false there. Owner decision (delegated), 2026-11-27 (#4561).
+decision 7 defines one: a 12-hour cap and about one hour of overshoot. A run
+outside the plan needs the owner's go, and the owner gave it. The local loop
+comes first and costs no Antithesis hours. The Antithesis run starts only
+after both properties went false there. Owner decision (delegated),
+2026-11-27 (#4561).
