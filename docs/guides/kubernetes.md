@@ -1475,8 +1475,8 @@ on commit records or on the catalog keyspace longer than its erasure
 deadline starts every logs producer with `--no-declared-stat-aggregates`
 from its first start on this release, or first shortens that retention
 to inside the deadline and scopes the catalog lock to
-`catalog/<signal>/HEAD`. A sum written to a locked record stays until its
-retain-until.
+`catalog/<signal>/HEAD`. A sum or a zero count written to a locked record
+stays until its retain-until.
 
 ## Probe semantics
 
