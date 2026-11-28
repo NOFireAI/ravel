@@ -387,7 +387,7 @@ and an Azure one in
 | `spec.retention.default` | string | none | Duration string, e.g. `30d`. |
 | `spec.retention.tenants` | map | none | Per-tenant overrides, tenant name to duration. |
 | `spec.probes.dedicatedHealthPort` | boolean | `true` | Probe the dedicated health listener on 4316 instead of the main HTTP port. Requires a server image of v0.19.0 or newer, which has `--listen-health`. Set `false` to keep probes on the main HTTP port. An existing cluster keeps its stored value; see "The dedicated health port" below. |
-| `spec.noDeclaredStatAggregates` | boolean | `false` | `true` renders `--no-declared-stat-aggregates` on the gateway and maintain pods, never on the query pods. Apply `crd.yaml` first and set it in the same change as a server image that has the flag. See "Withholding stamp sums" below. |
+| `spec.noDeclaredStatAggregates` | boolean | `false` | `true` renders `--no-declared-stat-aggregates` on the gateway and maintain pods, never on the query pods. Apply `crd.yaml` and upgrade the operator first, and set it in the same change as a server image that has the flag. See "Withholding stamp sums" below. |
 
 `spec.storage` sets exactly one of `s3` and `azure`: a CEL rule on
 `storage` refuses a spec with neither or both at admission, and the
