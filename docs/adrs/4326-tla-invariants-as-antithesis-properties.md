@@ -104,7 +104,7 @@ as it does `format-drill`.
 | commit | `ack-before-commit`, `commit-before-data`, `mismatched-identity-idempotent` (also pins the identity RNG), `marker-before-all-shards` |
 | catalog | `lost-cas-proceeds`, `compaction-swaps-record`, `sweep-superseded-no-head-gate`, `corrupt-head-ignores-delete-gate`; the #4335 amendment below adds `compaction-loser-overwrites` and names the property each compaction mutant breaks; the late-fence mutant amendment below adds `plan-takes-late-record` |
 | common | `lost-response-not-applied`, `cas-accepts-stale-version`, `list-never-progresses` (bounded page count), in a driver-side broken store, since RustFS cannot be mutated |
-| lifecycle | `refresh-failure-is-no-hold`, `delete-before-horizon`, `rewrite-keeps-erased-records`, `complete-ignores-served-set` |
+| lifecycle | `refresh-failure-is-no-hold`, `delete-before-horizon`, `rewrite-keeps-erased-records`, `complete-ignores-served-set` (it switches off both completion gates, and the completion-mutant amendment below names the property it breaks) |
 | resharding, maintenance | `mo-diverge-overwrites-record`, `mo-missing-part-reports-converged`, `no-writer-fence`, `token-validated-against-count` |
 
 Pass rule, two levels. Every mutant must make its named property false in the
@@ -176,7 +176,9 @@ A five-column table in an enrolled area fails, and so does a six-column table
 with no `.tsv`. A header is recognised by its exact first cell, not by a
 pattern. The `.tsv` has one line per `negative/*.cfg`, naming a mutant that
 occurs as a literal in Rust and a property the table carries, or `none:
-<reason>`. Each child epic's last task enrolls its area.
+<reason>`. Each child epic's last task enrolls its area. Where one Rust guard
+carries the switches of two configs, the completion-mutant amendment below
+says which line names the mutant.
 
 ### 7. Budget
 
@@ -751,3 +753,71 @@ outside the plan needs the owner's go, and the owner gave it. The local loop
 comes first and costs no Antithesis hours. The Antithesis run starts only
 after both properties went false there. Owner decision (delegated),
 2026-11-27 (#4561).
+
+## Amendment (2026-11-28): the completion mutant covers both completion switches (#4552)
+
+<!-- amendment-applies: sections="3. Mutant controls|6. The traceability column" pointer="completion-mutant amendment" -->
+
+This is the completion-mutant amendment. It changes which property decision
+3's lifecycle mutant `complete-ignores-served-set` must make false, and how
+decision 6's lifecycle `.tsv` records it.
+
+`formal/tla/lifecycle/LifecycleGC.tla` guards `CompleteErasure` with two
+switches. `CompleteIgnoresServedSet` drops the served-set check, which
+`CompletionImpliesNoPreRewriteExposure` judges. `CompletionIgnoresOpenBucket`
+drops the open-bucket check, which `CompletionCoversEveryBucketOpenAtRequest`
+judges. Each has its own negative config. The Rust code has one guard for
+both: `ravel_maintain::bucket_erasure_completion` returns one blocked set,
+which holds a request blocked by a bucket it may not judge yet (unsealed, or
+not yet plannable under the late-commit fence) and a request still served by
+a judged bucket. The guard in `services/ravel-server/src/maintain.rs` reads
+that union. The mutant drops the guard, so it switches off both checks.
+Decision 3 makes a mutant the Rust form of a broken-switch config at the same
+site. Here the site holds two switches, so the mutant is both configs at
+once.
+
+Until now, the `.tsv` mapped the mutant to the served-set property only. That
+property's evidence judges only buckets the gate may judge, which matches the
+model: an open bucket's records are outside `ServesNow`. In the lifecycle-gc
+workload the mutant changes a completion only while the request's ack-open
+hour is unsealed. The served-set property was evaluated there and passed,
+because the open-bucket check is not its invariant. The workload's local loop
+on origin/main d23dbb245 showed this: two evaluations emitted, both true,
+and one mutant-affected tick per maintain node (#4552). The mutant is real:
+in the same loop, the driver's erasure property read the erased records back
+after the `.dreq` sweep. But the mutant's named property could never go
+false, which decision 3 calls vacuous.
+
+The change:
+
+- `CompletionCoversEveryBucketOpenAtRequest` gains an SUT property at the
+  `.done` write in `maintain.rs`: `erasure: a completion is written only once
+  every bucket open at its acknowledgement is judged`. Its evidence is a fresh
+  listing, together with the hour open at each request's acknowledgement. For
+  each bucket the gate may not judge yet, the evidence is whether that bucket
+  is in the request's scope at acknowledgement.
+- The lifecycle `.tsv` maps the mutant to that property, on the
+  `completion-ignores-open-bucket` line. The `complete-ignores-served-set`
+  line becomes `none`, and its reason says the Rust guard unions both checks
+  and the mutant is counted on the other line. This retires the line's
+  earlier reason, that decision 3 ships no mutant for
+  `CompletionCoversEveryBucketOpenAtRequest`. Decision 6's one property per
+  line still holds.
+- The served-set property keeps its SUT site and its evidence. The mutant's
+  break of that property is shown by the capture-lane test
+  `completion_waits_for_the_served_set`, Part B, in
+  `services/ravel-server/src/erasure_e2e.rs`, as decision 1 allows. That test
+  is the only place the served-set check is switched off by itself.
+
+The pass rule for this mutant, in the local loop and in its Antithesis run:
+
+- The open-bucket property goes false, with a counterexample.
+- The served-set property holds.
+- The driver's `erasure: an erased subject is never returned after its
+  request` may go false. It is reported and does not decide the run.
+
+A run where the open-bucket property holds blocks, and is not rerun blind.
+
+The mutant's Antithesis run was already one of decision 7's 19 mutant runs,
+so the budget does not change. The local loop comes first. Owner decision
+(delegated), 2026-11-28 (#4552).
