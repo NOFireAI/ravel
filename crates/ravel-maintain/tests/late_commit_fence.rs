@@ -1704,6 +1704,69 @@ async fn a_fenced_compaction_evaluates_both_invariants() {
     assert!(names_none[names_none_before].0, "{names_none:?}");
 }
 
+/// Selects mutant `name` on this thread until the returned guard drops;
+/// `None` outside the invariants lane, where no mutant is compiled in.
+fn scoped_mutant(name: &'static str) -> Option<Box<dyn std::any::Any>> {
+    let guard: std::cell::RefCell<Option<Box<dyn std::any::Any>>> = Default::default();
+    let _ = name;
+    ravel_invariant::inv_sometimes!(
+        {
+            *guard.borrow_mut() =
+                ravel_invariant::test_support::scoped_mutant(name).expect("a registered mutant");
+            true
+        },
+        "ravel-maintain test: a mutant is scoped",
+        ""
+    );
+    guard.into_inner()
+}
+
+/// The `catalog/plan-takes-late-record` mutant on the compaction of test 10:
+/// the plan still classifies the two late records, takes them anyway, and the
+/// publish-side check evaluates false, naming one of them.
+#[tokio::test]
+async fn mutant_plan_takes_late_record_falsifies_the_publish_check() {
+    let _serial = SERIAL.lock().await;
+    if !capturing() {
+        return;
+    }
+    let Some(_mutant) = scoped_mutant("catalog/plan-takes-late-record") else {
+        return;
+    };
+    const NAMES_NONE: &str = "maintain: a published record names no late commit record";
+    let names_none_before = evaluations(NAMES_NONE, "\"compaction\"").len();
+    let store = MemoryStore::new();
+    let mut commit_keys = Vec::new();
+    for (stamp, spec) in stamped_three() {
+        commit_keys.push(seed_at(&store, &store, stamp, &spec).await);
+    }
+    let config = fenced(
+        FENCE,
+        CompactorConfig {
+            min_compaction_inputs: 1,
+            ..CompactorConfig::default()
+        },
+    );
+    compact_bucket(
+        &store,
+        &FixedClock::new(sealed_now_ns()),
+        &config,
+        &bucket(),
+    )
+    .await
+    .expect("compaction");
+
+    let names_none = evaluations(NAMES_NONE, "\"compaction\"");
+    assert_eq!(names_none.len(), names_none_before + 1, "{names_none:?}");
+    let (condition, details) = &names_none[names_none_before];
+    assert!(!*condition, "{details}");
+    let late_keys = &commit_keys[1..];
+    assert!(
+        late_keys.iter().any(|key| details.contains(key.as_str())),
+        "{details} names none of {late_keys:?}"
+    );
+}
+
 mod determinism {
     //! Test 8: the on-time and late split depends on the stamps alone.
 
