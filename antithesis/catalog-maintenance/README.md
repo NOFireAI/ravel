@@ -556,10 +556,12 @@ mutant (ADR-4326 decision 3). The driver forces each situation with a rule
 again in the `eventually` (all but the last until reached once, the
 unreadable-HEAD sweep once), and asserts reaching it as a
 sometimes-assertion that `local-run.sh` requires in a plain run. A
-seventh race, the late-records race (`race_late_records`), forces no
-mutant's situation: it makes the late-commit fence's properties
-(ADR-4561) hold over a bucket that a server plans and compacts while it
-holds a late commit record ("The late-records race").
+seventh race, the late-records race (`race_late_records`), forces the
+situation of the seventh mutant, `plan-takes-late-record`: a server
+plans and compacts a bucket that holds a late commit record beside two
+on-time ones ("The late-records race"). In a plain run the late-commit
+fence's properties (ADR-4561) hold there; under the mutant both the
+driver's and the SUT's go false.
 
 Every step is something the system must survive anyway: every clock moves
 forward together, never back; a `ravel-cli` maintenance run happens
@@ -995,8 +997,8 @@ dropped. The control port takes at most 8 connections and answers one more
 
 ## Mutants
 
-ADR-4326 decision 3 (as amended by #4335) gives the catalog area five
-mutants. Each is an `inv_mutant!("catalog/<stem>")` switch in ravel-server's
+ADR-4326 decision 3 (as amended by #4335 and by the late-fence mutant
+amendment) gives the catalog area six mutants. Each is an `inv_mutant!("catalog/<stem>")` switch in ravel-server's
 library code, compiled in only by the `antithesis-mutants` cargo feature and
 selected at start by `RAVEL_ANTITHESIS_MUTANT`; a name ravel-server does not
 register makes it refuse to start. `formal/tla/catalog/antithesis-mutants.tsv`
@@ -1010,6 +1012,7 @@ there.
 | `catalog/corrupt-head-ignores-delete-gate` | both delete paths treat an undecodable HEAD as naming nothing | `catalog: a delete gate never clears under an unreadable HEAD`, or its sibling on the unreferenced-part sweep, `catalog: a catalog sweep never deletes under an unreadable HEAD` | `crates/ravel-maintain/src/reachability.rs`, `crates/ravel-maintain/src/sweep.rs` |
 | `catalog/compaction-loser-overwrites` | a publisher that loses the record's create-only PUT writes its own payload over the winner's | `catalog: a published compaction record is never replaced` | `crates/ravel-maintain/src/publish.rs` |
 | `catalog/compaction-swaps-record` | compaction moves its last input identity to a writer id no writer is issued, before building the parts | `catalog: compaction preserves the acked multiset` | the driver (`driver/src/main.rs`) |
+| `catalog/plan-takes-late-record` | a plan takes every listed commit record, late ones included, while the listing still classifies which are late | `catalog: a server's compaction record names no late commit record` and `maintain: a published record names no late commit record`, both | the driver (`driver/src/late.rs`), `crates/ravel-maintain/src/late_commit.rs` |
 
 The workload's scripts also select the mutants of two more areas (ADR-4326
 decision 3), over the same `-mutants` images. `scripts/mutant-tsv.sh` lists the
@@ -1019,7 +1022,7 @@ whose column 2 starts with `<area>/` (a `none:` line names no mutant):
 
 | Area | Mutants |
 |---|---|
-| `catalog` | the five above |
+| `catalog` | the six above |
 | `resharding` | `resharding/no-writer-fence`, `resharding/token-validated-against-count` |
 | `maintenance` | `maintenance/mo-diverge-overwrites-record`, `maintenance/mo-missing-part-reports-converged` |
 
@@ -1041,6 +1044,20 @@ The corrupt-HEAD mutant switches off the HEAD guard of both delete passes,
 and each pass asserts `CorruptHeadFailsClosedOnDeletePaths` under its own
 literal, so either literal going false counts. The `.tsv` names the first.
 
+The late-fence mutant is the other way round: both of its properties must
+go false, and `local-run.sh` holds them in an all-of list. The `.tsv` names
+the driver's, and the script adds the SUT's, refusing to start when
+`crates/ravel-maintain/src/late_commit.rs` no longer asserts it. The mutant
+changes only which records a plan takes, so the SUT's publish-side check,
+which compares the record's inputs with the listing's classification, goes
+false at the publish, and the driver's audit goes false when it decodes the
+stored record. Requiring both shows that each check can fail. Only the
+late-records race reaches them. Compaction is the one maintenance pass this
+workload plans with (it sets no migration target and no erasure requests),
+and a compaction publishes only from two commit records
+(`DEFAULT_MIN_COMPACTION_INPUTS`). A seeded bucket holds one record, late,
+so no plan of it publishes, and the live hours' records are on time.
+
 Only the four ravel-server containers run a mutant. The driver's on-demand
 fold, compaction and sweep go through `ravel-cli`, which no image builds
 with `antithesis-mutants`, so a mutant fires only in the servers' scheduled
@@ -1059,7 +1076,7 @@ built with `--features sql,antithesis,antithesis-mutants` (the Dockerfile's
 carry the `org.ravel.antithesis.ref` label, and the server image also
 `org.ravel.antithesis.features`. Besides the instrumentation check, the build
 checks that the server binary registers every mutant name of the three areas
-and refuses unless the per-area counts are exactly catalog 5, resharding 2 and
+and refuses unless the per-area counts are exactly catalog 6, resharding 2 and
 maintenance 2, the mutants ADR-4326 decision 3 ships. Those counts are
 `EXPECTED_MUTANTS` in `scripts/mutant-tsv.sh`, beside the area list, and every
 script that reads the names (the build check, `mutant-config.sh`, and so
@@ -1074,9 +1091,9 @@ copy of `config/` where every workload image names its `-mutants` tag and the
 ravel-server environment's `RAVEL_ANTITHESIS_MUTANT: ""` names the mutant.
 It refuses, and so both scripts refuse:
 
-- a name that is not one of the nine mutants the three areas' `.tsv` files
+- a name that is not one of the ten mutants the three areas' `.tsv` files
   list, including a `none:` stem and a name of another area such as
-  `lifecycle/` or `commit/` (the message lists the nine);
+  `lifecycle/` or `commit/` (the message lists the ten);
 - a copy whose rewrite did not move every image line and set exactly one
   selector.
 
@@ -1087,7 +1104,8 @@ no mutant. With the variable unset or empty both run the plain config,
 unchanged.
 
 A mutant run of `local-run.sh` exits 0 only when the mutant's property was
-evaluated false at least once (it appears in `violated.tsv`). Every other
+evaluated false at least once (it appears in `violated.tsv`), or for the
+late-fence mutant, when both of its properties were. Every other
 always-type assertion that went false, and every other gate that failed, is
 printed as `REPORT (mutant run, not gated): ...` and does not change the exit
 code; a mutant that breaks only another property fails the run, as decision
@@ -1282,15 +1300,16 @@ machine:
 # build host (x86_64, Docker)
 antithesis/catalog-maintenance/scripts/build.sh
 MUTANTS=1 antithesis/catalog-maintenance/scripts/build.sh
-# ok ravel-antithesis-server:catalog-maintenance-mutants: /symbols/ravel-server registers the 9 mutants (catalog 5, resharding 2, maintenance 2)
+# ok ravel-antithesis-server:catalog-maintenance-mutants: /symbols/ravel-server registers the 10 mutants (catalog 6, resharding 2, maintenance 2)
 
 antithesis/catalog-maintenance/scripts/local-run.sh out/plain
 # OK: no always-type assertion violated or unhit, ...
 for m in lost-cas-proceeds sweep-superseded-no-head-gate corrupt-head-ignores-delete-gate \
-    compaction-loser-overwrites compaction-swaps-record; do
+    compaction-loser-overwrites compaction-swaps-record plan-takes-late-record; do
   RAVEL_ANTITHESIS_MUTANT=catalog/$m antithesis/catalog-maintenance/scripts/local-run.sh out/$m
 done
-# mutant OK: catalog/<stem> violated "<its property>"   (once per mutant)
+# mutant OK: catalog/<stem> violated "<its property>"   (once per mutant;
+# plan-takes-late-record prints "violated all of:" and both properties)
 
 antithesis/catalog-maintenance/scripts/export-images.sh s3://<bucket>/<prefix>
 MUTANTS=1 antithesis/catalog-maintenance/scripts/export-images.sh s3://<bucket>/<prefix>
