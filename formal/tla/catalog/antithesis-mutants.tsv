@@ -11,11 +11,13 @@ fold-names-entry-above-watermark	none: SnapshotEntriesBelowWatermark is out of t
 frontier-reconcile-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); retention-frontier reconcile is out of the catalog scope of decision 2
 head-corruption-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); carried by the reachable "catalog: delete pass refused on an unreadable HEAD"
 head-names-unwritten-part	none: ADR-4326 as amended by #4335 ships no mutant for HeadNamesUnwrittenPart; HeadNamesOnlyCompleteParts is checked by the store audit, "catalog: every object HEAD names exists"
+late-record-left-out-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); the catalog-maintenance late-records race reaches it as "catalog: a server planned a bucket holding a late commit record"
 lost-cas-proceeds	catalog/lost-cas-proceeds	catalog: a fold reports as folded only a HEAD the store holds
 metrics-dedup-dropped	none: SignalDedupContract is out of scope (ADR-4326 decision 2); differential tests own it
 overlap-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); no catalog assertion carries overlapping L1 outputs
 part-corruption-ignores-delete-gate	none: ADR-4326 as amended by #4335 ships no mutant for the covering-part trigger; the workload corrupts only HEAD, so no run reaches an unreadable covering part
 part-unreadable-nonvacuity	none: non-vacuity control, not a broken switch (ADR-4326 decision 1); the workload corrupts only HEAD, so no run reaches an unreadable covering part
+plan-takes-late-record	catalog/plan-takes-late-record	catalog: a server's compaction record names no late commit record
 query-fails-closed-on-missing-index	none: query rows are out of scope (ADR-4326 decision 2); differential tests own them
 reconcile-on-tick	none: ReconcileOnlyOnWatermarkAdvance is out of the catalog scope of ADR-4326 decision 2; crate tests own it
 snapshot-changes-mid-attempt	none: query rows are out of scope (ADR-4326 decision 2); differential tests own them
