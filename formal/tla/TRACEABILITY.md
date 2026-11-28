@@ -16,13 +16,13 @@ area tables are five-column.
 |---|---|---|---|---|
 | common | `common/RavelObjectStore.tla` | 9 | ravel-object-store, ravel-commit, ravel-ingest | [common/traceability.md](common/traceability.md) |
 | commit | `commit/CommitProtocol.tla` | 21 | ravel-ingest, ravel-commit, ravel-catalog, ravel-maintain, ravel-types | [commit/traceability.md](commit/traceability.md) |
-| catalog | `catalog/CatalogMVCC.tla` | 25 | ravel-catalog, ravel-commit, ravel-maintain, ravel-query | [catalog/traceability.md](catalog/traceability.md) |
+| catalog | `catalog/CatalogMVCC.tla` | 26 | ravel-catalog, ravel-commit, ravel-maintain, ravel-query | [catalog/traceability.md](catalog/traceability.md) |
 | lifecycle | `lifecycle/LifecycleGC.tla` | 29 | ravel-maintain, ravel-commit, ravel-query, ravel-catalog | [lifecycle/traceability.md](lifecycle/traceability.md) |
 | resharding | `resharding/OnlineResharding.tla` | 19 | ravel-ingest, ravel-catalog, ravel-commit, ravel-types, services/ravel-cli | [resharding/traceability.md](resharding/traceability.md) |
 | maintenance | `maintenance/MaintenanceOwnership.tla`, `maintenance/CompactionClaims.tla` | 45 | ravel-fleet, ravel-maintain, services/ravel-cli, services/ravel-server | [maintenance/traceability.md](maintenance/traceability.md) |
 | agents | `agents/AgentProtocol.tla`, `agents/AgentEffects.tla`, `agents/AgentIntegrated.tla` | 54 | ravel-agents-core, ravel-agents-store | [agents/traceability.md](agents/traceability.md) |
 
-Total: 202 traceability rows across the suite.
+Total: 203 traceability rows across the suite.
 
 ## Test debt
 

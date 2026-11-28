@@ -12,9 +12,10 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 
 | Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
-| exhaustive.cfg | FairSpec (safety + QueryTerminates liveness) | 3422524 | 31 | PASS | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
-| carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 3905496 | 33 | PASS | 20261128T063827Z-b5fdb4e36d81c9258b2457c8926d7613cdd77f81 |
+| exhaustive.cfg | FairSpec (safety + QueryTerminates liveness) | 3986424 | 31 | PASS | 20261128T064152Z-b5fdb4e36d81c9258b2457c8926d7613cdd77f81 |
+| positive/plan-leaves-late-record-out.cfg | Spec (safety, the late-commit fence at three publishes) | 790769 | 29 | PASS | direct TLC run, 2026-11-28 (see the late-commit fence note below) |
+| carryforward.cfg | Spec (safety, three-hour carry-forward) | 23416527 | 37 | PASS | direct TLC run, 2026-11-28 (see the late-commit fence note below) |
 | negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
 | negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
 | negative/compaction-loser-overwrites.cfg | Spec | first counterexample | n/a | CompactionRecordImmutable violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
@@ -36,15 +37,20 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 | negative/part-unreadable-nonvacuity.cfg | Spec | first counterexample | n/a | NoPartUnreadable violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
 | negative/entry-undecodable-nonvacuity.cfg | Spec | first counterexample | n/a | NoEntryUndecodable violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
 | negative/overlap-nonvacuity.cfg | Spec | first counterexample | n/a | NoOverlappingL1Output violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/plan-takes-late-record.cfg | Spec | first counterexample | n/a | PlanLeavesLateRecordsOut violated, exit 12 | direct TLC run, 2026-11-28 |
+| negative/late-record-left-out-nonvacuity.cfg | Spec | first counterexample | n/a | NoLateRecordLeftOut violated (probe), exit 12 | direct TLC run, 2026-11-28 |
 
-The twenty-one `negative/` configs each flip exactly one switch (or, for
+The twenty-three `negative/` configs each flip exactly one switch (or, for
 `carryforward-nonvacuity.cfg`, `frontier-reconcile-nonvacuity.cfg`,
 `compaction-loser-diverged-nonvacuity.cfg`, `head-corruption-nonvacuity.cfg`,
-`part-unreadable-nonvacuity.cfg`, `entry-undecodable-nonvacuity.cfg`, and
-`overlap-nonvacuity.cfg`, check a refuted probe) and must exit 12 reporting
+`part-unreadable-nonvacuity.cfg`, `entry-undecodable-nonvacuity.cfg`,
+`overlap-nonvacuity.cfg`, and `late-record-left-out-nonvacuity.cfg`, check a
+refuted probe) and must exit 12 reporting
 exactly the named property; each `.expect` pins that exit code and
 property, and the negative lane fails if any config passes or reports a
-different property. All twenty-one were run together with smoke and
+different property. The late-commit fence note below gives this round's
+run ids, which are not one `all` invocation. Before it, the twenty-one
+configs of the time were run together with smoke and
 exhaustive in one `scripts/check-tla.sh all
 -a catalog` invocation, run id `20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739`
 (`.cache/tla/last-run.tsv`); the Run column above cites that id uniformly
@@ -69,7 +75,14 @@ not run by any harness lane.
 A run outside these is a regression to investigate, not to widen; see
 `bands.tsv`.
 
-- smoke distinct states in [3455000, 3470000], depth in [33, 33].
+- smoke distinct states in [3898000, 3913000], depth in [33, 33].
+- exhaustive distinct states in [3978000, 3995000], depth in [31, 31].
+- positive/plan-leaves-late-record-out.cfg distinct states in [789000,
+  793000], depth in [29, 29].
+
+The paragraphs below record how the bands moved, round by round; the
+late-commit fence note at the end of this section gives the current
+figures.
 
 The safety model runs to a fixed complete state graph, so its distinct-state
 count and depth are deterministic; the band carries a small margin only to
@@ -225,6 +238,40 @@ described for `lastCompact.outcome`. Neither band above changed. See
 `overlap.cfg` (Overlap constants below) and `counterexamples/overlap-nonvacuity.md`
 for the config that does reach the fixed case.
 
+The ADR-4561 late-commit fence (issue #4561) added the `late` variable, a
+`leftOut` witness on each compaction record, the `PlanInputs` exclusion in
+`DoCompact`, the invariant `PlanLeavesLateRecordsOut` and its switch
+`PlanTakesLateRecord`. Every figure below is TLC 1.7.4 on Java 17, two
+workers, on the gcp2 build host. Smoke grew from 3463504 to 3905496
+distinct states, depth 33 unchanged, in 132 seconds (run
+`20261128T063827Z-b5fdb4e36d81c9258b2457c8926d7613cdd77f81`). Exhaustive
+grew from 3422524 to 3986424, depth 31 unchanged, in 1513 seconds, inside
+the 3600-second ceiling (run
+`20261128T064152Z-b5fdb4e36d81c9258b2457c8926d7613cdd77f81`). Both grow
+only because a commit landing at the maintenance-seal tick now carries the
+late flag, which splits states that were one before. Neither config reaches
+a compaction beside a late record: smoke has one record, and exhaustive
+spends its two publishes on two commits, or on one commit and its
+compaction. So `positive/plan-leaves-late-record-out.cfg` checks every
+safety invariant at three publishes over one hour: 2361719 states
+generated, 790769 distinct, depth 29, 20 seconds. At two hours the same
+config took 643 seconds for 16168394 distinct states, past the positive
+lane's 300-second budget; the fence acts on each hour alone, so one hour
+loses nothing it checks. `negative/late-record-left-out-nonvacuity.cfg`
+shows the fence leaves a late record out at those bounds, and
+`negative/plan-takes-late-record.cfg` violates `PlanLeavesLateRecordsOut`
+there (see `counterexamples/`). Each negative passed in the run that
+checked all twenty-three: `scripts/check-tla.sh negative -a catalog`,
+before `Hours` in the three late-fence configs went from `{0, 1}` to
+`{0}`, and the two late-fence configs again by hand at `{0}`.
+
+`carryforward.cfg` was re-run by hand at the same commit: 127377684 states
+generated, 23416527 distinct, depth 37, PASS, 1337 seconds. Its
+`FoldSealDelay = 0` makes the maintenance and fold seals one tick, so no
+commit there can be late, and the fence changes nothing in its graph. The
+growth from the 4481272 distinct states recorded above comes from rounds
+that changed the model since that figure was taken without re-running it.
+
 ## Invariant derivation audit
 
 Every invariant observes the modelled STORE (objects present, their content, the
@@ -249,11 +296,12 @@ authority; the table restates it.
 | TombstonedBucketContributesNothing | WITNESS: `lastHead.entries`, `lastHead.tombAtWrite`, `lastHead.reconcileLo`, and `lastHead.frontierReconciled` of the last fold |
 | SignalDedupContract | WITNESS: `qy.dupServed`, recomputed (`RawDupIdentities`) on the entry set the query actually served after `Dedup` ran on it, not on the switch that gates `Dedup` |
 | DedupPreservesCoverage | STORE: recomputes `Sources` and `Dedup` fresh against `FallbackView` at every reachable state, rather than reading any witness the model set for itself |
+| PlanLeavesLateRecordsOut | STORE: the L1 compaction-record plane (`crec[H][g].in`) and the commit records' stamps (`late`), which `DoCommit` sets from the clock whatever `PlanTakesLateRecord` says |
 
 ## Non-vacuity: behaviour mutant per invariant
 
 Each named safety invariant is shown load-bearing by a behaviour mutant. All
-twelve have a dedicated switch and a negative-control config that flips it and
+thirteen have a dedicated switch and a negative-control config that flips it and
 drives TLC to exit 12 on that invariant (the recorded lines are in the run
 table above). `CorruptHeadFailsClosedOnDeletePaths` has three: one per
 fail-closed trigger (unreadable HEAD, unreadable part, undecodable entry) on
@@ -275,6 +323,7 @@ the shared delete-gate guard.
 | CorruptHeadFailsClosedOnDeletePaths | switch `DeletePathIgnoresUndecodableEntry` | negative/entry-corruption-ignores-delete-gate.cfg, exit 12 |
 | SnapshotEntriesBelowWatermark | switch `FoldNamesEntryAboveWatermark` | negative/fold-names-entry-above-watermark.cfg, exit 12 |
 | TombstonedBucketContributesNothing | switch `FoldIncludesTombstonedEntries` | negative/fold-includes-tombstoned-entries.cfg, exit 12 |
+| PlanLeavesLateRecordsOut | switch `PlanTakesLateRecord` | negative/plan-takes-late-record.cfg, exit 12 |
 
 `DedupPreservesCoverage` (finding 1, issue #1121 round five) is proven
 non-vacuous by a different route than the switch-and-negative-control
@@ -439,3 +488,19 @@ pass, not the banded gate config, and the fixed model's full graph at these
 bounds did not finish exploring within five minutes (see Bands above and
 `counterexamples/overlap-nonvacuity.md`). Paired non-vacuity probe:
 `negative/overlap-nonvacuity.cfg`, same bounds, checks `NoOverlappingL1Output`.
+
+## Late-commit fence constants
+
+`positive/plan-leaves-late-record-out.cfg`: `Keys = {hk}`,
+`Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`, `Hours = {0}`,
+`Records = {rA, rB}`, `CompIds = {g1}`, `MaxClock = 3`, `MaxOps = 3`,
+`FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, every
+mutation switch FALSE, `EnableDeletePathCorruption = FALSE`,
+`SYMMETRY Symmetry`, every safety invariant. Three publishes let one commit
+land on time, a second land late, and a compaction plan the hour.
+`FoldSealDelay = 1` leaves the one tick, between the maintenance seal and
+the fold seal, in which a commit lands late. Paired non-vacuity probe:
+`negative/late-record-left-out-nonvacuity.cfg`, same bounds, checks
+`NoLateRecordLeftOut`. `negative/plan-takes-late-record.cfg` uses the same
+bounds with `PlanTakesLateRecord = TRUE`.
