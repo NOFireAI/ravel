@@ -819,6 +819,10 @@ The pass rule for this mutant, in the local loop and in its Antithesis run:
   request` may go false. It is reported and does not decide the run.
 
 A run where the open-bucket property holds blocks, and is not rerun blind.
+So does a run where the served-set property goes false. That is a choice,
+not an accident of one loop: in this workload the mutant reaches only the
+open-bucket gate, so a served-set failure means the run reached a situation
+this amendment does not describe, and it is looked at before it counts.
 
 The mutant's Antithesis run was already one of decision 7's 19 mutant runs,
 so the budget does not change. The local loop comes first. Owner decision
