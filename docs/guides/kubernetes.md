@@ -1461,11 +1461,14 @@ What the flag changes and does not change, and when to set it, is in
 [Withholding stamp sums](operations/configuration.md#withholding-stamp-sums)
 in the configuration guide.
 
-Two hazards:
+Three hazards:
 
 - An API server that still holds the old `RavelCluster` schema drops the
   unknown field silently on admission, so the pods run without the flag.
   Apply the new `deploy/k8s/operator/crd.yaml` before setting the field.
+- An operator older than the first release with the field accepts the spec,
+  ignores the field and renders no flag, with no error. Upgrade the operator
+  before setting the field.
 - A `ravel-server` image older than the first release with the flag refuses
   it at pod start. Set the field in the same change as `spec.image` moves to
   such a release, not ahead of it.
