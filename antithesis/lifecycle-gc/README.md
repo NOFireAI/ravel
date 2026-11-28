@@ -153,8 +153,9 @@ The SUT's own lifecycle assertions, compiled into ravel-server's
 deleted` and `gc: a failed hold refresh sweeps nothing`
 (`crates/ravel-maintain/src/legal_hold.rs`, the second also at the end of each
 tick in `services/ravel-server/src/maintain.rs`), and `erasure: a completion
-is written only when no pre-rewrite object is still served`
-(`services/ravel-server/src/maintain.rs`); and the reachables
+is written only when no pre-rewrite object is still served` and `erasure: a
+completion is written only once every bucket open at its acknowledgement is
+judged` (`services/ravel-server/src/maintain.rs`); and the reachables
 `gc: a failed hold refresh skips the maintain tick` and `gc: retention
 physical sweep delete`.
 
@@ -172,7 +173,7 @@ there.
 | `lifecycle/refresh-failure-is-no-hold` | a failed hold read is taken as an empty hold set, at the tick's refresh and at each delete batch's re-read | `gc: a failed hold refresh sweeps nothing` | the eventually's failed hold reads across the second hold-phase horizon jump |
 | `lifecycle/delete-before-horizon` | the retention sweep skips its protection-horizon gate | `gc: no object is deleted inside its protection window` | the eventually's second retention jump |
 | `lifecycle/rewrite-keeps-erased-records` | the metrics rewrite keeps the erased samples | `erasure: a rewrite's output is its inputs minus the erased records` | every metrics erasure |
-| `lifecycle/complete-ignores-served-set` | completion skips the served-set guard | `erasure: a completion is written only when no pre-rewrite object is still served` | a completion tick before the fold has moved HEAD off a rewritten input. Two local loops reached it (a tick with the catalog resolver still serving the subject, then `.done` in the same process) and never evaluated the property false; in one, the driver's erasure property caught the erased records served after the premature `.done`. Not yet a passing mutant. |
+| `lifecycle/complete-ignores-served-set` | completion skips the completion gate's whole blocked set: the served-set check and the open-bucket check, which the Rust guard unions | `erasure: a completion is written only once every bucket open at its acknowledgement is judged` (ADR-4326, the completion-mutant amendment). The served-set property, `erasure: a completion is written only when no pre-rewrite object is still served`, is expected to hold in the same run (`local-run.sh` reports a violation of it and does not gate on it); the capture-lane test `completion_waits_for_the_served_set` Part B shows the mutant breaking it. The driver's erasure property may go false, and is reported, not gated | a completion tick while a bucket open at the request's acknowledgement is still unsealed: a request acked after the sealing jump reaches its first non-deferred tick before its ack-open hour seals, the gate blocks it without reading that bucket, and the mutant writes `.done` over the block. The completion gate resolves the commit-prefix listing and never reads HEAD. |
 
 Only the four ravel-server containers run a mutant; the driver's
 `ravel-cli` is never built with `antithesis-mutants`.
