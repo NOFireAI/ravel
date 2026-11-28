@@ -44,7 +44,7 @@ config. All areas planned by ADR-1113 are shipped, and ADR-3331 adds agents:
 |---|---|---|---|---|
 | [common](common/) | object-store put/get/delete/list/multipart | `RavelObjectStore.tla` | smoke, exhaustive, 3 negative | shipped |
 | [commit](commit/) | commit publication, acknowledgement, retry, read-your-write | `CommitProtocol.tla` | smoke, exhaustive, live, 11 negative, plus an ungated dedup config | shipped |
-| [catalog](catalog/) | catalog fold, snapshots, compaction, MVCC | `CatalogMVCC.tla` | smoke, exhaustive, carryforward, overlap, 21 negative (14 broken-behavior, 7 reachability probes) | shipped |
+| [catalog](catalog/) | catalog fold, snapshots, compaction, MVCC | `CatalogMVCC.tla` | smoke, exhaustive, carryforward, overlap, 1 positive, 23 negative (15 broken-behavior, 8 reachability probes) | shipped |
 | [lifecycle](lifecycle/) | retention, erasure, legal holds, physical GC | `LifecycleGC.tla` | smoke, exhaustive, 7 negative, plus an ungated rejected-design candidate | shipped, with ADR-0064's out-of-window case open |
 | [resharding](resharding/) | generation-versioned online resharding | `OnlineResharding.tla` | smoke, exhaustive, 5 negative, plus several ungated liveness and simulation configs | shipped |
 | [maintenance](maintenance/) | maintenance ownership (shipped) and advisory claims (proposed) | `MaintenanceOwnership.tla`, `CompactionClaims.tla` | smoke, exhaustive (per spec), 12 negative | ownership: shipped; claims: proposed design over a landed primitive |

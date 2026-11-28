@@ -68,7 +68,7 @@ exhaustive config, not a protocol under separate development.
 | Area | Specification | Checks | Label |
 |---|---|---|---|
 | Commit | `commit/CommitProtocol.tla` | pinned flush identity; data-then-commit `CreateIfAbsent`; strict and buffered acknowledgement; lost responses; retry of the same flush; identity reuse with different content; multi-shard fan-out with the shipped per-signal partial-commit behavior; idempotency markers with fail-open lookup; commit-token resolution across all four outcomes (present, tombstoned, retired into a compaction or rewrite, missing) | shipped |
-| Catalog | `catalog/CatalogMVCC.tla` | immutable L0 commits; content-addressed L1 parts; compaction records naming inputs and outputs; snapshot parts; HEAD CAS with racing folders; both seal predicates; fixed-window and retention-frontier reconcile guarded on watermark advance; query pinning with one re-resolve; corrupt HEAD handled four ways; late compaction and rewrite records; abandoned parts | shipped |
+| Catalog | `catalog/CatalogMVCC.tla` | immutable L0 commits; content-addressed L1 parts; compaction records naming inputs and outputs; snapshot parts; HEAD CAS with racing folders; both seal predicates; fixed-window and retention-frontier reconcile guarded on watermark advance; query pinning with one re-resolve; corrupt HEAD handled four ways; late compaction and rewrite records; late commit records left out of compaction plans (ADR-4561); abandoned parts | shipped |
 | Lifecycle | `lifecycle/LifecycleGC.tla` | tombstone, exclusion, rewrite-and-supersede, completion verification, horizon-gated deletion, plaintext request cleanup; `sys/gc` validation; HEAD reachability on the retention path only; legal-hold refresh and its failure; hold scopes; rewrite-of-rewrite and rewrite-of-compaction predecessors; request-set-bound rewrite identity; pinned readers with `max_query_duration`; an abstract cache; the mass-orphan breaker as a recomputed predicate | shipped, with ADR-0064's out-of-window case recorded as open |
 | Resharding | `resharding/OnlineResharding.tla` | append-only generation history under CAS; concurrent reshards; lazy router refresh with interval `C`; activation lead `L`; degraded-grace routing; wall-clock routing versus pinned flush hour; scan slack `S`; safely-old HEAD rule; reader fail-closed; commit-token resolution independent of shard count; both increases and decreases | shipped |
 | Maintenance | `maintenance/MaintenanceOwnership.tla`, `maintenance/CompactionClaims.tla` | heartbeats, bidirectional staleness, rendezvous ownership over asymmetric live sets, per-cycle frozen live set, restart with a fresh identity, wedged workers, memos with expiry and corruption; claims with `CreateIfAbsent` acquisition, version-CAS renewal, server-time expiry, racing thieves, stale owners, no unconditional delete, and the terminal compaction record as the actual decision | ownership: shipped; claims: proposed design over a landed primitive |
@@ -109,23 +109,28 @@ Two configurations run outside any harness lane and carry no band:
 
 ### catalog
 
-Run `20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739` unless noted.
+Runs `20261128T063827Z-b5fdb4e36d81c9258b2457c8926d7613cdd77f81` (smoke) and
+`20261128T064152Z-b5fdb4e36d81c9258b2457c8926d7613cdd77f81` (exhaustive),
+after the ADR-4561 late-commit fence entered the model, unless noted.
 
 | Config | Spec | Distinct | Depth | Result | Band (distinct / depth) |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 3455000-3470000 / 33-33 |
-| exhaustive.cfg | FairSpec (safety + `QueryTerminates` liveness) | 3422524 | 31 | PASS | 3415000-3430000 / 31-31 |
-| carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS, run `tlc-carryforward-1845293` | no band (targeted, not a harness gate) |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 3905496 | 33 | PASS | 3898000-3913000 / 33-33 |
+| exhaustive.cfg | FairSpec (safety + `QueryTerminates` liveness) | 3986424 | 31 | PASS | 3978000-3995000 / 31-31 |
+| positive/plan-leaves-late-record-out.cfg | Spec (safety, the late-commit fence at three publishes) | 790769 | 29 | PASS, direct TLC run | 789000-793000 / 29-29 |
+| carryforward.cfg | Spec (safety, three-hour carry-forward) | 23416527 | 37 | PASS, direct TLC run 2026-11-28 | no band (targeted, not a harness gate) |
 
-Both banded figures land inside their bands. `overlap.cfg` has no completed
+All three banded figures land inside their bands. `overlap.cfg` has no completed
 PASS figure recorded in `results.md`: at its current bounds the full graph
 does not finish exploring within the area's own time budget, so it is run as
 a targeted safety check rather than a gated pass/fail lane.
 
 `late-supersession-shrink.cfg` (ungated, not run by any harness lane) checks
-`LateSupersessionEventuallyReflected` under `FairSpec`: 2,427,940 states
-generated, 947,275 distinct states found, depth 14, TLC exit 13 (temporal
-violation). `results.md` and the counterexample note both record this as a
+`LateSupersessionEventuallyReflected` under `FairSpec`: re-run 2026-11-28
+after the ADR-4561 late-commit fence entered the model, 3,469,017 states
+generated, 1,398,999 distinct states found, a 13-state counterexample, TLC
+exit 13 (temporal violation; 2,427,940 states, 947,275 distinct and depth 14
+before the fence). `results.md` and the counterexample note both record this as a
 finite-model limitation, not a defect (see section 6).
 
 ### lifecycle
@@ -345,11 +350,11 @@ under `counterexamples/` now each have one). All eleven are broken-behavior
 negative controls (D6); none is classified in `results.md` as a model bug,
 design flaw, or implementation defect, and none carries a tracking issue.
 
-**catalog** — twenty-three files under `counterexamples/` (plus
+**catalog** — twenty-five files under `counterexamples/` (plus
 `late-supersession-shrink.cfg`, a config with no matching negative lane).
-Of the 21 `negative/*.cfg` configurations, `results.md` itself marks seven as
+Of the 23 `negative/*.cfg` configurations, `results.md` itself marks eight as
 "(probe)" — reachability/non-vacuity checks, not broken-behavior controls —
-and the other fourteen as ordinary broken-behavior controls. Resolved
+and the other fifteen as ordinary broken-behavior controls. Resolved
 2026-09-05: the three probe configurations (`entry-undecodable-nonvacuity`,
 `head-corruption-nonvacuity`, `part-unreadable-nonvacuity`) that previously
 had no corresponding note under `counterexamples/` now each have one.
@@ -411,8 +416,8 @@ demonstration of broken behavior).
   idempotent, acknowledgement before durable commit, and others). The
   by-hand `dedup-mutant.cfg` and `live.cfg` runs (section 5) are reachability
   and liveness checks respectively, run outside the `negative/` harness lane.
-- **catalog**: 21 `negative/*.cfg` controls; `results.md` itself splits these
-  into fourteen broken-behavior controls and seven reachability/non-vacuity
+- **catalog**: 23 `negative/*.cfg` controls; `results.md` itself splits these
+  into fifteen broken-behavior controls and eight reachability/non-vacuity
   probes (named "(probe)" in its own results table — see section 6).
 - **lifecycle**: seven `negative/*.cfg` controls, all broken-behavior per
   D6's list for this area (deletion before the protection horizon, legal-hold
@@ -554,7 +559,7 @@ inferred by this report.
   reported five of commit's eleven negative controls and three of catalog's
   seven nonvacuity negative controls with no corresponding note under
   `counterexamples/`. Checked against the shipped tree: all eleven of
-  commit's `negative/*.cfg` files and all twenty-one of catalog's
+  commit's `negative/*.cfg` files and all twenty-three of catalog's
   `negative/*.cfg` files have a matching note under their respective
   `counterexamples/` directories, one
   per negative case as D6 calls for (section 6). No gap remains in either

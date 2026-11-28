@@ -60,6 +60,13 @@ the reproduction command above:
 Recorded run: 2,427,940 states generated, 947,275 distinct states found, depth
 14, exit 13.
 
+Re-run 2026-11-28, after the ADR-4561 late-commit fence entered the model
+(issue #4561): 3,469,017 states generated, 1,398,999 distinct states found,
+798,467 left on the queue, exit 13. TLC found a 13-state counterexample
+instead of the 14-state one above, ending the same way: a compaction
+(`DoCompact`, State 10) that no later fold reflects, then a stutter
+(State 13).
+
 ## Why this is a finite-model limitation, not a defect
 
 Reflection of a late compaction depends on a subsequent fold whose watermark
