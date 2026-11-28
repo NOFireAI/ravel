@@ -537,7 +537,10 @@ DoCompact(H, g) ==
 \* loser diverge. Only a forged record does, which this model does not have.
 \* The unfenced view keeps the diverged outcome reachable here, and since no
 \* outcome but "overwrite" mutates the record, it over-approximates the code
-\* without weakening any invariant.
+\* without weakening any invariant. The exception is a config that sets
+\* CompactionLoserOverwrites and also checks PlanLeavesLateRecordsOut: the
+\* overwrite would publish a late record the fenced code never plans, a false
+\* violation. No config does both.
 DoCompactLoser(H, g) ==
     /\ crec[H][g].used
     /\ l0[H] # {}

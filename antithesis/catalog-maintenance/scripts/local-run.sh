@@ -108,7 +108,11 @@ if [ -n "$MUTANT" ]; then
             ;;
     esac
     GATE="REPORT (mutant run, not gated)"
-    echo "mutant $MUTANT: expecting \"$expected\" to be violated"
+    if [ "${#ALL_OF[@]}" -gt 0 ]; then
+        echo "mutant $MUTANT: expecting all of $(printf '"%s" ' "${ALL_OF[@]}")to be violated"
+    else
+        echo "mutant $MUTANT: expecting \"$expected\" to be violated"
+    fi
 fi
 # The driver's own setup budget is 600 s (SETUP_BUDGET in driver/src/main.rs);
 # this bound and launch.sh's --setup-timeout add room for the containers to

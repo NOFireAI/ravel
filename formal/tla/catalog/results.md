@@ -7,6 +7,9 @@ count or depth falls outside them.
 
 Toolchain: TLC2 2.19 (tla2tools 1.7.4, sha256 verified by the harness),
 Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
+The smoke, exhaustive, positive and carry-forward rows are later: they were
+measured on OpenJDK 17 with two workers on another x86_64 host, as the
+late-commit fence note in the Bands section says.
 
 ## Recorded runs
 
@@ -429,7 +432,7 @@ present only so `QueryTerminates` can hold under the bounded clock.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1}`, `Records = {rA}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 2`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all fifteen
 mutation switches FALSE, `EnableDeletePathCorruption = TRUE`,
 `SYMMETRY Symmetry`. `Records` shrank from `{rA, rB}` to `{rA}` this round
 (finding 6, see Bands above) to keep the smoke run inside the fixed
@@ -443,7 +446,7 @@ together; see Bands above.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1, g2}`, `MaxClock = 3`,
 `MaxOps = 2`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all fifteen
 mutation switches FALSE, `EnableDeletePathCorruption = FALSE`, `FairSpec`
 (no symmetry, so liveness is checked soundly). Two records and a second
 compaction identity keep the multiset and dedup conflicts non-vacuous. The
@@ -461,7 +464,7 @@ See Bands above.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1, 2}`, `Records = {rA}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 2`, `FoldSealDelay = 0`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 2`, `DedupBySignal = TRUE`, all twelve
+`RetentionHorizon = 2`, `LagBound = 2`, `DedupBySignal = TRUE`, all fifteen
 mutation switches FALSE, `EnableDeletePathCorruption = FALSE`,
 `SYMMETRY Symmetry`. Three hours let a valid HEAD fold
 at successive watermarks; both seal delays are zero so all three hours seal
@@ -475,7 +478,7 @@ incremental fold carries a below-floor hour forward verbatim.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1}`, `Records = {rA, rB, rC}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 6`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all fifteen
 mutation switches FALSE, `EnableDeletePathCorruption = FALSE`,
 `SYMMETRY Symmetry`. A third record and a wider `MaxOps` than smoke or
 exhaustive let the same record identity be committed into two different
