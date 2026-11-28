@@ -30,7 +30,8 @@
 #
 # Exit 0: every gate passed (or, in the self-check, exactly the injected
 # failure appeared; in a mutant run, the mutant's property was evaluated
-# false at least once). Exit 1: any gate failed or could not be checked; the
+# false at least once, or for catalog/plan-takes-late-record, both of its
+# properties were). Exit 1: any gate failed or could not be checked; the
 # FAIL lines say which. In a mutant run every other gate, and every other
 # always-type assertion that went false, is reported and does not decide the
 # exit code.
@@ -79,6 +80,21 @@ if [ -n "$MUTANT" ]; then
             exit 1
         fi
         ACCEPTED+=("$sweep_literal")
+    fi
+    # The properties a mutant must make false all of, not any of. The
+    # late-fence mutant must make the .tsv's driver property and the SUT's
+    # publish-side check both false (ADR-4326, the late-fence mutant
+    # amendment): each sees the late record from its own side, so either one
+    # alone could pass the mutant with the other check vacuous.
+    ALL_OF=()
+    if [ "$MUTANT" = catalog/plan-takes-late-record ]; then
+        publish_literal="maintain: a published record names no late commit record"
+        late_rs="$(cd "$WL/../.." && pwd)/crates/ravel-maintain/src/late_commit.rs"
+        if ! grep -qF "$publish_literal" "$late_rs"; then
+            echo "refused: $late_rs does not assert '$publish_literal'; update the literal here"
+            exit 1
+        fi
+        ALL_OF=("$expected" "$publish_literal")
     fi
     # A ravel-server built without antithesis-mutants ignores
     # RAVEL_ANTITHESIS_MUTANT, and the run would test no mutant at all.
@@ -636,7 +652,7 @@ if [ -n "$MUTANT" ]; then
     hit=""
     while IFS= read -r m; do
         mine=""
-        for p in "${ACCEPTED[@]}"; do
+        for p in "${ACCEPTED[@]}" "${ALL_OF[@]}"; do
             [ "$m" = "$p" ] && mine=1
         done
         if [ -n "$mine" ]; then
@@ -646,6 +662,18 @@ if [ -n "$MUTANT" ]; then
         fi
     done < "$OUT/violated.tsv"
     [ "${#failures[@]}" -gt 0 ] && echo "${#failures[@]} other gate(s) failed in this mutant run, reported above; see $OUT"
+    if [ "${#ALL_OF[@]}" -gt 0 ]; then
+        missing=()
+        for p in "${ALL_OF[@]}"; do
+            grep -qxF "$p" "$OUT/violated.tsv" || missing+=("$p")
+        done
+        if [ "${#missing[@]}" -eq 0 ]; then
+            echo "mutant OK: $MUTANT violated all of: $(printf '"%s" ' "${ALL_OF[@]}")"
+            exit 0
+        fi
+        echo "FAIL: mutant $MUTANT must violate all of these, and these were not violated: $(printf '"%s" ' "${missing[@]}")"
+        exit 1
+    fi
     if [ -n "$hit" ]; then
         echo "mutant OK: $MUTANT violated \"$hit\""
         exit 0

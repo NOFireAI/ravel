@@ -11,7 +11,7 @@ MUTANT_AREAS="catalog resharding maintenance"
 # an area of MUTANT_AREAS that has no count here, before any build or run.
 # An area with a count here and not in MUTANT_AREAS fails only build.sh's
 # check, as an area whose tsv files give it no mutant.
-EXPECTED_MUTANTS="catalog=5 resharding=2 maintenance=2"
+EXPECTED_MUTANTS="catalog=6 resharding=2 maintenance=2"
 MUTANT_TSV_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 # Prints the expected mutant count of area $1 from EXPECTED_MUTANTS. Returns
