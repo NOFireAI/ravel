@@ -8,59 +8,151 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.37.0] - 2026-11-28
 
+**0.37.0 writes a sum and a zero count on the declared-column stamps of logs,
+and answers from them (ADR-4628).** The logs flush, `ravel-cli load` and logs
+compaction now write the exact sum of each declared `I64` column and the zero
+count of each declared `I64` and `BOOL` column. They add bytes to the commit
+record or part already written, and no object. On a logs table, `SUM(col)`,
+`SUM(col + k)`, `AVG(col)` and `COUNT(*) WHERE col <> lit` over a declared
+`I64` column answer from those stamps with no data-object GET. No statement
+reads the `BOOL` zero count in this release. On the ClickBench table
+(99,997,497 rows in 222 objects, 76 stamp entries a record) the four
+statements that sum, average or count typed columns answered from the stamp on
+222 of 222 segments with no data-object GET and gave the answers a scan gives,
+and a commit record grew by 682 bytes on average (#4628). A stamp written
+before this release lacks the two figures. Such a segment still answers a
+not-equal count whose literal lies outside its min and max. For a sum or an
+average it reads `.cstat`, and when one touched segment has neither carrier,
+the whole statement scans. See the entries under Added.
+
+**Upgrade, erasure: decide before the first 0.37.0 process starts whether the
+store may hold these figures.** The sum and the zero count are subject values
+for erasure. A sum can give back an erased value, and a zero count says
+whether an erased value was 0 or false. An Object Lock keeps them on a locked
+record until its retain-until, and nothing removes them earlier. This matters
+to a deployment with erasure obligations that keeps compliance retention on
+commit records (`t/*/*/c/*`) or on the catalog keyspace (`t/*/catalog/*/*`)
+longer than its erasure deadline. It has two options:
+
+- Start every logs producer with `--no-declared-stat-aggregates` from its
+  first start on 0.37.0: `ravel-server` in `--mode all`, `gateway` and
+  `maintain`, `ravel-cli load`, and `ravel-cli maintain compact-bucket`,
+  `compact-tenant` and `migrate`. 0.36.0 refuses the flag, so set it in the
+  same change as the upgrade, not ahead of it. The setting is not persisted:
+  a process started without it writes the figures again. The flag does not
+  withhold the min and max. It is enough for a lock on commit records. It is
+  not enough for a lock on the catalog keyspace, because it does not change
+  `.cstat`: see the known issue below.
+- First shorten that retention to inside the deadline, and scope the catalog
+  lock to `catalog/<signal>/HEAD`.
+
+Under the Kubernetes operator the flag is `spec.noDeclaredStatAggregates:
+true`. Do three things in this order. Apply the new
+`deploy/k8s/operator/crd.yaml`: an API server that still holds the old
+`RavelCluster` schema drops the field silently. Upgrade the operator to
+0.37.0: an older operator ignores the field and renders no flag. Then set the
+field in the same change that moves `spec.image` to 0.37.0: a 0.36.0 pod
+refuses the flag at start. In the first two cases nothing reports an error and
+the pods write the figures. The deployment guide has the rule under "Stamp
+sums under a lock".
+
+**Upgrade order: maintain processes before ingest.** A 0.36.0 compactor
+writes parts without the two figures, so in the other order the hours it
+compacts read `.cstat` or scan until a later compaction rewrites them. Answers
+are the same. A 0.36.0 fold carries the figures; a fold older than 0.36.0
+drops them, so on an upgrade from 0.35.0 or earlier upgrade the fold processes
+first too. `stats.pruning` reports `segmentsAnsweredFromStamp` and
+`segmentsAnsweredFromCstat` for each query. A rollback to 0.36.0 needs no
+repair of data: 0.36.0 reads every object 0.37.0 writes and answers nothing
+from the two figures. Remove `--no-declared-stat-aggregates`, or unset
+`spec.noDeclaredStatAggregates`, in the same change as the rollback, because
+0.36.0 refuses the flag.
+
+**Known issue: `--no-declared-stat-aggregates` does not change `.cstat`
+(#4716).** For each declared `I64` and `BOOL` column, the statistics object a
+fold writes holds the min, the max and, up to 10,000 distinct values a
+segment, every value with its count. For an `I64` column it also holds the
+sum. 0.36.0 writes the same. Under a compliance lock on the catalog keyspace
+these stay until the lock's retain-until, with or without the flag. A catalog
+lock scoped to `catalog/<signal>/HEAD`, the second option above, keeps
+`.cstat` out of the lock. The documentation states this exposure for `STR` and
+`BYTES` columns only.
+
+**Known issue, unchanged from 0.35.0: a commit record that lands after its
+hour sealed is never compacted (#4561).** Such a late record is still served
+and kept. An erasure request whose window overlaps it does not complete while
+the record is stored, and a format floor stays down. Each plan counts the
+records it leaves out in `ravel_maintain_late_commit_records_total`. A later
+release disposes of late records. The 0.36.0 notes say such a request raises
+the erasure deadline alarm; no release implements that alarm.
+
+**Known issue, unchanged from 0.36.0: RUSTSEC-2026-0595 is open on `parquet`
+59.3.0, which this release locks.** When `parquet` writes an encrypted Parquet
+file it writes bloom filters as plaintext. Ravel refuses encrypted Parquet on
+read and configures no Parquet encryption. The update to 59.3.3 (#4657) is not
+in this release: it moves the parquet decoder that ravel-parquet's footer
+check was written against, and six arrow crates with it, including a change to
+the bytes the Arrow IPC writer produces, and both need checking first (#4695).
+RUSTSEC-2026-0600 on `kube-client` is fixed; see the entry under Security.
+
 ### Added
 
 - **The logs flush and `ravel-cli load` stamp the sum and zero count of
   typed attribute columns.** Each logs commit record's declared-column
   stamp now carries the exact sum of every declared `I64` column and the
-  zero count of every declared `I64` and `BOOL` column, over the same
-  merged view as its min and max (ADR-4628). `SUM`, `AVG` and a `<> 0`
-  count over such a column can answer from them with no data-object GET
-  (see the entry on not-equal counts, sums and averages from stamps). The
-  ingest setting
-  `IngestConfig::emit_declared_stat_aggregates` (default true) withholds
-  them; `--no-declared-stat-aggregates` on `ravel-server` (ingest role)
-  and on `ravel-cli load` sets it. Upgrade note: these figures
-  are subject values for erasure, and a sum can recover an erased value,
-  so a compliance lock keeps them until its retain-until. An operator with
-  erasure obligations keeps per-object retention `R` on commit records
-  (`t/*/*/c/*`) inside the erasure SLA, and scopes any catalog lock to
-  `catalog/<signal>/HEAD` (docs/deletion-and-gc.md,
-  docs/object-store-contract.md "A lock on the catalog family"), or
-  withholds the fields with that flag on every producer (see the entry on
-  withholding stamp sums). Upgrade
-  fold and maintain processes before ingest.
+  zero count of every declared `I64` and `BOOL` column, computed over the
+  same rows as its min and max (ADR-4628). `SUM`, `AVG` and a not-equal
+  count over a declared `I64` column can answer from them with no
+  data-object GET (see the entry on not-equal counts, sums and averages
+  from stamps). No statement reads the `BOOL` zero count in this release.
+  The figures are written by default. `--no-declared-stat-aggregates` on
+  `ravel-server` (`--mode all` and `gateway`) and on `ravel-cli load`
+  withholds them. The upgrade notes above give the erasure rule and the
+  upgrade order.
 - **Logs compaction output parts carry the declared-column sum and zero
-  count.** A compaction, migrate or force 2 output part's declared-column
-  stamp now carries the exact sum (I64 columns, fields 6 or 7) and the zero
-  count (field 8), recomputed over that part's own rows and never copied from
-  an input's stamp (ADR-4628). Erasure-rewrite output parts still carry no
-  stamp. `CompactorConfig::emit_declared_stat_aggregates`, default `true`,
-  withholds both fields when `false`; `--no-declared-stat-aggregates` on
-  `ravel-server --mode maintain` and on `ravel-cli maintain compact-bucket`,
-  `compact-tenant` and `migrate` sets it. Statements over such a part read
-  the fields as they read a commit record's (see the entry on not-equal
-  counts, sums and averages from stamps).
+  count.** The declared-column stamp of each part a logs compaction, migrate
+  or re-encode writes now carries the exact sum (`I64` columns) and the zero
+  count, recomputed over that part's own rows and never copied from an
+  input's stamp (ADR-4628). Erasure-rewrite output parts still carry no
+  stamp. The figures are written by default.
+  `--no-declared-stat-aggregates` on `ravel-server --mode maintain` and on
+  `ravel-cli maintain compact-bucket`, `compact-tenant` and `migrate`
+  withholds them. Statements over such a part read the figures as they read
+  a commit record's (see the entry on not-equal counts, sums and averages
+  from stamps).
 - **Not-equal counts answer from existing stamps; sums and averages answer
-  from unfolded stamps.** On a logs table, `COUNT(*) WHERE col <> lit`
-  over a declared `I64` column now answers from each segment's
-  declared-column stamp, with no `.cstat` load and no data-object GET, when
-  the stamp puts `lit` outside the segment's `[min, max]` or the segment
-  holds only `lit`. Stamps written since ADR-0873 carry what these two cases
-  read, so this applies to existing stores. `SUM(col)`, `SUM(col + k)`,
-  `AVG(col)`, and a `<> 0` count where 0 lies inside `[min, max]`, read the
-  ADR-4628 sum and zero count, which the logs flush and logs compaction now
-  write (see their entries). For a segment whose stamp lacks them, such as
+  from stamps this release writes.** On a logs table,
+  `COUNT(*) WHERE col <> lit` over a declared `I64` column now answers from
+  each segment's declared-column stamp, with no `.cstat` load and no
+  data-object GET, when the stamp puts `lit` outside the segment's
+  `[min, max]` or the segment holds only `lit`. Stamps written since
+  ADR-0873 carry what these two cases read, so this applies to existing
+  stores. `SUM(col)`, `SUM(col + k)`, `AVG(col)`, and a `<> 0` count where 0
+  lies inside `[min, max]`, read the ADR-4628 sum and zero count, which the
+  logs flush and logs compaction now write (see their entries), in a folded
+  hour as in an unfolded one. For a segment whose stamp lacks them, such as
   one written before this release or under the producer opt-out, those
-  statements read the `.cstat` entry the stamp grants, or scan. With
-  neither carrier for a segment, the statement scans.
+  statements read the `.cstat` entry the stamp grants. When one touched
+  segment has neither carrier, the whole statement scans. Decode now drops a
+  stamp entry whose zero count contradicts its min and max: a zero count of 0
+  beside a min or max of 0 (or false) over non-null rows, or a zero count
+  equal to the non-null count beside a min or max that is not 0 (or false).
+  The drop is counted in `ravel_declared_stats_drops_observed_total`, and
+  every statement that answers that column from statistics then scans. No
+  producer writes such a stamp.
 - **A logs aggregate the stamps answer reads no statistics object.** When
   every segment a metadata-only aggregate touches answers every figure it
   reads from its declared-column stamp, the statement skips the statistics
   load (ADR-4628 decision 5): no plan-phase GET, where the load read the
   catalog HEAD on an unfolded tenant and the HEAD and the `.cstat` object on
-  a folded one. When one touched segment's stamp lacks a figure the load runs
-  as before. `stats.pruning` gains `segmentsAnsweredFromStamp` and
+  a folded one. The skip applies to a statement with one scan of one logs
+  table and plain constant literals. A `TIMESTAMP '...'` time bound (#4701),
+  a computed literal such as `100 + 100`, or two scans in one statement keep
+  the load. When one touched segment's stamp lacks a figure the load runs
+  as before. A statement that skips the load adds nothing to
+  `ravel_declared_stats_drops_observed_total{carrier="cstat"}`, which on a
+  folded tenant counted that statement's defective `.cstat` entries in
+  0.36.0. `stats.pruning` gains `segmentsAnsweredFromStamp` and
   `segmentsAnsweredFromCstat`, and the `MetadataOnlyExec` line in `EXPLAIN`
   ends with `stamp_segments=<s>, cstat_segments=<c>`: per query, how many
   touched segments answered from the stamp alone and how many read a figure
@@ -90,30 +182,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   take the same flag and print a `declared_stat_aggregates: emitted` or
   `withheld` line on a logs run; a metrics or spans run warns that it
   ignores the flag. Min, max and null count are still written, and every
-  surface emits by default. Upgrade note
-  for the first release that writes these fields: the sum and the zero
-  count are subject values for erasure, and an Object Lock keeps them on a
-  locked record until its retain-until (ADR-4628 question 6b). An
-  operator with erasure obligations either keeps per-object retention on
-  commit records (`t/*/*/c/*`) inside the erasure SLA and scopes any
-  catalog lock to `catalog/<signal>/HEAD`, or passes
-  `--no-declared-stat-aggregates` to every ingest, maintain, `load` and
-  `maintain` CLI process from the first start of each upgraded process:
-  an older binary refuses the unknown flag, so it cannot be set ahead of
-  the upgrade. The setting is not persisted, so a process without it
-  writes the fields again on its next compaction. A cluster run by the
-  Kubernetes operator sets it with `spec.noDeclaredStatAggregates: true`,
-  which renders the flag on the gateway and maintain pods and never on the
-  query pods.
-
-### Fixed
-
-- **Decode drops a declared-column stamp whose zero count contradicts its
-  min and max.** A zero count of 0 beside a min or max of 0 (or false) over
-  non-null rows, and a zero count equal to the non-null count beside a min
-  or max that is not 0 (or false), are now dropped and counted on the
-  existing drop metric. No producer writes such a stamp. With the stamp
-  dropped, `COUNT(*) WHERE col <> 0` over that segment scans.
+  surface emits by default. The setting is not persisted, so a process
+  without it writes the figures again on its next flush or compaction. A
+  cluster run by the Kubernetes operator sets it with
+  `spec.noDeclaredStatAggregates: true`, which renders the flag on the
+  gateway and maintain pods and never on the query pods. The upgrade notes
+  above say when to set it.
 
 ### Security
 
