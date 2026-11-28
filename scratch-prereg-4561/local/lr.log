@@ -1,0 +1,19 @@
+HEAD d23dbb245ea2a4caaf05059c47a1d6b75b18eb56 dirty=0
+IMAGE ravel-antithesis-server:catalog-maintenance sha256:7dacbc7ab8b8761736c849e7feca7e4268ed6c88c8a0bdfc4afbd71ba9357b1d d23dbb245ea2a4caaf05059c47a1d6b75b18eb56 sql,antithesis
+IMAGE ravel-antithesis-driver:catalog-maintenance sha256:d3f2d6ab4828780f98f3eb291440fa50d8cad0eb13076e50f73072d160ada170 d23dbb245ea2a4caaf05059c47a1d6b75b18eb56 <no value>
+IMAGE ravel-antithesis-server:catalog-maintenance-mutants sha256:8da6d9864d459299aa6b1e8bec1f1ff9dec266a9cdc35b47e197ad06b8ebc10d d23dbb245ea2a4caaf05059c47a1d6b75b18eb56 sql,antithesis,antithesis-mutants
+IMAGE ravel-antithesis-driver:catalog-maintenance-mutants sha256:25df6d948b4b0c6bddd482ccbd0d7bff08dfb7b9a91e3972196daa4a0593dea9 d23dbb245ea2a4caaf05059c47a1d6b75b18eb56 <no value>
+=== lr-plain start 2026-11-28T10:42:03Z
+local-run rc=0
+down rc=0
+=== lr-plain end 2026-11-28T11:12:46Z rc=0
+=== lr-mut start 2026-11-28T11:12:46Z
+local-run rc=0
+down rc=0
+=== lr-mut end 2026-11-28T11:39:37Z rc=0
+IMAGE ravel-antithesis-server:catalog-maintenance sha256:7dacbc7ab8b8761736c849e7feca7e4268ed6c88c8a0bdfc4afbd71ba9357b1d d23dbb245ea2a4caaf05059c47a1d6b75b18eb56 sql,antithesis
+IMAGE ravel-antithesis-driver:catalog-maintenance sha256:d3f2d6ab4828780f98f3eb291440fa50d8cad0eb13076e50f73072d160ada170 d23dbb245ea2a4caaf05059c47a1d6b75b18eb56 <no value>
+IMAGE ravel-antithesis-server:catalog-maintenance-mutants sha256:8da6d9864d459299aa6b1e8bec1f1ff9dec266a9cdc35b47e197ad06b8ebc10d d23dbb245ea2a4caaf05059c47a1d6b75b18eb56 sql,antithesis,antithesis-mutants
+IMAGE ravel-antithesis-driver:catalog-maintenance-mutants sha256:25df6d948b4b0c6bddd482ccbd0d7bff08dfb7b9a91e3972196daa4a0593dea9 d23dbb245ea2a4caaf05059c47a1d6b75b18eb56 <no value>
+images unchanged
+LR-DONE

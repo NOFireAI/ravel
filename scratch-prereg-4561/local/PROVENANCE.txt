@@ -1,0 +1,17 @@
+Local runs at d23dbb245 on gcp2 (/home/builder/logs/r4561 there).
+
+lr.log is the first wrapper (lr.sh). A quoting error expanded its output path and
+mutant name to empty strings, so both of its steps were PLAIN runs writing into
+the host's / directory:
+  step "lr-plain" 10:42:03-11:12:46Z rc 0 -> artifacts copied to lr-plain-a/
+     (its console log and node-restart.txt were overwritten by the next step)
+  step "lr-mut"   11:12:46-11:39:37Z rc 0 -> artifacts moved to lr-plain-b/,
+     console log as lr-plain-b/local-run.log. This was NOT a mutant run.
+The stray files were moved out of / afterwards; local-run.sh deletes nothing
+under its output dir besides its own files.
+
+The real mutant run is lr-mut/ (lr-mut.sh, lr-mut-wrap.log, lr-mut.log),
+11:40:43-12:08:21Z rc 0, RAVEL_ANTITHESIS_MUTANT=catalog/plan-takes-late-record.
+
+mpl-plain/ is the PR head c76c5cc81 plain run from the earlier #4718 work, used
+only to dry-run the tooling.

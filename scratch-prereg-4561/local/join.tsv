@@ -1,0 +1,122 @@
+message	type	must_hit	file	declared	hit_in	hits	true	false	mut_hits	mut_true	mut_false	nofence	fence_exact	rs_smoke	rs_long
+catalog: HEAD stayed unreadable while the clocks passed the protection horizon	Sometimes	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 30/29	Passing 30/12	Passing 21/7	Passing 21/30
+catalog: HEAD was overwritten with garbage through raw S3	Reachable	True	src/main.rs	driver	driver	1	1	0	0	0	0	Passing 85/0	Passing 120/0	Passing 139/0	Passing 166/0
+catalog: a catalog sweep never deletes under an unreadable HEAD	Always	True	crates/ravel-maintain/src/sweep.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	2	2	0	2	2	0	Passing 351/0	Passing 268/0	Passing 132/0	Passing 306/0
+catalog: a compaction record was published	Sometimes	True	src/main.rs	driver	driver	1	1	0	2	1	1	Passing 90/174	Passing 86/269	Passing 127/214	Passing 210/266
+catalog: a delete gate never clears under an unreadable HEAD	Always	True	crates/ravel-maintain/src/reachability.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	2	2	0	1	1	0	Passing 365/0	Passing 255/0	Passing 100/0	Passing 288/0
+catalog: a fold reports as folded only a HEAD the store holds	Always	True	crates/ravel-catalog/src/fold.rs	maint1,maint2,ravel1,ravel2	maint1,maint2,ravel1,ravel2	4	4	0	4	4	0	Passing 885/0	Passing 889/0	Passing 1081/0	Passing 1777/0
+catalog: a listed commit record decoded through ravel-cli	Sometimes	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 187/1	Passing 275/3	Passing 239/0	Passing 268/0
+catalog: a published compaction record is never replaced	Always	True	crates/ravel-maintain/src/publish.rs	maint1,maint2,ravel1,ravel2	maint1	1	1	0	1	1	0	Passing 103/0	Passing 78/0	Passing 92/0	Passing 135/0
+catalog: a record race's tamper was still in the store at its undo deadline	Unreachable	False	src/main.rs	driver		0	0	0	0	0	0	absent	absent	Passing 0/0	Passing 0/0
+catalog: a record race's undo started past its fold-seal deadline	Unreachable	False	src/main.rs	driver		0	0	0	0	0	0	absent	absent	Passing 0/0	Passing 0/0
+catalog: a sealed seeded hour was folded into HEAD	Sometimes	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 232/0	Passing 366/0	Passing 340/0	Passing 441/0
+catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead	Sometimes	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 74/8	Passing 98/16	Passing 51/6	Passing 72/19
+catalog: a server planned a bucket holding a late commit record	Sometimes	True	src/late.rs	driver	driver	1	1	0	1	1	0	absent	absent	absent	absent
+catalog: a server's compaction record PUT lost to a concurrent compaction	Sometimes	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 95/0	Passing 63/0	Passing 35/0	Passing 55/3
+catalog: a server's compaction record PUT lost to a record whose input-set hash diverges from its own	Sometimes	True	src/main.rs	driver	driver	1	1	0	1	1	0	absent	absent	Passing 10/3	Passing 13/4
+catalog: a server's compaction record PUT lost to a record whose part is missing from the store	Sometimes	True	src/main.rs	driver	driver	1	1	0	1	1	0	absent	absent	Passing 12/5	Passing 12/3
+catalog: a server's compaction record names no late commit record	Always	True	src/late.rs	driver	driver	1	1	0	1	0	1	absent	absent	absent	absent
+catalog: a sweep never deletes an object the current HEAD names	Always	True	crates/ravel-maintain/src/sweep.rs	maint1,maint2,ravel1,ravel2	maint2	1	1	0	1	1	0	Passing 111/0	Passing 81/0	Passing 25/0	Passing 90/0
+catalog: a token read ran after HEAD named the compaction output	Sometimes	True	src/main.rs	driver	driver	2	1	1	2	1	1	Passing 87/149	Passing 74/236	Passing 62/264	Passing 156/243
+catalog: a token read ran after its input commit record was swept	Sometimes	True	src/main.rs	driver	driver	2	1	1	2	1	1	Passing 74/152	Passing 81/240	Passing 17/265	Passing 65/243
+catalog: a token read ran after its input was compacted	Sometimes	True	src/main.rs	driver	driver	2	1	1	2	1	1	Passing 91/153	Passing 81/240	Passing 114/259	Passing 201/243
+catalog: a token read ran on a node restarted since the write	Sometimes	True	src/main.rs	driver	driver	2	1	1	2	1	1	Passing 81/152	Passing 91/240	Passing 74/267	Passing 136/243
+catalog: a token read ran twice on one node	Sometimes	True	src/main.rs	driver	driver	2	1	1	2	1	1	Passing 137/137	Passing 198/221	Passing 227/228	Passing 254/218
+catalog: a token read returns each acked record of its write exactly once	Always	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 154/0	Passing 238/0	Passing 275/0	Passing 298/0
+catalog: an on-demand fold succeeded	Reachable	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 241/0	Passing 355/0	Passing 347/0	Passing 433/0
+catalog: an on-demand sweep succeeded	Reachable	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 271/0	Passing 329/0	Passing 352/0	Passing 454/0
+catalog: compaction preserves the acked multiset	Always	True	src/main.rs	driver	driver	2	2	0	2	2	0	Passing 7/0	Passing 13/0	Passing 8/0	Failing 0/0
+catalog: compaction record published	Reachable	True	crates/ravel-maintain/src/publish.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	2	2	0	2	2	0	Passing 228/0	Passing 191/0	Passing 253/0	Passing 449/0
+catalog: delete pass refused on an unreadable HEAD	Reachable	True	crates/ravel-maintain/src/reachability.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	4	4	0	2	2	0	Passing 290/0	Passing 184/0	Passing 111/0	Passing 224/0
+catalog: every data object the catalog resolves exists	Always	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 186/0	Passing 275/0	Passing 239/0	Passing 268/0
+catalog: every object HEAD names exists	Always	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 186/0	Passing 275/0	Passing 239/0	Passing 268/0
+catalog: fold HEAD CAS lost	Reachable	True	crates/ravel-catalog/src/fold.rs	maint1,maint2,ravel1,ravel2	maint2,ravel1	2	2	0	2	2	0	Passing 719/0	Passing 615/0	Passing 577/0	Passing 1167/0
+catalog: fold HEAD CAS won	Reachable	True	crates/ravel-catalog/src/fold.rs	maint1,maint2,ravel1,ravel2	maint1,maint2,ravel1,ravel2	4	4	0	4	4	0	Passing 945/0	Passing 921/0	Passing 1109/0	Passing 1837/0
+catalog: inspect reported a corrupt HEAD	Reachable	True	src/main.rs	driver	driver	1	1	0	0	0	0	Passing 79/0	Passing 96/0	Passing 99/0	Passing 124/0
+catalog: no scan shows a phantom or an excess copy	Always	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 300/0	Passing 365/0	Passing 421/0	Passing 577/0
+catalog: superseded sweep delete	Reachable	True	crates/ravel-maintain/src/sweep.rs	maint1,maint2,ravel1,ravel2	maint2	1	1	0	1	1	0	Passing 111/0	Passing 81/0	Passing 25/0	Passing 90/0
+catalog: sweep deleted a superseded compaction input	Sometimes	True	src/main.rs	driver	driver	2	1	1	2	1	1	Passing 80/88	Passing 67/85	Passing 23/124	Passing 75/209
+catalog: the audit checked the data objects the catalog resolves	Sometimes	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 186/0	Passing 275/0	Passing 239/0	Passing 268/0
+catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it	Sometimes	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 15/14	Passing 9/11	Passing 3/0	Passing 11/5
+catalog: the seeded load reported other rows than planned	Unreachable	False	src/main.rs	driver		0	0	0	0	0	0	Passing 0/0	Passing 0/0	Passing 0/0	Passing 0/0
+catalog: the seeded load was refused	Unreachable	False	src/main.rs	driver		0	0	0	0	0	0	Passing 0/0	Passing 0/0	Passing 0/0	Passing 0/0
+catalog: the system recovers once faults stop	Always	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 34/0	Passing 49/0	Passing 58/0	Passing 50/0
+catalog: the workload starts	Reachable	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 402/0	Passing 443/0	Passing 448/0	Passing 853/0
+clock: HEAD changed while a clock move landed	Unreachable	False	src/main.rs	driver		0	0	0	0	0	0	absent	absent	Passing 0/0	Passing 0/0
+clock: an hour ingested live was sealed by a fold	Sometimes	True	src/main.rs	driver	driver	2	1	1	2	1	1	Passing 116/232	Passing 140/360	Passing 134/323	Passing 199/438
+clock: the clock jump did not reach the driver	Unreachable	False	src/main.rs	driver		0	0	0	0	0	0	Passing 0/0	Passing 0/0	Passing 0/0	Passing 0/0
+clock: the clocks jumped past the sweep's protection horizon and pinned-query window	Reachable	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 69/0	Passing 56/0	Passing 17/0	Passing 51/0
+clock: the driver could not write the clock offset	Unreachable	False	src/main.rs	driver		0	0	0	0	0	0	Passing 0/0	Passing 0/0	Passing 0/0	Passing 0/0
+clock: the driver's clock jumped forward	Reachable	True	src/main.rs	driver	driver	1	1	0	1	1	0	Passing 72/0	Passing 88/0	Passing 102/0	Passing 125/0
+commit: a commit record never exists without its data object	Always	True	crates/ravel-commit/src/publish.rs	maint1,maint2,ravel1,ravel2	ravel1,ravel2	3	3	0	3	3	0	Passing 882/0	Passing 1084/0	Passing 978/0	Passing 1751/0
+commit: a commit token never resolves to a stale answer	Always	True	crates/ravel-catalog/src/catalog.rs	maint1,maint2,ravel1,ravel2	ravel1,ravel2	4	4	0	5	5	0	Passing 583/0	Passing 410/0	Passing 356/0	Passing 983/0
+commit: a commit token's stale-answer evidence read evaluated	Sometimes	True	crates/ravel-catalog/src/catalog.rs	maint1,maint2,ravel1,ravel2	ravel1,ravel2	2	2	0	3	3	0	Passing 118/0	Passing 73/0	Passing 82/0	Passing 264/0
+commit: a commit's data-object evidence read completes before it gives up	Sometimes	True	crates/ravel-commit/src/publish.rs	maint1,maint2,ravel1,ravel2	ravel1,ravel2	3	3	0	3	3	0	Passing 882/203	Passing 1084/263	Passing 978/259	Passing 1751/402
+commit: a marker's durability evidence read completes before it gives up	Sometimes	True	crates/ravel-ingest/src/idempotency.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+commit: a strict logs ack names a durable commit record	Always	True	crates/ravel-ingest/src/log_router.rs	maint1,maint2,ravel1,ravel2	ravel1,ravel2	3	3	0	3	3	0	Passing 801/0	Passing 995/0	Passing 905/0	Passing 1586/0
+commit: a strict logs ack's durable-commit evidence read completes before it gives up	Sometimes	True	crates/ravel-ingest/src/log_router.rs	maint1,maint2,ravel1,ravel2	ravel1,ravel2	3	3	0	3	3	0	Passing 801/219	Passing 995/314	Passing 904/279	Passing 1586/405
+commit: a strict metrics ack names a durable commit record	Always	True	crates/ravel-ingest/src/router.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+commit: a strict metrics ack's durable-commit evidence read completes before it gives up	Sometimes	True	crates/ravel-ingest/src/router.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced	Always	True	crates/ravel-catalog/src/catalog.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+commit: an abandoned flush's commit record is absent at the abandon	Sometimes	True	crates/ravel-ingest/src/shard.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+commit: an abandoned flush's commit record never lands past the fold's seal margin	AlwaysOrUnreachable	False	crates/ravel-ingest/src/shard.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Passing 0/0	Passing 0/0	Passing 0/0	Passing 0/0
+commit: an idempotency marker implies every shard's commit is durable	Always	True	crates/ravel-ingest/src/idempotency.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+commit: commit record put	Reachable	True	crates/ravel-commit/src/publish.rs	maint1,maint2,ravel1,ravel2	ravel1,ravel2	3	3	0	3	3	0	Passing 902/0	Passing 1103/0	Passing 1000/0	Passing 1795/0
+commit: data object put	Reachable	True	crates/ravel-commit/src/publish.rs	maint1,maint2,ravel1,ravel2	ravel1,ravel2	3	3	0	3	3	0	Passing 905/0	Passing 1116/0	Passing 1019/0	Passing 1812/0
+commit: flush abandoned	Reachable	True	crates/ravel-ingest/src/shard.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+commit: idempotency marker written	Reachable	True	crates/ravel-ingest/src/idempotency.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+commit: one commit identity holds one content hash	Always	True	crates/ravel-commit/src/publish.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Passing 15/0	Passing 15/0	Passing 22/0	Passing 35/0
+commit: put retried	Reachable	True	crates/ravel-ingest/src/shard.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+commit: strict ack sent	Reachable	True	crates/ravel-ingest/src/shard.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+erasure: a completion .done was written	Reachable	True	services/ravel-server/src/maintain.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+erasure: a completion is written only when no pre-rewrite object is still served	Always	True	services/ravel-server/src/maintain.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+erasure: a rewrite record published	Reachable	True	crates/ravel-maintain/src/erasure_rewrite.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+erasure: a rewrite's output is its inputs minus the erased records	Always	True	crates/ravel-maintain/src/erasure_rewrite.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+fault: ingest/data-put-refused fired	Reachable	True	crates/ravel-invariant/src/lib.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+fault: ingest/encode-cancelled fired	Reachable	True	crates/ravel-invariant/src/lib.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+gc: a failed hold re-read skips a delete batch	Reachable	True	crates/ravel-maintain/src/legal_hold.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Passing 5/0	Failing 0/0	Failing 0/0	Passing 6/0
+gc: a failed hold refresh skips the maintain tick	Reachable	True	services/ravel-server/src/maintain.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Passing 10/0	Passing 7/0	Passing 12/0	Passing 32/0
+gc: a failed hold refresh sweeps nothing	Always	True	services/ravel-server/src/maintain.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	5	5	0	5	5	0	Passing 901/0	Passing 903/0	Passing 710/0	Passing 1501/0
+gc: a held object is never deleted	Always	True	crates/ravel-maintain/src/legal_hold.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	2	2	0	2	2	0	Passing 370/0	Passing 272/0	Passing 138/0	Passing 352/0
+gc: a legal hold is placed	Reachable	True	crates/ravel-maintain/src/legal_hold.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+gc: a legal hold is released	Reachable	True	crates/ravel-maintain/src/legal_hold.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+gc: no object is deleted inside its protection window	Always	True	crates/ravel-maintain/src/retention.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+gc: orphan sweep delete	Reachable	True	crates/ravel-maintain/src/sweep.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Passing 42/0	Passing 12/0	Passing 12/0	Passing 35/0
+gc: retention physical sweep delete	Reachable	True	crates/ravel-maintain/src/retention.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+logs ingest: a keyed request replayed a stored idempotency receipt	Reachable	True	services/ravel-server/src/logs_ingest.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+logs ingest: a keyed request was refused because its marker lookup failed	Reachable	True	services/ravel-server/src/logs_ingest.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+logs ingest: a strict write timed out waiting for its shard ack	Reachable	True	services/ravel-server/src/otlp_http.rs	maint1,maint2,ravel1,ravel2	ravel1	1	1	0	1	1	0	Passing 218/0	Passing 290/0	Passing 261/0	Passing 420/0
+logs ingest: a write committed on some shards before a sibling shard failed	Reachable	True	services/ravel-server/src/logs_ingest.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Passing 3/0	Passing 5/0	Passing 3/0	Passing 3/0
+logs ingest: a write found its shard actor unavailable	Reachable	True	services/ravel-server/src/otlp_http.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+logs ingest: a write was answered Abandoned	Reachable	True	services/ravel-server/src/otlp_http.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Passing 17/0	Passing 21/0	Passing 12/0	Passing 13/0
+logs ingest: an idempotency marker read back undecodable	Unreachable	False	services/ravel-server/src/logs_ingest.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Passing 0/0	Passing 0/0	Passing 0/0	Passing 0/0
+logs ingest: the idempotency marker write failed after a durable commit	Reachable	True	services/ravel-server/src/logs_ingest.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+maintain: a plan left a late commit record out	Sometimes	True	crates/ravel-maintain/src/late_commit.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	4	2	2	4	2	2	absent	Passing 451/346	Passing 449/312	Passing 794/635
+maintain: a published record names no late commit record	Always	True	crates/ravel-maintain/src/late_commit.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	2	2	0	3	2	1	absent	Passing 285/0	Passing 289/0	Passing 507/0
+maintenance: a heartbeat write is an overwrite, never refused as a CAS	Always	True	crates/ravel-fleet/src/worker_set.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	3	3	0	3	3	0	absent	absent	Passing 694/0	Passing 1562/0
+maintenance: a loser converged on the winner record	Reachable	True	crates/ravel-maintain/src/publish.rs	maint1,maint2,ravel1,ravel2	maint1	1	1	0	1	1	0	absent	absent	Passing 38/0	Passing 68/0
+maintenance: a loser observed a divergent input set and alarmed	Reachable	True	crates/ravel-maintain/src/publish.rs	maint1,maint2,ravel1,ravel2	maint1	1	1	0	1	1	0	absent	absent	Passing 32/0	Passing 37/0
+maintenance: a loser observing a divergent input-set hash fails closed and never overwrites the record	Always	True	crates/ravel-maintain/src/publish.rs	maint1,maint2,ravel1,ravel2	maint1	1	1	0	1	1	0	absent	absent	Passing 32/0	Passing 37/0
+maintenance: a loser reports Converged only when the winner part is observed present in the store	Always	True	crates/ravel-maintain/src/publish.rs	maint1,maint2,ravel1,ravel2	maint1	1	1	0	1	1	0	absent	absent	Passing 38/0	Passing 68/0
+maintenance: a memo snapshot was written	Reachable	True	crates/ravel-maintain/src/memo_snapshot.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	3	3	0	3	3	0	absent	absent	Passing 578/0	Passing 1150/0
+maintenance: a memo snapshot write is an overwrite, never refused as a CAS	Always	True	crates/ravel-maintain/src/memo_snapshot.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	3	3	0	3	3	0	absent	absent	Passing 582/0	Passing 1169/0
+maintenance: a memo was seeded from a snapshot	Reachable	True	crates/ravel-maintain/src/scan.rs	maint1,maint2,ravel1,ravel2	maint1	2	2	0	2	2	0	absent	absent	Passing 413/0	Passing 852/0
+maintenance: a seeded memo entry is never fresher than its snapshot	Always	True	crates/ravel-maintain/src/scan.rs	maint1,maint2,ravel1,ravel2	maint1	2	2	0	2	2	0	absent	absent	Passing 413/0	Passing 841/0
+maintenance: a worker heartbeat was written	Reachable	True	crates/ravel-fleet/src/worker_set.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	3	3	0	3	3	0	absent	absent	Passing 692/0	Passing 1559/0
+maintenance: the store holds the record a winning compaction publish wrote	Always	True	crates/ravel-maintain/src/publish.rs	maint1,maint2,ravel1,ravel2	maint1,maint2	2	2	0	2	2	0	absent	absent	Passing 253/0	Passing 448/0
+metrics ingest: a strict write timed out waiting for its shard ack	Reachable	True	services/ravel-server/src/otlp_http.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+metrics ingest: a write committed on some shards before a sibling shard failed	Reachable	True	services/ravel-server/src/ingest.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+metrics ingest: a write found its shard actor unavailable	Reachable	True	services/ravel-server/src/otlp_http.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+metrics ingest: a write was answered Abandoned	Reachable	True	services/ravel-server/src/otlp_http.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Failing 0/0	Failing 0/0	Failing 0/0	Failing 0/0
+resharding: a commit token whose record is durable resolves across a reshard	Always	True	crates/ravel-catalog/src/catalog.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Passing 52/0	Passing 124/0
+resharding: a generation append's history re-read completes	Sometimes	True	crates/ravel-catalog/src/provisioning.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Passing 114/4	Passing 163/0
+resharding: a lost race never drops a committed generation	Always	True	crates/ravel-catalog/src/provisioning.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Passing 114/0	Passing 163/0
+resharding: a stale writer routed on a grace-extended view	Reachable	True	crates/ravel-ingest/src/generation.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Passing 77/0	Passing 71/0
+resharding: a token resolved at a shard index above the active count	Reachable	True	crates/ravel-catalog/src/catalog.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Passing 52/0	Passing 83/0
+resharding: a writer past the lead horizon was fenced	Reachable	True	crates/ravel-ingest/src/generation.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Passing 37/0	Passing 35/0
+resharding: generation append CAS lost	Reachable	True	crates/ravel-catalog/src/provisioning.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Failing 0/0	Failing 0/0
+resharding: generation append CAS won	Reachable	True	crates/ravel-catalog/src/provisioning.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Passing 113/0	Passing 162/0
+resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops	Always	True	crates/ravel-ingest/src/generation.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Passing 77/0	Passing 71/0
+resharding: two concurrent reshards on the same base version: exactly one wins, the loser revalidates	Always	True	crates/ravel-catalog/src/provisioning.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	absent	absent	Passing 114/0	Passing 163/0
+server: a graceful drain did not complete cleanly	Reachable	True	services/ravel-server/src/main.rs	maint1,maint2,ravel1,ravel2		0	0	0	0	0	0	Passing 12/0	Failing 0/0	Failing 0/0	Passing 8/0
+server: a shutdown signal started a graceful drain	Reachable	True	services/ravel-server/src/main.rs	maint1,maint2,ravel1,ravel2	maint1,maint2,ravel2	4	4	0	4	4	0	Passing 716/0	Passing 788/0	Passing 868/0	Passing 1666/0

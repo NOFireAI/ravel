@@ -1,0 +1,10 @@
+NAME       IMAGE                                                                                                       COMMAND                  SERVICE    CREATED          STATUS                              PORTS
+driver     ravel-antithesis-driver:catalog-maintenance-mutants                                                         "/faketime/run /usr/…"   driver     27 minutes ago   Exited (0) 24 seconds ago           
+faketime   ravel-antithesis-server:catalog-maintenance-mutants                                                         "/usr/local/bin/rave…"   faketime   27 minutes ago   Exited (0) 27 minutes ago           
+init       ravel-antithesis-server:catalog-maintenance-mutants                                                         "/faketime/run /usr/…"   init       27 minutes ago   Exited (0) 27 minutes ago           
+maint1     ravel-antithesis-server:catalog-maintenance-mutants                                                         "/faketime/run /usr/…"   maint1     27 minutes ago   Up 29 seconds                       4317-4318/tcp
+maint2     ravel-antithesis-server:catalog-maintenance-mutants                                                         "/faketime/run /usr/…"   maint2     27 minutes ago   Exited (0) Less than a second ago   
+ravel1     ravel-antithesis-server:catalog-maintenance-mutants                                                         "/faketime/run /usr/…"   ravel1     27 minutes ago   Up 27 minutes                       4317-4318/tcp
+ravel2     ravel-antithesis-server:catalog-maintenance-mutants                                                         "/faketime/run /usr/…"   ravel2     27 minutes ago   Exited (0) 1 second ago             
+rustfs     ghcr.io/rustfs/rustfs:1.0.0-glibc@sha256:bffcab0c9d647aab0055d1c69d340b202d0909966b385932d4ead1aeb7602858   "/faketime/run /entr…"   rustfs     27 minutes ago   Up 27 minutes                       9000-9001/tcp
+s3proxy    ravel-antithesis-driver:catalog-maintenance-mutants                                                         "/usr/local/bin/s3-p…"   s3proxy    27 minutes ago   Up 27 minutes                       

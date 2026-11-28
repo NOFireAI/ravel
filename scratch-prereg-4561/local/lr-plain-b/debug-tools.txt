@@ -1,0 +1,3 @@
+curl 8.14.1 (x86_64-pc-linux-gnu) libcurl/8.14.1 OpenSSL/3.5.9 zlib/1.3.1 brotli/1.1.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.2 libssh2/1.11.1 nghttp2/1.64.0 nghttp3/1.8.0 librtmp/2.3 OpenLDAP/2.6.10
+jq-1.7
+Global tenant-hash scheme selection (ADR-0050 section 3). Every subcommand that computes a `t/<tenant_hash>/` prefix resolves the bucket's scheme from `sys/tenancy` before running (see `resolve_and_install_scheme`); these flags supply the deployment key, or the unkeyed opt-out, that resolution needs, mirroring the server's own startup flags. A keyed bucket run with neither flag refuses rather than hashing under the wrong (v1) derivation. `tenancy show` needs neither and takes its own key flag: it reads the marker directly to discover the scheme in the first place.

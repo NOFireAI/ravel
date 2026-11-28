@@ -1,0 +1,39 @@
+catalog: HEAD stayed unreadable while the clocks passed the protection horizon
+catalog: HEAD was overwritten with garbage through raw S3
+catalog: a compaction record was published
+catalog: a listed commit record decoded through ravel-cli
+catalog: a record race's tamper was still in the store at its undo deadline
+catalog: a record race's undo started past its fold-seal deadline
+catalog: a sealed seeded hour was folded into HEAD
+catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead
+catalog: a server planned a bucket holding a late commit record
+catalog: a server's compaction record PUT lost to a concurrent compaction
+catalog: a server's compaction record PUT lost to a record whose input-set hash diverges from its own
+catalog: a server's compaction record PUT lost to a record whose part is missing from the store
+catalog: a server's compaction record names no late commit record
+catalog: a token read ran after HEAD named the compaction output
+catalog: a token read ran after its input commit record was swept
+catalog: a token read ran after its input was compacted
+catalog: a token read ran on a node restarted since the write
+catalog: a token read ran twice on one node
+catalog: a token read returns each acked record of its write exactly once
+catalog: an on-demand fold succeeded
+catalog: an on-demand sweep succeeded
+catalog: compaction preserves the acked multiset
+catalog: every data object the catalog resolves exists
+catalog: every object HEAD names exists
+catalog: inspect reported a corrupt HEAD
+catalog: no scan shows a phantom or an excess copy
+catalog: sweep deleted a superseded compaction input
+catalog: the audit checked the data objects the catalog resolves
+catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it
+catalog: the seeded load reported other rows than planned
+catalog: the seeded load was refused
+catalog: the system recovers once faults stop
+catalog: the workload starts
+clock: HEAD changed while a clock move landed
+clock: an hour ingested live was sealed by a fold
+clock: the clock jump did not reach the driver
+clock: the clocks jumped past the sweep's protection horizon and pinned-query window
+clock: the driver could not write the clock offset
+clock: the driver's clock jumped forward

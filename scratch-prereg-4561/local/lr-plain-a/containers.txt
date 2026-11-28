@@ -1,0 +1,9 @@
+faketime exited 0
+init exited 0
+rustfs running 0
+s3proxy running 0
+ravel1 running 0
+ravel2 running 0
+maint1 running 0
+maint2 running 0
+driver exited 0

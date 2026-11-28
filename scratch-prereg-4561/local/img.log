@@ -1,0 +1,25 @@
+2026-11-28T10:15:02Z
+d23dbb245e test(antithesis): register the catalog/plan-takes-late-record mutant
+/dev/root       581G  461G  120G  80% /
+plain build rc=0
+#27 DONE 0.2s
+ok ravel-antithesis-server:catalog-maintenance: /symbols/ravel-server links the shim and carries sancov sections
+ok ravel-antithesis-driver:catalog-maintenance: /symbols/driver links the shim and carries sancov sections
+ok ravel-antithesis-driver:catalog-maintenance: /symbols/driver holds the reshard literal: no
+ok ravel-antithesis-driver:catalog-maintenance: /symbols/driver-reshard links the shim and carries sancov sections
+ok ravel-antithesis-driver:catalog-maintenance: /symbols/driver-reshard holds the reshard literal: yes
+ok ravel-antithesis-driver:catalog-maintenance: /symbols/s3-proxy links the shim and carries sancov sections
+ok ravel-antithesis-driver:catalog-maintenance: /symbols/ravel-cli-ant links the shim and carries sancov sections
+mutants build rc=0
+catalog: 6 mutants (expected 6)
+resharding: 2 mutants (expected 2)
+maintenance: 2 mutants (expected 2)
+ok ravel-antithesis-server:catalog-maintenance-mutants: /symbols/ravel-server registers the 10 mutants (catalog 6, resharding 2, maintenance 2)
+ok ravel-antithesis-driver:catalog-maintenance-mutants: /symbols/driver links the shim and carries sancov sections
+ok ravel-antithesis-driver:catalog-maintenance-mutants: /symbols/driver holds the reshard literal: no
+ok ravel-antithesis-driver:catalog-maintenance-mutants: /symbols/driver-reshard links the shim and carries sancov sections
+ok ravel-antithesis-driver:catalog-maintenance-mutants: /symbols/driver-reshard holds the reshard literal: yes
+ok ravel-antithesis-driver:catalog-maintenance-mutants: /symbols/s3-proxy links the shim and carries sancov sections
+ok ravel-antithesis-driver:catalog-maintenance-mutants: /symbols/ravel-cli-ant links the shim and carries sancov sections
+/dev/root       581G  467G  114G  81% /
+2026-11-28T10:40:59Z

@@ -1,0 +1,137 @@
+profile catalog-maintenance: /home/builder/wt/r4561/antithesis/catalog-maintenance/config/docker-compose.yaml
+ Network ravel-antithesis-catalog_default  Creating
+ Network ravel-antithesis-catalog_default  Created
+ Volume ravel-antithesis-catalog_faketime  Creating
+ Volume ravel-antithesis-catalog_faketime  Created
+ Container faketime  Creating
+ Container faketime  Created
+ Container rustfs  Creating
+ Container rustfs  Created
+ Container init  Creating
+ Container s3proxy  Creating
+ Container s3proxy  Created
+ Container init  Created
+ Container maint2  Creating
+ Container ravel1  Creating
+ Container maint1  Creating
+ Container driver  Creating
+ Container ravel2  Creating
+ Container ravel1  Created
+ Container maint2  Created
+ Container maint1  Created
+ Container driver  Created
+ Container ravel2  Created
+ Container faketime  Starting
+ Container faketime  Started
+ Container faketime  Waiting
+ Container faketime  Exited
+ Container rustfs  Starting
+ Container rustfs  Started
+ Container faketime  Waiting
+ Container s3proxy  Starting
+ Container s3proxy  Started
+ Container faketime  Exited
+ Container init  Starting
+ Container init  Started
+ Container init  Waiting
+ Container faketime  Waiting
+ Container faketime  Waiting
+ Container init  Waiting
+ Container faketime  Waiting
+ Container init  Waiting
+ Container faketime  Waiting
+ Container init  Waiting
+ Container faketime  Waiting
+ Container init  Waiting
+ Container faketime  Exited
+ Container faketime  Exited
+ Container faketime  Exited
+ Container faketime  Exited
+ Container faketime  Exited
+ Container init  Exited
+ Container maint2  Starting
+ Container init  Exited
+ Container ravel1  Starting
+ Container init  Exited
+ Container maint1  Starting
+ Container init  Exited
+ Container driver  Starting
+ Container init  Exited
+ Container ravel2  Starting
+ Container ravel1  Started
+ Container maint1  Started
+ Container ravel2  Started
+ Container driver  Started
+ Container maint2  Started
+setup complete after 6s
+maint1 restarted at 1795865942, before ravel2
+ravel2 restarted at 1795865942, when the eventually asked
+memo warm start after the maint1 restart: maint1 21s after it
+rustfs 1796236716
+ravel1 1796236716
+ravel2 1796236716
+maint1 1796236717
+maint2 1796236717
+rustfs-last-modified 1796236717
+host 1795865963 jump 370753
+sdk-cli.jsonl: none, the driver container holds no /tmp/sdk-cli.jsonl
+s3proxy: 1 start(s), open-file limit 65536 (inherited, 5200 needed), 0 lines with 'Too many open files'
+assertions: 121, would fail: 45
+Always	commit: a strict metrics ack names a durable commit record
+Always	commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced
+Always	commit: an idempotency marker implies every shard's commit is durable
+Always	commit: one commit identity holds one content hash
+Always	erasure: a completion is written only when no pre-rewrite object is still served
+Always	erasure: a rewrite's output is its inputs minus the erased records
+Always	gc: no object is deleted inside its protection window
+Always	resharding: a commit token whose record is durable resolves across a reshard
+Always	resharding: a lost race never drops a committed generation
+Always	resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops
+Always	resharding: two concurrent reshards on the same base version: exactly one wins, the loser revalidates
+Reachable	commit: flush abandoned
+Reachable	commit: idempotency marker written
+Reachable	commit: put retried
+Reachable	commit: strict ack sent
+Reachable	erasure: a completion .done was written
+Reachable	erasure: a rewrite record published
+Reachable	fault: ingest/data-put-refused fired
+Reachable	fault: ingest/encode-cancelled fired
+Reachable	gc: a failed hold re-read skips a delete batch
+Reachable	gc: a failed hold refresh skips the maintain tick
+Reachable	gc: a legal hold is placed
+Reachable	gc: a legal hold is released
+Reachable	gc: orphan sweep delete
+Reachable	gc: retention physical sweep delete
+Reachable	logs ingest: a keyed request replayed a stored idempotency receipt
+Reachable	logs ingest: a keyed request was refused because its marker lookup failed
+Reachable	logs ingest: a write committed on some shards before a sibling shard failed
+Reachable	logs ingest: a write found its shard actor unavailable
+Reachable	logs ingest: a write was answered Abandoned
+Reachable	logs ingest: the idempotency marker write failed after a durable commit
+Reachable	metrics ingest: a strict write timed out waiting for its shard ack
+Reachable	metrics ingest: a write committed on some shards before a sibling shard failed
+Reachable	metrics ingest: a write found its shard actor unavailable
+Reachable	metrics ingest: a write was answered Abandoned
+Reachable	resharding: a stale writer routed on a grace-extended view
+Reachable	resharding: a token resolved at a shard index above the active count
+Reachable	resharding: a writer past the lead horizon was fenced
+Reachable	resharding: generation append CAS lost
+Reachable	resharding: generation append CAS won
+Reachable	server: a graceful drain did not complete cleanly
+Sometimes	commit: a marker's durability evidence read completes before it gives up
+Sometimes	commit: a strict metrics ack's durable-commit evidence read completes before it gives up
+Sometimes	commit: an abandoned flush's commit record is absent at the abandon
+Sometimes	resharding: a generation append's history re-read completes
+not this workload's (owned: catalog and the driver's own), unreached and not gated:
+  commit: a strict metrics ack names a durable commit record
+  commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced
+  commit: an idempotency marker implies every shard's commit is durable
+  commit: one commit identity holds one content hash
+  erasure: a completion is written only when no pre-rewrite object is still served
+  erasure: a rewrite's output is its inputs minus the erased records
+  gc: no object is deleted inside its protection window
+  resharding: a commit token whose record is durable resolves across a reshard
+  resharding: a lost race never drops a committed generation
+  resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops
+  resharding: two concurrent reshards on the same base version: exactly one wins, the loser revalidates
+OK: no always-type assertion violated or unhit, every required assertion held, every container healthy, every clock jumped

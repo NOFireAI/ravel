@@ -1,0 +1,3 @@
+maint1 restarted at 1795865942, before ravel2
+ravel2 restarted at 1795865942, when the eventually asked
+memo warm start after the maint1 restart: maint1 21s after it

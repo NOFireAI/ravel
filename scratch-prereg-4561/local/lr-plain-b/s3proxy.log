@@ -1,0 +1,1033 @@
+s3proxy  | s3-proxy: 0.0.0.0:9000 to rustfs:9000 (bucket ravel), control on 0.0.0.0:9001, at most 512 connections, open-file limit 65536 (inherited, 5200 needed), 60 s socket timeout
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: refuse-records -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: refuse-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: hold-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> held t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD 87
+s3proxy  | s3-proxy: release -> ok
+s3proxy  | s3-proxy: held-result -> t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD 412
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: hold-record -> ok
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> held t/646219ab819d2b585711f6f13f4368c7/l/c/0003/20261130T00/l1.5023f02e52f25046.cmt 42
+s3proxy  | s3-proxy: release -> ok
+s3proxy  | s3-proxy: held-result -> none
+s3proxy  | s3-proxy: held-result -> t/646219ab819d2b585711f6f13f4368c7/l/c/0003/20261130T00/l1.5023f02e52f25046.cmt 412
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: hold-record -> ok
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> held t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261130T02/l1.6a9ad5075c0de65a.cmt 101
+s3proxy  | s3-proxy: release -> ok
+s3proxy  | s3-proxy: held-result -> none
+s3proxy  | s3-proxy: held-result -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261130T02/l1.6a9ad5075c0de65a.cmt 412
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: hold-record -> ok
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> none
+s3proxy  | s3-proxy: held -> held t/646219ab819d2b585711f6f13f4368c7/l/c/0003/20261130T04/l1.6a9ad5075c0de65a.cmt 173
+s3proxy  | s3-proxy: release -> ok
+s3proxy  | s3-proxy: held-result -> none
+s3proxy  | s3-proxy: held-result -> t/646219ab819d2b585711f6f13f4368c7/l/c/0003/20261130T04/l1.6a9ad5075c0de65a.cmt 412
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: refuse-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: capture-commit -> ok
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 48 102 CAESEGRiGauBnStYVxH28T9DaM... (582 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 51 280 CAESEGRiGauBnStYVxH28T9DaM... (582 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 52 346 CAESEGRiGauBnStYVxH28T9DaM... (582 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 52 1348 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 148 CAESEGRiGauBnStYVxH28T9DaM... (582 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 1150 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 2152 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 3154 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 4157 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 5159 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 6161 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 7163 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 8166 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 9168 CAESEGRiGauBnStYVxH28T9Da... (583 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 10171 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 11173 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 12175 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 13178 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 14180 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 15182 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 16184 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 17187 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 18189 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 19191 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: captured -> t/646219ab819d2b585711f6f13f4368c7/l/c/0001/20261201T07/7c4a44a6-a796-4be9-a856-65e86217e245.1795864375.00000000000000000004.cmt x-amz-checksum-crc64nvme:6c/MVPcLYSQ= 55 20193 CAESEGRiGauBnStYVxH28T9D... (584 bytes)
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: pass -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: freeze-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok
+s3proxy  | s3-proxy: thaw-key t/646219ab819d2b585711f6f13f4368c7/catalog/l/HEAD -> ok

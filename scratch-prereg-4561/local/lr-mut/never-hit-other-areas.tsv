@@ -1,0 +1,11 @@
+commit: a strict metrics ack names a durable commit record
+commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced
+commit: an idempotency marker implies every shard's commit is durable
+commit: one commit identity holds one content hash
+erasure: a completion is written only when no pre-rewrite object is still served
+erasure: a rewrite's output is its inputs minus the erased records
+gc: no object is deleted inside its protection window
+resharding: a commit token whose record is durable resolves across a reshard
+resharding: a lost race never drops a committed generation
+resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops
+resharding: two concurrent reshards on the same base version: exactly one wins, the loser revalidates

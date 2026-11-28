@@ -1,0 +1,121 @@
+Sometimes	1	1	catalog: HEAD stayed unreadable while the clocks passed the protection horizon
+Reachable	1	1	catalog: HEAD was overwritten with garbage through raw S3
+Always	2	2	catalog: a catalog sweep never deletes under an unreadable HEAD
+Sometimes	2	1	catalog: a compaction record was published
+Always	2	2	catalog: a delete gate never clears under an unreadable HEAD
+Always	4	4	catalog: a fold reports as folded only a HEAD the store holds
+Sometimes	1	1	catalog: a listed commit record decoded through ravel-cli
+Always	2	2	catalog: a published compaction record is never replaced
+Unreachable	0	0	catalog: a record race's tamper was still in the store at its undo deadline
+Unreachable	0	0	catalog: a record race's undo started past its fold-seal deadline
+Sometimes	1	1	catalog: a sealed seeded hour was folded into HEAD
+Sometimes	1	1	catalog: a server fold lost its HEAD CAS to a fold one sealed hour ahead
+Sometimes	1	1	catalog: a server planned a bucket holding a late commit record
+Sometimes	1	1	catalog: a server's compaction record PUT lost to a concurrent compaction
+Sometimes	1	1	catalog: a server's compaction record PUT lost to a record whose input-set hash diverges from its own
+Sometimes	1	1	catalog: a server's compaction record PUT lost to a record whose part is missing from the store
+Always	1	1	catalog: a server's compaction record names no late commit record
+Always	2	2	catalog: a sweep never deletes an object the current HEAD names
+Sometimes	2	1	catalog: a token read ran after HEAD named the compaction output
+Sometimes	2	1	catalog: a token read ran after its input commit record was swept
+Sometimes	2	1	catalog: a token read ran after its input was compacted
+Sometimes	2	1	catalog: a token read ran on a node restarted since the write
+Sometimes	2	1	catalog: a token read ran twice on one node
+Always	1	1	catalog: a token read returns each acked record of its write exactly once
+Reachable	1	1	catalog: an on-demand fold succeeded
+Reachable	1	1	catalog: an on-demand sweep succeeded
+Always	2	2	catalog: compaction preserves the acked multiset
+Reachable	2	2	catalog: compaction record published
+Reachable	4	4	catalog: delete pass refused on an unreadable HEAD
+Always	1	1	catalog: every data object the catalog resolves exists
+Always	1	1	catalog: every object HEAD names exists
+Reachable	3	3	catalog: fold HEAD CAS lost
+Reachable	4	4	catalog: fold HEAD CAS won
+Reachable	1	1	catalog: inspect reported a corrupt HEAD
+Always	1	1	catalog: no scan shows a phantom or an excess copy
+Reachable	2	2	catalog: superseded sweep delete
+Sometimes	2	1	catalog: sweep deleted a superseded compaction input
+Sometimes	1	1	catalog: the audit checked the data objects the catalog resolves
+Sometimes	1	1	catalog: the clocks passed a compaction record's protection horizon and pinned-query window while HEAD had not folded it
+Unreachable	0	0	catalog: the seeded load reported other rows than planned
+Unreachable	0	0	catalog: the seeded load was refused
+Always	1	1	catalog: the system recovers once faults stop
+Reachable	1	1	catalog: the workload starts
+Unreachable	0	0	clock: HEAD changed while a clock move landed
+Sometimes	2	1	clock: an hour ingested live was sealed by a fold
+Unreachable	0	0	clock: the clock jump did not reach the driver
+Reachable	1	1	clock: the clocks jumped past the sweep's protection horizon and pinned-query window
+Unreachable	0	0	clock: the driver could not write the clock offset
+Reachable	1	1	clock: the driver's clock jumped forward
+Always	3	3	commit: a commit record never exists without its data object
+Always	4	4	commit: a commit token never resolves to a stale answer
+Sometimes	3	3	commit: a commit token's stale-answer evidence read evaluated
+Sometimes	3	3	commit: a commit's data-object evidence read completes before it gives up
+Sometimes	0	0	commit: a marker's durability evidence read completes before it gives up
+Always	3	3	commit: a strict logs ack names a durable commit record
+Sometimes	3	3	commit: a strict logs ack's durable-commit evidence read completes before it gives up
+Always	0	0	commit: a strict metrics ack names a durable commit record
+Sometimes	0	0	commit: a strict metrics ack's durable-commit evidence read completes before it gives up
+Always	0	0	commit: a swept-token fallback never adds a rewrite's parts beside an object the rewrite replaced
+Sometimes	0	0	commit: an abandoned flush's commit record is absent at the abandon
+AlwaysOrUnreachable	0	0	commit: an abandoned flush's commit record never lands past the fold's seal margin
+Always	0	0	commit: an idempotency marker implies every shard's commit is durable
+Reachable	3	3	commit: commit record put
+Reachable	3	3	commit: data object put
+Reachable	0	0	commit: flush abandoned
+Reachable	0	0	commit: idempotency marker written
+Always	0	0	commit: one commit identity holds one content hash
+Reachable	0	0	commit: put retried
+Reachable	0	0	commit: strict ack sent
+Reachable	0	0	erasure: a completion .done was written
+Always	0	0	erasure: a completion is written only when no pre-rewrite object is still served
+Reachable	0	0	erasure: a rewrite record published
+Always	0	0	erasure: a rewrite's output is its inputs minus the erased records
+Reachable	0	0	fault: ingest/data-put-refused fired
+Reachable	0	0	fault: ingest/encode-cancelled fired
+Reachable	0	0	gc: a failed hold re-read skips a delete batch
+Reachable	0	0	gc: a failed hold refresh skips the maintain tick
+Always	5	5	gc: a failed hold refresh sweeps nothing
+Always	2	2	gc: a held object is never deleted
+Reachable	0	0	gc: a legal hold is placed
+Reachable	0	0	gc: a legal hold is released
+Always	0	0	gc: no object is deleted inside its protection window
+Reachable	0	0	gc: orphan sweep delete
+Reachable	0	0	gc: retention physical sweep delete
+Reachable	0	0	logs ingest: a keyed request replayed a stored idempotency receipt
+Reachable	0	0	logs ingest: a keyed request was refused because its marker lookup failed
+Reachable	1	1	logs ingest: a strict write timed out waiting for its shard ack
+Reachable	0	0	logs ingest: a write committed on some shards before a sibling shard failed
+Reachable	0	0	logs ingest: a write found its shard actor unavailable
+Reachable	0	0	logs ingest: a write was answered Abandoned
+Unreachable	0	0	logs ingest: an idempotency marker read back undecodable
+Reachable	0	0	logs ingest: the idempotency marker write failed after a durable commit
+Sometimes	6	3	maintain: a plan left a late commit record out
+Always	2	2	maintain: a published record names no late commit record
+Always	3	3	maintenance: a heartbeat write is an overwrite, never refused as a CAS
+Reachable	1	1	maintenance: a loser converged on the winner record
+Reachable	1	1	maintenance: a loser observed a divergent input set and alarmed
+Always	1	1	maintenance: a loser observing a divergent input-set hash fails closed and never overwrites the record
+Always	1	1	maintenance: a loser reports Converged only when the winner part is observed present in the store
+Reachable	3	3	maintenance: a memo snapshot was written
+Always	3	3	maintenance: a memo snapshot write is an overwrite, never refused as a CAS
+Reachable	3	3	maintenance: a memo was seeded from a snapshot
+Always	3	3	maintenance: a seeded memo entry is never fresher than its snapshot
+Reachable	3	3	maintenance: a worker heartbeat was written
+Always	2	2	maintenance: the store holds the record a winning compaction publish wrote
+Reachable	0	0	metrics ingest: a strict write timed out waiting for its shard ack
+Reachable	0	0	metrics ingest: a write committed on some shards before a sibling shard failed
+Reachable	0	0	metrics ingest: a write found its shard actor unavailable
+Reachable	0	0	metrics ingest: a write was answered Abandoned
+Always	0	0	resharding: a commit token whose record is durable resolves across a reshard
+Sometimes	0	0	resharding: a generation append's history re-read completes
+Always	0	0	resharding: a lost race never drops a committed generation
+Reachable	0	0	resharding: a stale writer routed on a grace-extended view
+Reachable	0	0	resharding: a token resolved at a shard index above the active count
+Reachable	0	0	resharding: a writer past the lead horizon was fenced
+Reachable	0	0	resharding: generation append CAS lost
+Reachable	0	0	resharding: generation append CAS won
+Always	0	0	resharding: grace routing continues only within the lead horizon of the last refresh; past it the writer stops
+Always	0	0	resharding: two concurrent reshards on the same base version: exactly one wins, the loser revalidates
+Reachable	0	0	server: a graceful drain did not complete cleanly
+Reachable	4	4	server: a shutdown signal started a graceful drain
