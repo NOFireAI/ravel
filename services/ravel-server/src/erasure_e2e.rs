@@ -1112,6 +1112,8 @@ async fn erasure_pass_at(
 
 const COMPLETION_NOT_SERVED: &str =
     "erasure: a completion is written only when no pre-rewrite object is still served";
+const COMPLETION_OPEN_BUCKETS_JUDGED: &str =
+    "erasure: a completion is written only once every bucket open at its acknowledgement is judged";
 
 /// CompletionImpliesNoPreRewriteExposure (ADR-4326), through the served-set
 /// branch of the completion gate. Every completion attempt runs at a clock
@@ -1253,7 +1255,9 @@ async fn completion_waits_for_the_served_set() {
 /// `bucket_erasure_completion` blocks every request in scope of a bucket it may
 /// not judge yet. The mutant drops that block with the rest of
 /// `catalog_blocked` and writes `.done` while the record is still served, so
-/// the property must evaluate false.
+/// CompletionCoversEveryBucketOpenAtRequest must evaluate false, while
+/// CompletionImpliesNoPreRewriteExposure, which judges only buckets the gate may
+/// judge, holds (ADR-4326, the completion-mutant amendment).
 #[tokio::test]
 async fn mutant_completion_over_the_unsealed_ack_hour_is_judged() {
     let mut harness = TickHarness::new();
@@ -1308,18 +1312,31 @@ async fn mutant_completion_over_the_unsealed_ack_hour_is_judged() {
         object_exists(&store, &done_key).await,
         "the mutant writes .done while the ack-open hour still serves the subject"
     );
-    let found: Vec<(bool, String)> = captured_evaluations(COMPLETION_NOT_SERVED)
-        .into_iter()
-        .filter(|(_, details)| details.contains(&mutant_id.to_string()))
-        .collect();
+    let of_request = |message: &'static str| -> Vec<(bool, String)> {
+        captured_evaluations(message)
+            .into_iter()
+            .filter(|(_, details)| details.contains(&mutant_id.to_string()))
+            .collect()
+    };
+    let open = of_request(COMPLETION_OPEN_BUCKETS_JUDGED);
     assert_eq!(
-        found.len(),
-        1,
-        "the mutant's one .done write is judged: {found:?}"
+        open.iter()
+            .map(|(violation, _)| *violation)
+            .collect::<Vec<_>>(),
+        vec![true],
+        "CompletionCoversEveryBucketOpenAtRequest judges the mutant's one .done write and \
+         evaluates false: {open:?}"
     );
-    assert!(
-        found.iter().any(|(violation, _)| *violation),
-        "CompletionImpliesNoPreRewriteExposure must evaluate false under the mutant: {found:?}"
+    // The split: the bucket the gate may not judge is left out of the
+    // served-set evidence, so that property holds for the same write.
+    let served = of_request(COMPLETION_NOT_SERVED);
+    assert_eq!(
+        served
+            .iter()
+            .map(|(violation, _)| *violation)
+            .collect::<Vec<_>>(),
+        vec![false],
+        "CompletionImpliesNoPreRewriteExposure judges the same write and holds: {served:?}"
     );
 }
 

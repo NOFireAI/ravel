@@ -4194,11 +4194,36 @@ pub(crate) async fn run_erasure_pass(
                 } else {
                     std::collections::HashMap::new()
                 };
+                // The evidence CompletionCoversEveryBucketOpenAtRequest judges
+                // the same writes from, also read afresh.
+                let open_now = if ravel_invariant::EVALUATES && !completing.is_empty() {
+                    open_buckets_after_completion(
+                        store,
+                        clock,
+                        compactor,
+                        tenant,
+                        signal,
+                        scan_shards,
+                        &pending,
+                    )
+                    .await
+                } else {
+                    std::collections::HashMap::new()
+                };
                 for entry in completing {
                     let _verdict = served_now.get(&entry.request.request_id).copied().flatten();
                     ravel_invariant::inv_always_if_known!(
                         _verdict,
                         "erasure: a completion is written only when no pre-rewrite object is still served",
+                        std::collections::BTreeMap::from([
+                            ("request_id", entry.request.request_id.clone()),
+                            ("tenant", tenant.to_hex()),
+                        ])
+                    );
+                    let _open_verdict = open_now.get(&entry.request.request_id).copied().flatten();
+                    ravel_invariant::inv_always_if_known!(
+                        _open_verdict,
+                        "erasure: a completion is written only once every bucket open at its acknowledgement is judged",
                         std::collections::BTreeMap::from([
                             ("request_id", entry.request.request_id.clone()),
                             ("tenant", tenant.to_hex()),
@@ -4294,8 +4319,8 @@ pub(crate) async fn run_erasure_pass(
 /// still serves each pending request's subject. Per request: `Some(true)` when
 /// no judged bucket serves it, `Some(false)` when one does, and `None` when a
 /// listing, a resolve or a held bucket leaves that unknown. A bucket the gate
-/// may not judge yet is left out: CompletionCoversEveryBucketOpenAtRequest owns
-/// that case.
+/// may not judge yet is left out: [`open_buckets_after_completion`] is the
+/// evidence for that case (CompletionCoversEveryBucketOpenAtRequest).
 ///
 /// The listing is fresh, but each bucket is judged by the same
 /// [`ravel_maintain::bucket_erasure_completion`] the pass uses. This checks
@@ -4345,6 +4370,64 @@ async fn served_after_completion(
         .map(|entry| {
             let id = entry.request.request_id.clone();
             let verdict = if served.contains(&id) {
+                Some(false)
+            } else {
+                known.then_some(true)
+            };
+            (id, verdict)
+        })
+        .collect()
+}
+
+/// The evidence for CompletionCoversEveryBucketOpenAtRequest (ADR-4326, the
+/// completion-mutant amendment), built apart from the pass that decided the
+/// completions: the tenant's hours listed again from the store, together with
+/// the hour open at each pending request's acknowledgement
+/// ([`ravel_maintain::erasure_rewrite::ack_open_ingest_hours`]), and of those
+/// buckets the ones the completion gate may not judge yet
+/// ([`ravel_maintain::may_judge_completion`]). Per request: `Some(false)` when
+/// such a bucket had opened by the request's acknowledgement, `Some(true)` when
+/// none had, and `None` when a shard's listing failed and none of the buckets
+/// that could be listed had.
+///
+/// A judged bucket is left out: [`served_after_completion`] judges whether it
+/// still serves the subject.
+async fn open_buckets_after_completion(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    tenant: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+    pending: &[PendingErasureRequest],
+) -> std::collections::HashMap<String, Option<bool>> {
+    let mut known = true;
+    let mut open: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let now_ns = clock.now_ns();
+    let derived = ravel_maintain::erasure_rewrite::ack_open_ingest_hours(pending);
+    for shard in 0..scan_shards {
+        let mut hours = derived.clone();
+        match list_erasure_scan_hours(store, tenant, signal, shard).await {
+            Ok(listed) => hours.extend(listed),
+            Err(_) => known = false,
+        }
+        for hour in hours {
+            let bucket = Bucket::new(*tenant, signal, shard, hour);
+            if ravel_maintain::may_judge_completion(store, &bucket, now_ns, compactor) {
+                continue;
+            }
+            for entry in pending {
+                if bucket.start_ns() <= entry.request.created_unix_ns {
+                    open.insert(entry.request.request_id.clone());
+                }
+            }
+        }
+    }
+    pending
+        .iter()
+        .map(|entry| {
+            let id = entry.request.request_id.clone();
+            let verdict = if open.contains(&id) {
                 Some(false)
             } else {
                 known.then_some(true)

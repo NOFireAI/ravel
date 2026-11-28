@@ -76,7 +76,7 @@ SERVERS="ravel1 ravel2 maint1 maint2"
 CONTAINERS="faketime rustfs init $SERVERS driver"
 P1="erasure: an erased subject is never returned after its request"
 # Every run must reach these: the driver's progress through the erasure, hold
-# and clock phases and the situations it forces, the four SUT
+# and clock phases and the situations it forces, the five SUT
 # always-assertions the lifecycle smoke run must reach and pass, the driver's
 # erasure property, and the SUT reachables that show the forced hold-read
 # failure skipped a tick and a retention delete happened.
@@ -96,6 +96,7 @@ REQUIRED=(
     "gc: a held object is never deleted"
     "gc: a failed hold refresh sweeps nothing"
     "erasure: a completion is written only when no pre-rewrite object is still served"
+    "erasure: a completion is written only once every bucket open at its acknowledgement is judged"
     "gc: a failed hold refresh skips the maintain tick"
     "gc: retention physical sweep delete"
 )

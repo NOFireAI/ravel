@@ -1,7 +1,7 @@
 # negative cfg stem	mutant (inv_mutant! in crates/ or services/)	property it must make false
 compaction-ignores-rewrite	none: ADR-4326 decision 3 ships no lifecycle mutant for AtMostOneLiveRecordSetServed; the compaction's rewrite guard and the bucket claim are crate-tested
-complete-ignores-served-set	lifecycle/complete-ignores-served-set	erasure: a completion is written only when no pre-rewrite object is still served
-completion-ignores-open-bucket	none: ADR-4326 decision 3 ships no mutant for CompletionCoversEveryBucketOpenAtRequest; crate tests own the open-hour union
+complete-ignores-served-set	lifecycle/complete-ignores-served-set	erasure: a completion is written only once every bucket open at its acknowledgement is judged
+completion-ignores-open-bucket	none: the Rust guard unions both completion gates, so lifecycle/complete-ignores-served-set switches off this config's gate too and its line names this config's property (ADR-4326, the completion-mutant amendment); the capture-lane test completion_waits_for_the_served_set Part B pins the served-set property
 delete-before-horizon	lifecycle/delete-before-horizon	gc: no object is deleted inside its protection window
 dreq-ignores-held-inputs	none: ADR-4326 decision 3 ships no mutant for DreqSweepRespectsLegalHold; crate tests own rule 6's chain-hold observation
 marker-ignores-anchor	none: ADR-4326 decision 3 ships no mutant for the marker anchor; the workload's jumps pass each window whole, so no run replaces a tombstone or record under a marker
