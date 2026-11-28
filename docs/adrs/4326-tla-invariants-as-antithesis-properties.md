@@ -795,14 +795,16 @@ The change:
   every bucket open at its acknowledgement is judged`. Its evidence is a fresh
   listing, together with the hour open at each request's acknowledgement. For
   each bucket the gate may not judge yet, the evidence is whether that bucket
-  is in the request's scope at acknowledgement.
-- The lifecycle `.tsv` maps the mutant to that property, on the
-  `completion-ignores-open-bucket` line. The `complete-ignores-served-set`
-  line becomes `none`, and its reason says the Rust guard unions both checks
-  and the mutant is counted on the other line. This retires the line's
-  earlier reason, that decision 3 ships no mutant for
-  `CompletionCoversEveryBucketOpenAtRequest`. Decision 6's one property per
-  line still holds.
+  had opened by the request's acknowledgement.
+- The lifecycle `.tsv` maps the mutant to that property. The mutant stays on
+  the `complete-ignores-served-set` line, because decision 3 names a mutant
+  `<area>/<negative cfg stem>` and `check-tla.sh` refuses any other name on a
+  line. That line now names the open-bucket property. The
+  `completion-ignores-open-bucket` line stays `none`, and its reason says the
+  Rust guard unions both checks and the mutant is counted on the other line.
+  This retires that line's earlier reason, that decision 3 ships no mutant
+  for `CompletionCoversEveryBucketOpenAtRequest`. Decision 6's one property
+  per line still holds.
 - The served-set property keeps its SUT site and its evidence. The mutant's
   break of that property is shown by the capture-lane test
   `completion_waits_for_the_served_set`, Part B, in
