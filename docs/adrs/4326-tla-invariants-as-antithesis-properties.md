@@ -795,7 +795,8 @@ The change:
   every bucket open at its acknowledgement is judged`. Its evidence is a fresh
   listing, together with the hour open at each request's acknowledgement. For
   each bucket the gate may not judge yet, the evidence is whether that bucket
-  had opened by the request's acknowledgement.
+  had opened by the request's acknowledgement, within the clock-skew
+  allowance, which is the scope the gate itself applies.
 - The lifecycle `.tsv` maps the mutant to that property. The mutant stays on
   the `complete-ignores-served-set` line, because decision 3 names a mutant
   `<area>/<negative cfg stem>` and `check-tla.sh` refuses any other name on a
