@@ -896,13 +896,25 @@ async fn publish_subject_l0(
     tenant: &TenantId,
     seq: u64,
 ) -> (ravel_proto::commit::v1::CompactionInputIdentity, String) {
+    publish_subject_l0_in(store, tenant, seq, 0).await
+}
+
+/// [`publish_subject_l0`] at ingest hour `hour`, the sample
+/// [`SAMPLE_TS_NS`] past the hour's start.
+async fn publish_subject_l0_in(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    seq: u64,
+    hour: u32,
+) -> (ravel_proto::commit::v1::CompactionInputIdentity, String) {
     let tenant_hash = tenant.hash();
+    let hour_start_ns = i64::from(hour) * NS_PER_HOUR;
     let labels = metric_labels(ERASED_SUBJECT, "a");
     let series = vec![SeriesInput {
         series_id: SeriesId::compute(tenant, METRIC_NAME, &labels).expect("series id"),
         labels,
         samples: vec![Sample {
-            ts_ns: SAMPLE_TS_NS,
+            ts_ns: hour_start_ns + SAMPLE_TS_NS,
             value: SUBJECT_VALUE,
         }],
     }];
@@ -917,8 +929,8 @@ async fn publish_subject_l0(
             writer_seq: seq,
         },
         IngestBounds {
-            min_ingest_ts_ns: 0,
-            max_ingest_ts_ns: 0,
+            min_ingest_ts_ns: hour_start_ns,
+            max_ingest_ts_ns: hour_start_ns,
         },
     )
     .expect("write segment");
@@ -939,7 +951,7 @@ async fn publish_subject_l0(
         max_ingest_ts_ns: written.summary.max_event_ts_ns,
         segment_format_version: 1,
         created_unix_ns: 10 + seq as i64,
-        ingest_hour_bucket: 0,
+        ingest_hour_bucket: hour,
     })
     .expect("valid commit record");
     let data_key = keys::reconstruct_data_key(&rec).expect("data key");
@@ -1228,6 +1240,83 @@ async fn completion_waits_for_the_served_set() {
         .into_iter()
         .filter(|(_, details)| details.contains(&request_id.to_string()))
         .collect();
+    assert!(
+        found.iter().any(|(violation, _)| *violation),
+        "CompletionImpliesNoPreRewriteExposure must evaluate false under the mutant: {found:?}"
+    );
+}
+
+/// The lifecycle-gc workload's situation for the `complete-ignores-served-set`
+/// mutant (issue #4552). The subject's only record sits in the ingest hour open
+/// at the request's acknowledgement, and the completion attempt runs before
+/// that hour seals. The shipped gate withholds `.done`, because
+/// `bucket_erasure_completion` blocks every request in scope of a bucket it may
+/// not judge yet. The mutant drops that block with the rest of
+/// `catalog_blocked` and writes `.done` while the record is still served, so
+/// the property must evaluate false.
+#[tokio::test]
+async fn mutant_completion_over_the_unsealed_ack_hour_is_judged() {
+    let mut harness = TickHarness::new();
+    let tenant_id = TenantId::new("acme");
+    let tenant = tenant_id.hash();
+    let ack_hour = (TEST_NOW_NS / NS_PER_HOUR) as u32;
+    let ack_ns = TEST_NOW_NS + 60 * 1_000_000_000;
+    let pass_ns = ack_ns + 20 * 1_000_000_000;
+    assert!(
+        !ravel_maintain::Bucket::new(tenant, Signal::Metrics, 0, ack_hour)
+            .is_sealed(pass_ns, &harness.compactor),
+        "the ack-open hour is unsealed at the completion attempt"
+    );
+    async fn fixture(
+        store: &MemoryStore,
+        tenant_id: &TenantId,
+        request_id: Uuid,
+        hour: u32,
+        ack_ns: i64,
+    ) -> String {
+        let tenant = tenant_id.hash();
+        publish_subject_l0_in(store, tenant_id, 1, hour).await;
+        submit_erasure_request(
+            store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            ERASED_SUBJECT,
+            ack_ns,
+        )
+        .await;
+        keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key")
+    }
+
+    let shipped_id = Uuid::from_u128(0x4552_0001);
+    let store = MemoryStore::new();
+    let done_key = fixture(&store, &tenant_id, shipped_id, ack_hour, ack_ns).await;
+    erasure_pass_at(&store, &mut harness, &tenant, pass_ns).await;
+    assert!(
+        !object_exists(&store, &done_key).await,
+        "the shipped gate withholds .done while the ack-open hour is unsealed"
+    );
+
+    let Some(_mutant) = scoped_mutant("lifecycle/complete-ignores-served-set") else {
+        return;
+    };
+    let mutant_id = Uuid::from_u128(0x4552_0002);
+    let store = MemoryStore::new();
+    let done_key = fixture(&store, &tenant_id, mutant_id, ack_hour, ack_ns).await;
+    erasure_pass_at(&store, &mut harness, &tenant, pass_ns).await;
+    assert!(
+        object_exists(&store, &done_key).await,
+        "the mutant writes .done while the ack-open hour still serves the subject"
+    );
+    let found: Vec<(bool, String)> = captured_evaluations(COMPLETION_NOT_SERVED)
+        .into_iter()
+        .filter(|(_, details)| details.contains(&mutant_id.to_string()))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "the mutant's one .done write is judged: {found:?}"
+    );
     assert!(
         found.iter().any(|(violation, _)| *violation),
         "CompletionImpliesNoPreRewriteExposure must evaluate false under the mutant: {found:?}"
